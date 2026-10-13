@@ -11,6 +11,49 @@
 
 ## 当前状态
 
-项目处于第一阶段启动期。计划中的 Nanite 类虚拟几何、Lumen 类世界空间 GI 和反射均尚未实现，文档中的性能数值是待验证目标。
+阶段 1.1 已建立可运行的基础切片：程序化角色和树木共用 GPU 蒙皮与 Morph 程序，主视图与阴影共用形变结果，并连接金属度/粗糙度 PBR、运动历史和 Rapier 固定步物理。
 
-第一批实现以原生 WebGPU 和 TypeScript 为基础，验证程序化角色与树木共用 GPU 蒙皮，以及材质、阴影、运动历史和固定步长物理的连接。具体实现与验证状态将在首个代码版本中记录。
+计划中的 Nanite 类虚拟几何、Lumen 类世界空间 GI 和反射均尚未实现，文档中的性能数值是待验证目标。当前固定四骨骼和单个位置 Morph 的实现，不等同完整形变图或材质编译器。完整边界与后续工作见 [实现状态](docs/implementation.md)。
+
+## 本地运行
+
+需要 Node.js 24 与支持 WebGPU 的浏览器。使用 localhost 或 HTTPS。
+
+```sh
+npm ci
+npm run dev
+```
+
+打开终端给出的本地地址。拖动旋转视角，滚轮缩放；侧栏支持暂停、重置、刚体增删、GPU 形变验证与 JSON 诊断导出。`?trees=128` 可调整树木实例数，上限为 256。页面是测试场景与诊断入口，不是编辑器。
+
+## 验证
+
+```sh
+npm run check
+npx playwright install chromium
+npm run test:browser
+```
+
+默认浏览器测试使用 SwiftShader，验证功能而非真实硬件帧率。安装系统 Chrome 的 Windows 环境可运行：
+
+```powershell
+$env:PLAYWRIGHT_CHANNEL = 'chrome'
+npm run test:browser
+$env:PLAYWRIGHT_GPU = 'hardware'
+npm run test:browser
+```
+
+第二次运行不启用实验 GPU flags，使用正常硬件适配器。没有兼容 GPU 时测试明确失败，不跳过验证。测试截图和诊断附在 Playwright 输出中，不提交生成文件。
+
+2026-10-14 本地验证：19 项单元测试、TypeScript 与生产构建通过；Chrome 154 在 SwiftShader 和本机 NVIDIA GPU 上分别通过 2 项浏览器测试。尚未完成性能档位、长期稳定性或跨厂商认证。
+
+## 代码入口
+
+| 文件 | 职责 |
+| --- | --- |
+| src/contracts.ts | 与游戏内容类别无关的场景输入 |
+| src/renderer.ts | WebGPU 资源、形变共享、阴影与表面调度 |
+| src/shaders/deform.wgsl | 当前/前帧 Morph 与四骨骼蒙皮 |
+| src/shaders/surface.wgsl | 直接光 PBR、阴影与运动向量 |
+| src/physics.ts | Rapier 适配与固定步姿态快照 |
+| src/scene.ts | 用代码组合通用能力的测试场景 |

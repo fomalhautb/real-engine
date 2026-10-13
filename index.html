@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#111b20" />
+    <title>Real Engine — Shared motion</title>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <a class="brand" href="./"><span class="brand-mark">r.</span> REAL ENGINE</a>
+        <span class="milestone">PHASE 01 / FOUNDATION</span>
+        <span id="status" role="status"><i></i> INITIALIZING</span>
+      </header>
+      <main>
+        <section class="viewport" aria-label="实时 WebGPU 场景">
+          <canvas id="viewport" aria-label="共享形变场景，可拖动旋转视角" tabindex="0"></canvas>
+          <div class="scene-title"><span class="eyebrow">EXPERIMENT 001</span><h1>Shared motion.</h1><p>一个形变核心。角色、树木与动态世界。</p></div>
+          <div class="legend"><span><i class="teal"></i> WIND → SKINNING</span><span><i class="blue"></i> POSE → SKINNING</span><span><i class="amber"></i> PHYSICS → TRANSFORM</span></div>
+          <div class="canvas-hint">拖动旋转 · 滚轮缩放</div>
+          <div id="error" role="alert" hidden></div>
+        </section>
+        <aside>
+          <div class="panel-heading"><span class="eyebrow">RUNTIME OBSERVATORY</span><h2>统一管线验证</h2><p>同一份几何结果，供主视图与阴影复用。</p></div>
+          <div class="pipeline"><span>01 &nbsp; MORPH + SKIN</span><b>↓</b><span>02 &nbsp; SHADOW</span><b>↓</b><span>03 &nbsp; PBR + VELOCITY</span></div>
+          <dl class="metrics">
+            <div><dt>实例</dt><dd id="instances">—</dd></div>
+            <div><dt>形变顶点 / 帧</dt><dd id="vertices">—</dd></div>
+            <div><dt>CPU 提交</dt><dd id="cpu">—</dd></div>
+            <div><dt>GPU 三个 pass</dt><dd id="gpu">—</dd></div>
+            <div><dt>已分配 GPU 资源</dt><dd id="memory">—</dd></div>
+            <div><dt>物理</dt><dd id="physics">60 Hz</dd></div>
+          </dl>
+          <div class="controls"><button id="pause" type="button">暂停 / 继续</button><button id="reset" type="button">重置场景</button><button id="spawn" type="button">添加刚体</button><button id="remove" type="button">移除刚体</button></div>
+          <button id="verify" class="wide" type="button">验证 GPU 形变结果</button>
+          <p id="verification" aria-live="polite">与 CPU 参考比较当前和上一帧位置。</p>
+          <button id="export" class="subtle" type="button">导出运行诊断 JSON ↗</button>
+          <div class="scope"><strong>第一阶段 1.1</strong><p>原生 WebGPU · 程序化测试资产 · Rapier 物理</p><p>当前使用直接光和常量环境补光。虚拟几何、世界空间 GI 与反射尚未实现。</p></div>
+        </aside>
+      </main>
+      <footer><span>CODE FIRST. SHARED CONTRACTS.</span><span id="adapter">Requesting WebGPU adapter…</span></footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

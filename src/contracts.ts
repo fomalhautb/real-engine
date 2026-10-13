@@ -1,13 +1,14 @@
 import type { Mat4 } from './math';
 import type { MeshData } from './geometry';
+import type { DeformationGraph, MorphTarget } from './deformation';
 
-/** Stage 1.1 capabilities: four rigid joints, one position morph, opaque metal/rough. */
+/** Render input independent of the gameplay category or pose producer. */
 export interface InstanceState {
   entityId: number;
   model: Mat4;
   normalMatrix: Mat4;
   bones: Mat4[];
-  morph: number;
+  deformScalars: number[];
   color: [number, number, number, number];
   metalness: number;
   roughness: number;
@@ -15,8 +16,13 @@ export interface InstanceState {
   historyVersion: number;
 }
 export interface SceneBatch {
+  /** Committed inputs replace instance objects on every change; mutable inputs
+   * are re-evaluated on every render. Assets are immutable after GPU upload. */
+  inputMode?: 'committed' | 'mutable';
   name: string;
   mesh: MeshData;
   capacity: number;
   instances: InstanceState[];
+  deformation: DeformationGraph;
+  morphTargets: MorphTarget[];
 }

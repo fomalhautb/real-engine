@@ -1,27 +1,38 @@
 import deformationSource from './shaders/deform.wgsl?raw';
 import surfaceSource from './shaders/surface.wgsl?raw';
-import { identity, lookAt, multiply, perspective, type Mat4 } from './math';
-import type { SceneBatch } from './contracts';
+import { identity, lookAt, multiply, perspective, transformPoint, type Mat4 } from './math';
+import type { InstanceState, SceneBatch } from './contracts';
+import { compileDeformation, conservativeDeformationBounds, evaluateDeformation,
+  validateDeformationVertex, validateMorphTargets, type Bounds3 } from './deformation';
+import { compileRenderGraph } from './render-graph';
 
-type Previous = { model: Mat4; bones: Mat4[]; morph: number; version: number };
+type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; source?: InstanceState; settled: boolean };
 type Batch = {
   scene: SceneBatch; rest: GPUBuffer; indices: GPUBuffer; params: GPUBuffer;
-  instances: GPUBuffer; palettes: GPUBuffer; output: GPUBuffer;
+  instances: GPUBuffer; palettes: GPUBuffer; output: GPUBuffer; scalars: GPUBuffer;
   compute: GPUBindGroup; render: GPUBindGroup;
-  instanceData: Float32Array<ArrayBuffer>; paletteData: Float32Array<ArrayBuffer>;
+  program: ReturnType<typeof compileDeformation>; pipeline: GPUComputePipeline;
+  instanceData: Float32Array<ArrayBuffer>; paletteData: Float32Array<ArrayBuffer>; scalarData: Float32Array<ArrayBuffer>;
+  morphBounds: Bounds3[]; bounds: Map<number, Bounds3>;
   history: Map<number, Previous>;
+  dirty: boolean; lastInstances: InstanceState[];
 };
 export interface FrameStats {
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
   gpuMs: { deformation: number; shadow: number; surface: number } | null;
+  deformationDispatches: number; uploadedBytes: number;
+}
+export interface DeformationVerification {
+  vertices: number; maxError: number; maxNormalError: number; boundsViolations: number;
+  samples: { batch: string; entityId: number; current: number[]; previous: number[] }[];
 }
 
 /** Stage 1 scheduler: one deformation dispatch per mesh batch, shared by both views. */
 export class Renderer {
   readonly errors: string[] = [];
   readonly stats: FrameStats = { frames: 0, drawCalls: 0, triangles: 0, deformedVertices: 0,
-    ownedGpuBytes: 0, width: 0, height: 0, cpuSubmitMs: 0, gpuMs: null };
+    ownedGpuBytes: 0, width: 0, height: 0, cpuSubmitMs: 0, gpuMs: null, deformationDispatches: 0, uploadedBytes: 0 };
   readonly info: { adapter: string; features: string[]; userAgent: string; timing: string };
   private readonly batches: Batch[] = [];
   private readonly buffers: GPUBuffer[] = [];
@@ -39,7 +50,8 @@ export class Renderer {
   private queryRead?: GPUBuffer;
   private timingPending = false;
   private disposed = false;
-  private computePipeline!: GPUComputePipeline;
+  private readonly deformationPipelines = new Map<string, GPUComputePipeline>();
+  private graph!: ReturnType<typeof compileRenderGraph<GPUCommandEncoder>>;
   private surfacePipeline!: GPURenderPipeline;
   private shadowPipeline!: GPURenderPipeline;
   private computeLayout!: GPUBindGroupLayout;
@@ -132,10 +144,8 @@ export class Renderer {
   }
 
   private async initialize(format: GPUTextureFormat, scene: SceneBatch[]): Promise<void> {
-    const [deform, surface] = await Promise.all([
-      this.shader(deformationSource, 'shared-deformation'), this.shader(surfaceSource, 'surface'),
-    ]);
-    this.computeLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4].map(binding => ({
+    const surface = await this.shader(surfaceSource, 'surface');
+    this.computeLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5, 6].map(binding => ({
       binding, visibility: GPUShaderStage.COMPUTE,
       buffer: { type: binding === 0 ? 'uniform' : binding === 4 ? 'storage' : 'read-only-storage' },
     })) });
@@ -143,10 +153,6 @@ export class Renderer {
       binding, visibility: GPUShaderStage.VERTEX,
       buffer: { type: binding === 2 ? 'uniform' : 'read-only-storage' },
     })) });
-    this.computePipeline = await this.device.createComputePipelineAsync({
-      label: 'morph then shared skinning', layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] }),
-      compute: { module: deform, entryPoint: 'main' },
-    });
     this.surfacePipeline = await this.device.createRenderPipelineAsync({
       label: 'opaque metal rough PBR and velocity',
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout] }),
@@ -162,38 +168,80 @@ export class Renderer {
       primitive: { topology: 'triangle-list', cullMode: 'back' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
     });
-    for (const entry of scene) this.batches.push(this.createBatch(entry));
+    for (const entry of scene) this.batches.push(await this.createBatch(entry));
+    this.graph = compileRenderGraph<GPUCommandEncoder>([
+      { name: 'scene-input', kind: 'buffer', source: 'imported' },
+      { name: 'shared-geometry', kind: 'buffer', source: 'imported' },
+      { name: 'sun-shadow', kind: 'texture', source: 'transient' },
+      { name: 'canvas', kind: 'texture', source: 'imported' },
+      { name: 'depth', kind: 'texture', source: 'transient' },
+      { name: 'velocity', kind: 'texture', source: 'transient' },
+    ], [
+      { name: 'deformation', uses: [{ resource: 'scene-input', access: 'read' }, { resource: 'shared-geometry', access: 'write' }], execute: encoder => this.encodeDeformation(encoder) },
+      { name: 'shadow', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'write' }], execute: encoder => this.encodeShadow(encoder) },
+      { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' },
+        { resource: 'canvas', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
+    ]);
   }
 
-  private createBatch(scene: SceneBatch): Batch {
+  private async createBatch(scene: SceneBatch): Promise<Batch> {
     const capacity = scene.capacity;
     const mesh = scene.mesh;
+    const program = compileDeformation(scene.deformation);
+    const morphBounds = validateMorphTargets(program, mesh.vertexCount, scene.morphTargets);
+    const source = new DataView(mesh.vertices);
+    for (let i = 0; i < mesh.vertexCount; i++) validateDeformationVertex(program, this.readVertex(source, i));
+    let pipeline = this.deformationPipelines.get(program.key);
+    if (!pipeline) {
+      const module = await this.shader(deformationSource.replace('// OPERATOR_BODY', program.wgslBody), 'deformation:' + program.key);
+      pipeline = await this.device.createComputePipelineAsync({ label: 'compiled deformation',
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] }), compute: { module, entryPoint: 'main' } });
+      this.deformationPipelines.set(program.key, pipeline);
+    }
     const rest = this.buffer(scene.name + ' source', mesh.vertices.byteLength, GPUBufferUsage.STORAGE, mesh.vertices);
     const indices = this.buffer(scene.name + ' indices', mesh.indices.byteLength, GPUBufferUsage.INDEX, new Uint32Array(mesh.indices).buffer);
     const params = this.buffer(scene.name + ' params', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const instances = this.buffer(scene.name + ' instances', capacity * 224, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    const palettes = this.buffer(scene.name + ' palettes', capacity * 512, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const palettes = this.buffer(scene.name + ' palettes', Math.max(1, capacity * program.jointCount * 2) * 64, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const scalarStride = Math.max(1, program.scalarCount);
+    const scalars = this.buffer(scene.name + ' scalars', capacity * scalarStride * 2 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const morphData = new Float32Array(Math.max(1, program.morphTargetCount * mesh.vertexCount) * 8);
+    for (let t = 0; t < program.morphTargetCount; t++) for (let i = 0; i < mesh.vertexCount; i++) {
+      morphData.set(scene.morphTargets[t].positions.subarray(i * 3, i * 3 + 3), (t * mesh.vertexCount + i) * 8);
+      morphData.set(scene.morphTargets[t].normals.subarray(i * 3, i * 3 + 3), (t * mesh.vertexCount + i) * 8 + 4);
+    }
+    const morphs = this.buffer(scene.name + ' morph targets', morphData.byteLength, GPUBufferUsage.STORAGE, morphData.buffer);
     const output = this.buffer(scene.name + ' shared deformed', capacity * mesh.vertexCount * 48, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     return {
-      scene, rest, indices, params, instances, palettes, output,
+      scene, rest, indices, params, instances, palettes, output, scalars, program, pipeline, morphBounds, bounds: new Map(),
       compute: this.device.createBindGroup({ layout: this.computeLayout,
-        entries: [params, rest, instances, palettes, output].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
+        entries: [params, rest, instances, palettes, output, morphs, scalars].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
       render: this.device.createBindGroup({ layout: this.geometryLayout,
         entries: [output, instances, params].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
-      instanceData: new Float32Array(capacity * 56), paletteData: new Float32Array(capacity * 128), history: new Map(),
+      instanceData: new Float32Array(capacity * 56), paletteData: new Float32Array(capacity * program.jointCount * 32),
+      scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, lastInstances: [],
     };
   }
 
   private upload(batch: Batch): void {
     const states = batch.scene.instances;
     if (states.length > batch.scene.capacity) throw new Error('INSTANCE_CAPACITY: ' + batch.scene.name);
+    // Inputs are committed frame objects. After one stationary frame has settled
+    // previous=current, keep the shared output until this batch changes again.
+    if (batch.scene.inputMode === 'committed' && states.length === batch.lastInstances.length && states.every((state, i) =>
+      state === batch.lastInstances[i] && batch.history.get(state.entityId)?.settled)) {
+      batch.dirty = false;
+      return;
+    }
+    batch.dirty = true;
     const alive = new Set<number>();
+    const joints = batch.program.jointCount, scalarCount = Math.max(1, batch.program.scalarCount);
     for (let i = 0; i < states.length; i++) {
       const state = states[i];
-      if (state.bones.length !== 4) throw new Error('DEFORMATION_CONTRACT: expected four joints');
+      const bounds = conservativeDeformationBounds(batch.program, batch.scene.mesh.bounds, batch.morphBounds, state.bones, state.deformScalars, state.model);
       let previous = batch.history.get(state.entityId);
       if (!previous || previous.version !== state.historyVersion) {
-        previous = { model: state.model.slice(), bones: state.bones.map(b => b.slice()), morph: state.morph, version: state.historyVersion };
+        previous = { model: state.model.slice(), bones: state.bones.map(b => b.slice()), scalars: [...state.deformScalars], version: state.historyVersion, settled: true };
         batch.history.set(state.entityId, previous);
       }
       const offset = i * 56;
@@ -201,21 +249,32 @@ export class Renderer {
       batch.instanceData.set(previous.model, offset + 16);
       batch.instanceData.set(state.normalMatrix, offset + 32);
       batch.instanceData.set(state.color, offset + 48);
-      batch.instanceData.set([state.metalness, state.roughness, state.morph, previous.morph], offset + 52);
-      for (let j = 0; j < 4; j++) {
-        batch.paletteData.set(state.bones[j], i * 128 + j * 16);
-        batch.paletteData.set(previous.bones[j], i * 128 + 64 + j * 16);
+      batch.instanceData.set([state.metalness, state.roughness, 0, 0], offset + 52);
+      for (let j = 0; j < joints; j++) {
+        batch.paletteData.set(state.bones[j], i * joints * 32 + j * 16);
+        batch.paletteData.set(previous.bones[j], i * joints * 32 + joints * 16 + j * 16);
         previous.bones[j].set(state.bones[j]);
       }
-      previous.model.set(state.model); previous.morph = state.morph; previous.version = state.historyVersion;
+      for (let s = 0; s < batch.program.scalarCount; s++) {
+        batch.scalarData[i * scalarCount * 2 + s] = state.deformScalars[s];
+        batch.scalarData[i * scalarCount * 2 + scalarCount + s] = previous.scalars[s];
+      }
+      batch.bounds.set(state.entityId, bounds);
+      previous.settled = previous.source === undefined || previous.source === state;
+      previous.source = state;
+      previous.model.set(state.model); previous.scalars = [...state.deformScalars]; previous.version = state.historyVersion;
       alive.add(state.entityId);
     }
-    for (const id of batch.history.keys()) if (!alive.has(id)) batch.history.delete(id);
-    this.device.queue.writeBuffer(batch.params, 0, new Uint32Array([batch.scene.mesh.vertexCount, states.length, 4, 0]));
+    for (const id of batch.history.keys()) if (!alive.has(id)) { batch.history.delete(id); batch.bounds.delete(id); }
+    this.device.queue.writeBuffer(batch.params, 0, new Uint32Array([batch.scene.mesh.vertexCount, states.length, joints, scalarCount]));
+    this.stats.uploadedBytes += 16;
     if (states.length) {
       this.device.queue.writeBuffer(batch.instances, 0, batch.instanceData, 0, states.length * 56);
-      this.device.queue.writeBuffer(batch.palettes, 0, batch.paletteData, 0, states.length * 128);
+      if (joints) this.device.queue.writeBuffer(batch.palettes, 0, batch.paletteData, 0, states.length * joints * 32);
+      this.device.queue.writeBuffer(batch.scalars, 0, batch.scalarData, 0, states.length * scalarCount * 2);
+      this.stats.uploadedBytes += states.length * (224 + joints * 128 + scalarCount * 8);
     }
+    batch.lastInstances = [...states];
   }
 
   private resize(): void {
@@ -240,6 +299,7 @@ export class Renderer {
   render(eye: [number, number, number], target: [number, number, number]): void {
     if (this.disposed || this.errors.length) return;
     const started = performance.now();
+    this.stats.uploadedBytes = 256; this.stats.deformationDispatches = 0;
     this.resize();
     for (const batch of this.batches) this.upload(batch);
     const vp = multiply(perspective(Math.PI / 3.2, this.stats.width / this.stats.height, 0.1, 150), lookAt(eye, target, [0, 1, 0]));
@@ -248,26 +308,7 @@ export class Renderer {
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
     this.lastViewProjection = vp;
     const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → surface' });
-    const timestamp = (index: number): GPUComputePassTimestampWrites | undefined => this.querySet
-      ? { querySet: this.querySet, beginningOfPassWriteIndex: index, endOfPassWriteIndex: index + 1 } : undefined;
-    const compute = encoder.beginComputePass({ label: 'shared deformation', timestampWrites: timestamp(0) });
-    compute.setPipeline(this.computePipeline);
-    for (const batch of this.batches) {
-      if (!batch.scene.instances.length) continue;
-      compute.setBindGroup(0, batch.compute);
-      compute.dispatchWorkgroups(Math.ceil(batch.scene.mesh.vertexCount * batch.scene.instances.length / 64));
-    }
-    compute.end();
-    const shadow = encoder.beginRenderPass({ label: 'sun shadow', colorAttachments: [], timestampWrites: timestamp(2),
-      depthStencilAttachment: { view: this.shadow.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
-    shadow.setPipeline(this.shadowPipeline); shadow.setBindGroup(0, this.shadowFrameBindGroup);
-    this.draw(shadow); shadow.end();
-    const surface = encoder.beginRenderPass({ label: 'PBR and velocity', timestampWrites: timestamp(4), colorAttachments: [
-      { view: this.context.getCurrentTexture().createView(), clearValue: [0.035, 0.055, 0.065, 1], loadOp: 'clear', storeOp: 'store' },
-      { view: this.velocity!.createView(), clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
-    ], depthStencilAttachment: { view: this.depth!.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard' } });
-    surface.setPipeline(this.surfacePipeline); surface.setBindGroup(0, this.frameBindGroup);
-    this.draw(surface); surface.end();
+    this.graph.execute(encoder);
     const readTiming = !!this.querySet && !this.timingPending && this.stats.frames % 30 === 0;
     if (readTiming) {
       encoder.resolveQuerySet(this.querySet!, 0, 6, this.queryResolve!, 0);
@@ -279,8 +320,46 @@ export class Renderer {
     this.stats.frames++;
     this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2;
     this.stats.triangles = this.batches.reduce((sum, batch) => sum + batch.scene.mesh.indices.length / 3 * batch.scene.instances.length, 0);
-    this.stats.deformedVertices = this.batches.reduce((sum, batch) => sum + batch.scene.mesh.vertexCount * batch.scene.instances.length, 0);
+    this.stats.deformedVertices = this.batches.reduce((sum, batch) => sum + (batch.dirty ? batch.scene.mesh.vertexCount * batch.scene.instances.length : 0), 0);
     this.stats.cpuSubmitMs = performance.now() - started;
+  }
+  private timestamp(index: number): GPUComputePassTimestampWrites | undefined {
+    return this.querySet ? { querySet: this.querySet, beginningOfPassWriteIndex: index, endOfPassWriteIndex: index + 1 } : undefined;
+  }
+  private encodeDeformation(encoder: GPUCommandEncoder): void {
+    const compute = encoder.beginComputePass({ label: 'shared deformation', timestampWrites: this.timestamp(0) });
+    for (const batch of this.batches) {
+      if (!batch.scene.instances.length || !batch.dirty) continue;
+      compute.setPipeline(batch.pipeline); compute.setBindGroup(0, batch.compute);
+      compute.dispatchWorkgroups(Math.ceil(batch.scene.mesh.vertexCount * batch.scene.instances.length / 64));
+      this.stats.deformationDispatches++;
+    }
+    compute.end();
+  }
+  private encodeShadow(encoder: GPUCommandEncoder): void {
+    const pass = encoder.beginRenderPass({ label: 'sun shadow', colorAttachments: [], timestampWrites: this.timestamp(2),
+      depthStencilAttachment: { view: this.shadow.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
+    pass.setPipeline(this.shadowPipeline); pass.setBindGroup(0, this.shadowFrameBindGroup);
+    this.draw(pass); pass.end();
+  }
+  private encodeSurface(encoder: GPUCommandEncoder): void {
+    const pass = encoder.beginRenderPass({ label: 'PBR and velocity', timestampWrites: this.timestamp(4), colorAttachments: [
+      { view: this.context.getCurrentTexture().createView(), clearValue: [0.035, 0.055, 0.065, 1], loadOp: 'clear', storeOp: 'store' },
+      { view: this.velocity!.createView(), clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
+    ], depthStencilAttachment: { view: this.depth!.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard' } });
+    pass.setPipeline(this.surfacePipeline); pass.setBindGroup(0, this.frameBindGroup);
+    this.draw(pass); pass.end();
+  }
+  diagnostics() {
+    return { deformationVariants: this.deformationPipelines.size, passes: this.graph.order,
+      lifetimes: Object.fromEntries(this.graph.lifetimes),
+      bounds: this.batches.flatMap(batch => Array.from(batch.bounds, ([entityId, bounds]) => ({ entityId, ...bounds }))) };
+  }
+  private readVertex(source: DataView, vertex: number) {
+    const floats = (offset: number, count: number) => Array.from({ length: count }, (_, axis) => source.getFloat32(vertex * 80 + offset + axis * 4, true));
+    return { position: floats(0, 3) as [number, number, number], normal: floats(16, 3) as [number, number, number],
+      joints: Array.from({ length: 4 }, (_, axis) => source.getUint32(vertex * 80 + 32 + axis * 4, true)) as [number, number, number, number],
+      weights: floats(48, 4) as [number, number, number, number] };
   }
   private draw(pass: GPURenderPassEncoder): void {
     for (const batch of this.batches) {
@@ -301,37 +380,49 @@ export class Renderer {
   }
 
   /** Explicit diagnostic readback only; never used by the production frame loop. */
-  async verifyDeformation(): Promise<{ vertices: number; maxError: number }> {
-    let maxError = 0, vertices = 0;
-    for (const batch of this.batches.filter(b => b.scene.name === 'character' || b.scene.name === 'trees')) {
+  async verifyDeformation(options: { allInstances?: boolean } = {}): Promise<DeformationVerification> {
+    let maxError = 0, vertices = 0, maxNormalError = 0, boundsViolations = 0;
+    const samples: DeformationVerification['samples'] = [];
+    for (const batch of this.batches) {
       if (!batch.scene.instances.length) continue;
-      const count = batch.scene.mesh.vertexCount;
+      const instanceCount = options.allInstances ? batch.scene.instances.length : 1;
+      const count = batch.scene.mesh.vertexCount * instanceCount;
       const read = this.device.createBuffer({ size: count * 48, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-      const instance = batch.instanceData.slice(0, 56), palette = batch.paletteData.slice(0, 128);
+      const joints = batch.program.jointCount, scalarCount = Math.max(1, batch.program.scalarCount);
+      const instances = batch.instanceData.slice(0, instanceCount * 56), palette = batch.paletteData.slice(0, instanceCount * joints * 32), scalars = batch.scalarData.slice(0, instanceCount * scalarCount * 2);
+      const entityIds = batch.scene.instances.slice(0, instanceCount).map(state => state.entityId);
+      const instanceBounds = entityIds.map(id => structuredClone(batch.bounds.get(id)!));
       const encoder = this.device.createCommandEncoder();
       encoder.copyBufferToBuffer(batch.output, 0, read, 0, count * 48);
       this.device.queue.submit([encoder.finish()]);
       try {
         await read.mapAsync(GPUMapMode.READ);
         const result = new Float32Array(read.getMappedRange()), source = new DataView(batch.scene.mesh.vertices);
-        const transform = (matrix: ArrayLike<number>, p: number[]) => [0, 1, 2, 3].map(row =>
-          matrix[row] * p[0] + matrix[4 + row] * p[1] + matrix[8 + row] * p[2] + matrix[12 + row] * p[3]);
         for (let vertex = 0; vertex < count; vertex++) {
+          const instanceIndex = Math.floor(vertex / batch.scene.mesh.vertexCount), vertexIndex = vertex % batch.scene.mesh.vertexCount;
+          const instance = instances.subarray(instanceIndex * 56, instanceIndex * 56 + 56), bounds = instanceBounds[instanceIndex];
+          if (vertexIndex === 0) samples.push({ batch: batch.scene.name, entityId: entityIds[instanceIndex],
+            current: Array.from(result.subarray(vertex * 12, vertex * 12 + 3)), previous: Array.from(result.subarray(vertex * 12 + 8, vertex * 12 + 11)) });
           for (let history = 0; history < 2; history++) {
-            const p = [0, 1, 2, 3].map(axis => source.getFloat32(vertex * 80 + axis * 4, true)
-              + source.getFloat32(vertex * 80 + 64 + axis * 4, true) * instance[54 + history]);
-            const skinned = [0, 0, 0, 0];
-            for (let j = 0; j < 4; j++) {
-              const joint = source.getUint32(vertex * 80 + 32 + j * 4, true);
-              const weight = source.getFloat32(vertex * 80 + 48 + j * 4, true);
-              const transformed = transform(palette.subarray(history * 64 + joint * 16, history * 64 + joint * 16 + 16), p);
-              for (let axis = 0; axis < 4; axis++) skinned[axis] += transformed[axis] * weight;
-            }
-            const expected = transform(instance.subarray(history * 16, history * 16 + 16), skinned);
-            for (let axis = 0; axis < 4; axis++) {
+            const paletteOffset = instanceIndex * joints * 32 + history * joints * 16;
+            const bones = Array.from({ length: joints }, (_, j) => palette.subarray(paletteOffset + j * 16, paletteOffset + j * 16 + 16));
+            const reference = evaluateDeformation(batch.program, this.readVertex(source, vertexIndex), vertexIndex, batch.scene.morphTargets, bones, scalars.subarray(instanceIndex * scalarCount * 2 + history * scalarCount));
+            const expected = transformPoint(instance.subarray(history * 16, history * 16 + 16), reference.position);
+            for (let axis = 0; axis < 3; axis++) {
               const actual = result[vertex * 12 + history * 8 + axis];
               if (!Number.isFinite(actual)) throw new Error('NONFINITE_DEFORMATION');
               maxError = Math.max(maxError, Math.abs(actual - expected[axis]));
+              if (history === 0 && (actual < bounds.min[axis] - 0.0002 || actual > bounds.max[axis] + 0.0002)) boundsViolations++;
+            }
+            if (history === 0) {
+              const m = instance.subarray(32, 48), n = reference.normal;
+              const worldNormal = [0, 1, 2].map(row => m[row] * n[0] + m[4 + row] * n[1] + m[8 + row] * n[2]);
+              const length = Math.hypot(...worldNormal);
+              for (let axis = 0; axis < 3; axis++) {
+                const actual = result[vertex * 12 + 4 + axis];
+                if (!Number.isFinite(actual)) throw new Error('NONFINITE_NORMAL');
+                maxNormalError = Math.max(maxNormalError, Math.abs(actual - worldNormal[axis] / length));
+              }
             }
           }
           vertices++;
@@ -339,7 +430,7 @@ export class Renderer {
         read.unmap();
       } finally { read.destroy(); }
     }
-    return { vertices, maxError };
+    return { vertices, maxError, maxNormalError, boundsViolations, samples };
   }
 
   dispose(): void {

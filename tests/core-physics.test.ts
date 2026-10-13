@@ -98,4 +98,82 @@ describe('PhysicsWorld', () => {
       world.dispose();
     }
   });
+
+  it('raycasts the nearest box in world units, filters an entity, and identifies the ground', async () => {
+    const world = await PhysicsWorld.create();
+    try {
+      world.createBox(11, [0, 2, 0], [0.5, 0.5, 0.5]);
+      world.createBox(12, [0, 4, 0], [0.5, 0.5, 0.5]);
+      const nearest = world.raycast([0, 6, 0], [0, -4, 0], 10);
+      expect(nearest?.entityId).toBe(12);
+      expect(nearest?.distance).toBeCloseTo(1.5);
+      expect(nearest?.point).toEqual([0, 4.5, 0]);
+      expect(nearest?.normal).toEqual([0, 1, 0]);
+
+      const excluded = world.raycast([0, 6, 0], [0, -4, 0], 10, 12);
+      expect(excluded?.entityId).toBe(11);
+      expect(excluded?.distance).toBeCloseTo(3.5);
+      world.step(1 / 60);
+      expect(world.raycast([0, 6, 0], [0, -4, 0], 10)?.entityId).toBe(12);
+      expect(world.raycast([0, 6, 0], [0, -4, 0], 10, 12)?.entityId).toBe(11);
+      world.remove(11);
+      expect(world.raycast([0, 6, 0], [0, -1, 0], 10, 12)).toMatchObject({
+        entityId: null, point: [0, 0, 0], distance: 6,
+      });
+      world.remove(12);
+      expect(world.raycast([0, 6, 0], [0, -1, 0], 5)).toBeNull();
+    } finally {
+      world.dispose();
+    }
+  });
+
+  it('validates ray inputs and rejects queries after disposal', async () => {
+    const world = await PhysicsWorld.create();
+    try {
+      expect(() => world.raycast([0, 1, 0], [0, 0, 0], 10)).toThrow(RangeError);
+      expect(() => world.raycast([0, 1, 0], [0, -1, 0], 0)).toThrow(RangeError);
+      expect(() => world.raycast([0, Number.NaN, 0], [0, -1, 0], 10)).toThrow(RangeError);
+      expect(() => world.raycast([0, 1, 0], [0, -1, 0], 10, -1)).toThrow(RangeError);
+    } finally {
+      world.dispose();
+    }
+    expect(() => world.raycast([0, 1, 0], [0, -1, 0], 10)).toThrow('disposed');
+  });
+
+  it('queries the current collider position after a step and a teleport', async () => {
+    const world = await PhysicsWorld.create();
+    try {
+      world.createBox(21, [0, 3, 0], [0.5, 0.5, 0.5]);
+      world.step(1 / 60);
+      expect(world.raycast([0, 6, 0], [0, -1, 0], 10)?.entityId).toBe(21);
+
+      world.teleportBox(21, [5, 3, 0]);
+      expect(world.raycast([0, 6, 0], [0, -1, 0], 10)?.entityId).toBeNull();
+      expect(world.raycast([5, 6, 0], [0, -1, 0], 10)?.entityId).toBe(21);
+    } finally {
+      world.dispose();
+    }
+  });
+
+  it('finds sphere overlaps in current collider state and omits the ground', async () => {
+    const world = await PhysicsWorld.create();
+    try {
+      world.createBox(31, [0, 2, 0], [0.5, 0.5, 0.5]);
+      world.createBox(32, [5, 2, 0], [0.5, 0.5, 0.5]);
+      expect(world.overlapSphere([0, 2, 0], 1)).toEqual([31]);
+      expect(world.overlapSphere([0, 0, 0], 0.25)).toEqual([]);
+      world.step(1 / 60);
+      expect(world.overlapSphere([0, 2, 0], 1)).toEqual([31]);
+      expect(world.overlapSphere([5, 2, 0], 1)).toEqual([32]);
+      expect(world.overlapSphere([0, 0, 0], 0.25)).toEqual([]);
+      world.teleportBox(31, [5, 2, 0]);
+      expect(world.overlapSphere([5, 2, 0], 1)).toEqual([31, 32]);
+      world.remove(31);
+      expect(world.overlapSphere([5, 2, 0], 1)).toEqual([32]);
+      expect(() => world.overlapSphere([0, 0, 0], 0)).toThrow(RangeError);
+    } finally {
+      world.dispose();
+    }
+    expect(() => world.overlapSphere([0, 0, 0], 1)).toThrow('disposed');
+  });
 });

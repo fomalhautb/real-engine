@@ -23,6 +23,9 @@ test('shared deformation, lifetime, physics controls, resize, and GPU validation
   expect(first.stats!.drawCalls).toBe(8);
   expect(first.physics.bodies).toBe(6);
   expect(first.errors).toEqual([]);
+  expect(first.renderGraph!.passes).toEqual(['deformation', 'shadow', 'surface']);
+  expect(first.renderGraph!.deformationVariants).toBe(3);
+  expect(first.renderGraph!.bounds.length).toBe(20);
   const result = await page.evaluate(async () => {
     const engine = window.__REAL_ENGINE__!;
     engine.pause(true);
@@ -31,6 +34,13 @@ test('shared deformation, lifetime, physics controls, resize, and GPU validation
   });
   expect(result.vertices).toBeGreaterThan(100);
   expect(result.passed).toBe(true);
+  expect(result.maxNormalError).toBeLessThan(0.0002);
+  expect(result.boundsViolations).toBe(0);
+  await page.waitForFunction(() => window.__REAL_ENGINE__!.snapshot().stats!.deformationDispatches === 0);
+  const cached = await page.evaluate(() => window.__REAL_ENGINE__!.snapshot());
+  expect(cached.stats!.uploadedBytes).toBe(256); // Only the camera/light uniform changes.
+  expect(cached.sceneChanges!.lastFrame).toEqual({ create: 0, update: 0, remove: 0 });
+  expect((await page.evaluate(() => window.__REAL_ENGINE__!.verify())).passed).toBe(true);
   await page.getByRole('button', { name: '添加刚体', exact: true }).click();
   expect(await page.evaluate(() => window.__REAL_ENGINE__!.snapshot().physics.bodies)).toBe(7);
   await page.getByRole('button', { name: '移除刚体', exact: true }).click();
@@ -40,6 +50,9 @@ test('shared deformation, lifetime, physics controls, resize, and GPU validation
     return window.__REAL_ENGINE__!.verify();
   });
   expect(reset.passed).toBe(true);
+  const hit = await page.evaluate(() => window.__REAL_ENGINE__!.raycast([0, 10, -2.5], [0, -1, 0], 20));
+  expect(typeof hit?.entityId).toBe('number');
+  expect(hit!.normal[1]).toBeGreaterThan(0.99);
   await page.setViewportSize({ width: 1100, height: 820 });
   await page.waitForFunction(() => window.__REAL_ENGINE__!.snapshot().stats!.width < 1000);
   const afterResize = await page.evaluate(() => window.__REAL_ENGINE__!.verify());

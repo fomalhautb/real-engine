@@ -1,6 +1,7 @@
 import './style.css';
 import { DemoScene } from './scene';
 import { Renderer } from './renderer';
+import type { RayHit } from './physics';
 
 const element = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -23,9 +24,11 @@ function fail(error: unknown): void {
 }
 function snapshot() {
   return {
-    stage: '1.1', time: scene?.time ?? 0, paused: scene?.paused ?? false,
+    stage: '1.2', time: scene?.time ?? 0, paused: scene?.paused ?? false,
     stats: renderer ? structuredClone(renderer.stats) : null, environment: renderer?.info ?? null,
     errors: [...renderer?.errors ?? []],
+    renderGraph: renderer?.diagnostics() ?? null,
+    sceneChanges: scene ? { revision: scene.committedRevision, lastFrame: scene.changeCounts } : null,
     physics: { bodies: scene?.physics.bodyCount ?? 0, active: scene?.physics.activeCount ?? 0, droppedSeconds: scene?.droppedSeconds ?? 0 },
     cpuSubmit: samples.length ? { samples: samples.length, p50: percentile(samples, 0.5), p95: percentile(samples, 0.95) } : null,
     scope: { virtualGeometry: false, worldSpaceGI: false, reflections: false, fullDeformationCompiler: false },
@@ -35,7 +38,7 @@ function percentile(values: number[], q: number): number {
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
 }
-function render(): void { renderer!.render(camera(), [0, 1.2, -1.5]); }
+function render(): void { scene!.commitFrame(); renderer!.render(camera(), [0, 1.2, -1.5]); }
 function frame(now: number): void {
   if (disposed) return;
   try {
@@ -62,7 +65,7 @@ async function verify() {
   button.disabled = true;
   try {
     const result = await renderer!.verifyDeformation();
-    const passed = result.vertices > 0 && result.maxError < 0.0002;
+    const passed = result.vertices > 0 && result.maxError < 0.0002 && result.maxNormalError < 0.0002 && result.boundsViolations === 0;
     element('verification').textContent = (passed ? 'PASS' : 'FAIL') + ' · ' + result.vertices + ' vertices · max error ' + result.maxError.toExponential(2);
     return { ...result, passed };
   } finally { button.disabled = false; }
@@ -76,7 +79,7 @@ async function start(): Promise<void> {
   const queryCount = Number(new URLSearchParams(location.search).get('trees') ?? 32);
   const count = Number.isInteger(queryCount) ? Math.min(256, Math.max(1, queryCount)) : 32;
   scene = await DemoScene.create(count);
-  renderer = await Renderer.create(canvas, scene.batches);
+  renderer = await Renderer.create(canvas, scene.renderBatches);
   element('adapter').textContent = renderer.info.adapter + ' · ' + renderer.info.timing;
   element('pause').addEventListener('click', () => { scene!.paused = !scene!.paused; }, { signal });
   element('reset').addEventListener('click', () => { scene!.reset(); samples.length = 0; }, { signal });
@@ -107,6 +110,7 @@ async function start(): Promise<void> {
     reset() { scene!.reset(); render(); },
     spawn() { return scene!.spawnBox(); },
     remove() { return scene!.removeBox(); },
+    raycast(origin, direction, maxDistance, excludeEntityId) { return scene!.physics.raycast(origin, direction, maxDistance, excludeEntityId); },
     verify,
     dispose,
   };
@@ -120,6 +124,7 @@ export interface EngineHarness {
   reset(): void;
   spawn(): boolean;
   remove(): boolean;
+  raycast(origin: [number, number, number], direction: [number, number, number], maxDistance: number, excludeEntityId?: number): RayHit | null;
   verify: typeof verify;
   dispose(): void;
 }

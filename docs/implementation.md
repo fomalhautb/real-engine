@@ -48,6 +48,8 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 浏览器配置通过 PLAYWRIGHT_CHANNEL 选择已安装通道，通过 PLAYWRIGHT_GPU=hardware 禁用软件测试 flags。默认 Chromium for Testing 下载与系统浏览器是独立安装，测试不修改用户的日常浏览器配置。
 
+CI 将失败时的运行状态直接输出到日志。截图附件上传属于可选诊断；账户存储配额不足时只影响附件上传，不能令通过的测试失败，也不能令失败的测试变为通过。
+
 ## 阶段 1 的下一批工作
 
 1. 把固定形变程序扩展为有边界、坐标系、依赖和历史声明的可编译算子组合；补齐 Morph 法线和动态边界。

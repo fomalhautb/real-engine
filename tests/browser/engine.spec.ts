@@ -1,12 +1,24 @@
 import { expect, test } from '@playwright/test';
 
+test.afterEach(async ({ page }, testInfo) => {
+  if (testInfo.status !== testInfo.expectedStatus && !page.isClosed()) {
+    const diagnostic = await page.evaluate(() => ({
+      error: document.getElementById('error')?.textContent,
+      snapshot: window.__REAL_ENGINE__?.snapshot(),
+    })).catch(error => ({ error: String(error) }));
+    console.log('ENGINE_FAILURE_DIAGNOSTIC ' + JSON.stringify(diagnostic));
+  }
+});
+
 test('shared deformation, lifetime, physics controls, resize, and GPU validation', async ({ page }, testInfo) => {
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
+  page.on('console', message => { if (message.type() === 'error') console.log('BROWSER_ERROR ' + message.text()); });
   await page.goto('/?trees=12');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
-  await page.waitForFunction(() => (window.__REAL_ENGINE__?.snapshot().stats?.frames ?? 0) >= 5);
+  await page.waitForFunction(() => (window.__REAL_ENGINE__?.snapshot().stats?.frames ?? 0) >= 5 || !document.getElementById('error')!.hidden);
+  await expect(page.locator('#error')).toBeHidden();
   const first = await page.evaluate(() => window.__REAL_ENGINE__!.snapshot());
   expect(first.stats!.drawCalls).toBe(8);
   expect(first.physics.bodies).toBe(6);

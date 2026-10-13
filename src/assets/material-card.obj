@@ -1,0 +1,13 @@
+# Original demo card: a 1.6 m square in the XY plane, facing +Z.
+o material-card
+v -0.8 -0.8 0
+v 0.8 -0.8 0
+v 0.8 0.8 0
+v -0.8 0.8 0
+vt 0 1
+vt 1 1
+vt 1 0
+vt 0 0
+vn 0 0 1
+usemtl signal-ring
+f 1/1/1 2/2/1 3/3/1 4/4/1

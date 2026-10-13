@@ -21,6 +21,20 @@ struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, paddi
 @group(1) @binding(0) var<storage, read> vertices: array<Deformed>;
 @group(1) @binding(1) var<storage, read> instances: array<Instance>;
 @group(1) @binding(2) var<uniform> params: Parameters;
+@group(1) @binding(3) var<storage, read> uvs: array<vec2f>;
+struct MaterialParameters { values: array<vec4f, 16> }
+@group(2) @binding(0) var<uniform> materialParameters: MaterialParameters;
+@group(2) @binding(1) var materialImage0: texture_2d<f32>;
+@group(2) @binding(2) var materialImage1: texture_2d<f32>;
+@group(2) @binding(3) var materialImage2: texture_2d<f32>;
+@group(2) @binding(4) var materialImage3: texture_2d<f32>;
+@group(2) @binding(5) var materialSampler: sampler;
+// Raster uses implicit derivatives; world-space backends supply explicit-LOD helpers.
+fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage0, materialSampler, uv); }
+fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage1, materialSampler, uv); }
+fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage2, materialSampler, uv); }
+fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage3, materialSampler, uv); }
+// MATERIAL_PROGRAM
 
 struct Varyings {
     @builtin(position) position: vec4f,
@@ -31,6 +45,7 @@ struct Varyings {
     @location(4) light: vec4f,
     @location(5) previous: vec4f,
     @location(6) current: vec4f,
+    @location(7) uv: vec2f,
 }
 @vertex
 fn vertexMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instanceIndex: u32) -> Varyings {
@@ -45,11 +60,27 @@ fn vertexMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instan
     result.color = instance.color;
     result.material = instance.material.xy;
     result.light = frame.lightViewProjection * vertex.position;
+    result.uv = uvs[index];
     return result;
 }
+struct ShadowVaryings {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,
+    @location(1) color: vec4f,
+    @location(2) material: vec2f,
+}
 @vertex
-fn shadowMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instanceIndex: u32) -> @builtin(position) vec4f {
-    return frame.lightViewProjection * vertices[instanceIndex * params.vertexCount + index].position;
+fn shadowMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instanceIndex: u32) -> ShadowVaryings {
+    var result: ShadowVaryings;
+    result.position = frame.lightViewProjection * vertices[instanceIndex * params.vertexCount + index].position;
+    result.uv = uvs[index];
+    result.color = instances[instanceIndex].color;
+    result.material = instances[instanceIndex].material.xy;
+    return result;
+}
+@fragment
+fn shadowFragment(input: ShadowVaryings) {
+    if (!evaluateCoverage(input.uv, 0.0, input.color, input.material)) { discard; }
 }
 
 fn visibility(light: vec4f, ndotl: f32) -> f32 {
@@ -72,27 +103,26 @@ fn tonemap(color: vec3f) -> vec3f {
 }
 struct FragmentOutput { @location(0) color: vec4f, @location(1) velocity: vec2f }
 @fragment
-fn fragmentMain(input: Varyings) -> FragmentOutput {
-    let n = normalize(input.normal);
+fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> FragmentOutput {
+    let surface = evaluateMaterial(input.uv, 0.0, input.color, input.material);
+    let covered = evaluateCoverage(input.uv, 0.0, input.color, input.material);
+    if (!covered) { discard; }
+    let n = normalize(input.normal) * select(-1.0, 1.0, front);
     let v = normalize(frame.camera.xyz - input.world);
     let l = normalize(frame.sunDirection.xyz);
-    let h = normalize(l + v);
+    let h = (l + v) / max(length(l + v), 0.00001);
     let nv = max(dot(n, v), 0.001);
     let nl = max(dot(n, l), 0.0);
     let nh = max(dot(n, h), 0.0);
     let vh = max(dot(v, h), 0.0);
-    let metalness = clamp(input.material.x, 0.0, 1.0);
-    let roughness = clamp(input.material.y, 0.08, 1.0);
-    var base = input.color.rgb;
-    if (input.color.a < 0.5) {
-        let grid = abs(fract(input.world.xz * 0.5 - 0.5) - 0.5);
-        let line = 1.0 - smoothstep(0.01, 0.035, min(grid.x, grid.y));
-        base *= 1.0 - line * 0.24;
-    }
+    let metalness = surface.metallic;
+    let roughness = surface.roughness;
+    let base = surface.baseColor;
     let alpha = roughness * roughness;
     let a2 = alpha * alpha;
-    let denominator = nh * nh * (a2 - 1.0) + 1.0;
-    let distribution = a2 / max(3.14159265 * denominator * denominator, 0.00001);
+    // This form avoids subtracting nearly equal values for smooth surfaces at normal incidence.
+    let denominator = (1.0 - nh * nh) + nh * nh * a2;
+    let distribution = a2 / max(3.14159265 * denominator * denominator, 1e-20);
     let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
     let geometry = (nv / (nv * (1.0 - k) + k)) * (nl / (nl * (1.0 - k) + k));
     let f0 = mix(vec3f(0.04), base, metalness);
@@ -103,7 +133,8 @@ fn fragmentMain(input: Varyings) -> FragmentOutput {
     // Constant ambient fill is explicitly not world-space GI.
     let ambient = base * (0.045 + 0.065 * max(n.y, 0.0)) * (1.0 - metalness * 0.6);
     let distanceFog = 1.0 - exp(-distance(frame.camera.xyz, input.world) * 0.008);
-    let radiance = mix(direct + ambient, vec3f(0.055, 0.085, 0.10), distanceFog);
+    let lighting = select(direct + ambient + surface.emissive, base + surface.emissive, MATERIAL_UNLIT);
+    let radiance = mix(lighting, vec3f(0.055, 0.085, 0.10), distanceFog);
     var output: FragmentOutput;
     output.color = vec4f(pow(tonemap(radiance), vec3f(1.0 / 2.2)), 1.0);
     output.velocity = vec2f(0.0);

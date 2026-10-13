@@ -1,6 +1,16 @@
 import type { Mat4 } from './math';
 import type { MeshData } from './geometry';
 import type { DeformationGraph, MorphTarget } from './deformation';
+import type { MaterialDefinition } from './material';
+import type { TextureAsset } from './texture-assets';
+
+export interface MaterialBinding {
+  definition: MaterialDefinition;
+  /** Runtime vec4 parameters, packed in slot order. Updating them never compiles a pipeline. */
+  parameters?: Float32Array;
+  /** Immutable image assets; slots referenced by the definition must be present. */
+  textures?: readonly (TextureAsset | undefined)[];
+}
 
 /** Render input independent of the gameplay category or pose producer. */
 export interface InstanceState {
@@ -16,6 +26,7 @@ export interface InstanceState {
   historyVersion: number;
 }
 export interface SceneBatch {
+  material?: MaterialBinding;
   /** Committed inputs replace instance objects on every change; mutable inputs
    * are re-evaluated on every render. Assets are immutable after GPU upload. */
   inputMode?: 'committed' | 'mutable';

@@ -1,5 +1,7 @@
 /** Interleaved vertex: position, normal, joints, weights, morph delta (80 bytes). */
 export interface MeshData {
+  /** Separate packed UV0 stream; omitted assets receive zero UVs. */
+  uvs?: Float32Array;
   vertices: ArrayBuffer;
   indices: Uint32Array;
   vertexCount: number;
@@ -10,6 +12,7 @@ type Vec3 = [number, number, number];
 type Weights = [number, number, number, number];
 
 class MeshBuilder {
+  private readonly uvs: number[] = [];
   private readonly data: number[] = [];
   private readonly triangles: number[] = [];
   private readonly min: Vec3 = [Infinity, Infinity, Infinity];
@@ -24,6 +27,7 @@ class MeshBuilder {
       ...weights,
       ...morph, 0,
     );
+    this.uvs.push(0, 0);
     for (let axis = 0; axis < 3; axis++) {
       this.min[axis] = Math.min(this.min[axis], position[axis]);
       this.max[axis] = Math.max(this.max[axis], position[axis]);
@@ -33,7 +37,11 @@ class MeshBuilder {
 
   quad(positions: [Vec3, Vec3, Vec3, Vec3], normal: Vec3, weights: Weights, morph: (p: Vec3) => Vec3): void {
     const start = this.data.length / 20;
-    for (const position of positions) this.vertex(position, normal, weights, morph(position));
+    for (let i = 0; i < positions.length; i++) {
+      this.vertex(positions[i], normal, weights, morph(positions[i]));
+      this.uvs[(start + i) * 2] = i === 1 || i === 2 ? 1 : 0;
+      this.uvs[(start + i) * 2 + 1] = i >= 2 ? 1 : 0;
+    }
     this.triangles.push(start, start + 1, start + 2, start, start + 2, start + 3);
   }
 
@@ -75,6 +83,7 @@ class MeshBuilder {
     }
     return {
       vertices,
+      uvs: new Float32Array(this.uvs),
       indices: new Uint32Array(this.triangles),
       vertexCount: this.data.length / 20,
       bounds: { min: this.min, max: this.max },

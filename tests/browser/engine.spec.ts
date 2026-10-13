@@ -20,12 +20,14 @@ test('shared deformation, lifetime, physics controls, resize, and GPU validation
   await page.waitForFunction(() => (window.__REAL_ENGINE__?.snapshot().stats?.frames ?? 0) >= 5 || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
   const first = await page.evaluate(() => window.__REAL_ENGINE__!.snapshot());
-  expect(first.stats!.drawCalls).toBe(8);
+  expect(first.stats!.drawCalls).toBe(10);
   expect(first.physics.bodies).toBe(6);
   expect(first.errors).toEqual([]);
   expect(first.renderGraph!.passes).toEqual(['deformation', 'shadow', 'surface']);
   expect(first.renderGraph!.deformationVariants).toBe(3);
-  expect(first.renderGraph!.bounds.length).toBe(20);
+  expect(first.renderGraph!.bounds.length).toBe(21);
+  expect(first.renderGraph!.materialVariants).toBe(3);
+  expect(first.renderGraph!.materials.images).toBe(2);
   const result = await page.evaluate(async () => {
     const engine = window.__REAL_ENGINE__!;
     engine.pause(true);

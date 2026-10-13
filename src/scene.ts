@@ -8,6 +8,9 @@ import {
 import { PhysicsWorld } from './physics';
 import { authoredMorph, buildMorphTarget } from './morph-assets';
 import { SceneStore, type ChangeKind, type EntityHandle } from './scene-store';
+import { createCardMaterial, createGroundMaterial } from './demo-materials';
+import { parseObj } from './mesh-import';
+import materialCardObj from './assets/material-card.obj?raw';
 
 const pivotRotation = (pivot: readonly number[], rotation: Mat4): Mat4 =>
   multiply(
@@ -58,14 +61,24 @@ export class DemoScene {
   private constructor(physics: PhysicsWorld) {
     this.physics = physics;
     const character = createCharacter();
+    const ground = createPlane();
+    // The ground spans 80 metres, so forty UV repeats make each tile 2 metres.
+    for (let i = 0; i < ground.uvs!.length; i++) ground.uvs![i] *= 40;
+    const cardAsset = parseObj(materialCardObj);
+    if (cardAsset.primitives.length !== 1 || cardAsset.primitives[0].materialName !== 'signal-ring') {
+      throw new Error('Demo card OBJ must contain one signal-ring primitive');
+    }
     this.batches = [
       { name: 'character', mesh: character, capacity: 1, instances: [],
         deformation: { jointCount: 4, nodes: [{ kind: 'morph', target: 0, weight: 0 }, { kind: 'morph', target: 1, weight: 1 }, { kind: 'skin' }] },
         morphTargets: [authoredMorph(character), buildMorphTarget(character, p => [p[1] > 2.3 ? 0.035 * Math.sin(p[1] * 5) : 0, 0, 0])] },
       { name: 'trees', mesh: createTree(), capacity: 256, instances: [],
         deformation: { jointCount: 4, nodes: [{ kind: 'skin' }, { kind: 'wave', amplitude: 0.035, frequency: 1.3, phase: 0 }] }, morphTargets: [] },
-      { name: 'ground', mesh: createPlane(), capacity: 1, instances: [], deformation: { jointCount: 4, nodes: [] }, morphTargets: [] },
+      { name: 'ground', mesh: ground, capacity: 1, instances: [], deformation: { jointCount: 4, nodes: [] }, morphTargets: [],
+        material: createGroundMaterial() },
       { name: 'boxes', mesh: createCube(), capacity: 64, instances: [], deformation: { jointCount: 4, nodes: [] }, morphTargets: [] },
+      { name: 'material-card', mesh: cardAsset.primitives[0].mesh, capacity: 1, instances: [],
+        deformation: { jointCount: 4, nodes: [] }, morphTargets: [], material: createCardMaterial() },
     ];
     this.renderBatches = this.batches.map((batch) => ({ ...batch, instances: [], inputMode: 'committed' }));
     this.renderKeysByBatch = this.batches.map(() => []);
@@ -166,13 +179,18 @@ export class DemoScene {
     }
     this.batches[2].instances.push(instance(
       this.ids.create(), scaling(80, 1, 80), scaling(1 / 80, 1, 1 / 80),
-      [0.12, 0.19, 0.20, 0], 0, 1,
+      [1, 1, 1, 1], 0, 1,
     ));
     for (let i = 0; i < 6; i++) this.spawnBox();
+    this.batches[4].instances.push(instance(
+      this.ids.create(), translation(0, 1.5, 1), identity(), [1, 1, 1, 1], 0, 1,
+    ));
     this.updateAnimated();
     this.updateBoxes(0);
-    for (let batchIndex = 0; batchIndex < 3; batchIndex++) {
-      for (const item of this.batches[batchIndex].instances) this.register(item, batchIndex);
+    for (const [batchIndex, batch] of this.batches.entries()) {
+      for (const item of batch.instances) {
+        if (!this.handlesByEntity.has(item.entityId)) this.register(item, batchIndex);
+      }
     }
     for (const item of this.batches[3].instances) this.updateCommitted(item, ['transform']);
   }

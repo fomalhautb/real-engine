@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { DemoScene } from '../src/scene';
 import { transformPoint } from '../src/math';
+import { compileMaterial, evaluateMaterial } from '../src/material';
+import type { TextureAsset } from '../src/texture-assets';
 
 describe('DemoScene', () => {
   it('creates bounded batches with four compatible bone transforms', async () => {
     const scene = await DemoScene.create();
     try {
-      expect(scene.batches.map((batch) => batch.name)).toEqual(['character', 'trees', 'ground', 'boxes']);
-      expect(scene.batches.map((batch) => batch.capacity)).toEqual([1, 256, 1, 64]);
-      expect(scene.batches.map((batch) => batch.instances.length)).toEqual([1, 32, 1, 6]);
+      expect(scene.batches.map((batch) => batch.name)).toEqual(['character', 'trees', 'ground', 'boxes', 'material-card']);
+      expect(scene.batches.map((batch) => batch.capacity)).toEqual([1, 256, 1, 64, 1]);
+      expect(scene.batches.map((batch) => batch.instances.length)).toEqual([1, 32, 1, 6, 1]);
       expect(scene.physics.bodyCount).toBe(6);
       for (const batch of scene.batches) {
         for (const item of batch.instances) {
@@ -18,9 +20,43 @@ describe('DemoScene', () => {
       }
       expect(transformPoint(scene.batches[0].instances[0].model, [0, 0, 0])).toEqual([-2, 0, 0]);
       expect(transformPoint(scene.batches[1].instances[0].model, [0, 0, 0])).toEqual([2.4000000953674316, 0, 0]);
-      expect(scene.batches[2].instances[0].color[3]).toBe(0);
+      expect(scene.batches[2].instances[0].color[3]).toBe(1);
       expect(scene.batches[2].instances[0].normalMatrix[0]).toBeCloseTo(1 / 80);
       expect(scene.batches[2].instances[0].normalMatrix[5]).toBe(1);
+    } finally {
+      scene.dispose();
+    }
+  });
+
+  it('registers an imported masked card and repeats a textured ground', async () => {
+    const scene = await DemoScene.create(0);
+    try {
+      const card = scene.batches[4];
+      expect(card.mesh.vertexCount).toBe(4);
+      expect([...card.mesh.indices]).toEqual([0, 1, 2, 0, 2, 3]);
+      expect(card.mesh.bounds).toEqual({ min: [-0.800000011920929, -0.800000011920929, 0], max: [0.800000011920929, 0.800000011920929, 0] });
+      expect([...card.mesh.uvs!]).toEqual([0, 1, 1, 1, 1, 0, 0, 0]);
+      expect(transformPoint(card.instances[0].model, [0, 0, 0])).toEqual([0, 1.5, 1]);
+      expect(scene.handleForEntity(card.instances[0].entityId)).toBeDefined();
+      expect(scene.renderBatches[4].instances[0].entityId).toBe(card.instances[0].entityId);
+      expect(scene.batches[2].mesh.uvs).toEqual(new Float32Array([0, 0, 40, 0, 40, 40, 0, 40]));
+      expect(card.deformation.nodes).toEqual([]);
+
+      const binding = card.material!;
+      const program = compileMaterial(binding.definition);
+      expect([program.shading, program.alphaMode, program.doubleSided]).toEqual(['unlit', 'mask', true]);
+      expect(program.textureSlots).toEqual([0]);
+      const texture = binding.textures![0]!;
+      const sample = (x: number, y: number) => Array.from(texture.pixels.slice((y * texture.width + x) * 4, (y * texture.width + x) * 4 + 4), v => v / 255) as [number, number, number, number];
+      const input = { parameters: binding.parameters, instanceColor: [1, 1, 1, 1] as const, instanceMetalRough: [0, 1] as const };
+      expect(evaluateMaterial(program, { ...input, textures: () => sample(32, 32) }).covered).toBe(false);
+      expect(evaluateMaterial(program, { ...input, textures: () => sample(55, 32) }).covered).toBe(true);
+
+      const ground = scene.batches[2].material!;
+      expect(ground.definition.alphaMode).toBe('opaque');
+      const groundTexture: TextureAsset = ground.textures![0]!;
+      expect(groundTexture.pixels[3]).toBe(255);
+      expect(groundTexture.pixels[(40 * groundTexture.width + 40) * 4 + 3]).toBe(255);
     } finally {
       scene.dispose();
     }

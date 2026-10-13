@@ -34,7 +34,11 @@ npx playwright install chromium
 npm run test:browser
 ```
 
-默认浏览器测试使用 SwiftShader，验证功能而非真实硬件帧率。安装系统 Chrome 的 Windows 环境可运行：
+默认浏览器测试使用 SwiftShader，验证功能而非真实硬件帧率。
+
+Linux 无显示器环境先用 `npx playwright install --with-deps chromium` 安装依赖，再执行 `xvfb-run -a npm run test:browser`，保证 WebGPU canvas 的合成与截图路径可用。
+
+安装系统 Chrome 的 Windows 环境可运行：
 
 ```powershell
 $env:PLAYWRIGHT_CHANNEL = 'chrome'

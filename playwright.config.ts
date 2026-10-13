@@ -12,7 +12,12 @@ export default defineConfig({
     launchOptions: {
       args: process.env.PLAYWRIGHT_GPU === 'hardware' ? [] : [
         '--enable-unsafe-webgpu', '--use-webgpu-adapter=swiftshader',
-        ...(process.platform === 'linux' ? ['--enable-features=Vulkan', '--use-angle=vulkan', '--use-vulkan=swiftshader', '--disable-vulkan-surface'] : []),
+        // Linux CI also runs under Xvfb: Dawn and the headless compositor need
+        // compatible Vulkan presentation, not just a working compute adapter.
+        ...(process.platform === 'linux' ? [
+          '--enable-gpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan',
+          '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--use-vulkan=swiftshader',
+        ] : []),
       ],
     },
     screenshot: 'only-on-failure',

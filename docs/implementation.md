@@ -48,6 +48,8 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 浏览器配置通过 PLAYWRIGHT_CHANNEL 选择已安装通道，通过 PLAYWRIGHT_GPU=hardware 禁用软件测试 flags。默认 Chromium for Testing 下载与系统浏览器是独立安装，测试不修改用户的日常浏览器配置。
 
+Linux 软件 GPU 的 CI 使用 Xvfb、启用 GPU 合成和 Vulkan SwiftShader，避免适配器初始化成功但 canvas 首次获取纹理时设备丢失。该配置依据 [luma.gl 的复现实验](https://github.com/visgl/luma.gl/issues/2874)；必须由本仓库的实际渲染测试验证，不能把获得 adapter 当作渲染通过。
+
 CI 将失败时的运行状态直接输出到日志。截图附件上传属于可选诊断；账户存储配额不足时只影响附件上传，不能令通过的测试失败，也不能令失败的测试变为通过。
 
 ## 阶段 1 的下一批工作

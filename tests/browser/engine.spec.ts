@@ -50,8 +50,32 @@ test('shared deformation, lifetime, physics controls, resize, and GPU validation
   expect(final.errors).toEqual([]);
   expect(final.stats!.ownedGpuBytes).toBe(first.stats!.ownedGpuBytes);
   expect(pageErrors).toEqual([]);
+  const viewportPng = await page.locator('#viewport').screenshot();
+  const visiblePixels = await page.evaluate(async (base64) => {
+    const bytes = Uint8Array.from(atob(base64), char => char.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/png' }));
+    const probe = document.createElement('canvas');
+    probe.width = bitmap.width;
+    probe.height = bitmap.height;
+    const context = probe.getContext('2d', { willReadFrequently: true })!;
+    context.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    const pixels = context.getImageData(0, 0, probe.width, probe.height).data;
+    let blue = 0;
+    let green = 0;
+    for (let i = 0; i < pixels.length; i += 4) {
+      const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+      // Relative color checks reject the dark backdrop and blue-gray ground.
+      if (b > r * 1.3 && b > g * 1.15 && b > 45) blue++;
+      if (g > r * 1.15 && g > b * 1.15 && g > 40) green++;
+    }
+    return { blue, green };
+  }, viewportPng.toString('base64'));
+  expect(visiblePixels.blue, 'visible blue character pixels').toBeGreaterThan(50);
+  expect(visiblePixels.green, 'visible green tree pixels').toBeGreaterThan(50);
+  console.log('ENGINE_RENDER_DIAGNOSTIC ' + JSON.stringify({ result, visiblePixels }));
   await page.screenshot({ path: testInfo.outputPath('foundation.png'), fullPage: true });
-  await testInfo.attach('diagnostics', { body: JSON.stringify({ result, snapshot: final }, null, 2), contentType: 'application/json' });
+  await testInfo.attach('diagnostics', { body: JSON.stringify({ result, snapshot: final, visiblePixels }, null, 2), contentType: 'application/json' });
   await page.evaluate(() => window.__REAL_ENGINE__!.dispose());
   expect(pageErrors).toEqual([]);
 });

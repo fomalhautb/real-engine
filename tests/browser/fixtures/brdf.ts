@@ -33,10 +33,11 @@ function unit(x: number, y: number): Vec3 {
   return [x, y, Math.sqrt(1 - x * x - y * y)];
 }
 
-/** One 1×1 image means the sole sample ray goes through the authored world origin. */
+/** The center of an odd-sized image targets the authored world origin. Keeping
+ * a finite raster footprint limits vertex subpixel quantization at oblique views. */
 export async function runBrdfFixture() {
   const canvas = document.createElement('canvas');
-  canvas.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;';
+  canvas.style.cssText = 'position:fixed;left:0;top:0;width:65px;height:65px;';
   document.body.appendChild(canvas);
   const batch: SceneBatch = { name: 'brdf-quad', mesh: quad(), capacity: 1, inputMode: 'committed',
     instances: [pose(0, 0.5)], deformation: { jointCount: 0, nodes: [] }, morphTargets: [] };
@@ -49,7 +50,7 @@ export async function runBrdfFixture() {
       renderer!.setSun({ direction: light, color: [sunStrength, sunStrength, sunStrength] });
       renderer!.render([view[0] * 6, view[1] * 6, view[2] * 6], target);
       const size = renderer!.stats;
-      if (size.width !== 1 || size.height !== 1) {
+      if (size.width !== 65 || size.height !== 65) {
         throw new Error(`BRDF_CENTER_PIXEL_REQUIRED: actual ${size.width}x${size.height}`);
       }
       return (await renderer!.probeHdr([{ x: Math.floor(size.width / 2), y: Math.floor(size.height / 2) }]))[0];

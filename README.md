@@ -53,6 +53,8 @@ npm run test:browser
 
 2026-10-14 本地验证：166 项单元测试、TypeScript 与生产构建通过；Chrome 154 正常硬件配置通过 12 项浏览器测试，覆盖 glTF 动画、仿射骨骼、材质覆盖、Compute 材质数值、独立采样器、物理、运动向量、历史、预算、基准时长与错误路径。这些是功能证据，尚未完成性能档位、长期稳定性或跨厂商认证。
 
+同日后续提交 `2454e22` 已通过 [远程 Linux 软件 GPU 回归](https://github.com/fomalhautb/real-engine/actions/runs/38510988726)：184 项单元测试和 16 项浏览器测试。新增可选的共享形变 BVH 世界查询、线性 HDR 与曝光/显示转换、显式设备丢失验证；均未在用户使用电脑期间进行本机 GPU 压测。体积雾目前只有 CPU 解析参考，完整 GI、反射、虚拟几何和 GPU 体积雾仍待实现。
+
 ## 可重复基准
 
 安装系统 Chrome 后可执行：
@@ -123,6 +125,9 @@ renderer.render([4, 3, 6], [0, 1, 0]);
 | src/animation.ts、src/gltf-scene.ts | TRS/Morph 动画采样、层级姿态和统一场景输入 |
 | src/shaders/deform.wgsl | 融合算子的当前/前帧执行模板 |
 | src/shaders/surface.wgsl | 直接光 PBR、阴影与运动向量 |
+| src/shaders/resolve.wgsl | 线性 HDR 的曝光、色调映射与 sRGB 输出 |
+| src/gpu-world-query.ts | 共享形变 BVH refit 与有界世界射线命中 |
+| src/participating-media.ts | 均匀介质积分与合成的 CPU 数值参考 |
 | src/physics.ts | Rapier 适配与固定步姿态快照 |
 | src/scene.ts | 用代码组合通用能力的测试场景 |
 | src/benchmark.ts、src/benchmark-scenario.ts、src/benchmark-stats.ts | 固定轨迹/事件、真实时长运行与有界逐帧统计 |

@@ -6,7 +6,7 @@
 
 | 要求 | 当前证据 | 剩余工作 |
 | --- | --- | --- |
-| WebGPU 运行时与可诊断错误 | renderer/main；真实浏览器初始化、渲染、resize、释放及失败路径测试 | 扩大浏览器矩阵、主动设备丢失回归 |
+| WebGPU 运行时与可诊断错误 | renderer/main；真实浏览器初始化、渲染、resize、释放及失败路径测试；远程软件 GPU 验证显式设备销毁后报错、停帧、查询拒绝和释放 | 扩大浏览器/厂商矩阵；真实驱动丢失及恢复路径 |
 | 场景身份、generation、版本与增量变更 | SceneStore；DemoScene.commitFrame；快照隔离、增删复用和版本测试；异步原子换材质及参数更新接口 | 换材质与场景事件的更广联合回归、资源身份/失效语义 |
 | 代码形变图、当前/前帧与边界 | 有界顺序算子编译器；Morph/skin/wave 融合 WGSL；glTF 2.0/GLB、蒙皮与 Morph 动画；刚性/仿射骨骼法线；官方模型独立动画及 GPU 历史对照；静止批次缓存 | 细粒度上传、规模性能与算子组合的更广回归 |
 | 多 pass 共享与依赖 | 实际 compute、shadow、HDR surface、resolve 与可选 BVH refit 通过 Render Graph 执行；读写和环路验证 | 资源用途/格式与分配管理扩展；临时内存复用 |

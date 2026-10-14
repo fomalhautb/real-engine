@@ -20,7 +20,9 @@ type Batch = {
   instanceData: Float32Array<ArrayBuffer>; paletteData: Float32Array<ArrayBuffer>; scalarData: Float32Array<ArrayBuffer>;
   morphBounds: Bounds3[]; bounds: Map<number, Bounds3>;
   history: Map<number, Previous>;
-  dirty: boolean; lastInstances: InstanceState[];
+  dirty: boolean; lastInstances: InstanceState[]; lastInputMode?: SceneBatch['inputMode'];
+  /** Reused [start, end) slot ranges, bounded to 16 writes per input stream. */
+  uploadRanges: number[];
   material: GpuMaterial; materialPipelines: MaterialPipelines; materialRequest: number;
 };
 export interface FrameStats {
@@ -373,30 +375,51 @@ export class Renderer {
       render: this.device.createBindGroup({ layout: this.geometryLayout,
         entries: [output, instances, params, uvs].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
       instanceData: new Float32Array(capacity * 56), paletteData: new Float32Array(capacity * program.jointCount * 32),
-      scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, lastInstances: [],
+      scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, lastInstances: [], uploadRanges: [],
     };
   }
 
   private upload(batch: Batch): void {
     const states = batch.scene.instances;
     if (states.length > batch.scene.capacity) throw new Error('INSTANCE_CAPACITY: ' + batch.scene.name);
+    const committed = batch.scene.inputMode === 'committed' && batch.lastInputMode === 'committed';
+    const reusable = (state: InstanceState, i: number, previous: Previous | undefined): boolean =>
+      committed && state === batch.lastInstances[i] && previous?.settled === true && previous.source === state
+      && previous.version === state.historyVersion && previous.generation === (state.entityGeneration ?? 0);
     // Inputs are committed frame objects. After one stationary frame has settled
     // previous=current, keep the shared output until this batch changes again.
-    if (batch.scene.inputMode === 'committed' && states.length === batch.lastInstances.length && states.every((state, i) =>
-      state === batch.lastInstances[i] && batch.history.get(state.entityId)?.settled
-      && batch.history.get(state.entityId)?.generation === (state.entityGeneration ?? 0))) {
+    if (committed && states.length === batch.lastInstances.length && states.every((state, i) =>
+      reusable(state, i, batch.history.get(state.entityId)))) {
       batch.dirty = false;
       return;
     }
     batch.dirty = true;
     const alive = new Set<number>();
+    // Validate identity before updating any history. A duplicate would otherwise
+    // overwrite the previous pose used by a second slot in the same batch.
+    for (const state of states) {
+      if (!Number.isSafeInteger(state.entityId) || state.entityId < 0 || state.entityId > 0xffffffff) throw new Error('INVALID_ENTITY_ID');
+      const generation = state.entityGeneration ?? 0;
+      if (!Number.isSafeInteger(generation) || generation < 0 || generation > 0xffffffff) throw new Error('INVALID_ENTITY_GENERATION');
+      if (alive.has(state.entityId)) throw new Error('DUPLICATE_ENTITY_ID: ' + batch.scene.name);
+      alive.add(state.entityId);
+    }
+    const ranges = batch.uploadRanges;
+    ranges.length = 0;
+    let coalesced = false;
     const joints = batch.program.jointCount, scalarCount = Math.max(1, batch.program.scalarCount);
     for (let i = 0; i < states.length; i++) {
       const state = states[i];
       const generation = state.entityGeneration ?? 0;
-      if (!Number.isSafeInteger(generation) || generation < 0 || generation > 0xffffffff) throw new Error('INVALID_ENTITY_GENERATION');
-      const bounds = conservativeDeformationBounds(batch.program, batch.scene.mesh.bounds, batch.morphBounds, state.bones, state.deformScalars, state.model);
       let previous = batch.history.get(state.entityId);
+      if (reusable(state, i, previous)) continue;
+      // Adjacent changes share a write. Highly fragmented updates use one
+      // envelope instead of issuing an unbounded number of tiny queue writes.
+      if (coalesced) ranges[1] = i + 1;
+      else if (ranges.length && ranges[ranges.length - 1] === i) ranges[ranges.length - 1] = i + 1;
+      else if (ranges.length < 32) ranges.push(i, i + 1);
+      else { ranges[1] = i + 1; ranges.length = 2; coalesced = true; }
+      const bounds = conservativeDeformationBounds(batch.program, batch.scene.mesh.bounds, batch.morphBounds, state.bones, state.deformScalars, state.model);
       if (!previous || previous.version !== state.historyVersion || previous.generation !== generation) {
         previous = { model: state.model.slice(), bones: state.bones.map(b => b.slice()), scalars: [...state.deformScalars], version: state.historyVersion, generation, settled: true };
         batch.history.set(state.entityId, previous);
@@ -420,18 +443,21 @@ export class Renderer {
       previous.settled = previous.source === undefined || previous.source === state;
       previous.source = state;
       previous.model.set(state.model); previous.scalars = [...state.deformScalars]; previous.version = state.historyVersion; previous.generation = generation;
-      alive.add(state.entityId);
     }
     for (const id of batch.history.keys()) if (!alive.has(id)) { batch.history.delete(id); batch.bounds.delete(id); }
-    this.device.queue.writeBuffer(batch.params, 0, new Uint32Array([batch.scene.mesh.vertexCount, states.length, joints, scalarCount]));
-    this.stats.uploadedBytes += 16;
-    if (states.length) {
-      this.device.queue.writeBuffer(batch.instances, 0, batch.instanceData, 0, states.length * 56);
-      if (joints) this.device.queue.writeBuffer(batch.palettes, 0, batch.paletteData, 0, states.length * joints * 32);
-      this.device.queue.writeBuffer(batch.scalars, 0, batch.scalarData, 0, states.length * scalarCount * 2);
-      this.stats.uploadedBytes += states.length * (224 + joints * 128 + scalarCount * 8);
+    if (states.length !== batch.lastInstances.length) {
+      this.device.queue.writeBuffer(batch.params, 0, new Uint32Array([batch.scene.mesh.vertexCount, states.length, joints, scalarCount]));
+      this.stats.uploadedBytes += 16;
+    }
+    for (let r = 0; r < ranges.length; r += 2) {
+      const start = ranges[r], count = ranges[r + 1] - start;
+      this.device.queue.writeBuffer(batch.instances, start * 224, batch.instanceData, start * 56, count * 56);
+      if (joints) this.device.queue.writeBuffer(batch.palettes, start * joints * 128, batch.paletteData, start * joints * 32, count * joints * 32);
+      this.device.queue.writeBuffer(batch.scalars, start * scalarCount * 8, batch.scalarData, start * scalarCount * 2, count * scalarCount * 2);
+      this.stats.uploadedBytes += count * (224 + joints * 128 + scalarCount * 8);
     }
     batch.lastInstances = [...states];
+    batch.lastInputMode = batch.scene.inputMode;
   }
 
   private resize(): void {

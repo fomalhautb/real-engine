@@ -10,6 +10,7 @@ interface FixtureDocument extends GltfBinaryDocument {
   nodes: Array<{ children?: number[]; mesh?: number; skin?: number; translation?: number[]; scale?: number[] }>;
   meshes: Array<{ primitives: Array<{ attributes: Record<string, number>; targets?: Array<Record<string, number>> }> }>;
   skins?: Array<{ joints: number[] }>;
+  animations?: Array<Record<string, unknown>>;
   extensionsRequired?: string[];
   materials?: Array<Record<string, unknown>>;
 }
@@ -141,6 +142,42 @@ describe('Khronos glTF 2.0 reference assets', () => {
     const history = first.batches[0].instances[0].historyVersion;
     first.sample(1.5, 0, false, true);
     expect(first.batches[0].instances[0].historyVersion).toBe(history + 1);
+  });
+
+  it('reuses committed states for an asset without clips while preserving validation and history invalidation', () => {
+    const { json, buffers } = fixture('AnimatedMorphCube');
+    delete json.animations;
+    const scene = new GltfSceneInstance(importGltf(json, buffers));
+    const initial = scene.batches.map(batch => batch.instances[0]);
+    scene.sample(10);
+    scene.sample(-20, 0, true);
+    expect(scene.batches.map(batch => batch.instances[0])).toEqual(initial);
+    for (let i = 0; i < initial.length; i++) expect(scene.batches[i].instances[0]).toBe(initial[i]);
+    expect(() => scene.sample(Number.NaN)).toThrow(/sample time/);
+    expect(() => scene.sample(1, 1)).toThrow(/clip index/);
+    expect(() => scene.sample(1, -1)).toThrow(/clip index/);
+    for (let i = 0; i < initial.length; i++) expect(scene.batches[i].instances[0]).toBe(initial[i]);
+    scene.sample(30, undefined, false, true);
+    for (let i = 0; i < initial.length; i++) {
+      expect(scene.batches[i].instances[0]).not.toBe(initial[i]);
+      expect(scene.batches[i].instances[0].historyVersion).toBe(initial[i].historyVersion + 1);
+    }
+    const invalidated = scene.batches.map(batch => batch.instances[0]);
+    scene.sample(40);
+    for (let i = 0; i < invalidated.length; i++) expect(scene.batches[i].instances[0]).toBe(invalidated[i]);
+  });
+
+  it('does not treat an omitted clip index as a static pose when clips exist', () => {
+    const { json, buffers } = fixture('SimpleSkin');
+    const scene = new GltfSceneInstance(importGltf(json, buffers));
+    const initial = scene.batches[0].instances[0];
+    scene.sample(1);
+    const animated = scene.batches[0].instances[0];
+    expect(animated).not.toBe(initial);
+    scene.sample(0);
+    const returned = scene.batches[0].instances[0];
+    expect(returned).not.toBe(animated);
+    close(transformPoint(returned.bones[1], [0.5, 2, 0]), [0.5, 2, 0]);
   });
 
   it('cancels mesh-node translation in the skin palette before applying the model matrix', () => {

@@ -12,7 +12,9 @@
 
 每个变化的批次执行一次 Compute，输出当前世界位置、法线和上一渲染帧位置，供主视图和太阳阴影共用。Morph 包含位置与法线增量；wave 使用解析雅可比修正法线。动态包围盒在 CPU 按算子传播保守边界，不遍历运行时顶点，也不做 GPU 几何读回；蒙皮边界取各骨骼变换后的并集，目前偏宽松。
 
-SceneStore 使用 index/generation 句柄和按影响分类的资源版本，显式提交增删、变换、形变和历史失效事件。DemoScene 的模拟数据与 renderBatches 分离；commitFrame 仅应用增量事件。渲染历史使用事件携带的 historyVersion，重置和尺寸变化拒绝旧历史。已提交的实例对象在变化时替换：相同数据静止一帧、使前帧追上当前帧后，可复用形变结果并跳过整批上传。直接提供 mutable 输入的调用方仍逐帧更新。当前仍按批次更新；不是完整的稀疏 GPU 更新器。
+SceneStore 使用 index/generation 句柄和按影响分类的资源版本，显式提交增删、变换、形变和历史失效事件。DemoScene 的模拟数据与 renderBatches 分离；commitFrame 仅应用增量事件。渲染历史使用事件携带的 historyVersion，重置和尺寸变化拒绝旧历史。已提交的实例对象在变化时替换：相同数据静止一帧、使前帧追上当前帧后，可复用形变结果。SceneStore 在提交边界隔离输入，包括更新回调保留的草稿和插入的外部嵌套对象；drainChanges 复用内部已提交值，对外 getter 仍返回防御性副本。
+
+CPU 打包和实例/骨骼/标量上传按变化的槽位执行，相邻槽位合并；超过 16 个分散区间时，上传从首个到末个变化槽位的一个连续区间，限制 queue.writeBuffer 调用数量。数量变化才更新批次参数；未变化槽位保留已有 GPU 输入。移动后的下一静止帧仍更新 previous=current；重排按槽位重写而历史按实体/generation 查找，删除后清理历史。同批实体 ID 必须唯一，ID/generation 为 uint32。mutable 输入每帧重打包全部活动槽位，从 mutable 切回 committed 也强制更新一次。变化批次的 GPU 形变和可选 BVH refit 仍整批执行，尚未实现按脏实例的 GPU dispatch 或逐帧上传字节预算。完全静止场景只上传 256 字节相机/光照参数。
 
 实际 deformation、shadow、surface、resolve pass 通过 Render Graph 执行，编译时检查读写依赖、未初始化读取、纹理同 pass 读写和环路，记录资源使用区间。开启世界查询时还执行 BVH refit。当前 GPU 分配仍由 Renderer 持有，没有自动资源别名分配器。
 
@@ -60,7 +62,7 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供后续光照直�
 
 动画支持节点 TRS 和 Morph 权重的 STEP、LINEAR、CUBICSPLINE；旋转 LINEAR 用四元数球面插值，三次插值按 glTF 时间间隔处理切线并归一化旋转。层级、节点矩阵、通道唯一性、时间顺序和数据类型均验证。默认/硬上限为 4096 节点、65,536 通道和累计 1600 万个动画标量（含时间）；动画解码前计入每个重复引用的通道，可配置更低预算。几何默认上限为输出 100 万顶点、300 万索引。
 
-`GltfSceneInstance` 选择一个场景，将每个节点/primitive 的姿态发布到统一 SceneBatch，Morph 在蒙皮前执行；骨骼矩阵为 `inverse(meshWorld) * jointWorld * inverseBind`，与实例世界矩阵组合。共享资产的各实例可以独立采样动画，Renderer 按实体保存前帧；跳播/瞬移可显式使历史失效。资产和像素在导入后按不可变输入使用；实例状态变化需重新发布。当前每个 primitive 单独成批、采样分配 CPU 数组，尚无跨节点自动批处理、动画混合或大型角色群性能保证。
+`GltfSceneInstance` 选择一个场景，将每个节点/primitive 的姿态发布到统一 SceneBatch，Morph 在蒙皮前执行；骨骼矩阵为 `inverse(meshWorld) * jointWorld * inverseBind`，与实例世界矩阵组合。共享资产的各实例可以独立采样动画，Renderer 按实体保存前帧；跳播/瞬移可显式使历史失效。资产和像素在导入后按不可变输入使用；实例状态变化需重新发布。无动画片段的资产复用已提交姿态，显式历史失效时重新发布；时间和片段索引仍验证。有动画时省略片段索引表示播放第 0 段，不会误用静态缓存。当前每个 primitive 单独成批，动画采样仍分配 CPU 数组，尚无跨节点自动批处理、动画混合或大型角色群性能保证。
 
 SimpleSkin 和 AnimatedMorphCube 已与原演示同场运行。测试用它们验证独立时间线、实际运动顶点、两目标 Morph、前帧状态和法线；它们不是最终规模与画质资产。实现依据 [Khronos glTF 2.0 规范](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html)。阶段 2 后期的完整高质量场景另按 [大型场景验收](benchmarks.md#阶段-2-大型场景与视觉交付)交付。
 
@@ -84,7 +86,7 @@ Rapier 以独立适配器提供盒子刚体和地面碰撞、最近命中射线�
 | 平台 | WebGPU 必需；初始化失败明确报错，设备丢失报告后停止帧循环，恢复需要重新加载 |
 | 性能 | 基础可测量切片；未完成大量动态物体、30 分钟稳定性及真实硬件性能验收 |
 
-场景动画仍在 CPU 生成矩阵，变化的批次仍上传全部活动实例。SceneStore 的防御性拷贝和骨骼验证也有 CPU 成本；虽然已去除逐实例线性查找和静止批次重复变形，但尚未达到大量动态对象的性能目标。后续需要连续数据布局、细粒度上传、Worker 与 GPU 姿态生成的测量。
+场景动画仍在 CPU 生成矩阵。CPU 打包/上传已支持变化槽位和有限区间，GPU 形变及 BVH refit 仍以批次为粒度；世界查询身份元数据和层级参数也仍随脏批次整批上传。SceneStore 的防御性拷贝和骨骼验证仍有 CPU 成本，尚未达到大量动态对象的性能目标。后续需要连续数据布局、Worker、GPU 姿态生成与按脏实例调度的测量；减少上传字节不等于已经证明整帧提速。
 
 Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分包和 WASM 单独加载是后续加载性能任务，不能通过提高构建警告阈值当作解决。
 

@@ -160,7 +160,9 @@ export class SceneStore<T> {
     if (typeof edit === 'function') {
       const draft = structuredClone(slot.value as T);
       const result = (edit as (draft: T) => T | void)(draft);
-      committed = result === undefined || result === draft ? draft : structuredClone(result);
+      // The callback can retain its draft or insert caller-owned nested objects.
+      // Publish a detached value so neither can mutate committed state later.
+      committed = structuredClone(result === undefined ? draft : result);
     } else {
       committed = structuredClone(edit);
     }
@@ -243,7 +245,9 @@ export class SceneStore<T> {
         historyInvalidated: item.historyInvalidated,
       };
       if (item.kind === 'remove') return Object.freeze({ ...base, kind: 'remove' as const });
-      const committed = structuredClone(item.value as T);
+      // create/update already detached this value from the caller. Later commits
+      // replace it rather than mutating it, so only the public read needs a copy.
+      const committed = item.value as T;
       return Object.freeze({
         ...base, kind: item.kind,
         get value(): T { return structuredClone(committed); },

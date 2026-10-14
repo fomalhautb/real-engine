@@ -222,6 +222,9 @@ export class AnimationRig {
   /** Fresh copies keep callers from changing validated keys after construction. */
   get clips(): readonly AnimationClip[] { return this.ownedClips.map(cloneClip); }
 
+  /** Inspect availability without copying animation key arrays. */
+  get clipCount(): number { return this.ownedClips.length; }
+
   sample(time: number, clipIndex = 0, loop = false): AnimationPose {
     finite(time, 'sample time');
     if (!Number.isInteger(clipIndex) || clipIndex < 0 || (this.ownedClips.length > 0 && clipIndex >= this.ownedClips.length)

@@ -16,6 +16,7 @@ export interface MaterialBinding {
 
 /** Render input independent of the gameplay category or pose producer. */
 export interface InstanceState {
+  /** Unsigned 32-bit identity, unique among the active instances of a batch. */
   entityId: number;
   /** Identity generation; omitted means zero. Reusing an ID with a new generation rejects previous-frame history. */
   entityGeneration?: number;

@@ -68,6 +68,64 @@ describe('SceneStore', () => {
     expect(entry.historyVersion).toBe(1);
   });
 
+  it('keeps drained create and update values independent of later commits and reader edits', () => {
+    const store = new SceneStore<State>();
+    const input = state(1);
+    const handle = store.create(input);
+    const created = store.drainChanges()[0];
+    if (created.kind !== 'create') throw new Error('Expected create');
+
+    input.transform[0] = 90;
+    input.material.color[0] = 90;
+    const createRead = created.value;
+    createRead.transform[0] = 80;
+    createRead.material.color[0] = 80;
+    const replacement = state(2);
+    store.update(handle, ['transform'], replacement);
+    replacement.transform[0] = 70;
+    replacement.material.color[0] = 70;
+    expect(created.value.transform[0]).toBe(1);
+    expect(created.value.material.color[0]).toBe(0.2);
+
+    const updated = store.drainChanges()[0];
+    if (updated.kind !== 'update') throw new Error('Expected update');
+    const updateRead = updated.value;
+    updateRead.transform[0] = 60;
+    updateRead.material.color[0] = 60;
+    store.update(handle, ['transform'], draft => {
+      draft.transform[0] = 3;
+      draft.material.color[0] = 0.9;
+    });
+    expect(updated.value.transform[0]).toBe(2);
+    expect(updated.value.material.color[0]).toBe(0.2);
+    expect(created.value.transform[0]).toBe(1);
+    expect(store.get(handle).transform[0]).toBe(3);
+    expect(store.get(handle).material.color[0]).toBe(0.9);
+  });
+
+  it('detaches callback drafts and inserted nested objects before committing', () => {
+    const store = new SceneStore<State>();
+    const handle = store.create(state(1));
+    store.drainChanges();
+    const inserted = state(2).material;
+    let retained: State | undefined;
+    store.update(handle, ['transform', 'materialParameters'], draft => {
+      retained = draft;
+      draft.transform[0] = 2;
+      draft.material = inserted;
+    });
+    const beforeDrain = store.get(handle);
+    retained!.transform[0] = 40;
+    inserted.color[0] = 40;
+    expect(store.get(handle)).toEqual(beforeDrain);
+    const change = store.drainChanges()[0];
+    if (change.kind !== 'update') throw new Error('Expected update');
+    retained!.transform[0] = 50;
+    inserted.color[0] = 50;
+    expect(change.value).toEqual(beforeDrain);
+    expect(store.get(handle)).toEqual(beforeDrain);
+  });
+
   it('coalesces updates by live identity and records independent revisions', () => {
     const store = new SceneStore<State>();
     const handle = store.create(state());

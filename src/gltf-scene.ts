@@ -17,7 +17,9 @@ export class GltfSceneInstance {
   readonly batches: SceneBatch[] = [];
   private readonly bindings: { node: number; skin?: number; entityId: number; program: ReturnType<typeof compileDeformation> }[] = [];
   private readonly transform: Mat4;
+  private readonly staticPose: boolean;
   private historyVersion = 0;
+  private hasCommittedPose = false;
 
   constructor(private readonly asset: GltfAsset, options: GltfSceneOptions = {}) {
     const sceneIndex = options.scene ?? asset.scene;
@@ -57,10 +59,21 @@ export class GltfSceneInstance {
           capacity: 1, inputMode: 'committed', instances: [] });
       }
     }
+    // AnimationRig.sample defaults an omitted clip index to clip 0. Only assets
+    // without clips have a pose that is independent of time and loop mode.
+    this.staticPose = asset.rig.clipCount === 0;
     this.sample(0);
   }
 
   sample(time: number, clipIndex?: number, loop = false, invalidateHistory = false): void {
+    if (this.staticPose && this.hasCommittedPose && !invalidateHistory) {
+      // Match AnimationRig.sample validation even when the committed state is reused.
+      if (!Number.isFinite(time)) throw new RangeError('sample time must be finite');
+      if (clipIndex !== undefined && (!Number.isInteger(clipIndex) || clipIndex !== 0)) {
+        throw new RangeError('invalid animation clip index');
+      }
+      return;
+    }
     const pose = this.asset.rig.sample(time, clipIndex, loop);
     const version = this.historyVersion + Number(invalidateHistory);
     // Validate all new inputs before publishing any batch, so bad poses cannot leave a partial frame.
@@ -79,5 +92,6 @@ export class GltfSceneInstance {
     });
     this.historyVersion = version;
     for (let i = 0; i < states.length; i++) this.batches[i].instances = [states[i]];
+    this.hasCommittedPose = true;
   }
 }

@@ -37,6 +37,7 @@ let distance = 8.7;
 let manualCamera = false;
 let paused = false;
 let giEnabled = true;
+let multiBounce = true;
 let wallColor: WallColor = 'coral';
 let sunAzimuth = 72;
 let sunElevation = 52;
@@ -85,7 +86,23 @@ function toggleGi(enabled = !giEnabled): void {
   giEnabled = enabled;
   renderer?.setDiffuseGiEnabled(enabled);
   element<HTMLInputElement>('gi-enabled').checked = enabled;
-  element('stage-mode').textContent = enabled ? 'GI ON · INDIRECT DIFFUSE' : 'GI OFF · DIRECT SUN ONLY';
+  refreshStageMode();
+  renderIfPaused();
+  refreshUi();
+}
+
+function refreshStageMode(): void {
+  element('stage-mode').textContent = !giEnabled ? 'GI OFF · DIRECT SUN ONLY'
+    : multiBounce ? 'GI ON · MULTI-BOUNCE DIFFUSE' : 'GI ON · SINGLE-BOUNCE DIFFUSE';
+}
+
+function setMultiBounce(enabled: boolean): void {
+  if (disposed) throw new Error('GI_DEMO_DISPOSED');
+  if (typeof enabled !== 'boolean') throw new RangeError('GI_DEMO_MULTI_BOUNCE');
+  renderer?.setDiffuseGiMultiBounce(enabled);
+  multiBounce = enabled;
+  element<HTMLInputElement>('gi-multi-bounce').checked = enabled;
+  refreshStageMode();
   renderIfPaused();
   refreshUi();
 }
@@ -121,11 +138,16 @@ function refreshUi(): void {
 function snapshot() {
   const diagnostics = renderer?.diagnostics();
   return {
-    page: 'diffuse-gi-demo', scope: { bounceCount: 1, temporalAccumulation: false, ambientFallback: false },
+    page: 'diffuse-gi-demo', scope: {
+      transport: 'diffuse-only', probePlacement: 'fixed-manual-grid',
+      multiBounce,
+      feedback: multiBounce ? 'previous-completed-probe-SH' : 'none',
+      temporalFiltering: false, ambientFallback: false,
+    },
     scene: scene ? { triangles: scene.triangles, batches: scene.batches.map(batch => batch.name) } : null,
     probeGrid: GI_PROBE_GRID,
     camera: { eye: eye(), target: [...target], yaw, elevation, distance, phase, manualCamera },
-    controls: { paused, giEnabled, wallColor, sunAzimuth, sunElevation, sunColor, sunIntensity },
+    controls: { paused, giEnabled, multiBounce, wallColor, sunAzimuth, sunElevation, sunColor, sunIntensity },
     probe: latestProbe ? structuredClone(latestProbe) : null,
     diffuseGi: diagnostics?.diffuseGi ?? null,
     stats: renderer ? structuredClone(renderer.stats) : null,
@@ -220,6 +242,8 @@ function wireControls(): void {
   const signal = events.signal;
   element<HTMLInputElement>('gi-enabled').addEventListener('change', event =>
     toggleGi((event.target as HTMLInputElement).checked), { signal });
+  element<HTMLInputElement>('gi-multi-bounce').addEventListener('change', event =>
+    setMultiBounce((event.target as HTMLInputElement).checked), { signal });
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-wall]')) {
     button.addEventListener('click', () => setWallColor(button.dataset.wall as WallColor), { signal });
   }
@@ -291,7 +315,8 @@ async function start(): Promise<void> {
   applySun();
   element('adapter').textContent = `${renderer.info.adapter} · ${renderer.info.timing}`;
   wireControls();
-  window.__GI_DEMO__ = { get renderer() { return renderer; }, snapshot, pause, step, toggleGi, setWallColor, dispose };
+  window.__GI_DEMO__ = { get renderer() { return renderer; }, snapshot, pause, step, toggleGi, setMultiBounce, setWallColor, dispose };
+  refreshStageMode();
   renderOnce();
   refreshUi();
   lastTime = performance.now();
@@ -304,6 +329,7 @@ export interface GiDemoHarness {
   pause(value: boolean): void;
   step(dt?: number): void;
   toggleGi(enabled?: boolean): void;
+  setMultiBounce(enabled: boolean): void;
   setWallColor(value: WallColor): void;
   dispose(): void;
 }

@@ -10,6 +10,9 @@ struct Hit {
 @group(0) @binding(2) var<storage, read> primary: array<Hit>;
 @group(0) @binding(3) var<storage, read> shadows: array<Hit>;
 @group(0) @binding(4) var<storage, read_write> probes: array<GiProbe>;
+@group(0) @binding(5) var<storage, read> giProbes: array<GiProbe>;
+
+// GI_INTERPOLATE
 
 @compute @workgroup_size(64)
 fn generate(@builtin(global_invocation_id) id: vec3u) {
@@ -40,6 +43,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     var probe: GiProbe;
     var primaryOverflows = 0u;
     var shadowOverflows = 0u;
+    var maximum = vec3f(0.0);
     for (var i = 0u; i < gi.counts.w; i++) {
         let index = id.x * gi.counts.w + i;
         let hit = primary[index];
@@ -60,10 +64,15 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
                 // Diffuse-only capture: dielectric F0=.04, no specular bounce.
                 radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)
                     * gi.sunColor.xyz * nl * visible;
+                if (gi.state.z != 0u) {
+                    radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)
+                        * giSampleIrradiance(hit.position.xyz, hit.normal.xyz, gi.state.y);
+                }
             }
         }
         // Bounded linear HDR transport; bad/incomplete probes are never sampled.
         radiance = clamp(radiance, vec3f(0.0), vec3f(65504.0));
+        maximum = max(maximum, radiance);
         let basis = giBasis(direction);
         for (var coefficient = 0u; coefficient < 9u; coefficient++) {
             probe.coefficients[coefficient] += vec4f(radiance * basis[coefficient] * (12.56637061 / f32(gi.counts.w)), 0.0);
@@ -76,5 +85,8 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
         if (count > 0.0) { probe.moments[face] = vec4f(probe.moments[face].xy / count, count, 0.0); }
     }
     probe.state = vec4u(select(0u, 1u, primaryOverflows + shadowOverflows == 0u), gi.state.x, primaryOverflows, shadowOverflows);
+    probe.coefficients[0].w = maximum.x;
+    probe.coefficients[1].w = maximum.y;
+    probe.coefficients[2].w = maximum.z;
     probes[id.x] = probe;
 }

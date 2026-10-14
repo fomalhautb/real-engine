@@ -1,30 +1,33 @@
 import commonSource from './shaders/diffuse-gi-common.wgsl?raw';
 import updateSource from './shaders/diffuse-gi-update.wgsl?raw';
 import sampleSource from './shaders/diffuse-gi-sample.wgsl?raw';
+import interpolateSource from './shaders/diffuse-gi-interpolate.wgsl?raw';
 import { DIFFUSE_GI_PROBE_BYTES, resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
 import { WORLD_HIT_BYTES } from './world-query';
 import type { GpuWorldQuery } from './gpu-world-query';
 
-export const diffuseGiSampleSource = sampleSource.replace('// GI_COMMON', commonSource);
+const giSource = (source: string) => source.replace('// GI_COMMON', commonSource).replace('// GI_INTERPOLATE', interpolateSource);
+export const diffuseGiSampleSource = giSource(sampleSource);
 export interface DiffuseGiProbeResult {
   frame: number;
   invalidProbes: number;
-  probes: { coefficients: number[][]; moments: number[][]; valid: boolean; primaryOverflows: number; shadowOverflows: number }[];
+  probes: { coefficients: number[][]; moments: number[][]; maxRadiance: number[]; valid: boolean; primaryOverflows: number; shadowOverflows: number }[];
 }
 
-/** Fixed world-space radiance probes. One diffuse surface bounce, refreshed in
- * full each rendered frame; no screen input, temporal history or readback in lighting. */
+/** Fixed world-space probes with optional cross-frame diffuse transport. Each
+ * complete update reads the preceding field and writes a separate buffer. */
 export class GpuDiffuseGi {
   readonly options: ReturnType<typeof resolveDiffuseGiOptions>;
   readonly surfaceLayout!: GPUBindGroupLayout;
-  readonly surfaceGroup!: GPUBindGroup;
   private readonly buffers: GPUBuffer[] = [];
   private parameters!: GPUBuffer;
   private primary!: GPUBuffer;
-  private probes!: GPUBuffer;
+  private probeBuffers!: [GPUBuffer, GPUBuffer];
+  private surfaceGroups!: GPUBindGroup[];
+  private currentIndex = 1;
   private readback!: GPUBuffer;
   private computeLayout!: GPUBindGroupLayout;
-  private computeGroup!: GPUBindGroup;
+  private computeGroups!: GPUBindGroup[];
   private generate!: GPUComputePipeline;
   private generateShadows!: GPUComputePipeline;
   private integrate!: GPUComputePipeline;
@@ -33,6 +36,14 @@ export class GpuDiffuseGi {
   private pending = false;
   private disposed = false;
   private enabled = true;
+  private multiBounce: boolean;
+  private historyUpdates = 0;
+  private lastHistoryFrame = 0;
+  private historyResetReason = 'initial';
+  private resetRequested: string | null = 'initial';
+  private previousDependencies?: { material: number; scene: number; sun: number[] };
+
+  get surfaceGroup(): GPUBindGroup { return this.surfaceGroups[this.currentIndex]; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: DiffuseGiOptions,
     account: (bytes: number) => void): Promise<GpuDiffuseGi> {
@@ -40,6 +51,7 @@ export class GpuDiffuseGi {
     if (resolved.rayCount > queries.options.maxRays) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
     if (resolved.rayCount > queries.options.maxTotalWorkUnits) throw new Error('DIFFUSE_GI_QUERY_WORK_BUDGET');
     const sizes = [112, resolved.rayCount * WORLD_HIT_BYTES, resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
+      resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       resolved.probeCount * DIFFUSE_GI_PROBE_BYTES];
     if (sizes.some(size => size > Math.min(device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize))
       || sizes.reduce((a, b) => a + b, 0) > resolved.maxBytes) throw new Error('DIFFUSE_GI_MEMORY_BUDGET');
@@ -50,27 +62,31 @@ export class GpuDiffuseGi {
   private constructor(private readonly device: GPUDevice, private readonly queries: GpuWorldQuery,
     options: ReturnType<typeof resolveDiffuseGiOptions>, private readonly account: (bytes: number) => void) {
     this.options = options;
+    this.multiBounce = options.multiBounce;
   }
   private initializeResources(): void {
     const { device, queries, options } = this;
     this.parameters = this.buffer('diffuse GI parameters', 112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.primary = this.buffer('diffuse GI primary hits', options.rayCount * WORLD_HIT_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    this.probes = this.buffer('diffuse GI radiance and visibility', options.probeCount * DIFFUSE_GI_PROBE_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    this.readback = this.buffer('diffuse GI diagnostics', this.probes.size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
-    this.computeLayout = device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4].map(binding => ({
+    const probeBytes = options.probeCount * DIFFUSE_GI_PROBE_BYTES;
+    this.probeBuffers = [this.buffer('diffuse GI field A', probeBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC),
+      this.buffer('diffuse GI field B', probeBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC)];
+    this.readback = this.buffer('diffuse GI diagnostics', probeBytes, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    this.computeLayout = device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5].map(binding => ({
       binding, visibility: GPUShaderStage.COMPUTE,
       buffer: { type: binding === 0 ? 'uniform' : binding === 1 || binding === 4 ? 'storage' : 'read-only-storage' },
     })) });
-    this.computeGroup = device.createBindGroup({ layout: this.computeLayout,
-      entries: [this.parameters, queries.rayBuffer, this.primary, queries.hitBuffer, this.probes].map((buffer, binding) => ({ binding, resource: { buffer } })) });
+    this.computeGroups = this.probeBuffers.map((output, index) => device.createBindGroup({ layout: this.computeLayout,
+      entries: [this.parameters, queries.rayBuffer, this.primary, queries.hitBuffer, output, this.probeBuffers[1 - index]]
+        .map((buffer, binding) => ({ binding, resource: { buffer } })) }));
     const surfaceLayout = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     ] });
-    const surfaceGroup = device.createBindGroup({ layout: surfaceLayout, entries: [
-      { binding: 0, resource: { buffer: this.parameters } }, { binding: 1, resource: { buffer: this.probes } },
-    ] });
-    Object.assign(this, { surfaceLayout, surfaceGroup });
+    this.surfaceGroups = this.probeBuffers.map(buffer => device.createBindGroup({ layout: surfaceLayout, entries: [
+      { binding: 0, resource: { buffer: this.parameters } }, { binding: 1, resource: { buffer } },
+    ] }));
+    Object.assign(this, { surfaceLayout });
   }
   private buffer(label: string, size: number, usage: GPUBufferUsageFlags): GPUBuffer {
     const buffer = this.device.createBuffer({ label, size, usage });
@@ -80,7 +96,7 @@ export class GpuDiffuseGi {
   private async initialize(): Promise<void> {
     // Allocate inside create()'s try/finally ownership boundary.
     this.initializeResources();
-    const module = this.device.createShaderModule({ label: 'diffuse GI', code: updateSource.replace('// GI_COMMON', commonSource) });
+    const module = this.device.createShaderModule({ label: 'diffuse GI', code: giSource(updateSource) });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `diffuse GI:${error.lineNum}: ${error.message}`).join('\n'));
     const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
@@ -90,15 +106,39 @@ export class GpuDiffuseGi {
   setEnabled(enabled: boolean): void {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
     if (typeof enabled !== 'boolean') throw new Error('DIFFUSE_GI_INVALID_ENABLED');
+    if (this.enabled !== enabled) this.resetRequested = 'enabled-changed';
     this.enabled = enabled;
   }
-  update(frame: number, direction: readonly number[], color: readonly number[]): number {
+  setMultiBounce(enabled: boolean): void {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    if (typeof enabled !== 'boolean') throw new Error('DIFFUSE_GI_INVALID_MULTI_BOUNCE');
+    if (this.multiBounce !== enabled) this.resetRequested = 'mode-changed';
+    this.multiBounce = enabled;
+  }
+  invalidateHistory(): void {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    this.resetRequested = 'explicit';
+  }
+  update(frame: number, direction: readonly number[], color: readonly number[], materialRevision: number, sceneRevision: number): number {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    const sun = [...direction, ...color], previous = this.previousDependencies;
+    const reset = this.resetRequested ?? (previous && (
+      previous.material !== materialRevision ? 'material-changed' : previous.scene !== sceneRevision ? 'scene-discontinuity'
+        : sun.some((value, i) => value !== previous.sun[i]) ? 'sun-changed' : null));
+    if (reset) {
+      this.historyUpdates = 0;
+      this.historyResetReason = reset;
+    }
+    this.resetRequested = null;
+    this.previousDependencies = { material: materialRevision, scene: sceneRevision, sun };
+    this.lastHistoryFrame = this.enabled && this.multiBounce && this.historyUpdates > 0 ? this.frame : 0;
     const data = new Float32Array(28), integers = new Uint32Array(data.buffer), o = this.options;
     data.set([...o.origin, this.enabled ? 1 : 0]); data.set([...o.spacing, o.maxDistance], 4);
     integers.set([...o.counts, o.raysPerProbe], 8);
     data.set([...direction, o.normalBias], 12); data.set(color, 16); data.set(o.skyRadiance, 20);
     integers[24] = frame;
+    integers[25] = this.lastHistoryFrame;
+    integers[26] = this.lastHistoryFrame ? 1 : 0;
     this.device.queue.writeBuffer(this.parameters, 0, data);
     return data.byteLength;
   }
@@ -106,9 +146,10 @@ export class GpuDiffuseGi {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
     if (!this.enabled) { encoder.beginComputePass({ label: 'disabled diffuse GI', timestampWrites: timing }).end(); return 0; }
     const count = this.options.rayCount;
+    const outputIndex = 1 - this.currentIndex;
     const dispatch = (label: string, pipeline: GPUComputePipeline, count: number, timestampWrites?: GPUComputePassTimestampWrites) => {
       const pass = encoder.beginComputePass({ label, timestampWrites });
-      pass.setPipeline(pipeline); pass.setBindGroup(0, this.computeGroup);
+      pass.setPipeline(pipeline); pass.setBindGroup(0, this.computeGroups[outputIndex]);
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     };
     dispatch('generate world-space GI rays', this.generate, count, timing && { querySet: timing.querySet, beginningOfPassWriteIndex: timing.beginningOfPassWriteIndex });
@@ -119,6 +160,8 @@ export class GpuDiffuseGi {
     dispatch('integrate world-space GI radiance', this.integrate, this.options.probeCount,
       timing && { querySet: timing.querySet, endOfPassWriteIndex: timing.endOfPassWriteIndex });
     this.frame = frame;
+    this.currentIndex = outputIndex;
+    this.historyUpdates = this.multiBounce ? this.historyUpdates + 1 : 1;
     return uploaded;
   }
   async probe(): Promise<DiffuseGiProbeResult> {
@@ -128,7 +171,8 @@ export class GpuDiffuseGi {
     const frame = this.frame;
     try {
       const encoder = this.device.createCommandEncoder({ label: 'diffuse GI diagnostics' });
-      encoder.copyBufferToBuffer(this.probes, 0, this.readback, 0, this.probes.size);
+      const probesBuffer = this.probeBuffers[this.currentIndex];
+      encoder.copyBufferToBuffer(probesBuffer, 0, this.readback, 0, probesBuffer.size);
       this.device.queue.submit([encoder.finish()]);
       await this.readback.mapAsync(GPUMapMode.READ);
       try {
@@ -139,8 +183,9 @@ export class GpuDiffuseGi {
           if (u32[base + 61] !== frame) throw new Error('DIFFUSE_GI_FRAME_MISMATCH');
           const coefficients = Array.from({ length: 9 }, (_, j) => Array.from(data.slice(base + j * 4, base + j * 4 + 3)));
           const moments = Array.from({ length: 6 }, (_, j) => Array.from(data.slice(base + 36 + j * 4, base + 39 + j * 4)));
-          if (![...coefficients.flat(), ...moments.flat()].every(Number.isFinite)) throw new Error('DIFFUSE_GI_NONFINITE');
-          probes.push({ coefficients, moments, valid: u32[base + 60] === 1,
+          const maxRadiance = [data[base + 3], data[base + 7], data[base + 11]];
+          if (![...coefficients.flat(), ...moments.flat(), ...maxRadiance].every(Number.isFinite)) throw new Error('DIFFUSE_GI_NONFINITE');
+          probes.push({ coefficients, moments, maxRadiance, valid: u32[base + 60] === 1,
             primaryOverflows: u32[base + 62], shadowOverflows: u32[base + 63] });
         }
         return { frame, probes, invalidProbes: probes.filter(probe => !probe.valid).length };
@@ -149,7 +194,9 @@ export class GpuDiffuseGi {
   }
   diagnostics() {
     return { enabled: this.enabled, frame: this.frame, options: this.options, ownedGpuBytes: this.bytes,
-      bounceCount: 1, capture: 'diffuse-and-emissive', update: 'full-grid-every-frame', representation: 'radiance-SH9',
+      multiBounce: this.multiBounce, historyUpdates: this.historyUpdates, lastHistoryFrame: this.lastHistoryFrame,
+      historyResetReason: this.historyResetReason, transport: this.multiBounce ? 'cross-frame-diffuse-feedback' : 'single-diffuse-bounce',
+      capture: 'diffuse-and-emissive', update: 'full-grid-every-frame', representation: 'radiance-SH9',
       visibility: 'six-direction-distance-moments', placement: 'caller-provided-free-space-grid',
       queriesPerUpdate: this.options.rayCount * 2, maxWorkUnitsPerUpdate: this.queries.options.maxTotalWorkUnits * 2,
       temporalAccumulation: false, automaticRelocation: false, reflections: false };

@@ -23,6 +23,7 @@ describe('diffuse GI probe contract', () => {
     expect(value.rayCount).toBe(1536);
     expect(value.maxDistance).toBe(30);
     expect(value.normalBias).toBe(0.03);
+    expect(value.multiBounce).toBe(false);
     expect(value.maxBytes).toBe(32 * 1024 * 1024);
     expect(DIFFUSE_GI_PROBE_BYTES).toBe(256);
     expect([value, value.origin, value.spacing, value.counts, value.skyRadiance].every(Object.isFrozen)).toBe(true);
@@ -32,6 +33,18 @@ describe('diffuse GI probe contract', () => {
     const value = resolveDiffuseGiOptions({ ...grid, spacing: [0.001, 0.002, 0.003] });
     expect(value.normalBias).toBeCloseTo(0.00025, 12);
     expect(() => resolveDiffuseGiOptions({ ...grid, spacing: [0.001, 0.002, 0.003], normalBias: 0.03 })).toThrow();
+  });
+
+  it('accepts only boolean multi-bounce modes and freezes the resolved choice', () => {
+    const enabled = resolveDiffuseGiOptions({ ...grid, multiBounce: true });
+    const disabled = resolveDiffuseGiOptions({ ...grid, multiBounce: false });
+    expect(enabled.multiBounce).toBe(true);
+    expect(disabled.multiBounce).toBe(false);
+    expect(Object.isFrozen(enabled)).toBe(true);
+    for (const invalid of [null, 0, 1, 'true', NaN]) {
+      expect(() => resolveDiffuseGiOptions({ ...grid, multiBounce: invalid as unknown as boolean }))
+        .toThrow('DIFFUSE_GI_MULTI_BOUNCE');
+    }
   });
 
   it('rejects invalid grids, float32-collapsed neighbours, and excess work or storage', () => {

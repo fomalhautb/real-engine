@@ -109,17 +109,47 @@ fn shadowFragment(input: ShadowVaryings) {
     if (!evaluateCoverage(input.uv, 0.0, input.color, input.material)) { discard; }
 }
 
-fn visibility(light: vec4f, ndotl: f32) -> f32 {
+fn visibility(light: vec4f) -> f32 {
     let projected = light.xyz / light.w;
     let uv = projected.xy * vec2f(0.5, -0.5) + 0.5;
+    // Receiver-plane depth gradients: each PCF tap compares the receiver at
+    // that tap, not the center depth of a sloping surface. Derivatives precede
+    // the divergent bounds branch so every fragment in the quad participates.
+    let du = dpdx(uv);
+    let dv = dpdy(uv);
+    let dz = vec2f(dpdx(projected.z), dpdy(projected.z));
+    let determinant = du.x * dv.y - du.y * dv.x;
+    var gradient = vec2f(0.0);
+    if (abs(determinant) > 1e-12) {
+        gradient = vec2f(dz.x * dv.y - dz.y * du.y, du.x * dz.y - dv.x * dz.x) / determinant;
+    }
     if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || projected.z < 0.0 || projected.z > 1.0) {
         return 1.0;
     }
-    let pixel = 1.0 / vec2f(textureDimensions(shadowMap));
+    let size = vec2i(textureDimensions(shadowMap));
+    let texel = uv * vec2f(size) - 0.5;
+    let base = vec2i(floor(texel));
+    let fraction = fract(texel);
     var sum = 0.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            sum += textureSampleCompareLevel(shadowMap, shadowSampler, uv + vec2f(f32(x), f32(y)) * pixel, projected.z - 0.0004 - (1.0 - ndotl) * 0.0008);
+    // Equivalent weights to 3x3 bilinear PCF, using the 16 unique texels.
+    // Compare at each texel center: hardware linear compare uses a single
+    // reference for four different receiver depths and causes slope acne.
+    for (var y = -1; y <= 2; y++) {
+        for (var x = -1; x <= 2; x++) {
+            let coordinate = base + vec2i(x, y);
+            var weight = vec2f(1.0);
+            if (x == -1) { weight.x = 1.0 - fraction.x; }
+            if (x == 2) { weight.x = fraction.x; }
+            if (y == -1) { weight.y = 1.0 - fraction.y; }
+            if (y == 2) { weight.y = fraction.y; }
+            let sampleUv = (vec2f(coordinate) + 0.5) / vec2f(size);
+            let receiverDepth = projected.z + dot(gradient, sampleUv - uv);
+            var lit = 1.0;
+            if (all(coordinate >= vec2i(0)) && all(coordinate < size)) {
+                let depth = textureLoad(shadowMap, coordinate, 0);
+                lit = select(0.0, 1.0, receiverDepth - 0.000002 <= depth);
+            }
+            sum += lit * weight.x * weight.y;
         }
     }
     return sum / 9.0;
@@ -127,6 +157,7 @@ fn visibility(light: vec4f, ndotl: f32) -> f32 {
 struct FragmentOutput { @location(0) color: vec4f, @location(1) velocity: vec2f }
 @fragment
 fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> FragmentOutput {
+    let shadowVisibility = visibility(input.light);
     let surface = evaluateMaterial(input.uv, 0.0, input.color, input.material);
     let covered = evaluateCoverage(input.uv, 0.0, input.color, input.material);
     if (!covered) { discard; }
@@ -152,7 +183,7 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     let fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
     let specular = distribution * geometry * fresnel / max(4.0 * nv * nl, 0.001);
     let diffuse = (1.0 - fresnel) * (1.0 - metalness) * base / 3.14159265;
-    let direct = (diffuse + specular) * frame.sunColor.rgb * nl * visibility(input.light, nl);
+    let direct = (diffuse + specular) * frame.sunColor.rgb * nl * shadowVisibility;
     // Compiled world-space irradiance, or the legacy fill when GI is unconfigured.
     // INDIRECT_LIGHTING
     let lighting = select(direct + ambient + surface.emissive, base + surface.emissive, MATERIAL_UNLIT);

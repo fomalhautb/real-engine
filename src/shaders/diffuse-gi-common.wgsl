@@ -5,10 +5,10 @@ struct GiParameters {
     sunDirection: vec4f, // xyz unit vector, w world-space normal bias
     sunColor: vec4f,
     sky: vec4f,
-    state: vec4u, // rendered frame
+    state: vec4u, // rendered frame, usable history frame, feedback enabled, reserved
 }
 struct GiProbe {
-    coefficients: array<vec4f, 9>, // incoming radiance SH, not surface color
+    coefficients: array<vec4f, 9>, // RGB incoming radiance SH; first three w values store sampled RGB maxima
     moments: array<vec4f, 6>, // mean distance, mean squared distance, sample count
     state: vec4u, // valid, frame, primary overflows, shadow overflows
 }

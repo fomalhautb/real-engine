@@ -267,7 +267,7 @@ export class Renderer {
         { resource: 'world-query-bounds', access: 'read' as const },
         { resource: 'shared-geometry', access: 'read' as const },
         { resource: 'world-query-scratch', access: 'readWrite' as const },
-        { resource: 'diffuse-gi-probes', access: 'write' as const },
+        { resource: 'diffuse-gi-probes', access: 'readWrite' as const },
       ], execute: (encoder: GPUCommandEncoder) => {
         this.stats.uploadedBytes += this.diffuseGi!.encode(encoder, this.stats.frames + 1, this.materialRevision,
           this.timestamp(10 + (this.geometryLod ? 2 : 0)));
@@ -318,7 +318,7 @@ export class Renderer {
           const shadow = await this.device.createRenderPipelineAsync({ label: 'shared material shadow coverage',
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.shadowFrameLayout, this.geometryLayout, this.materialResources.layout] }),
             vertex: { module, entryPoint: 'shadowMain' }, fragment: { module, entryPoint: 'shadowFragment', targets: [] },
-            primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
+            primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
           });
           const query = this.worldQueries ? await this.worldQueries.createPipeline(program) : undefined;
           return { surface, surfaceLod, shadow, query };
@@ -385,6 +385,17 @@ export class Renderer {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
     this.diffuseGi.setEnabled(enabled);
+  }
+  setDiffuseGiMultiBounce(enabled: boolean): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    this.diffuseGi.setMultiBounce(enabled);
+  }
+  /** Explicit reset for discontinuities outside the scene/material identity contracts. */
+  invalidateDiffuseGiHistory(): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    this.diffuseGi.invalidateHistory();
   }
   async probeDiffuseGi(): Promise<DiffuseGiProbeResult> {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
@@ -598,7 +609,8 @@ export class Renderer {
     new Uint32Array(this.frameData.buffer)[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : 0;
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
     this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
-    this.stats.uploadedBytes += this.diffuseGi?.update(this.stats.frames + 1, this.sunDirection, this.sunColor) ?? 0;
+    this.stats.uploadedBytes += this.diffuseGi?.update(this.stats.frames + 1, this.sunDirection, this.sunColor,
+      this.materialRevision, this.worldQueries!.historyRevision) ?? 0;
     this.lastViewProjection = vp;
     const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → HDR surface → resolve' });
     this.graph.execute(encoder);

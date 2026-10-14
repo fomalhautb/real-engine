@@ -7,6 +7,8 @@ export interface DiffuseGiOptions {
   maxDistance?: number;
   normalBias?: number;
   skyRadiance?: readonly [number, number, number];
+  /** Feed the previous completed probe field into this frame's diffuse capture. */
+  multiBounce?: boolean;
   maxBytes?: number;
 }
 
@@ -18,6 +20,7 @@ export interface ResolvedDiffuseGiOptions {
   readonly maxDistance: number;
   readonly normalBias: number;
   readonly skyRadiance: readonly [number, number, number];
+  readonly multiBounce: boolean;
   readonly maxBytes: number;
   readonly probeCount: number;
   readonly rayCount: number;
@@ -75,6 +78,10 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   }
 
   const maxDistance = options.maxDistance ?? 30;
+  if (options.multiBounce !== undefined && typeof options.multiBounce !== 'boolean') {
+    throw new RangeError('DIFFUSE_GI_MULTI_BOUNCE');
+  }
+  const multiBounce = options.multiBounce ?? false;
   const normalBiasLimit = Math.min(...spacing) * 0.25;
   // A millimetre-scale grid must remain legal when the caller omits the bias.
   const normalBias = options.normalBias ?? Math.min(0.03, normalBiasLimit);
@@ -86,7 +93,7 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   }
   if (probeCount * DIFFUSE_GI_PROBE_BYTES > maxBytes) throw new RangeError('DIFFUSE_GI_MEMORY_BUDGET');
   return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias,
-    skyRadiance, maxBytes, probeCount, rayCount });
+    skyRadiance, multiBounce, maxBytes, probeCount, rayCount });
 }
 
 /** Deterministic Fibonacci-sphere direction; rayIndex is zero based. */

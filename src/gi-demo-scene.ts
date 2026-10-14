@@ -43,15 +43,17 @@ export function createGiDemoScene(): { batches: SceneBatch[]; triangles: number 
   const plane = createPlane();
   const cube = createCube();
   const pale: [number, number, number, number] = [0.82, 0.84, 0.82, 1];
-  const floor = instance(1, transform([0, -0.025, 0], [6.4, 1, 7.2]), [0.76, 0.79, 0.76, 1]);
+  // Overlap the floor and walls: a real 2.5 cm opening here previously let sun
+  // through even with GI disabled. The visible wall tops remain at y=3.7 m.
+  const floor = instance(1, transform([0, 0, 0], [6.6, 1, 7.4]), [0.76, 0.79, 0.76, 1]);
   const back = instance(2,
-    multiply(translation(0, 1.85, -3.6), multiply(rotationX(Math.PI / 2), scaling(6.4, 1, 3.7))),
+    multiply(translation(0, 1.775, -3.6), multiply(rotationX(Math.PI / 2), scaling(6.6, 1, 3.85))),
     pale);
   const left = instance(3,
-    multiply(translation(-3.2, 1.85, 0), multiply(rotationZ(-Math.PI / 2), scaling(3.7, 1, 7.2))),
+    multiply(translation(-3.2, 1.775, 0), multiply(rotationZ(-Math.PI / 2), scaling(3.85, 1, 7.4))),
     [1, 1, 1, 1]);
   const right = instance(4,
-    multiply(translation(3.2, 1.85, 0), multiply(rotationZ(Math.PI / 2), scaling(3.7, 1, 7.2))),
+    multiply(translation(3.2, 1.775, 0), multiply(rotationZ(Math.PI / 2), scaling(3.85, 1, 7.4))),
     [1, 1, 1, 1]);
   const objects = [
     instance(10, transform([0, 1.05, -0.25], [0.87, 2.1, 0.87]), [0.91, 0.89, 0.84, 1]),
@@ -82,4 +84,5 @@ export const GI_PROBE_GRID = Object.freeze({
   maxDistance: 12,
   normalBias: 0.03,
   skyRadiance: [0.045, 0.055, 0.075] as [number, number, number],
+  multiBounce: true,
 });

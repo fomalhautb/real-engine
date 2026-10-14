@@ -64,6 +64,7 @@ export class GpuWorldQuery {
   private readonly batches: QueryBatch[] = [];
   private bytes = 0;
   private frame = 0;
+  private sceneHistoryRevision = 0;
   private disposed = false;
   private pending = false;
   /** Uniform buffers are shared by every dispatch recorded into one encoder. */
@@ -209,12 +210,18 @@ export class GpuWorldQuery {
   updateSnapshot(frame: number, _materialRevision: number): number {
     this.frame = u32(frame, 'FRAME');
     let uploadedBytes = 0;
+    let historyChanged = false;
     for (const batch of this.batches) {
       batch.dirty = batch.source.getDirty?.() ?? true;
+      historyChanged ||= batch.count !== batch.source.scene.instances.length;
       batch.count = batch.source.scene.instances.length;
       if (!batch.dirty || !batch.count) continue;
-      batch.source.scene.instances.forEach((state, i) => batch.metadata.set(
-        [state.entityId, state.entityGeneration ?? 0, state.historyVersion, 0], i * 4));
+      batch.source.scene.instances.forEach((state, i) => {
+        const offset = i * 4, generation = state.entityGeneration ?? 0;
+        historyChanged ||= batch.metadata[offset] !== state.entityId || batch.metadata[offset + 1] !== generation
+          || batch.metadata[offset + 2] !== state.historyVersion;
+        batch.metadata.set([state.entityId, generation, state.historyVersion, 0], offset);
+      });
       this.device.queue.writeBuffer(batch.identities, 0, batch.metadata, 0, batch.count * 4);
       uploadedBytes += batch.count * 16 + batch.levels.length * 48;
       for (const level of batch.levels) this.device.queue.writeBuffer(level.params, 0, new Uint32Array([
@@ -222,8 +229,11 @@ export class GpuWorldQuery {
         ...batch.offsets, level.offset, level.count, 0, 0, 0,
       ]));
     }
+    if (historyChanged) this.sceneHistoryRevision = (this.sceneHistoryRevision + 1) >>> 0;
     return uploadedBytes;
   }
+  /** Discrete identity/history changes; ordinary current/previous pose motion does not advance it. */
+  get historyRevision(): number { return this.sceneHistoryRevision; }
   encodeRefit(encoder: GPUCommandEncoder, timing?: GPUComputePassTimestampWrites): void {
     let remaining = this.batches.reduce((sum, batch) => sum + (batch.count && batch.dirty ? batch.levels.length : 0), 0);
     let first = true;

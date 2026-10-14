@@ -2,6 +2,8 @@
 export interface MeshData {
   /** Separate packed UV0 stream; omitted assets receive zero UVs. */
   uvs?: Float32Array;
+  /** Separate packed tangent xyzw stream, including handedness in w. */
+  tangents?: Float32Array;
   vertices: ArrayBuffer;
   indices: Uint32Array;
   vertexCount: number;

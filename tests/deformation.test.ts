@@ -63,6 +63,50 @@ describe('deformation compiler and reference', () => {
     close(result2.position, [1 + shift, 2 + shift * 2, 3]);
   });
 
+  it('uses the inverse transpose of the weighted affine blend for normals', () => {
+    const rigid = compileDeformation({ jointCount: 2, nodes: [{ kind: 'skin' }] });
+    const affine = compileDeformation({ jointCount: 2, nodes: [{ kind: 'skin', normalMode: 'affine' }] });
+    expect(affine.key).not.toBe(rigid.key);
+    expect(compileDeformation({ jointCount: 2, nodes: [{ kind: 'skin', normalMode: 'rigid' }] }).key).toBe(rigid.key);
+    expect(affine.wgslBody).toContain('cross(b, c)');
+    const palette = [
+      multiply(translation(10, 0, 0), scaling(2, 1, 1)),
+      multiply(translation(0, 20, 0), scaling(1, 3, 1)),
+    ];
+    const v: DeformationVertex = {
+      position: [1, 1, 0], normal: [Math.SQRT1_2, -Math.SQRT1_2, 0],
+      joints: [1, 0, 1, 0], weights: [0.5, 0.25, 0.25, 0],
+    };
+    expect(() => validateDeformationState(rigid, palette, [])).toThrow(/rigid/);
+    validateDeformationState(affine, palette, []);
+    const result = evaluateDeformation(affine, v, 0, [], palette, []);
+    close(result.position, [3.75, 17.5, 0]);
+    const tangent = [1.25, 2.5, 0];
+    expect(result.normal.reduce((sum, value, axis) => sum + value * tangent[axis], 0)).toBeCloseTo(0, 6);
+    close(result.normal, [2 / Math.sqrt(5), -1 / Math.sqrt(5), 0]);
+  });
+
+  it('handles shear, reflection, and translation without changing affine normal direction', () => {
+    const program = compileDeformation({ jointCount: 1, nodes: [{ kind: 'skin', normalMode: 'affine' }] });
+    const shear = new Float32Array([1, 0, 0, 0, 2, 1, 0, 0, 0, 0, 1, 0, 10, -4, 3, 1]);
+    const v: DeformationVertex = { ...vertex, position: [0, 1, 0], normal: [1, 0, 0] };
+    const result = evaluateDeformation(program, v, 0, [], [shear], []);
+    close(result.position, [12, -3, 3]);
+    close(result.normal, [1 / Math.sqrt(5), -2 / Math.sqrt(5), 0]);
+    expect(result.normal[0] * 2 + result.normal[1]).toBeCloseTo(0, 6);
+    const reflection = evaluateDeformation(program, { ...v, position: [1, 0, 0] }, 0, [], [scaling(-1, 1, 1)], []);
+    close(reflection.normal, [-1, 0, 0]);
+  });
+
+  it('falls back to a finite rotated normal for a singular weighted blend', () => {
+    const program = compileDeformation({ jointCount: 2, nodes: [{ kind: 'skin', normalMode: 'affine' }] });
+    const v: DeformationVertex = {
+      position: [0, 0, 0], normal: [1, 1, 0], joints: [0, 1, 0, 0], weights: [0.5, 0.5, 0, 0],
+    };
+    close(evaluateDeformation(program, v, 0, [], [identity(), scaling(-1, 1, 1)], []).normal, [0, 1, 0]);
+    expect(() => validateDeformationState(program, [scaling(0, 1, 1), identity()], [])).toThrow(/invertible/);
+  });
+
   it('wave inverse-transpose normals remain perpendicular to the displaced surface', () => {
     const program = compileDeformation({ jointCount: 0, nodes: [{ kind: 'wave', amplitude: 0.8, frequency: 1.7, phase: 0 }] });
     const v: DeformationVertex = { ...vertex, position: [0, 0.3, 0], normal: [1, 0, 0] };

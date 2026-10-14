@@ -141,7 +141,8 @@ function emitNodes(nodes: readonly Node[], selected: ReadonlySet<number>): strin
  * Explicit LOD makes evaluation legal in fragment, compute, and ray-hit contexts; helpers own
  * address/filter/color-space policy. Parameters use materialParameters.values: array<vec4f,16>.
  * PBR base color is linear reflectance in [0,1]; Unlit base color and emissive retain nonnegative
- * HDR values. Alpha/metallic/cutoff clamp to [0,1], roughness to [0.04,1]. Mask equality passes.
+ * HDR values. Alpha/metallic clamp to [0,1], roughness to [0.04,1]. Cutoff is nonnegative;
+ * values above 1 reject every fragment (including opacity 1). Mask equality passes.
  * Opaque coverage always passes, regardless of stored opacity.
  */
 export function compileMaterial(definition: MaterialDefinition): MaterialProgram {
@@ -212,14 +213,14 @@ export function compileMaterial(definition: MaterialDefinition): MaterialProgram
   Object.freeze(nodes);
   const surfaceNodes = reachable(nodes, [graph.baseColor, graph.metallic, graph.roughness, graph.emissive, graph.alphaCutoff]);
   const coverageNodes = reachable(nodes, definition.alphaMode === 'mask' ? [graph.baseColor, graph.alphaCutoff] : []);
-  const coverageWgsl = `fn evaluateCoverage(${argumentsWGSL}) -> bool {\n${emitNodes(nodes, coverageNodes)}\n    return ${definition.alphaMode === 'opaque' ? 'true' : `clamp(v${graph.baseColor}.a, 0.0, 1.0) >= clamp(v${graph.alphaCutoff}, 0.0, 1.0)`};\n}`;
+  const coverageWgsl = `fn evaluateCoverage(${argumentsWGSL}) -> bool {\n${emitNodes(nodes, coverageNodes)}\n    return ${definition.alphaMode === 'opaque' ? 'true' : `clamp(v${graph.baseColor}.a, 0.0, 1.0) >= max(v${graph.alphaCutoff}, 0.0)`};\n}`;
   const baseColorWgsl = definition.shading === 'pbr'
     ? `clamp(v${graph.baseColor}.rgb, vec3f(0.0), vec3f(1.0))`
     : `max(v${graph.baseColor}.rgb, vec3f(0.0))`;
-  const wgsl = `struct MaterialSurface {\n    baseColor: vec3f,\n    opacity: f32,\n    metallic: f32,\n    roughness: f32,\n    emissive: vec3f,\n    alphaCutoff: f32,\n}\nfn evaluateMaterial(${argumentsWGSL}) -> MaterialSurface {\n${emitNodes(nodes, surfaceNodes)}\n    return MaterialSurface(\n        ${baseColorWgsl}, clamp(v${graph.baseColor}.a, 0.0, 1.0),\n        clamp(v${graph.metallic}, 0.0, 1.0), clamp(v${graph.roughness}, 0.04, 1.0),\n        max(v${graph.emissive}.rgb, vec3f(0.0)), clamp(v${graph.alphaCutoff}, 0.0, 1.0)\n    );\n}\n${coverageWgsl}`;
+  const wgsl = `struct MaterialSurface {\n    baseColor: vec3f,\n    opacity: f32,\n    metallic: f32,\n    roughness: f32,\n    emissive: vec3f,\n    alphaCutoff: f32,\n}\nfn evaluateMaterial(${argumentsWGSL}) -> MaterialSurface {\n${emitNodes(nodes, surfaceNodes)}\n    return MaterialSurface(\n        ${baseColorWgsl}, clamp(v${graph.baseColor}.a, 0.0, 1.0),\n        clamp(v${graph.metallic}, 0.0, 1.0), clamp(v${graph.roughness}, 0.04, 1.0),\n        max(v${graph.emissive}.rgb, vec3f(0.0)), max(v${graph.alphaCutoff}, 0.0)\n    );\n}\n${coverageWgsl}`;
   const surfaceResources = resources(nodes, surfaceNodes), coverageResources = resources(nodes, coverageNodes);
   const program: MaterialProgram = Object.freeze({
-    key: `material-v1:${JSON.stringify([definition.shading, definition.alphaMode, definition.doubleSided, graph])}`,
+    key: `material-v2:${JSON.stringify([definition.shading, definition.alphaMode, definition.doubleSided, graph])}`,
     wgsl, coverageWgsl, ...surfaceResources,
     coverageParameterCount: coverageResources.parameterCount,
     coverageTextureSlots: coverageResources.textureSlots,
@@ -281,7 +282,7 @@ export function evaluateMaterial(program: MaterialProgram, inputs: MaterialEvalu
   }
   const clamp = (v: number, low = 0, high = 1) => Math.min(high, Math.max(low, v));
   const color = vec(graph.baseColor), emissive = vec(graph.emissive);
-  const opacity = clamp(color[3]), alphaCutoff = clamp(scalar(graph.alphaCutoff));
+  const opacity = clamp(color[3]), alphaCutoff = Math.max(0, scalar(graph.alphaCutoff));
   return {
     baseColor: [clamp(color[0], 0, program.shading === 'pbr' ? 1 : Infinity),
       clamp(color[1], 0, program.shading === 'pbr' ? 1 : Infinity),

@@ -113,3 +113,28 @@ export function quaternionMatrix(x: number, y: number, z: number, w: number): Ma
     0, 0, 0, 1,
   ]);
 }
+
+/** Inverse of a nonsingular affine transform, including nonuniform scale/shear. */
+export function inverseAffine(m: ArrayLike<number>): Mat4 {
+  if (m.length !== 16 || !Array.from(m).every(Number.isFinite) || m[3] !== 0 || m[7] !== 0 || m[11] !== 0 || m[15] !== 1) {
+    throw new RangeError('inverseAffine requires a finite affine matrix');
+  }
+  const a = m[0], b = m[4], c = m[8], d = m[1], e = m[5], f = m[9], g = m[2], h = m[6], i = m[10];
+  const determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+  if (!Number.isFinite(determinant) || determinant === 0) throw new RangeError('inverseAffine requires a nonsingular matrix');
+  const out = new Float32Array([
+    e * i - f * h, f * g - d * i, d * h - e * g, 0,
+    c * h - b * i, a * i - c * g, b * g - a * h, 0,
+    b * f - c * e, c * d - a * f, a * e - b * d, 0,
+    0, 0, 0, determinant,
+  ].map(value => value / determinant));
+  for (let row = 0; row < 3; row++) out[12 + row] = -(out[row] * m[12] + out[4 + row] * m[13] + out[8 + row] * m[14]);
+  if (!out.every(Number.isFinite)) throw new RangeError('inverseAffine exceeds finite f32 range');
+  return out;
+}
+
+export function normalMatrix(model: ArrayLike<number>): Mat4 {
+  const inverse = inverseAffine(model), out = identity();
+  for (let col = 0; col < 3; col++) for (let row = 0; row < 3; row++) out[col * 4 + row] = inverse[row * 4 + col];
+  return out;
+}

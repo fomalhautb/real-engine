@@ -61,7 +61,7 @@ describe('shared material expression compiler', () => {
       expect(result.metallic).toBe(0);
       expect(result.roughness).toBe(Math.fround(0.04));
       expect(result.emissive).toEqual([0, 5, 0]);
-      expect(result.alphaCutoff).toBe(1);
+      expect(result.alphaCutoff).toBe(4);
     }
     expect(evaluateMaterial(compile({ metallic: 4, roughness: 8 }), inputs)).toMatchObject({ metallic: 1, roughness: 1 });
   });
@@ -74,8 +74,10 @@ describe('shared material expression compiler', () => {
     expect(sample(0.5, 0.5).covered).toBe(true);
     expect(sample(0.4999, 0.5).covered).toBe(false);
     expect(sample(-2, -1)).toMatchObject({ opacity: 0, alphaCutoff: 0, covered: true });
-    expect(sample(4, 3)).toMatchObject({ opacity: 1, alphaCutoff: 1, covered: true });
-    expect(program.coverageWgsl).toMatch(/clamp\(v\d+\.a, 0\.0, 1\.0\) >= clamp\(v\d+, 0\.0, 1\.0\)/);
+    expect(sample(4, 3)).toMatchObject({ opacity: 1, alphaCutoff: 3, covered: false });
+    expect(sample(1, 1).covered).toBe(true);
+    expect(sample(1, 1.01).covered).toBe(false);
+    expect(program.coverageWgsl).toMatch(/clamp\(v\d+\.a, 0\.0, 1\.0\) >= max\(v\d+, 0\.0\)/);
     expect(evaluateMaterial(compile({ baseColor: m.constant([1, 1, 1, 0]) }), inputs).covered).toBe(true);
   });
 

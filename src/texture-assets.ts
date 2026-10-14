@@ -127,17 +127,19 @@ export function textureByteSize(texture: TextureAsset | readonly TextureMipLevel
 
 /** Decode through browser canvas APIs. Canvas readback can lose RGB values at
  * fully transparent pixels because 2D canvases may internally premultiply. */
-export async function decodeTexture(blob: Blob, colorSpace: TextureAsset['colorSpace']): Promise<TextureAsset> {
+export async function decodeTexture(blob: Blob, colorSpace: TextureAsset['colorSpace'], maxDecodedBytes = Number.MAX_SAFE_INTEGER): Promise<TextureAsset> {
   if (colorSpace !== 'srgb' && colorSpace !== 'linear') {
     throw new TypeError('TEXTURE_ASSET: colorSpace must be srgb or linear');
   }
   if (!(blob instanceof Blob)) throw new TypeError('TEXTURE_ASSET: expected a Blob');
+  if (!Number.isSafeInteger(maxDecodedBytes) || maxDecodedBytes < 0) throw new RangeError('TEXTURE_DECODE_BUDGET: invalid limit');
   if (typeof createImageBitmap !== 'function') throw new Error('TEXTURE_ASSET: createImageBitmap unavailable');
 
   const bitmap = await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
   try {
     const { width, height } = bitmap;
-    checkedByteLength(width, height);
+    const decodedBytes = checkedByteLength(width, height);
+    if (decodedBytes > maxDecodedBytes) throw new RangeError('TEXTURE_DECODE_BUDGET: decoded image exceeds byte limit');
     let context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
     if (typeof OffscreenCanvas !== 'undefined') {
       context = new OffscreenCanvas(width, height).getContext('2d', { willReadFrequently: true });
@@ -149,7 +151,8 @@ export async function decodeTexture(blob: Blob, colorSpace: TextureAsset['colorS
     }
     if (!context) throw new Error('TEXTURE_ASSET: 2D canvas unavailable');
     context.drawImage(bitmap, 0, 0);
-    const pixels = new Uint8Array(context.getImageData(0, 0, width, height).data);
+    const rgba = context.getImageData(0, 0, width, height).data;
+    const pixels = new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength);
     const asset: TextureAsset = { width, height, pixels, colorSpace };
     validateTextureAsset(asset);
     return asset;

@@ -28,12 +28,15 @@ struct MaterialParameters { values: array<vec4f, 16> }
 @group(2) @binding(2) var materialImage1: texture_2d<f32>;
 @group(2) @binding(3) var materialImage2: texture_2d<f32>;
 @group(2) @binding(4) var materialImage3: texture_2d<f32>;
-@group(2) @binding(5) var materialSampler: sampler;
+@group(2) @binding(5) var materialSampler0: sampler;
+@group(2) @binding(6) var materialSampler1: sampler;
+@group(2) @binding(7) var materialSampler2: sampler;
+@group(2) @binding(8) var materialSampler3: sampler;
 // Raster uses implicit derivatives; world-space backends supply explicit-LOD helpers.
-fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage0, materialSampler, uv); }
-fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage1, materialSampler, uv); }
-fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage2, materialSampler, uv); }
-fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage3, materialSampler, uv); }
+fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage0, materialSampler0, uv); }
+fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage1, materialSampler1, uv); }
+fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage2, materialSampler2, uv); }
+fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage3, materialSampler3, uv); }
 // MATERIAL_PROGRAM
 
 struct Varyings {

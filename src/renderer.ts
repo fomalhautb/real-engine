@@ -28,7 +28,7 @@ export interface FrameStats {
 }
 export interface DeformationVerification {
   vertices: number; maxError: number; maxNormalError: number; boundsViolations: number;
-  samples: { batch: string; entityId: number; current: number[]; previous: number[] }[];
+  samples: { batch: string; entityId: number; vertexIndex: number; current: number[]; previous: number[] }[];
 }
 export interface RendererOptions {
   /** Includes pending compilation and resident cached definitions. Two render pipelines per definition. */
@@ -515,7 +515,9 @@ export class Renderer {
   }
 
   /** Explicit diagnostic readback only; never used by the production frame loop. */
-  async verifyDeformation(options: { allInstances?: boolean } = {}): Promise<DeformationVerification> {
+  async verifyDeformation(options: { allInstances?: boolean; sampleVertices?: readonly number[] } = {}): Promise<DeformationVerification> {
+    if (options.sampleVertices && (options.sampleVertices.length > 1024 || options.sampleVertices.some(index => !Number.isSafeInteger(index) || index < 0))) throw new Error('INVALID_SAMPLE_VERTICES');
+    const sampleVertices = new Set([0, ...options.sampleVertices ?? []]);
     let maxError = 0, vertices = 0, maxNormalError = 0, boundsViolations = 0;
     const samples: DeformationVerification['samples'] = [];
     for (const batch of this.batches) {
@@ -536,7 +538,7 @@ export class Renderer {
         for (let vertex = 0; vertex < count; vertex++) {
           const instanceIndex = Math.floor(vertex / batch.scene.mesh.vertexCount), vertexIndex = vertex % batch.scene.mesh.vertexCount;
           const instance = instances.subarray(instanceIndex * 56, instanceIndex * 56 + 56), bounds = instanceBounds[instanceIndex];
-          if (vertexIndex === 0) samples.push({ batch: batch.scene.name, entityId: entityIds[instanceIndex],
+          if (sampleVertices.has(vertexIndex)) samples.push({ batch: batch.scene.name, entityId: entityIds[instanceIndex], vertexIndex,
             current: Array.from(result.subarray(vertex * 12, vertex * 12 + 3)), previous: Array.from(result.subarray(vertex * 12 + 8, vertex * 12 + 11)) });
           for (let history = 0; history < 2; history++) {
             const paletteOffset = instanceIndex * joints * 32 + history * joints * 16;

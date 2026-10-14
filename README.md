@@ -9,12 +9,13 @@
 - [基准测试与验收](docs/benchmarks.md)
 - [技术调研与一手来源](docs/research.md)
 - [阶段 1–2 交付跟踪](docs/phase-1-2-status.md)
+- [第三方测试资产与许可证](docs/assets.md)
 
 ## 当前状态
 
-阶段 1.2 进行中：代码定义的 Morph/蒙皮/wave 算子编译为共享 GPU 程序，主视图与阴影共用当前/前帧形变；动态包围盒、generation 场景句柄、增量帧提交和 Render Graph 已接入实际场景。现有代码生成材质表达式支持 PBR/Unlit、Opaque/Masked、双面、纹理与共享阴影覆盖；OBJ 导入的原创卡片和重复纹理地面与 Rapier 固定步刚体同场运行。
+阶段 1.2 进行中：代码定义的 Morph/蒙皮/wave 算子编译为共享 GPU 程序，主视图与阴影共用当前/前帧形变；动态包围盒、generation 场景句柄、增量帧提交和 Render Graph 已接入实际场景。现有代码生成材质表达式支持 PBR/Unlit、Opaque/Masked、双面、纹理与共享阴影覆盖；glTF/GLB 蒙皮与 Morph 动画、OBJ 卡片、纹理地面及 Rapier 固定步刚体同场运行。
 
-计划中的 Nanite 类虚拟几何、Lumen 类世界空间 GI 和反射均尚未实现，文档中的性能数值是待验证目标。当前形变和材质编译器均有明确上限；没有 glTF/蒙皮资产导入、法线贴图、多层材质或透射。完整边界与后续工作见 [实现状态](docs/implementation.md)。
+计划中的 Nanite 类虚拟几何、Lumen 类世界空间 GI 和反射均尚未实现，文档中的性能数值是待验证目标。当前形变和材质编译器均有明确上限；没有法线贴图、多层材质或透射。阶段 2 后期需交付大规模完整场景及次世代观感的联合验收，现有小模型仅用于正确性检查。完整边界与后续工作见 [实现状态](docs/implementation.md)。
 
 ## 本地运行
 
@@ -50,7 +51,7 @@ npm run test:browser
 
 第二次运行不启用实验 GPU flags，使用正常硬件适配器。没有兼容 GPU 时测试明确失败，不跳过验证。测试截图和诊断附在 Playwright 输出中，不提交生成文件。
 
-2026-10-14 本地验证：107 项单元测试、TypeScript 与生产构建通过；Chrome 154 的 SwiftShader 和正常硬件配置各通过 8 项浏览器测试，覆盖形变、材质覆盖、Compute 材质数值、纹理、物理、历史、预算与错误路径。这些是功能证据，尚未完成性能档位、长期稳定性或跨厂商认证。
+2026-10-14 本地验证：156 项单元测试、TypeScript 与生产构建通过；Chrome 154 的 SwiftShader 和正常硬件配置各通过 9 项浏览器测试，覆盖 glTF 动画、仿射骨骼、材质覆盖、Compute 材质数值、独立采样器、物理、历史、预算与错误路径。这些是功能证据，尚未完成性能档位、长期稳定性或跨厂商认证。
 
 ## 材质接口示例
 
@@ -77,6 +78,23 @@ renderer.setMaterialParameters('card', new Float32Array([0.8, 1, 1, 1]));
 
 `await renderer.setMaterial('card', binding)` 异步准备后原子替换整套材质；`renderer.setSun({ direction, color })` 更新太阳方向与线性 RGB 辐亮度。详见 [实现状态](docs/implementation.md)。
 
+## glTF 动画接口示例
+
+`canvas` 由应用提供，时间单位为秒。实例共享不可变资产，各自采样姿态；所有实例的实体 ID 和批次名称需唯一。外部文件必须支持浏览器跨域访问或由本地托管。
+
+```ts
+import { loadGltf } from './src/gltf-load';
+import { GltfSceneInstance } from './src/gltf-scene';
+import { Renderer } from './src/renderer';
+
+const asset = await loadGltf('/assets/gltf/SimpleSkin/glTF/SimpleSkin.gltf');
+const actor = new GltfSceneInstance(asset, { name: 'actor', firstEntityId: 1 });
+const renderer = await Renderer.create(canvas, actor.batches);
+actor.sample(1, 0, true); // 时间、动画索引、循环；第四参数 true 用于跳播时使历史失效。
+renderer.render([4, 3, 6], [0, 1, 0]);
+// 应用下一帧再次 sample/render；退出时 renderer.dispose()。
+```
+
 ## 代码入口
 
 | 文件 | 职责 |
@@ -88,6 +106,8 @@ renderer.setMaterialParameters('card', new Float32Array([0.8, 1, 1, 1]));
 | src/renderer.ts | WebGPU 资源、形变共享、阴影与表面调度 |
 | src/material.ts、src/gpu-material.ts | 有界材质表达式、覆盖程序、GPU 材质与纹理资源 |
 | src/mesh-import.ts、src/texture-assets.ts | OBJ 网格导入与 RGBA8 纹理/mip 处理 |
+| src/gltf-binary.ts、src/gltf-import.ts、src/gltf-load.ts | 有界 glTF/GLB 解码、网格/蒙皮/材质导入与资源加载 |
+| src/animation.ts、src/gltf-scene.ts | TRS/Morph 动画采样、层级姿态和统一场景输入 |
 | src/shaders/deform.wgsl | 融合算子的当前/前帧执行模板 |
 | src/shaders/surface.wgsl | 直接光 PBR、阴影与运动向量 |
 | src/physics.ts | Rapier 适配与固定步姿态快照 |

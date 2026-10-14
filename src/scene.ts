@@ -11,6 +11,8 @@ import { SceneStore, type ChangeKind, type EntityHandle } from './scene-store';
 import { createCardMaterial, createGroundMaterial } from './demo-materials';
 import { parseObj } from './mesh-import';
 import materialCardObj from './assets/material-card.obj?raw';
+import type { GltfAsset } from './gltf-import';
+import { GltfSceneInstance } from './gltf-scene';
 
 const pivotRotation = (pivot: readonly number[], rotation: Mat4): Mat4 =>
   multiply(
@@ -57,8 +59,9 @@ export class DemoScene {
   private nextBoxOrdinal = 0;
   private disposed = false;
   private isPaused = false;
+  private readonly importedScenes: GltfSceneInstance[] = [];
 
-  private constructor(physics: PhysicsWorld) {
+  private constructor(physics: PhysicsWorld, assets: readonly GltfAsset[]) {
     this.physics = physics;
     const character = createCharacter();
     const ground = createPlane();
@@ -80,17 +83,22 @@ export class DemoScene {
       { name: 'material-card', mesh: cardAsset.primitives[0].mesh, capacity: 1, instances: [],
         deformation: { jointCount: 4, nodes: [] }, morphTargets: [], material: createCardMaterial() },
     ];
+    for (const [index, asset] of assets.entries()) {
+      const imported = new GltfSceneInstance(asset, { name: 'reference-' + index, allocateEntityId: () => this.ids.create(),
+        transform: translation(index === 0 ? -4.5 : 4.5, index === 0 ? 0.2 : 1.4, 1) });
+      this.importedScenes.push(imported); this.batches.push(...imported.batches);
+    }
     this.renderBatches = this.batches.map((batch) => ({ ...batch, instances: [], inputMode: 'committed' }));
     this.renderKeysByBatch = this.batches.map(() => []);
   }
 
-  static async create(treeCount = 32): Promise<DemoScene> {
+  static async create(treeCount = 32, assets: readonly GltfAsset[] = []): Promise<DemoScene> {
     if (!Number.isSafeInteger(treeCount) || treeCount < 0 || treeCount > 256) {
       throw new RangeError('treeCount must be an integer from 0 to 256');
     }
     const physics = await PhysicsWorld.create();
-    const scene = new DemoScene(physics);
     try {
+      const scene = new DemoScene(physics, assets);
       scene.initialize(treeCount);
       scene.commitFrame();
       return scene;
@@ -207,6 +215,7 @@ export class DemoScene {
     for (const item of this.batches[0].instances) this.updateCommitted(item, ['deformation']);
     for (const item of this.batches[1].instances) this.updateCommitted(item, ['deformation']);
     for (const item of this.batches[3].instances) this.updateCommitted(item, ['transform']);
+    for (const batch of this.batches.slice(5)) for (const item of batch.instances) this.updateCommitted(item, ['deformation', 'transform']);
   }
 
   spawnBox(): boolean {
@@ -248,7 +257,7 @@ export class DemoScene {
     this.time = 0;
     this.droppedSeconds = 0;
     this.stepper.reset();
-    this.updateAnimated();
+    this.updateAnimated(true);
     this.batches[0].instances[0].historyVersion++;
     for (const tree of this.batches[1].instances) tree.historyVersion++;
     for (const [index, box] of this.batches[3].instances.entries()) {
@@ -259,6 +268,7 @@ export class DemoScene {
     for (const item of this.batches[0].instances) this.updateCommitted(item, ['deformation', 'teleport']);
     for (const item of this.batches[1].instances) this.updateCommitted(item, ['deformation', 'teleport']);
     for (const item of this.batches[3].instances) this.updateCommitted(item, ['transform', 'teleport']);
+    for (const batch of this.batches.slice(5)) for (const item of batch.instances) this.updateCommitted(item, ['deformation', 'transform', 'teleport']);
   }
 
   dispose(): void {
@@ -267,8 +277,9 @@ export class DemoScene {
     this.disposed = true;
   }
 
-  private updateAnimated(): void {
+  private updateAnimated(invalidateHistory = false): void {
     const t = this.time;
+    for (const imported of this.importedScenes) imported.sample(t, 0, true, invalidateHistory);
     const character = this.batches[0].instances[0];
     character.bones = [
       identity(),

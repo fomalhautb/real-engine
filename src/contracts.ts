@@ -10,6 +10,8 @@ export interface MaterialBinding {
   parameters?: Float32Array;
   /** Immutable image assets; slots referenced by the definition must be present. */
   textures?: readonly (TextureAsset | undefined)[];
+  /** Per-texture sampling, independent of immutable image identity. */
+  samplers?: readonly (Omit<GPUSamplerDescriptor, 'compare'> | undefined)[];
 }
 
 /** Render input independent of the gameplay category or pose producer. */

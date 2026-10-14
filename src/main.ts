@@ -2,6 +2,7 @@ import './style.css';
 import { DemoScene } from './scene';
 import { Renderer } from './renderer';
 import type { RayHit } from './physics';
+import { loadGltf } from './gltf-load';
 
 const element = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -78,7 +79,11 @@ const signal = controls.signal;
 async function start(): Promise<void> {
   const queryCount = Number(new URLSearchParams(location.search).get('trees') ?? 32);
   const count = Number.isInteger(queryCount) ? Math.min(256, Math.max(1, queryCount)) : 32;
-  scene = await DemoScene.create(count);
+  const assets = await Promise.all([
+    loadGltf('/assets/gltf/SimpleSkin/glTF/SimpleSkin.gltf'),
+    loadGltf('/assets/gltf/AnimatedMorphCube/glTF/AnimatedMorphCube.gltf'),
+  ]);
+  scene = await DemoScene.create(count, assets);
   renderer = await Renderer.create(canvas, scene.renderBatches);
   element('adapter').textContent = renderer.info.adapter + ' · ' + renderer.info.timing;
   element('pause').addEventListener('click', () => { scene!.paused = !scene!.paused; }, { signal });

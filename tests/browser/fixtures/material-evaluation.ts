@@ -14,11 +14,14 @@ struct MaterialParameters { values: array<vec4f, 16> }
 @group(0) @binding(2) var materialImage1: texture_2d<f32>;
 @group(0) @binding(3) var materialImage2: texture_2d<f32>;
 @group(0) @binding(4) var materialImage3: texture_2d<f32>;
-@group(0) @binding(5) var materialSampler: sampler;
-fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage0, materialSampler, uv, lod); }
-fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage1, materialSampler, uv, lod); }
-fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage2, materialSampler, uv, lod); }
-fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage3, materialSampler, uv, lod); }
+@group(0) @binding(5) var materialSampler0: sampler;
+@group(0) @binding(6) var materialSampler1: sampler;
+@group(0) @binding(7) var materialSampler2: sampler;
+@group(0) @binding(8) var materialSampler3: sampler;
+fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage0, materialSampler0, uv, lod); }
+fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage1, materialSampler1, uv, lod); }
+fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage2, materialSampler2, uv, lod); }
+fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage3, materialSampler3, uv, lod); }
 `;
 const probeWGSL = `
 struct ProbeInputs { instanceColor: vec4f, metalRoughUv: vec4f, lodAndPadding: vec4f }
@@ -136,6 +139,9 @@ export async function runMaterialEvaluationFixture() {
       parameters[3] = -4; parameters[9] = -1;
       manager.updateParameters(expression, parameters);
       await run('expression-clamped-alpha-cutoff', expression, inputs);
+      parameters[3] = 2; parameters[9] = 1.25;
+      manager.updateParameters(expression, parameters);
+      await run('expression-mask-cutoff-above-one', expression, inputs);
       parameterUpdate.sameProgram = expression.program === originalProgram;
       parameterUpdate.compilationsAfter = pipelineCompilations;
       parameterUpdate.bytesAfter = ownedGpuBytes;
@@ -169,6 +175,31 @@ export async function runMaterialEvaluationFixture() {
         await run(sample.name, material, { instanceColor: [1, 1, 1, 1], instanceMetalRough: [0, 0.5], uv: [0.25, 0.25],
           lod: sample.lod, textures: () => sample.sample }, 0.004);
       } finally { manager.release(material); }
+    }
+    const stripes: TextureAsset = { width: 2, height: 1, colorSpace: 'linear',
+      pixels: new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255]) };
+    const filters = { magFilter: 'nearest', minFilter: 'nearest', mipmapFilter: 'nearest', lodMaxClamp: 0 } as const;
+    const distinctSamplers = manager.create({ definition: { ...DEFAULT_MATERIAL_DEFINITION, shading: 'unlit',
+      baseColor: m.add(m.texture(0), m.texture(1)), emissive: m.add(m.texture(2), m.texture(3)) },
+      textures: [stripes, stripes, stripes, stripes], samplers: [
+        { ...filters, addressModeU: 'repeat' }, { ...filters, addressModeU: 'clamp-to-edge' },
+        { ...filters, addressModeU: 'mirror-repeat' }, { ...filters, addressModeU: 'repeat' },
+      ] });
+    try {
+      for (const u of [1.25, -0.25]) {
+        const red: Vec4 = [1, 0, 0, 1], green: Vec4 = [0, 1, 0, 1];
+        const expected = u > 1 ? [red, green, green, red] : [green, red, red, green];
+        await run('per-slot-sampler-' + u, distinctSamplers, { instanceColor: [1, 1, 1, 1],
+          instanceMetalRough: [0, 0.5], uv: [u, 0.5], lod: 1, textures: slot => expected[slot] });
+      }
+    } finally { manager.release(distinctSamplers); }
+    // Invalid sampler descriptors must fail before retaining images or allocating uniforms.
+    for (const invalid of [{ compare: 'less' }, { lodMaxClamp: -1 }, { maxAnisotropy: 2, minFilter: 'nearest' }]) {
+      const bytes = ownedGpuBytes;
+      let rejected = false;
+      try { manager.create({ definition: DEFAULT_MATERIAL_DEFINITION, samplers: [invalid as GPUSamplerDescriptor] }); }
+      catch (error) { rejected = String(error).includes('MATERIAL_SAMPLER_'); }
+      if (!rejected || bytes !== ownedGpuBytes) throw new Error('MATERIAL_SAMPLER_INVALID_NOT_ATOMIC');
     }
     await device.queue.onSubmittedWorkDone();
     // Give uncaptured GPU validation events a task boundary before returning diagnostics.

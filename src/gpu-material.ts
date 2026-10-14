@@ -3,6 +3,22 @@ import { buildMipChain, textureByteSize, type TextureAsset } from './texture-ass
 import type { MaterialBinding } from './contracts';
 
 type ImageResource = { texture: GPUTexture; bytes: number; refs: number; asset: TextureAsset };
+function materialSampler(source: GPUSamplerDescriptor): GPUSamplerDescriptor {
+  if (!source || typeof source !== 'object' || source.compare !== undefined) throw new Error('MATERIAL_SAMPLER_DESCRIPTOR');
+  const descriptor: GPUSamplerDescriptor = { addressModeU: 'repeat', addressModeV: 'repeat',
+    magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', ...source };
+  for (const mode of [descriptor.addressModeU, descriptor.addressModeV, descriptor.addressModeW ?? 'clamp-to-edge']) {
+    if (!['repeat', 'mirror-repeat', 'clamp-to-edge'].includes(mode!)) throw new Error('MATERIAL_SAMPLER_ADDRESS');
+  }
+  for (const mode of [descriptor.magFilter, descriptor.minFilter, descriptor.mipmapFilter]) {
+    if (mode !== 'linear' && mode !== 'nearest') throw new Error('MATERIAL_SAMPLER_FILTER');
+  }
+  const min = descriptor.lodMinClamp ?? 0, max = descriptor.lodMaxClamp ?? 32, anisotropy = descriptor.maxAnisotropy ?? 1;
+  if (![min, max].every(value => Number.isFinite(value) && Number.isFinite(Math.fround(value))) || min < 0 || max < min) throw new Error('MATERIAL_SAMPLER_LOD');
+  if (!Number.isInteger(anisotropy) || anisotropy < 1 || anisotropy > 16 ||
+    (anisotropy > 1 && [descriptor.magFilter, descriptor.minFilter, descriptor.mipmapFilter].some(mode => mode !== 'linear'))) throw new Error('MATERIAL_SAMPLER_ANISOTROPY');
+  return descriptor;
+}
 export interface GpuMaterial {
   readonly program: MaterialProgram;
   readonly bindGroup: GPUBindGroup;
@@ -28,7 +44,7 @@ export class MaterialResources {
     this.layout = device.createBindGroupLayout({ label: 'shared material inputs', entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 256 } },
       ...[1, 2, 3, 4].map(binding => ({ binding, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, texture: { sampleType: 'float' as const } })),
-      { binding: 5, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+      ...[5, 6, 7, 8].map(binding => ({ binding, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, sampler: { type: 'filtering' as const } })),
     ] });
     this.sampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear' });
     this.fallback = device.createTexture({ label: 'unused material texture', size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
@@ -40,6 +56,11 @@ export class MaterialResources {
     if (this.disposed) throw new Error('MATERIAL_RESOURCES_DISPOSED');
     const program = compileMaterial(binding?.definition ?? DEFAULT_MATERIAL_DEFINITION);
     const parameters = this.parameters(program, binding?.parameters);
+    if ((binding?.samplers?.length ?? 0) > 4) throw new Error('MATERIAL_SAMPLER_COUNT');
+    const samplers = Array.from({ length: 4 }, (_, slot) => {
+      const descriptor = binding?.samplers?.[slot];
+      return descriptor === undefined ? undefined : materialSampler(descriptor);
+    });
     const retained: ImageResource[] = [];
     let uniform: GPUBuffer | undefined;
     try {
@@ -54,7 +75,8 @@ export class MaterialResources {
       const bindGroup = this.device.createBindGroup({ layout: this.layout, entries: [
         { binding: 0, resource: { buffer: uniform } },
         ...views.map((resource, index) => ({ binding: index + 1, resource })),
-        { binding: 5, resource: this.sampler },
+        ...[0, 1, 2, 3].map(slot => ({ binding: slot + 5,
+          resource: samplers[slot] ? this.device.createSampler(samplers[slot]) : this.sampler })),
       ] });
       const result: GpuMaterial = { program, bindGroup, uniform, images: retained, disposed: false };
       this.materials.add(result);

@@ -106,4 +106,24 @@ describe('browser texture decoding', () => {
     expect(canvas).not.toHaveBeenCalled();
     expect(close).toHaveBeenCalledOnce();
   });
+
+  it('enforces a decoded byte limit before canvas allocation and closes failed decodes', async () => {
+    const close = vi.fn(), canvas = vi.fn();
+    vi.stubGlobal('createImageBitmap', vi.fn().mockResolvedValue({ width: 2, height: 1, close }));
+    vi.stubGlobal('OffscreenCanvas', canvas);
+    await expect(decodeTexture(new Blob(), 'srgb', 7)).rejects.toThrow(/TEXTURE_DECODE_BUDGET/);
+    expect(canvas).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    await expect(decodeTexture(new Blob(), 'srgb', -1)).rejects.toThrow(/TEXTURE_DECODE_BUDGET/);
+  });
+
+  it('closes a bitmap when canvas readback fails', async () => {
+    const close = vi.fn();
+    vi.stubGlobal('createImageBitmap', vi.fn().mockResolvedValue({ width: 1, height: 1, close }));
+    vi.stubGlobal('OffscreenCanvas', class {
+      getContext() { return { drawImage: () => {}, getImageData: () => { throw new Error('readback failed'); } }; }
+    });
+    await expect(decodeTexture(new Blob(), 'linear', 4)).rejects.toThrow(/readback failed/);
+    expect(close).toHaveBeenCalledOnce();
+  });
 });

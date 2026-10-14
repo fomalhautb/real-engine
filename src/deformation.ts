@@ -6,10 +6,10 @@ export interface Bounds3 { min: [number, number, number]; max: [number, number, 
 /** Scalars are per-instance, per-frame values; node constants form the pipeline key. */
 export type DeformationNode =
   | Readonly<{ kind: 'morph'; target: number; weight: number }>
-  | Readonly<{ kind: 'skin' }>
+  | Readonly<{ kind: 'skin'; normalMode?: 'rigid' | 'affine' }>
   | Readonly<{ kind: 'wave'; amplitude: number; frequency: number; phase: number }>;
 export interface DeformationGraph { jointCount: number; nodes: readonly DeformationNode[] }
-export interface MorphTarget { positions: Float32Array; normals: Float32Array }
+export interface MorphTarget { positions: Float32Array; normals: Float32Array; tangents?: Float32Array }
 export interface DeformationVertex {
   position: Vec3;
   normal: Vec3;
@@ -52,7 +52,8 @@ function floatLiteral(value: number): string {
  * instance/model transform is applied by the caller after this local-space graph.
  *
  * Four influences per vertex may address any of jointCount bones. Bones must be
- * rigid; blended normal rotation is the declared LBS approximation. Morph deltas
+ * rigid by default; affine mode uses the inverse transpose of each vertex's
+ * weighted blended linear transform. Morph deltas
  * belong to the coordinate space at their node, so ordering is significant.
  * No intermediate normal normalization discards morph normal magnitude.
  */
@@ -72,7 +73,11 @@ export function compileDeformation(graph: DeformationGraph): CompiledDeformation
         return Object.freeze({ kind: 'morph', target: node.target, weight: node.weight });
       case 'skin':
         if (!graph.jointCount) throw new RangeError('skin requires at least one joint');
-        return Object.freeze({ kind: 'skin' });
+        if (node.normalMode !== undefined && node.normalMode !== 'rigid' && node.normalMode !== 'affine') {
+          throw new RangeError('skin.normalMode must be rigid or affine');
+        }
+        // Preserve existing pipeline keys for omitted and explicit rigid mode.
+        return Object.freeze(node.normalMode === 'affine' ? { kind: 'skin', normalMode: 'affine' } : { kind: 'skin' });
       case 'wave':
         finite(node.amplitude, 'wave.amplitude');
         finite(node.frequency, 'wave.frequency');
@@ -92,7 +97,43 @@ export function compileDeformation(graph: DeformationGraph): CompiledDeformation
     p += delta.position.xyz * weight;
     n += delta.normal.xyz * weight;
 }`;
-      case 'skin': return `{
+      case 'skin': return node.normalMode === 'affine' ? `{
+    let weights = vertex.weights / dot(vertex.weights, vec4f(1.0));
+    var skinnedPosition = vec3f(0.0);
+    var rotatedNormal = vec3f(0.0);
+    var c0 = vec3f(0.0);
+    var c1 = vec3f(0.0);
+    var c2 = vec3f(0.0);
+    for (var influence = 0u; influence < 4u; influence++) {
+        let bone = palettes[paletteBase + vertex.joints[influence]];
+        let weight = weights[influence];
+        skinnedPosition += (bone * vec4f(p, 1.0)).xyz * weight;
+        rotatedNormal += (bone * vec4f(n, 0.0)).xyz * weight;
+        c0 += bone[0].xyz * weight;
+        c1 += bone[1].xyz * weight;
+        c2 += bone[2].xyz * weight;
+    }
+    p = skinnedPosition;
+    let matrixScale = max(
+        max(max(abs(c0.x), abs(c0.y)), abs(c0.z)),
+        max(max(max(abs(c1.x), abs(c1.y)), abs(c1.z)), max(max(abs(c2.x), abs(c2.y)), abs(c2.z))));
+    var affineNormal = rotatedNormal;
+    if (matrixScale > 0.0 && matrixScale <= 3.402823e38f) {
+        let a = c0 / matrixScale;
+        let b = c1 / matrixScale;
+        let c = c2 / matrixScale;
+        let cof0 = cross(b, c);
+        let cof1 = cross(c, a);
+        let cof2 = cross(a, b);
+        let determinant = dot(a, cof0);
+        if (abs(determinant) > 0.000001f) {
+            let candidate = (cof0 * n.x + cof1 * n.y + cof2 * n.z) / (matrixScale * determinant);
+            if (all(abs(candidate) <= vec3f(3.402823e38f))) { affineNormal = candidate; }
+        }
+    }
+    if (all(abs(affineNormal) <= vec3f(3.402823e38f))) { n = affineNormal; }
+    else { n = vec3f(0.0); }
+}` : `{
     let weights = vertex.weights / dot(vertex.weights, vec4f(1.0));
     var skinnedPosition = vec3f(0.0);
     var skinnedNormal = vec3f(0.0);
@@ -142,21 +183,25 @@ export function validateDeformationState(
   if (scalars.length < program.scalarCount) throw new RangeError('deformation scalar array is too short');
   for (let i = 0; i < program.scalarCount; i++) finite(scalars[i], `scalar[${i}]`);
   const usesSkin = program.nodes.some((node) => node.kind === 'skin');
+  const needsRigid = program.nodes.some((node) => node.kind === 'skin' && node.normalMode !== 'affine');
   for (let i = 0; i < program.jointCount; i++) {
     const matrix = palette[i];
     validateAffine(matrix, `bone[${i}]`);
     if (!usesSkin) continue;
-    for (let a = 0; a < 3; a++) for (let b = a; b < 3; b++) {
-      let dot = 0;
-      for (let r = 0; r < 3; r++) dot += matrix[a * 4 + r] * matrix[b * 4 + r];
-      if (Math.abs(dot - Number(a === b)) > 0.0001) {
-        throw new RangeError(`bone[${i}] must be rigid (no scale or shear)`);
+    if (needsRigid) {
+      for (let a = 0; a < 3; a++) for (let b = a; b < 3; b++) {
+        let dot = 0;
+        for (let r = 0; r < 3; r++) dot += matrix[a * 4 + r] * matrix[b * 4 + r];
+        if (Math.abs(dot - Number(a === b)) > 0.0001) {
+          throw new RangeError(`bone[${i}] must be rigid (no scale or shear)`);
+        }
       }
     }
     const determinant = matrix[0] * (matrix[5] * matrix[10] - matrix[9] * matrix[6])
       - matrix[4] * (matrix[1] * matrix[10] - matrix[9] * matrix[2])
       + matrix[8] * (matrix[1] * matrix[6] - matrix[5] * matrix[2]);
-    if (determinant < 0) throw new RangeError(`bone[${i}] must not reflect orientation`);
+    if (!Number.isFinite(determinant) || determinant === 0) throw new RangeError(`bone[${i}] must be invertible`);
+    if (needsRigid && determinant < 0) throw new RangeError(`bone[${i}] must not reflect orientation`);
   }
 }
 
@@ -210,6 +255,26 @@ function transform(matrix: ArrayLike<number>, value: Vec3, w: number): [number, 
   return [0, 1, 2].map((r) => matrix[r] * value[0] + matrix[4 + r] * value[1] + matrix[8 + r] * value[2] + matrix[12 + r] * w) as [number, number, number];
 }
 
+/** Inverse transpose of the vertex's weighted blend; a singular blend uses its finite rotated normal. */
+function affineSkinNormal(columns: readonly number[], normal: Vec3, rotatedNormal: Vec3): [number, number, number] {
+  const fallback: [number, number, number] = rotatedNormal.every((value) => Number.isFinite(Math.fround(value)))
+    ? [...rotatedNormal] : [0, 0, 0];
+  const matrixScale = Math.max(...columns.map(Math.abs));
+  if (!(matrixScale > 0) || !Number.isFinite(Math.fround(matrixScale))) return fallback;
+  const a = columns.slice(0, 3).map((value) => value / matrixScale);
+  const b = columns.slice(3, 6).map((value) => value / matrixScale);
+  const c = columns.slice(6, 9).map((value) => value / matrixScale);
+  const cross = (x: readonly number[], y: readonly number[]): [number, number, number] => [
+    x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0],
+  ];
+  const cof0 = cross(b, c), cof1 = cross(c, a), cof2 = cross(a, b);
+  const determinant = a[0] * cof0[0] + a[1] * cof0[1] + a[2] * cof0[2];
+  if (!(Math.abs(determinant) > 0.000001)) return fallback;
+  const result: [number, number, number] = [0, 1, 2].map((row) =>
+    (cof0[row] * normal[0] + cof1[row] * normal[1] + cof2[row] * normal[2]) / (matrixScale * determinant)) as [number, number, number];
+  return result.every((value) => Number.isFinite(Math.fround(value))) ? result : fallback;
+}
+
 /** CPU reference for correctness tests/tools; production rendering evaluates the WGSL. */
 export function evaluateDeformation(
   program: CompiledDeformation, vertex: DeformationVertex, vertexIndex: number,
@@ -237,6 +302,7 @@ export function evaluateDeformation(
       }
       case 'skin': {
         const position: [number, number, number] = [0, 0, 0], normal: [number, number, number] = [0, 0, 0];
+        const columns = node.normalMode === 'affine' ? new Array<number>(9).fill(0) : undefined;
         const sum = vertex.weights.reduce((total, weight) => total + weight, 0);
         for (let influence = 0; influence < 4; influence++) {
           const bone = palette[vertex.joints[influence]], weight = vertex.weights[influence] / sum;
@@ -245,8 +311,11 @@ export function evaluateDeformation(
             position[axis] += bp[axis] * weight;
             normal[axis] += bn[axis] * weight;
           }
+          if (columns) for (let col = 0; col < 3; col++) for (let row = 0; row < 3; row++) {
+            columns[col * 3 + row] += bone[col * 4 + row] * weight;
+          }
         }
-        p = position; n = normal;
+        p = position; n = columns ? affineSkinNormal(columns, n, normal) : normal;
         break;
       }
       case 'wave': {

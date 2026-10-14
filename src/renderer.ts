@@ -6,9 +6,11 @@ import { MaterialResources, type GpuMaterial } from './gpu-material';
 import { compileDeformation, conservativeDeformationBounds, evaluateDeformation,
   validateDeformationVertex, validateMorphTargets, type Bounds3 } from './deformation';
 import { compileRenderGraph } from './render-graph';
+import { GpuWorldQuery } from './gpu-world-query';
+import type { WorldQueryOptions, WorldRay, WorldQueryResult } from './world-query';
 
-type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; source?: InstanceState; settled: boolean };
-type MaterialPipelines = { surface: GPURenderPipeline; shadow: GPURenderPipeline };
+type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
+type MaterialPipelines = { surface: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
 type Batch = {
   scene: SceneBatch; rest: GPUBuffer; indices: GPUBuffer; params: GPUBuffer;
   instances: GPUBuffer; palettes: GPUBuffer; output: GPUBuffer; scalars: GPUBuffer;
@@ -37,6 +39,8 @@ export interface RendererOptions {
   materialVariantLimit?: number;
   /** Shared material images, all mips. Atomic replacements require overlap with their old images. */
   textureBudgetBytes?: number;
+  /** Optional GPU world-space ray queries; disabled unless explicitly configured. */
+  worldQueries?: WorldQueryOptions;
 }
 
 /** Stage 1 scheduler: one deformation dispatch per mesh batch, shared by both views. */
@@ -69,6 +73,8 @@ export class Renderer {
   private readonly materialPipelines = new Map<string, Promise<MaterialPipelines>>();
   private readonly compilingMaterials = new Set<string>();
   private readonly materialVariantLimit: number;
+  private readonly worldQueryOptions?: WorldQueryOptions;
+  private worldQueries?: GpuWorldQuery;
   private materialRevision = 0;
   private format!: GPUTextureFormat;
   private computeLayout!: GPUBindGroupLayout;
@@ -117,6 +123,7 @@ export class Renderer {
       if (!this.disposed) this.errors.push('DEVICE_LOST: ' + loss.reason + ' ' + loss.message);
     });
     this.materialVariantLimit = options.materialVariantLimit ?? 128;
+    this.worldQueryOptions = options.worldQueries;
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.shadow = device.createTexture({ label: 'sun shadow', size: [1024, 1024], format: 'depth32float',
@@ -177,16 +184,30 @@ export class Renderer {
       buffer: { type: binding === 2 ? 'uniform' : 'read-only-storage' },
     })) });
     if (new Set(scene.map(batch => batch.name)).size !== scene.length) throw new Error('DUPLICATE_BATCH_NAME');
-    for (const entry of scene) this.batches.push(await this.createBatch(entry));
+    if (this.worldQueryOptions) {
+      this.worldQueries = await GpuWorldQuery.create(this.device, this.materialResources.layout,
+        bytes => { this.stats.ownedGpuBytes += bytes; }, this.worldQueryOptions);
+    }
+    for (const entry of scene) {
+      const batch = await this.createBatch(entry);
+      this.batches.push(batch);
+      this.worldQueries?.addBatch({ scene: batch.scene, output: batch.output, instances: batch.instances,
+        getMaterial: () => batch.material, getPipeline: () => batch.materialPipelines.query!, getDirty: () => batch.dirty });
+    }
     this.graph = compileRenderGraph<GPUCommandEncoder>([
       { name: 'scene-input', kind: 'buffer', source: 'imported' },
       { name: 'shared-geometry', kind: 'buffer', source: 'imported' },
+      ...(this.worldQueries ? [{ name: 'world-query-bounds', kind: 'buffer' as const, source: 'imported' as const }] : []),
       { name: 'sun-shadow', kind: 'texture', source: 'transient' },
       { name: 'canvas', kind: 'texture', source: 'imported' },
       { name: 'depth', kind: 'texture', source: 'transient' },
       { name: 'velocity', kind: 'texture', source: 'transient' },
     ], [
       { name: 'deformation', uses: [{ resource: 'scene-input', access: 'read' }, { resource: 'shared-geometry', access: 'write' }], execute: encoder => this.encodeDeformation(encoder) },
+      ...(this.worldQueries ? [{ name: 'world-query-refit', uses: [
+        { resource: 'shared-geometry' as const, access: 'read' as const },
+        { resource: 'world-query-bounds' as const, access: 'write' as const },
+      ], after: ['deformation'], execute: (encoder: GPUCommandEncoder) => this.worldQueries!.encodeRefit(encoder) }] : []),
       { name: 'shadow', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'write' }], execute: encoder => this.encodeShadow(encoder) },
       { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' },
         { resource: 'canvas', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
@@ -220,7 +241,8 @@ export class Renderer {
             vertex: { module, entryPoint: 'shadowMain' }, fragment: { module, entryPoint: 'shadowFragment', targets: [] },
             primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
           });
-          return { surface, shadow };
+          const query = this.worldQueries ? await this.worldQueries.createPipeline(program) : undefined;
+          return { surface, shadow, query };
         })();
         this.materialPipelines.set(program.key, pending);
         // Permit a corrected retry after compilation/device errors; do not cache rejected work.
@@ -330,7 +352,8 @@ export class Renderer {
     // Inputs are committed frame objects. After one stationary frame has settled
     // previous=current, keep the shared output until this batch changes again.
     if (batch.scene.inputMode === 'committed' && states.length === batch.lastInstances.length && states.every((state, i) =>
-      state === batch.lastInstances[i] && batch.history.get(state.entityId)?.settled)) {
+      state === batch.lastInstances[i] && batch.history.get(state.entityId)?.settled
+      && batch.history.get(state.entityId)?.generation === (state.entityGeneration ?? 0))) {
       batch.dirty = false;
       return;
     }
@@ -339,10 +362,12 @@ export class Renderer {
     const joints = batch.program.jointCount, scalarCount = Math.max(1, batch.program.scalarCount);
     for (let i = 0; i < states.length; i++) {
       const state = states[i];
+      const generation = state.entityGeneration ?? 0;
+      if (!Number.isSafeInteger(generation) || generation < 0 || generation > 0xffffffff) throw new Error('INVALID_ENTITY_GENERATION');
       const bounds = conservativeDeformationBounds(batch.program, batch.scene.mesh.bounds, batch.morphBounds, state.bones, state.deformScalars, state.model);
       let previous = batch.history.get(state.entityId);
-      if (!previous || previous.version !== state.historyVersion) {
-        previous = { model: state.model.slice(), bones: state.bones.map(b => b.slice()), scalars: [...state.deformScalars], version: state.historyVersion, settled: true };
+      if (!previous || previous.version !== state.historyVersion || previous.generation !== generation) {
+        previous = { model: state.model.slice(), bones: state.bones.map(b => b.slice()), scalars: [...state.deformScalars], version: state.historyVersion, generation, settled: true };
         batch.history.set(state.entityId, previous);
       }
       const offset = i * 56;
@@ -363,7 +388,7 @@ export class Renderer {
       batch.bounds.set(state.entityId, bounds);
       previous.settled = previous.source === undefined || previous.source === state;
       previous.source = state;
-      previous.model.set(state.model); previous.scalars = [...state.deformScalars]; previous.version = state.historyVersion;
+      previous.model.set(state.model); previous.scalars = [...state.deformScalars]; previous.version = state.historyVersion; previous.generation = generation;
       alive.add(state.entityId);
     }
     for (const id of batch.history.keys()) if (!alive.has(id)) { batch.history.delete(id); batch.bounds.delete(id); }
@@ -408,7 +433,9 @@ export class Renderer {
     const started = performance.now();
     this.stats.uploadedBytes = 256; this.stats.deformationDispatches = 0;
     this.resize();
+    this.worldQueries?.validateSources();
     for (const batch of this.batches) this.upload(batch);
+    this.worldQueries?.updateSnapshot(this.stats.frames + 1, this.materialRevision);
     const vp = multiply(perspective(Math.PI / 3.2, this.stats.width / this.stats.height, 0.1, 150), lookAt(eye, target, [0, 1, 0]));
     this.frameData.set(vp); this.frameData.set(this.lastViewProjection ?? vp, 16); this.frameData.set(this.lightMatrix, 32);
     this.frameData.set([...eye, 1], 48); this.frameData.set([...this.sunDirection, 0], 52); this.frameData.set([...this.sunColor, 1], 56);
@@ -429,6 +456,14 @@ export class Renderer {
     this.stats.triangles = this.batches.reduce((sum, batch) => sum + batch.scene.mesh.indices.length / 3 * batch.scene.instances.length, 0);
     this.stats.deformedVertices = this.batches.reduce((sum, batch) => sum + (batch.dirty ? batch.scene.mesh.vertexCount * batch.scene.instances.length : 0), 0);
     this.stats.cpuSubmitMs = performance.now() - started;
+  }
+  /** Query the last submitted deformation snapshot; material changes use the current revision. */
+  async traceRays(rays: readonly WorldRay[], options: { textureLod?: number } = {}): Promise<WorldQueryResult> {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.worldQueries) throw new Error('WORLD_QUERY_DISABLED');
+    if (this.stats.frames === 0) throw new Error('WORLD_QUERY_NO_FRAME');
+    if (this.errors.length) throw new Error(this.errors.join('\n'));
+    return this.worldQueries.traceRays(rays, options, this.materialRevision);
   }
   private timestamp(index: number): GPUComputePassTimestampWrites | undefined {
     return this.querySet ? { querySet: this.querySet, beginningOfPassWriteIndex: index, endOfPassWriteIndex: index + 1 } : undefined;
@@ -459,6 +494,7 @@ export class Renderer {
   }
   diagnostics() {
     return { deformationVariants: this.deformationPipelines.size, materialVariants: this.materialPipelines.size,
+      worldQueries: this.worldQueries?.diagnostics() ?? null,
       materials: this.materialResources.diagnostics(), materialRevision: this.materialRevision, passes: this.graph.order,
       lifetimes: Object.fromEntries(this.graph.lifetimes),
       bounds: this.batches.flatMap(batch => Array.from(batch.bounds, ([entityId, bounds]) => ({ entityId, ...bounds }))) };
@@ -469,7 +505,7 @@ export class Renderer {
       joints: Array.from({ length: 4 }, (_, axis) => source.getUint32(vertex * 80 + 32 + axis * 4, true)) as [number, number, number, number],
       weights: floats(48, 4) as [number, number, number, number] };
   }
-  private draw(pass: GPURenderPassEncoder, kind: keyof MaterialPipelines): void {
+  private draw(pass: GPURenderPassEncoder, kind: 'surface' | 'shadow'): void {
     for (const batch of this.batches) {
       if (!batch.scene.instances.length) continue;
       pass.setPipeline(batch.materialPipelines[kind]); pass.setBindGroup(2, batch.material.bindGroup);
@@ -621,6 +657,7 @@ export class Renderer {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.worldQueries?.dispose();
     this.materialResources.dispose(); this.materialPipelines.clear();
     for (const buffer of this.buffers) buffer.destroy();
     this.shadow.destroy(); this.depth?.destroy(); this.velocity?.destroy(); this.querySet?.destroy();

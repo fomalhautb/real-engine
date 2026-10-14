@@ -17,6 +17,8 @@ export interface MaterialBinding {
 /** Render input independent of the gameplay category or pose producer. */
 export interface InstanceState {
   entityId: number;
+  /** Identity generation; omitted means zero. Reusing an ID with a new generation rejects previous-frame history. */
+  entityGeneration?: number;
   model: Mat4;
   normalMatrix: Mat4;
   bones: Mat4[];
@@ -29,6 +31,8 @@ export interface InstanceState {
 }
 export interface SceneBatch {
   material?: MaterialBinding;
+  /** Stable asset/primitive identity for optional world queries; bump on topology replacement. */
+  queryIdentity?: { assetId: string; primitiveId: number; topologyVersion: number };
   /** Committed inputs replace instance objects on every change; mutable inputs
    * are re-evaluated on every render. Assets are immutable after GPU upload. */
   inputMode?: 'committed' | 'mutable';

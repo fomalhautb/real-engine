@@ -47,6 +47,7 @@ export class GpuGiEmissiveSampler {
   private bytes = 0;
   private disposed = false;
   private updated = false;
+  private currentRayCount = 0;
   private samples!: GPUBuffer;
   private parameters!: GPUBuffer;
   private clearPipeline!: GPUComputePipeline;
@@ -57,6 +58,9 @@ export class GpuGiEmissiveSampler {
 
   get enabled(): boolean { return !this.disposed && this.samplesPerProbe > 0 && this.batches.length > 0; }
   get emitterCount(): number { return this.batches.length; }
+  /** Active blocks keep their stable indices; only inactive trailing blocks
+   * are omitted. Interior holes use empty rays, without full-grid padding. */
+  get queryRayCount(): number { return this.currentRayCount; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, giParameterBuffer: GPUBuffer,
     outputProbeBuffers: [GPUBuffer, GPUBuffer], rayCount: number, samplesPerProbe: number,
@@ -195,8 +199,14 @@ export class GpuGiEmissiveSampler {
       }
     }
     this.updated = true;
+    let blockCount = 0;
+    this.batches.forEach((batch, index) => {
+      batch.count = batch.scene.instances.length;
+      if (batch.count) blockCount = index + 1;
+    });
+    this.currentRayCount = blockCount * this.probeCount * this.samplesPerProbe;
     this.device.queue.writeBuffer(this.parameters, 0, new Uint32Array([
-      this.batches.length, 0, 0, 0, this.rayCount, this.probeCount, this.samplesPerProbe, 0,
+      blockCount, 0, 0, 0, this.currentRayCount, this.probeCount, this.samplesPerProbe, 0,
     ]));
     let uploaded = PARAMETER_BYTES;
     this.batches.forEach((batch, index) => {
@@ -208,7 +218,7 @@ export class GpuGiEmissiveSampler {
       }
       this.device.queue.writeBuffer(batch.parameters, 0, new Uint32Array([
         batch.vertexCount, batch.indexCount / 3, batch.count, batch.sourceId,
-        this.rayCount, this.probeCount, this.samplesPerProbe, index * this.probeCount * this.samplesPerProbe,
+        this.currentRayCount, this.probeCount, this.samplesPerProbe, index * this.probeCount * this.samplesPerProbe,
       ]));
       uploaded += PARAMETER_BYTES;
     });
@@ -220,18 +230,17 @@ export class GpuGiEmissiveSampler {
     uint(materialRevision, 'MATERIAL_REVISION');
     if (!this.enabled) return 0;
     if (!this.updated) throw new Error('GI_EMISSIVE_SNAPSHOT_MISSING');
+    if (!this.currentRayCount) return 0;
     const dispatch = (label: string, pipeline: GPUComputePipeline, group: GPUBindGroup, count: number) => {
       const pass = encoder.beginComputePass({ label });
       pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     };
-    dispatch('clear padded GI emissive rays', this.clearPipeline, this.clearGroup, this.rayCount);
+    dispatch('clear GI emissive sample blocks', this.clearPipeline, this.clearGroup, this.currentRayCount);
     for (const batch of this.batches) if (batch.count) {
       dispatch('sample deformed GI emissive triangles', this.generatePipeline, batch.group,
         this.probeCount * this.samplesPerProbe);
     }
-    // The shared query implementation requires identical query parameters for
-    // all traces in an encoder. Unused slots have empty ray intervals.
-    const uploaded = this.queries.encodeTrace(encoder, this.rayCount, 0, materialRevision);
+    const uploaded = this.queries.encodeTrace(encoder, this.currentRayCount, 0, materialRevision);
     dispatch('integrate GI emissive solid angle', this.integratePipeline, this.integrateGroups[outputIndex], this.probeCount);
     return uploaded;
   }
@@ -239,10 +248,13 @@ export class GpuGiEmissiveSampler {
     return { enabled: this.enabled, emitterCount: this.emitterCount,
       activeEmitterCount: this.batches.filter(batch => batch.count > 0).length,
       samplesPerProbePerEmitter: this.samplesPerProbe,
-      samplesPerUpdate: this.batches.length * this.probeCount * this.samplesPerProbe,
+      sampleCapacity: this.batches.length * this.probeCount * this.samplesPerProbe,
+      samplesPerUpdate: this.batches.filter(batch => batch.count > 0).length * this.probeCount * this.samplesPerProbe,
       activeSamplesPerUpdate: this.batches.filter(batch => batch.count > 0).length * this.probeCount * this.samplesPerProbe,
-      paddedQueryRaysPerUpdate: this.enabled ? this.rayCount : 0,
-      maxWorkUnitsPerUpdate: this.enabled ? this.queries.options.maxTotalWorkUnits : 0,
+      queryRaysPerUpdate: this.currentRayCount, queryRayCapacity: this.rayCount,
+      inactiveBlockRaysPerUpdate: this.currentRayCount
+        - this.batches.filter(batch => batch.count > 0).length * this.probeCount * this.samplesPerProbe,
+      maxWorkUnitsPerUpdate: this.currentRayCount ? this.queries.options.maxTotalWorkUnits : 0,
       ownedGpuBytes: this.bytes, maxBytes: this.maxBytes, representation: 'triangle-area-to-radiance-SH9',
       coverage: 'shared-world-query', geometry: 'shared-current-deformation',
       sampling: 'fixed-probe-source-hashed-triangles-rotated-Hammersley',

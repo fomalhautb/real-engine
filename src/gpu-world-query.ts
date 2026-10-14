@@ -20,7 +20,7 @@ type QueryBatch = {
   topologyVersion: number; nodeCount: number; offsets: number[]; count: number; dirty: boolean;
   emissiveSampling: SceneBatch['emissiveSampling'];
   vertexCount: number; vertices: ArrayBuffer; indices: Uint32Array; uvs?: Float32Array;
-  identities: GPUBuffer; metadata: Uint32Array<ArrayBuffer>; params: GPUBuffer; trace: GPUBindGroup;
+  identities: GPUBuffer; metadata: Uint32Array<ArrayBuffer>; params: GPUBuffer; trace: GPUBindGroup[];
   levels: { params: GPUBuffer; bindGroup: GPUBindGroup; count: number; offset: number }[];
 };
 
@@ -68,14 +68,19 @@ export class GpuWorldQuery {
   private sceneHistoryRevision = 0;
   private disposed = false;
   private pending = false;
-  /** Uniform buffers are shared by every dispatch recorded into one encoder. */
-  private readonly traceParameters = new WeakMap<GPUCommandEncoder, string>();
+  /** A recorded dispatch never observes a later parameter overwrite. The same
+   * frame/material snapshot may use bounded distinct count/LOD parameter sets. */
+  private readonly traceParameters = new WeakMap<GPUCommandEncoder, {
+    snapshot: string; slots: Map<string, number>;
+  }>();
+  private readonly traceUniformStride: number;
+  private readonly resetUniformStride: number;
   private readonly refitLayout: GPUBindGroupLayout;
   private readonly traceLayout: GPUBindGroupLayout;
   private resetParams!: GPUBuffer;
   private readBuffer!: GPUBuffer;
   private resetPipeline!: GPUComputePipeline;
-  private resetGroup!: GPUBindGroup;
+  private resetGroups!: GPUBindGroup[];
   private refitPipeline!: GPUComputePipeline;
 
   static async create(device: GPUDevice, materialLayout: GPUBindGroupLayout,
@@ -87,6 +92,9 @@ export class GpuWorldQuery {
   private constructor(private readonly device: GPUDevice, private readonly materialLayout: GPUBindGroupLayout,
     private readonly account: (bytes: number) => void, options: WorldQueryOptions) {
     this.options = Object.freeze(resolveWorldQueryOptions(options));
+    const alignment = device.limits.minUniformBufferOffsetAlignment;
+    this.traceUniformStride = Math.ceil(80 / alignment) * alignment;
+    this.resetUniformStride = Math.ceil(16 / alignment) * alignment;
     this.refitLayout = device.createBindGroupLayout({ entries: [0, 1, 2, 3].map(binding => ({
       binding, visibility: GPUShaderStage.COMPUTE,
       buffer: { type: binding === 0 ? 'uniform' : binding === 3 ? 'storage' : 'read-only-storage' },
@@ -117,7 +125,8 @@ export class GpuWorldQuery {
   }
   private async initialize(): Promise<void> {
     const sizes = [this.options.maxRays * WORLD_RAY_BYTES, this.options.maxRays * WORLD_HIT_BYTES,
-      this.options.maxRays * WORLD_HIT_BYTES, 16];
+      this.options.maxRays * WORLD_HIT_BYTES,
+      this.resetUniformStride * this.options.maxTraceParameterSetsPerEncoder];
     this.preflight(sizes);
     // readonly public references; ownership remains entirely with this module.
     Object.assign(this, {
@@ -125,18 +134,19 @@ export class GpuWorldQuery {
       hitBuffer: this.buffer('world hits', sizes[1], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC),
     });
     this.readBuffer = this.buffer('world hit diagnostics', sizes[2], GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
-    this.resetParams = this.buffer('world query reset parameters', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    this.resetParams = this.buffer('world query reset parameter slots', sizes[3], GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.refitPipeline = await this.device.createComputePipelineAsync({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.refitLayout] }),
       compute: { module: await this.module(refitSource, 'world BVH refit'), entryPoint: 'main' },
     });
     this.resetPipeline = await this.device.createComputePipelineAsync({ layout: 'auto',
       compute: { module: await this.module(resetSource, 'world ray reset'), entryPoint: 'main' } });
-    this.resetGroup = this.device.createBindGroup({ layout: this.resetPipeline.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: this.resetParams } },
+    this.resetGroups = Array.from({ length: this.options.maxTraceParameterSetsPerEncoder }, (_, slot) =>
+      this.device.createBindGroup({ layout: this.resetPipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: this.resetParams, offset: slot * this.resetUniformStride, size: 16 } },
       { binding: 1, resource: { buffer: this.rayBuffer } },
       { binding: 2, resource: { buffer: this.hitBuffer } },
-    ] });
+    ] }));
   }
   async createPipeline(program: MaterialProgram): Promise<GPUComputePipeline> {
     if (this.disposed) throw new Error('WORLD_QUERY_DISPOSED');
@@ -159,7 +169,8 @@ export class GpuWorldQuery {
     let length = offsets[2] + mesh.vertexCount * 2;
     const levelOffsets = topology.levels.map(level => { const start = length; length += level.length; return start; });
     const boundsSize = topology.nodeCount * scene.capacity * 32;
-    this.preflight([length * 4, boundsSize, scene.capacity * 16, 80, ...topology.levels.map(() => 48)]);
+    const parameterBytes = this.traceUniformStride * this.options.maxTraceParameterSetsPerEncoder;
+    this.preflight([length * 4, boundsSize, scene.capacity * 16, parameterBytes, ...topology.levels.map(() => 48)]);
     for (const level of topology.levels) {
       if (Math.ceil(level.length * scene.capacity / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('WORLD_QUERY_REFIT_DISPATCH_LIMIT');
     }
@@ -170,10 +181,12 @@ export class GpuWorldQuery {
     const data = this.buffer('world BVH topology and UVs', packed.byteLength, GPUBufferUsage.STORAGE, packed.buffer);
     const bounds = this.buffer('world BVH instance bounds', boundsSize, GPUBufferUsage.STORAGE);
     const identities = this.buffer('world entity identities', scene.capacity * 16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    const params = this.buffer('world batch parameters', 80, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const params = this.buffer('world batch parameter slots', parameterBytes, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const traceBuffers = [params, source.output, data, bounds, source.instances, this.rayBuffer, this.hitBuffer, identities];
-    const trace = this.device.createBindGroup({ layout: this.traceLayout,
-      entries: traceBuffers.map((buffer, binding) => ({ binding, resource: { buffer } })) });
+    const trace = Array.from({ length: this.options.maxTraceParameterSetsPerEncoder }, (_, slot) =>
+      this.device.createBindGroup({ layout: this.traceLayout,
+      entries: traceBuffers.map((buffer, binding) => ({ binding, resource: binding === 0
+        ? { buffer, offset: slot * this.traceUniformStride, size: 80 } : { buffer } })) }));
     const levels = topology.levels.map((level, i) => {
       const params = this.buffer('world refit depth parameters', 48, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
       return { params, count: level.length, offset: levelOffsets[i],
@@ -259,8 +272,10 @@ export class GpuWorldQuery {
       }
     }
   }
-  /** Encode GPU-resident rays -> hits. The same encoder may trace more than once
-   * with identical uniforms while the caller rewrites rayBuffer between traces.
+  /** Encode GPU-resident rays -> hits. One encoder may vary ray count and texture
+   * LOD while retaining the same frame, material and geometry snapshot. Every
+   * distinct parameter set gets a slot; identical sets reuse their slot. Rewrite
+   * rays with encoded GPU operations, not queue writes that alias recorded work.
    * Submit it before encoding another encoder with different parameters: GPU
    * snapshots and uniform buffers assume serial encode/submit. Callers own ray
    * generation and inspect hit.work.z for an explicit overflow. Returns the
@@ -274,35 +289,46 @@ export class GpuWorldQuery {
     if (!count) return 0;
     const workPerRay = Math.min(this.options.maxNodeVisits, Math.floor(this.options.maxTotalWorkUnits / count));
     if (workPerRay < 1) throw new Error('WORLD_QUERY_WORK_BUDGET: total budget cannot cover every ray');
-    const parameters = JSON.stringify([this.frame, count, textureLod, materialRevision, workPerRay,
+    const snapshot = JSON.stringify([this.frame, materialRevision,
       this.batches.map((batch, index) => [index + 1, batch.nodeCount, batch.mesh.vertexCount, batch.count,
         ...batch.offsets, batch.topologyVersion])]);
-    const previous = this.traceParameters.get(encoder);
-    if (previous !== undefined && previous !== parameters) throw new Error('WORLD_QUERY_ENCODER_PARAMETERS_CHANGED');
-    if (previous === undefined) this.traceParameters.set(encoder, parameters);
+    let state = this.traceParameters.get(encoder);
+    if (state && state.snapshot !== snapshot) throw new Error('WORLD_QUERY_ENCODER_SNAPSHOT_CHANGED');
+    const key = JSON.stringify([count, Math.fround(textureLod), workPerRay]);
+    let slot = state?.slots.get(key);
+    const upload = slot === undefined;
+    if (upload) {
+      const next = state?.slots.size ?? 0;
+      if (next >= this.options.maxTraceParameterSetsPerEncoder) throw new Error('WORLD_QUERY_ENCODER_PARAMETER_BUDGET');
+      if (!state) { state = { snapshot, slots: new Map() }; this.traceParameters.set(encoder, state); }
+      slot = next;
+      state.slots.set(key, slot);
+    }
+    const parameterSlot = slot!;
     let uploadedBytes = 0;
-    if (previous === undefined) {
-      this.device.queue.writeBuffer(this.resetParams, 0, new Uint32Array([count, this.frame, materialRevision, 0]));
+    if (upload) {
+      this.device.queue.writeBuffer(this.resetParams, parameterSlot * this.resetUniformStride,
+        new Uint32Array([count, this.frame, materialRevision, 0]));
       uploadedBytes += 16;
     }
     const reset = encoder.beginComputePass({ label: 'world ray reset' });
-    reset.setPipeline(this.resetPipeline); reset.setBindGroup(0, this.resetGroup);
+    reset.setPipeline(this.resetPipeline); reset.setBindGroup(0, this.resetGroups[parameterSlot]);
     reset.dispatchWorkgroups(Math.ceil(count / 64)); reset.end();
     for (let index = 0; index < this.batches.length; index++) {
       const batch = this.batches[index];
       if (!batch.count) continue;
-      if (previous === undefined) {
+      if (upload) {
         const params = new ArrayBuffer(80);
         new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
           ...batch.offsets, 0, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
           batch.emissiveSampling === 'triangle-area' ? 1 : 0]);
         new Float32Array(params)[16] = textureLod;
-        this.device.queue.writeBuffer(batch.params, 0, params);
+        this.device.queue.writeBuffer(batch.params, parameterSlot * this.traceUniformStride, params);
         uploadedBytes += 80;
       }
       // Distinct passes provide ordering for closest-hit updates between batches.
       const pass = encoder.beginComputePass({ label: 'world rays ' + batch.name });
-      pass.setPipeline(batch.source.getPipeline()); pass.setBindGroup(0, batch.trace);
+      pass.setPipeline(batch.source.getPipeline()); pass.setBindGroup(0, batch.trace[parameterSlot]);
       pass.setBindGroup(1, batch.source.getMaterial().bindGroup);
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     }
@@ -332,6 +358,8 @@ export class GpuWorldQuery {
     return { frame: this.frame, batches: this.batches.length, ownedGpuBytes: this.bytes,
       topologyNodes: this.batches.reduce((sum, batch) => sum + batch.nodeCount, 0),
       instances: this.batches.reduce((sum, batch) => sum + batch.count, 0), options: { ...this.options },
+      traceParameters: 'aligned-immutable-slots-per-encoder', traceUniformStride: this.traceUniformStride,
+      resetUniformStride: this.resetUniformStride,
       instanceAcceleration: 'linear-root-scan', refit: 'changed-batches', refitTiming: 'provided-by-caller', externalTraceTiming: false };
   }
   dispose(): void {

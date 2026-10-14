@@ -28,9 +28,12 @@ describe('world query wire contract', () => {
     expect(resolveWorldQueryOptions()).toEqual({
       maxRays: 1024, maxBytes: 128 * 1024 * 1024, maxTrianglesPerMesh: 65536,
       maxInstancesPerBatch: 256, maxNodeVisits: 262144, maxTotalWorkUnits: 16777216,
+      maxTraceParameterSetsPerEncoder: 8,
     });
     expect(resolveWorldQueryOptions({ maxRays: 2048, maxInstancesPerBatch: 16 }).maxRays).toBe(2048);
     expect(resolveWorldQueryOptions({ maxTotalWorkUnits: 67108864 }).maxTotalWorkUnits).toBe(67108864);
+    expect(resolveWorldQueryOptions({ maxTraceParameterSetsPerEncoder: 1 }).maxTraceParameterSetsPerEncoder).toBe(1);
+    expect(resolveWorldQueryOptions({ maxTraceParameterSetsPerEncoder: 32 }).maxTraceParameterSetsPerEncoder).toBe(32);
     expect(() => resolveWorldQueryOptions({ maxRays: 0 })).toThrow(/maxRays/);
     expect(() => resolveWorldQueryOptions({ maxRays: 65537 })).toThrow(/maxRays/);
     expect(() => resolveWorldQueryOptions({ maxBytes: 512 * 1024 * 1024 + 1 })).toThrow(/maxBytes/);
@@ -39,6 +42,10 @@ describe('world query wire contract', () => {
     expect(() => resolveWorldQueryOptions({ maxNodeVisits: -1 })).toThrow(/maxNodeVisits/);
     expect(() => resolveWorldQueryOptions({ maxTotalWorkUnits: 0 })).toThrow(/maxTotalWorkUnits/);
     expect(() => resolveWorldQueryOptions({ maxTotalWorkUnits: 67108865 })).toThrow(/maxTotalWorkUnits/);
+    for (const invalid of [0, 33, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => resolveWorldQueryOptions({ maxTraceParameterSetsPerEncoder: invalid }))
+        .toThrow(/maxTraceParameterSetsPerEncoder/);
+    }
   });
 
   it('packs normalized rays, defaults, and optional ignore identity in 48-byte records', () => {

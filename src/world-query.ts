@@ -8,6 +8,8 @@ export interface WorldQueryOptions {
   maxNodeVisits?: number;
   /** Shared cap across every ray and batch in one query. */
   maxTotalWorkUnits?: number;
+  /** Distinct count/textureLod parameter snapshots retained within one GPU encoder; identical snapshots reuse a slot. */
+  maxTraceParameterSetsPerEncoder?: number;
 }
 
 export interface WorldRay {
@@ -58,6 +60,7 @@ const DEFAULT_OPTIONS: Required<WorldQueryOptions> = {
   maxInstancesPerBatch: 256,
   maxNodeVisits: 262_144,
   maxTotalWorkUnits: 16_777_216,
+  maxTraceParameterSetsPerEncoder: 8,
 };
 const HARD_OPTIONS: Required<WorldQueryOptions> = {
   maxRays: MAX_RAYS,
@@ -66,6 +69,7 @@ const HARD_OPTIONS: Required<WorldQueryOptions> = {
   maxInstancesPerBatch: 4_096,
   maxNodeVisits: 1_048_576,
   maxTotalWorkUnits: 67_108_864,
+  maxTraceParameterSetsPerEncoder: 32,
 };
 
 function boundedInteger(value: number, label: string, min: number, max: number): number {

@@ -126,6 +126,9 @@ export class Renderer {
     if (options.diffuseGi) {
       const gi = resolveDiffuseGiOptions(options.diffuseGi);
       if (!options.worldQueries || (options.worldQueries.maxRays ?? 1024) < gi.rayCount) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
+      if (gi.emissiveSamplesPerProbe && (options.worldQueries.maxTraceParameterSetsPerEncoder ?? 8) < 2) {
+        throw new Error('DIFFUSE_GI_QUERY_PARAMETER_BUDGET');
+      }
     }
     if (!navigator.gpu) throw new Error('WEBGPU_UNAVAILABLE: use a WebGPU browser on HTTPS or localhost.');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });

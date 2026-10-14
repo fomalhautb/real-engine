@@ -59,6 +59,9 @@ export class GpuDiffuseGi {
     const resolved = resolveDiffuseGiOptions(options);
     if (device.limits.maxStorageBuffersPerShaderStage < 6) throw new Error('DIFFUSE_GI_STORAGE_BINDING_LIMIT');
     if (resolved.rayCount > queries.options.maxRays) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
+    if (resolved.emissiveSamplesPerProbe && queries.options.maxTraceParameterSetsPerEncoder < 2) {
+      throw new Error('DIFFUSE_GI_QUERY_PARAMETER_BUDGET');
+    }
     if (resolved.rayCount > queries.options.maxTotalWorkUnits) throw new Error('DIFFUSE_GI_QUERY_WORK_BUDGET');
     const sizes = [112, resolved.rayCount * WORLD_HIT_BYTES, resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
@@ -173,7 +176,7 @@ export class GpuDiffuseGi {
     integers[26] = this.lastHistoryFrame ? 1 : 0;
     integers[27] = this.emissiveSampler?.enabled ? 1 : 0;
     this.device.queue.writeBuffer(this.parameters, 0, data);
-    return data.byteLength + (this.emissiveSampler?.update() ?? 0);
+    return data.byteLength + (this.enabled ? this.emissiveSampler?.update() ?? 0 : 0);
   }
   encode(encoder: GPUCommandEncoder, frame: number, materialRevision: number, timing?: GPUComputePassTimestampWrites): number {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
@@ -232,6 +235,7 @@ export class GpuDiffuseGi {
     } finally { this.pending = false; }
   }
   diagnostics() {
+    const emissive = this.emissiveSampler?.diagnostics();
     return { enabled: this.enabled, frame: this.frame, options: this.options, ownedGpuBytes: this.bytes,
       multiBounce: this.multiBounce, historyUpdates: this.historyUpdates, lastHistoryFrame: this.lastHistoryFrame,
       historyResetReason: this.historyResetReason, transport: this.multiBounce ? 'cross-frame-diffuse-feedback' : 'single-diffuse-bounce',
@@ -239,9 +243,15 @@ export class GpuDiffuseGi {
       visibility: 'octahedral-distance-moments', visibilityResolution: GI_DISTANCE_RESOLUTION,
       visibilityCapture: 'normalized-cosine-power-32', distanceCaptureSamplesPerUpdate: GI_DISTANCE_CELLS * this.options.rayCount,
       placement: 'caller-provided-free-space-grid',
-      emissiveSampling: this.emissiveSampler?.diagnostics() ?? null,
-      queriesPerUpdate: this.options.rayCount * (this.emissiveSampler?.enabled ? 3 : 2),
-      maxWorkUnitsPerUpdate: this.queries.options.maxTotalWorkUnits * (this.emissiveSampler?.enabled ? 3 : 2),
+      emissiveSampling: emissive ? { ...emissive, enabled: this.enabled && emissive.enabled,
+        samplesPerUpdate: this.enabled ? emissive.samplesPerUpdate : 0,
+        activeSamplesPerUpdate: this.enabled ? emissive.activeSamplesPerUpdate : 0,
+        inactiveBlockRaysPerUpdate: this.enabled ? emissive.inactiveBlockRaysPerUpdate : 0,
+        queryRaysPerUpdate: this.enabled ? emissive.queryRaysPerUpdate : 0,
+        maxWorkUnitsPerUpdate: this.enabled ? emissive.maxWorkUnitsPerUpdate : 0 } : null,
+      queriesPerUpdate: this.enabled ? this.options.rayCount * 2 + (this.emissiveSampler?.queryRayCount ?? 0) : 0,
+      maxWorkUnitsPerUpdate: this.enabled ? this.queries.options.maxTotalWorkUnits
+        * (this.emissiveSampler?.queryRayCount ? 3 : 2) : 0,
       temporalAccumulation: false, automaticRelocation: false, reflections: false };
   }
   dispose(): void {

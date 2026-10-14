@@ -1,6 +1,6 @@
 import { writeFile } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
-import type { runGiEmissiveFixture, runGiEmissiveOverflowFixture } from './fixtures/gi-emissive';
+import type { runGiEmissiveFixture, runGiEmissiveOverflowFixture, runGiEmissiveBlocksFixture } from './fixtures/gi-emissive';
 
 type Result = Awaited<ReturnType<typeof runGiEmissiveFixture>>;
 type OverflowResult = Awaited<ReturnType<typeof runGiEmissiveOverflowFixture>>;
@@ -217,4 +217,49 @@ test('area query overflow is reported separately from primary and sun rays', asy
   expect(result.errors).toEqual([]);
   expect(result.afterDispose).toBe(0);
   expect(pageErrors).toEqual([]);
+});
+
+test('emissive query blocks preserve superposition through holes, deletion and restoration', async ({ page }, testInfo) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  await page.goto('/?trees=1');
+  await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
+  await expect(page.locator('#error')).toBeHidden();
+  const result = await page.evaluate(async () => {
+    window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose();
+    const fixture = await import('/tests/browser/fixtures/' + 'gi-emissive.ts') as {
+      runGiEmissiveBlocksFixture: typeof runGiEmissiveBlocksFixture;
+    };
+    return fixture.runGiEmissiveBlocksFixture();
+  });
+  const both = coefficients(result.both.probe), a = coefficients(result.firstOnly.probe);
+  const b = coefficients(result.secondOnly.probe), restored = coefficients(result.restored.probe);
+  const sum = a.map((probe, i) => probe.map((term, j) => term.map((v, c) => v + b[i][j][c])));
+  const cases = [result.both, result.firstOnly, result.secondOnly, result.empty, result.restored];
+  const metrics = { superpositionError: relativeRms(both, sum), restorationError: relativeRms(restored, both),
+    emptyMagnitude: maximumMagnitude(coefficients(result.empty.probe)),
+    rays: cases.map(value => value.diagnostics!.emissiveSampling!.queryRaysPerUpdate),
+    holeRays: result.secondOnly.diagnostics!.emissiveSampling!.inactiveBlockRaysPerUpdate,
+    giQueries: cases.map(value => value.diagnostics!.queriesPerUpdate) };
+  const path = testInfo.outputPath('gi-emissive-blocks.json');
+  await writeFile(path, JSON.stringify({ metrics, result }, null, 2));
+  await testInfo.attach('gi-emissive-blocks', { path, contentType: 'application/json' });
+  console.log('GI_EMISSIVE_BLOCKS ' + JSON.stringify(metrics));
+  expect(metrics.superpositionError).toBeLessThan(1e-5);
+  expect(metrics.restorationError).toBeLessThan(1e-6);
+  expect(metrics.emptyMagnitude).toBe(0);
+  expect(metrics.rays).toEqual([256, 128, 256, 0, 256]);
+  expect(metrics.giQueries).toEqual([1280, 1152, 1280, 1024, 1280]);
+  expect(metrics.holeRays).toBe(128);
+  expect(result.parameterBudgetError).toContain('DIFFUSE_GI_QUERY_PARAMETER_BUDGET');
+  expect(result.unexpectedlyCreated).toBe(false);
+  expect(result.disabled!.queriesPerUpdate).toBe(0);
+  expect(result.disabled!.emissiveSampling!.queryRaysPerUpdate).toBe(0);
+  expect(result.disabled!.emissiveSampling!.samplesPerUpdate).toBe(0);
+  expect(result.disabled!.emissiveSampling!.activeSamplesPerUpdate).toBe(0);
+  expect(result.disabled!.emissiveSampling!.inactiveBlockRaysPerUpdate).toBe(0);
+  expect(result.disabled!.emissiveSampling!.sampleCapacity).toBe(256);
+  expect(result.disabled!.emissiveSampling!.enabled).toBe(false);
+  expect(result.errors).toEqual([]); expect(pageErrors).toEqual([]);
+  expect(result.afterDispose).toBe(0);
 });

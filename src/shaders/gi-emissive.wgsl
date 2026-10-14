@@ -8,7 +8,7 @@ struct Hit {
 }
 struct AreaParameters {
     shape: vec4u, // generation: vertices, triangles, active instances, source ID; integration: source count
-    limits: vec4u, // padded ray count, probe count, samples per probe/source, source block offset
+    limits: vec4u, // used block ray count, probe count, samples per probe/source, source block offset
 }
 struct AreaSample {
     expected: vec4u, // source, entity, generation, original triangle

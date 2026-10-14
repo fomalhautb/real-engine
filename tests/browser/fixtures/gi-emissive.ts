@@ -132,3 +132,53 @@ export async function runGiEmissiveOverflowFixture() {
       afterDispose: renderer.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }
 }
+
+export async function runGiEmissiveBlocksFixture() {
+  const canvas = document.createElement('canvas');
+  canvas.style.cssText = 'position:fixed;left:0;top:0;width:256px;height:256px;';
+  document.body.appendChild(canvas);
+  const first = emitterBatch(), second = emitterBatch();
+  second.name = 'gi-area-emitter-second';
+  second.queryIdentity = { assetId: 'gi-emissive/second-plane', primitiveId: 2, topologyVersion: 1 };
+  const secondModel = multiply(translation(0.8, 0, 0), model(1, tinySize));
+  second.instances = [state(202, secondModel)];
+  second.material = material([2, 6, 3]);
+  const firstPose = first.instances, secondPose = second.instances;
+  const grid = { ...probeGrid, emissiveSamplesPerProbe: 16 };
+  let renderer: Renderer | undefined, unexpected: Renderer | undefined;
+  try {
+    let parameterBudgetError = '';
+    try {
+      unexpected = await Renderer.create(canvas, [first], {
+        worldQueries: { maxRays: 512, maxTraceParameterSetsPerEncoder: 1 }, diffuseGi: grid,
+      });
+    } catch (error) { parameterBudgetError = String(error); }
+    const unexpectedlyCreated = !!unexpected;
+    unexpected?.dispose();
+    renderer = await Renderer.create(canvas, [first, second], {
+      worldQueries: { maxRays: 512, maxTrianglesPerMesh: 2, maxInstancesPerBatch: 1 }, diffuseGi: grid,
+    });
+    renderer.setSun({ direction: [0, 1, 0], color: [0, 0, 0] });
+    const capture = async () => {
+      renderer!.render(cameraEye, cameraTarget);
+      return { probe: await renderer!.probeDiffuseGi(), diagnostics: renderer!.diagnostics().diffuseGi };
+    };
+    const both = await capture();
+    second.instances = [];
+    const firstOnly = await capture();
+    first.instances = []; second.instances = secondPose;
+    const secondOnly = await capture();
+    second.instances = [];
+    const empty = await capture();
+    first.instances = firstPose; second.instances = secondPose;
+    const restored = await capture();
+    const bytesBeforeDisable = renderer.stats.ownedGpuBytes;
+    renderer.setDiffuseGiEnabled(false);
+    renderer.render(cameraEye, cameraTarget);
+    const disabled = renderer.diagnostics().diffuseGi;
+    const errors = [...renderer.errors];
+    renderer.dispose();
+    return { both, firstOnly, secondOnly, empty, restored, disabled, parameterBudgetError,
+      unexpectedlyCreated, bytesBeforeDisable, errors, afterDispose: renderer.stats.ownedGpuBytes };
+  } finally { renderer?.dispose(); unexpected?.dispose(); canvas.remove(); }
+}

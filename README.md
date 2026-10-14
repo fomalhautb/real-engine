@@ -15,7 +15,7 @@
 
 阶段 1.2 进行中：代码定义的 Morph/蒙皮/wave 算子编译为共享 GPU 程序，主视图与阴影共用当前/前帧形变；动态包围盒、generation 场景句柄、增量帧提交和 Render Graph 已接入实际场景。现有代码生成材质表达式支持 PBR/Unlit、Opaque/Masked、双面、纹理与共享阴影覆盖；glTF/GLB 蒙皮与 Morph 动画、OBJ 卡片、纹理地面及 Rapier 固定步刚体同场运行。
 
-阶段 2 已开始建立离线几何簇层级、简化与压缩分页，以及共享形变的世界空间查询基础。运行时 GPU LOD/流送、世界空间 GI、反射和参与介质仍待实现，文档中的性能数值是待验证目标。当前形变和材质编译器均有明确上限；没有法线贴图、多层材质或透射。阶段 2 后期将通过大规模完整场景联合验收画质和性能；现有小模型仅用于正确性检查。完整边界与后续工作见 [实现状态](docs/implementation.md)。
+阶段 2 已建立离线几何簇层级、简化与压缩分页，并接入全部驻留的 GPU LOD、视锥剔除、间接绘制和分簇颜色演示；共享形变的世界空间查询已有基础。页面流送、遮挡剔除、世界空间 GI、反射和参与介质仍待实现，文档中的性能数值是待验证目标。当前形变和材质编译器均有明确上限；没有法线贴图、多层材质或透射。阶段 2 后期将通过大规模完整场景联合验收画质和性能；现有小模型仅用于正确性检查。完整边界与后续工作见 [实现状态](docs/implementation.md)。
 
 ## 本地运行
 
@@ -27,6 +27,8 @@ npm run dev
 ```
 
 打开终端给出的本地地址。拖动旋转视角，滚轮缩放；侧栏支持暂停、重置、刚体增删、GPU 形变验证与 JSON 诊断导出。`?trees=128` 可调整树木实例数，上限为 256。页面是测试场景与诊断入口，不是编辑器。
+
+`/geometry.html` 展示 GPU 自动 LOD：正常材质、稳定簇颜色和 LOD 层级三种视图，支持误差调整、固定相机轨迹、暂停逐帧、冻结选择视点和按 H 隐藏界面。雕塑的实际簇/三角形数量来自限频 GPU 读回，并标注采样帧。当前模型为 5,120 三角形的程序雕塑，三个实例共享层级；这是正确性与可视化原型，不是最终大规模场景或性能成绩。
 
 ## 验证
 
@@ -74,7 +76,7 @@ npm run benchmark -- --seconds 1800 --warmup 300 --trees 128 --stress --repeat 1
 npm run build:geometry -- --input path/to/static.obj --output artifacts/geometry/example --coverage opaque
 ```
 
-输入为静态 OBJ，必须显式确认使用 Opaque 覆盖；工具保留对象/材质分段和来源哈希，不转换 MTL。输出包含简化簇层级、可独立解码的压缩页面、根页面映射与构建参数，拒绝覆盖已有输出目录。层级 JSON 用于离线审计，不是运行时驻留格式。当前页面尚未接入 Renderer；自动 LOD、实际簇分色与录屏演示按阶段 2 后续交付。支持范围见 [离线构建说明](docs/implementation.md#离线几何构建与页面)。
+输入为静态 OBJ，必须显式确认使用 Opaque 覆盖；工具保留对象/材质分段和来源哈希，不转换 MTL。输出包含简化簇层级、可独立解码的压缩页面、根页面映射与构建参数，拒绝覆盖已有输出目录。层级 JSON 用于离线审计，不是运行时驻留格式。GPU LOD 目前直接使用内存中的层级，压缩页面尚未接入运行时流送。支持范围见 [离线构建说明](docs/implementation.md#离线几何构建与页面)。
 
 ## 材质接口示例
 
@@ -130,6 +132,8 @@ renderer.render([4, 3, 6], [0, 1, 0]);
 | src/material.ts、src/gpu-material.ts | 有界材质表达式、覆盖程序、GPU 材质与纹理资源 |
 | src/mesh-import.ts、src/texture-assets.ts | OBJ 网格导入与 RGBA8 纹理/mip 处理 |
 | src/geometry-hierarchy.ts、src/geometry-pages.ts | 离线简化簇 DAG、CPU 参考 LOD 与有界压缩页面 |
+| src/geometry-lod-data.ts、src/gpu-geometry-lod.ts | 层级验证/打包、GPU 选簇、索引压紧和间接绘制参数 |
+| src/geometry-demo.ts、src/geometry-demo-scene.ts | 实际簇分色、LOD 层级及可重复镜头演示 |
 | scripts/build-geometry.mjs | 静态 Opaque OBJ 构建、来源/页面哈希与原子输出 |
 | src/gltf-binary.ts、src/gltf-import.ts、src/gltf-load.ts | 有界 glTF/GLB 解码、网格/蒙皮/材质导入与资源加载 |
 | src/animation.ts、src/gltf-scene.ts | TRS/Morph 动画采样、层级姿态和统一场景输入 |

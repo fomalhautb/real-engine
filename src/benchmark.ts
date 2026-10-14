@@ -118,7 +118,10 @@ export class FoundationBenchmark {
       const captureGpu = () => {
         const { gpuSampleFrame, gpuMs } = renderer.stats;
         if (gpuSampleFrame !== null && gpuMs && gpuSampleFrame > lastGpuFrame) {
-          this.recorder.recordGpu({ frame: gpuSampleFrame, ...gpuMs }); lastGpuFrame = gpuSampleFrame;
+          this.recorder.recordGpu({ frame: gpuSampleFrame, deformation: gpuMs.deformation,
+            shadow: gpuMs.shadow, surface: gpuMs.surface, resolve: gpuMs.resolve,
+            worldQueryRefit: gpuMs.worldQueryRefit, geometryLod: gpuMs.geometryLod });
+          lastGpuFrame = gpuSampleFrame;
         }
       };
       this.progress.phase = 'measuring';

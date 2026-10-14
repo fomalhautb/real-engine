@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#081014" />
+    <title>Real Engine — Geometry residency / LOD</title>
+  </head>
+  <body>
+    <div class="geometry-app" id="geometry-app">
+      <header class="topbar">
+        <a class="brand" href="./"><span class="brand-glyph">r.</span><span>REAL ENGINE</span></a>
+        <span class="topbar-divider"></span>
+        <span class="topbar-title">GEOMETRY / 001</span>
+        <span class="topbar-status" id="status" role="status">BUILDING HIERARCHY</span>
+      </header>
+      <main class="main-layout">
+        <section class="stage" aria-label="WebGPU geometry LOD demo">
+          <canvas id="viewport" aria-label="可拖拽的几何 LOD 场景" tabindex="0"></canvas>
+          <div class="stage-vignette" aria-hidden="true"></div>
+          <div class="stage-heading">
+            <span class="eyebrow">RESIDENT GEOMETRY / LIVE LOD</span>
+            <h1>Shape at every<br /><em>distance.</em></h1>
+            <p>一份层级。三件雕塑。相机运动时由 GPU 选择实际绘制的簇。</p>
+          </div>
+          <div class="stage-foot">
+            <span><i class="live-dot"></i> <span id="stage-mode">NORMAL MATERIAL</span></span>
+            <span>拖拽旋转 · 滚轮远近 · H 隐藏界面</span>
+          </div>
+          <div id="error" class="error-panel" role="alert" hidden></div>
+        </section>
+        <aside id="control-panel" class="control-panel" aria-label="几何 LOD 控件与诊断">
+          <div class="panel-intro">
+            <span class="eyebrow">FIELD NOTES / 02</span>
+            <h2>层级几何观察台</h2>
+            <p>观察可见细节如何随屏幕误差、距离和视锥改变。</p>
+          </div>
+
+          <section class="panel-block">
+            <div class="block-head"><h3>渲染视图</h3><span>01 / VIEW</span></div>
+            <div class="segmented" role="group" aria-label="调试颜色">
+              <button type="button" data-debug="material" class="active" aria-pressed="true">材质</button>
+              <button type="button" data-debug="clusters" aria-pressed="false">簇颜色</button>
+              <button type="button" data-debug="levels" aria-pressed="false">LOD 层级</button>
+            </div>
+            <p class="microcopy">簇颜色固定于 cluster ID；层级颜色显示最终被选中的 LOD。</p>
+          </section>
+
+          <section class="panel-block">
+            <div class="block-head"><h3>屏幕误差</h3><output id="error-value" for="error-range">2.0 px</output></div>
+            <input id="error-range" type="range" min="0" max="12" step="0.5" value="2" aria-label="最大屏幕误差像素" />
+            <div class="range-labels"><span>更高细节</span><span>更少三角形</span></div>
+            <div class="toggle-row"><label for="freeze"><span>冻结 LOD 视点</span><small>相机仍可移动</small></label><input id="freeze" type="checkbox" /></div>
+            <div class="toggle-row"><label for="frustum"><span>视锥剔除</span><small>仅视锥，不含遮挡剔除</small></label><input id="frustum" type="checkbox" checked /></div>
+          </section>
+
+          <section class="panel-block">
+            <div class="block-head"><h3>相机轨迹</h3><span>02 / CAMERA</span></div>
+            <select id="trajectory" aria-label="相机轨迹">
+              <option value="combined">绕行 + 拉近拉远</option>
+              <option value="orbit">仅绕行</option>
+              <option value="dolly">仅拉近拉远</option>
+              <option value="manual">手动视角</option>
+            </select>
+            <div class="action-row"><button id="pause" type="button">暂停轨迹</button><button id="step" type="button">逐帧前进</button></div>
+          </section>
+
+          <section class="panel-block readout">
+            <div class="block-head"><h3>实际绘制</h3><span>GPU PROBE · ≤ 2 Hz</span></div>
+            <dl class="metric-grid">
+              <div class="metric-feature"><dt>雕塑实际三角形</dt><dd id="actual-triangles">—</dd></div>
+              <div><dt>所选簇</dt><dd id="selected-clusters">—</dd></div>
+              <div><dt>实际索引</dt><dd id="actual-indices">—</dd></div>
+              <div><dt>统计帧</dt><dd id="probe-frame">—</dd></div>
+              <div><dt>GPU LOD 选择</dt><dd id="gpu-lod-ms">—</dd></div>
+              <div><dt>GPU 采样帧</dt><dd id="gpu-sample-frame">—</dd></div>
+              <div><dt>CPU 提交</dt><dd id="cpu-submit-ms">—</dd></div>
+              <div><dt>视口</dt><dd id="viewport-size">—</dd></div>
+              <div><dt>GPU 资源</dt><dd id="gpu-memory">—</dd></div>
+            </dl>
+            <p class="source-count">源雕塑网格：<strong id="source-triangles">—</strong> 三角形 / 实例 · <strong id="source-total">—</strong> 三角形 / 三实例。上方实际值仅统计雕塑，不含地面与基座。</p>
+            <p id="probe-status" class="probe-status" aria-live="polite">等待第一帧 GPU 统计…</p>
+          </section>
+
+          <section class="panel-bottom">
+            <button id="export" class="export-button" type="button">导出诊断 JSON <span>↗</span></button>
+            <p class="scope-note">驻留 GPU LOD 原型，尚无流送 / 遮挡剔除。当前页仅验证可见几何选择与光栅绘制。</p>
+            <p class="adapter" id="adapter">等待 WebGPU 适配器…</p>
+          </section>
+        </aside>
+      </main>
+      <footer class="bottom-bar"><span>CODE-FIRST GEOMETRY SYSTEM</span><span id="footer-frame">FRAME —</span><button id="toggle-ui" type="button" aria-label="隐藏界面">H / 隐藏界面</button></footer>
+    </div>
+    <script type="module" src="/src/geometry-demo.ts"></script>
+  </body>
+</html>

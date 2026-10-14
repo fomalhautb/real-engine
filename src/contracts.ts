@@ -3,6 +3,7 @@ import type { MeshData } from './geometry';
 import type { DeformationGraph, MorphTarget } from './deformation';
 import type { MaterialDefinition } from './material';
 import type { TextureAsset } from './texture-assets';
+import type { GeometryHierarchy } from './geometry-hierarchy-types';
 
 export interface MaterialBinding {
   definition: MaterialDefinition;
@@ -31,6 +32,9 @@ export interface InstanceState {
   historyVersion: number;
 }
 export interface SceneBatch {
+  /** Optional fully resident LOD for a static primitive. mesh must be hierarchy.source.
+   * Opaque materials use GPU selection; Masked keeps the full-detail path. */
+  geometryLod?: GeometryHierarchy;
   material?: MaterialBinding;
   /** Stable asset/primitive identity for optional world queries; bump on topology replacement. */
   queryIdentity?: { assetId: string; primitiveId: number; topologyVersion: number };

@@ -5,6 +5,7 @@ struct Frame {
     camera: vec4f,
     sunDirection: vec4f,
     sunColor: vec4f,
+    debug: vec4u,
 }
 struct Instance {
     model: mat4x4f,
@@ -22,6 +23,7 @@ struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, paddi
 @group(1) @binding(1) var<storage, read> instances: array<Instance>;
 @group(1) @binding(2) var<uniform> params: Parameters;
 @group(1) @binding(3) var<storage, read> uvs: array<vec2f>;
+@group(1) @binding(4) var<storage, read> clusterVertices: array<vec4u>;
 struct MaterialParameters { values: array<vec4f, 16> }
 @group(2) @binding(0) var<uniform> materialParameters: MaterialParameters;
 @group(2) @binding(1) var materialImage0: texture_2d<f32>;
@@ -49,9 +51,9 @@ struct Varyings {
     @location(5) previous: vec4f,
     @location(6) current: vec4f,
     @location(7) uv: vec2f,
+    @location(8) @interpolate(flat) clusterDebug: vec3u,
 }
-@vertex
-fn vertexMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instanceIndex: u32) -> Varyings {
+fn makeVaryings(index: u32, instanceIndex: u32) -> Varyings {
     let vertex = vertices[instanceIndex * params.vertexCount + index];
     let instance = instances[instanceIndex];
     var result: Varyings;
@@ -64,7 +66,27 @@ fn vertexMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instan
     result.material = instance.material.xy;
     result.light = frame.lightViewProjection * vertex.position;
     result.uv = uvs[index];
+    result.clusterDebug = vec3u(0u);
     return result;
+}
+@vertex
+fn vertexMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instanceIndex: u32) -> Varyings {
+    return makeVaryings(index, instanceIndex);
+}
+@vertex
+fn clusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
+    let count = arrayLength(&clusterVertices);
+    let identity = clusterVertices[index % count];
+    var result = makeVaryings(identity.x, index / count);
+    result.clusterDebug = vec3u(identity.w, identity.z, 1u);
+    return result;
+}
+fn debugColor(seed: u32) -> vec3f {
+    // A fixed integer avalanche, independent of frame, dispatch and draw order.
+    var value = seed ^ (seed >> 16u);
+    value *= 0x7feb352du; value ^= value >> 15u;
+    value *= 0x846ca68bu; value ^= value >> 16u;
+    return vec3f(0.08) + vec3f(f32(value & 255u), f32((value >> 8u) & 255u), f32((value >> 16u) & 255u)) / 255.0 * 0.65;
 }
 struct ShadowVaryings {
     @builtin(position) position: vec4f,
@@ -137,6 +159,10 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     // rgba16float is the bounded scene-linear transport buffer. Exposure and
     // display transfer belong to the final resolve, after lighting and media.
     output.color = vec4f(clamp(lighting, vec3f(0.0), vec3f(65504.0)), 1.0);
+    if (input.clusterDebug.z != 0u && frame.debug.x != 0u) {
+        let seed = select(input.clusterDebug.x, input.clusterDebug.y + 17u, frame.debug.x == 2u);
+        output.color = vec4f(debugColor(seed), 1.0);
+    }
     output.velocity = vec2f(0.0);
     if (input.current.w > 0.0001 && input.previous.w > 0.0001) {
         output.velocity = clamp((input.current.xy / input.current.w - input.previous.xy / input.previous.w) * vec2f(0.5, -0.5), vec2f(-2.0), vec2f(2.0));

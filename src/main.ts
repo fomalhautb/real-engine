@@ -58,7 +58,7 @@ function updateUI(): void {
   element('vertices').textContent = stats.deformedVertices.toLocaleString();
   element('cpu').textContent = stats.cpuSubmitMs.toFixed(2) + ' ms';
   element('gpu').textContent = gpu
-    ? (gpu.deformation + gpu.shadow + gpu.surface + gpu.resolve + gpu.worldQueryRefit).toFixed(2) + ' ms'
+    ? (gpu.deformation + gpu.shadow + gpu.surface + gpu.resolve + gpu.worldQueryRefit + gpu.geometryLod).toFixed(2) + ' ms'
     : '不可用 / 等待采样';
   element('memory').textContent = (stats.ownedGpuBytes / 1048576).toFixed(1) + ' MiB';
   element('physics').textContent = scene!.physics.activeCount + '/' + scene!.physics.bodyCount + ' active · 60 Hz';

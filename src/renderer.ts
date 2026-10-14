@@ -9,13 +9,15 @@ import { compileDeformation, conservativeDeformationBounds, evaluateDeformation,
 import { compileRenderGraph } from './render-graph';
 import { GpuWorldQuery } from './gpu-world-query';
 import type { WorldQueryOptions, WorldRay, WorldQueryResult } from './world-query';
+import { GpuGeometryLod, type GeometryLodBinding, type GeometryLodSettings, type GeometryLodProbe } from './gpu-geometry-lod';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
-type MaterialPipelines = { surface: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
+type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
 type Batch = {
   scene: SceneBatch; rest: GPUBuffer; indices: GPUBuffer; params: GPUBuffer;
   instances: GPUBuffer; palettes: GPUBuffer; output: GPUBuffer; scalars: GPUBuffer;
   compute: GPUBindGroup; render: GPUBindGroup;
+  geometryLod?: GeometryLodBinding;
   program: ReturnType<typeof compileDeformation>; pipeline: GPUComputePipeline;
   instanceData: Float32Array<ArrayBuffer>; paletteData: Float32Array<ArrayBuffer>; scalarData: Float32Array<ArrayBuffer>;
   morphBounds: Bounds3[]; bounds: Map<number, Bounds3>;
@@ -26,9 +28,10 @@ type Batch = {
   material: GpuMaterial; materialPipelines: MaterialPipelines; materialRequest: number;
 };
 export interface FrameStats {
+  /** triangles is source instance-expanded geometry; use probeGeometryLod for actual selected triangles. */
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
-  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number } | null;
+  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number } | null;
   /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
   gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
@@ -38,7 +41,7 @@ export interface DeformationVerification {
   samples: { batch: string; entityId: number; vertexIndex: number; current: number[]; previous: number[] }[];
 }
 export interface RendererOptions {
-  /** Includes pending compilation and resident cached definitions. Two render pipelines per definition. */
+  /** Includes pending/resident definitions. Two render pipelines, plus a LOD variant when enabled. */
   materialVariantLimit?: number;
   /** Shared material images, all mips. Atomic replacements require overlap with their old images. */
   textureBudgetBytes?: number;
@@ -85,6 +88,8 @@ export class Renderer {
   private readonly materialVariantLimit: number;
   private readonly worldQueryOptions?: WorldQueryOptions;
   private worldQueries?: GpuWorldQuery;
+  private geometryLod?: GpuGeometryLod;
+  private defaultClusterVertices!: GPUBuffer;
   private materialRevision = 0;
   private format!: GPUTextureFormat;
   private computeLayout!: GPUBindGroupLayout;
@@ -106,7 +111,7 @@ export class Renderer {
       if (!context) throw new Error('CANVAS_UNAVAILABLE: cannot create WebGPU context.');
       const format = navigator.gpu.getPreferredCanvasFormat();
       context.configure({ device, format, alphaMode: 'opaque' });
-      renderer = new Renderer(canvas, context, device, adapter, timing, options);
+      renderer = new Renderer(canvas, context, device, adapter, timing, options, scene.some(batch => !!batch.geometryLod));
       await renderer.initialize(format, scene);
       return renderer;
     } catch (error) {
@@ -118,7 +123,7 @@ export class Renderer {
 
   private constructor(
     private canvas: HTMLCanvasElement, private context: GPUCanvasContext,
-    private device: GPUDevice, adapter: GPUAdapter, timing: boolean, options: RendererOptions,
+    private device: GPUDevice, adapter: GPUAdapter, timing: boolean, options: RendererOptions, private hasGeometryLod: boolean,
   ) {
     this.info = {
       adapter: [adapter.info.vendor, adapter.info.architecture, adapter.info.description].filter(Boolean).join(' / ') || 'Unreported adapter',
@@ -134,7 +139,7 @@ export class Renderer {
     });
     this.materialVariantLimit = options.materialVariantLimit ?? 128;
     this.worldQueryOptions = options.worldQueries;
-    this.timestampCount = options.worldQueries ? 10 : 8;
+    this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -171,6 +176,10 @@ export class Renderer {
   private shadowFrameLayout: GPUBindGroupLayout;
 
   private buffer(label: string, size: number, usage: GPUBufferUsageFlags, data?: ArrayBuffer): GPUBuffer {
+    if (!Number.isSafeInteger(size) || size < 0 || Math.max(4, Math.ceil(size / 4) * 4) > this.device.limits.maxBufferSize
+      || (usage & GPUBufferUsage.STORAGE) && Math.max(4, Math.ceil(size / 4) * 4) > this.device.limits.maxStorageBufferBindingSize) {
+      throw new Error('BUFFER_BUDGET: ' + label);
+    }
     const buffer = this.device.createBuffer({ label, size: Math.max(4, Math.ceil(size / 4) * 4), usage, mappedAtCreation: !!data });
     if (data) { new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(data)); buffer.unmap(); }
     this.buffers.push(buffer);
@@ -202,11 +211,13 @@ export class Renderer {
       binding, visibility: GPUShaderStage.COMPUTE,
       buffer: { type: binding === 0 ? 'uniform' : binding === 4 ? 'storage' : 'read-only-storage' },
     })) });
-    this.geometryLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3].map(binding => ({
+    this.geometryLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4].map(binding => ({
       binding, visibility: GPUShaderStage.VERTEX,
       buffer: { type: binding === 2 ? 'uniform' : 'read-only-storage' },
     })) });
+    this.defaultClusterVertices = this.buffer('unused cluster identity', 16, GPUBufferUsage.STORAGE);
     if (new Set(scene.map(batch => batch.name)).size !== scene.length) throw new Error('DUPLICATE_BATCH_NAME');
+    if (this.hasGeometryLod) this.geometryLod = await GpuGeometryLod.create(this.device, bytes => { this.stats.ownedGpuBytes += bytes; });
     if (this.worldQueryOptions) {
       this.worldQueries = await GpuWorldQuery.create(this.device, this.materialResources.layout,
         bytes => { this.stats.ownedGpuBytes += bytes; }, this.worldQueryOptions);
@@ -221,6 +232,7 @@ export class Renderer {
       { name: 'scene-input', kind: 'buffer', source: 'imported' },
       { name: 'shared-geometry', kind: 'buffer', source: 'imported' },
       ...(this.worldQueries ? [{ name: 'world-query-bounds', kind: 'buffer' as const, source: 'imported' as const }] : []),
+      ...(this.geometryLod ? [{ name: 'selected-geometry', kind: 'buffer' as const, source: 'transient' as const }] : []),
       { name: 'sun-shadow', kind: 'texture', source: 'transient' },
       { name: 'canvas', kind: 'texture', source: 'imported' },
       { name: 'scene-hdr', kind: 'texture', source: 'transient' },
@@ -232,8 +244,13 @@ export class Renderer {
         { resource: 'shared-geometry' as const, access: 'read' as const },
         { resource: 'world-query-bounds' as const, access: 'write' as const },
       ], after: ['deformation'], execute: (encoder: GPUCommandEncoder) => this.worldQueries!.encodeRefit(encoder, this.timestamp(8)) }] : []),
+      ...(this.geometryLod ? [{ name: 'geometry-lod', uses: [
+        { resource: 'scene-input' as const, access: 'read' as const },
+        { resource: 'selected-geometry' as const, access: 'write' as const },
+      ], execute: (encoder: GPUCommandEncoder) => this.geometryLod!.encode(encoder, this.timestamp(this.worldQueries ? 10 : 8)) }] : []),
       { name: 'shadow', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'write' }], execute: encoder => this.encodeShadow(encoder) },
       { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' },
+        ...(this.geometryLod ? [{ resource: 'selected-geometry', access: 'read' as const }] : []),
         { resource: 'scene-hdr', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
       { name: 'resolve', uses: [{ resource: 'scene-hdr', access: 'read' }, { resource: 'canvas', access: 'write' }], execute: encoder => this.encodeResolve(encoder) },
     ]);
@@ -261,13 +278,19 @@ export class Renderer {
             fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: 'rgba16float' }, { format: 'rg16float' }] },
             primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
           });
+          const surfaceLod = this.hasGeometryLod ? await this.device.createRenderPipelineAsync({ label: 'material GPU LOD surface and velocity',
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout, this.materialResources.layout] }),
+            vertex: { module, entryPoint: 'clusterVertexMain' },
+            fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: 'rgba16float' }, { format: 'rg16float' }] },
+            primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+          }) : undefined;
           const shadow = await this.device.createRenderPipelineAsync({ label: 'shared material shadow coverage',
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.shadowFrameLayout, this.geometryLayout, this.materialResources.layout] }),
             vertex: { module, entryPoint: 'shadowMain' }, fragment: { module, entryPoint: 'shadowFragment', targets: [] },
             primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 },
           });
           const query = this.worldQueries ? await this.worldQueries.createPipeline(program) : undefined;
-          return { surface, shadow, query };
+          return { surface, surfaceLod, shadow, query };
         })();
         this.materialPipelines.set(program.key, pending);
         // Permit a corrected retry after compilation/device errors; do not cache rejected work.
@@ -312,6 +335,20 @@ export class Renderer {
     this.materialRevision++;
   }
 
+  setGeometryLod(settings: GeometryLodSettings): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.geometryLod) throw new Error('GEOMETRY_LOD_DISABLED');
+    this.geometryLod.setSettings(settings);
+  }
+
+  /** Explicit asynchronous diagnostic, never required to choose or draw geometry. */
+  async probeGeometryLod(batchName: string): Promise<GeometryLodProbe> {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (this.errors.length) throw new Error(this.errors.join('\n'));
+    if (!this.geometryLod) throw new Error('GEOMETRY_LOD_DISABLED');
+    return this.geometryLod.probe(batchName);
+  }
+
   /** Exposure in stops, applied only during final scene-linear HDR resolve. */
   setExposure(ev: number): void {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
@@ -338,6 +375,12 @@ export class Renderer {
   private async createBatch(scene: SceneBatch): Promise<Batch> {
     const capacity = scene.capacity;
     const mesh = scene.mesh;
+    if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('INVALID_BATCH_CAPACITY');
+    if (!Number.isSafeInteger(mesh.vertexCount) || mesh.vertexCount < 1
+      || Math.ceil(capacity * mesh.vertexCount / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('DEFORMATION_DISPATCH_BUDGET');
+    if (capacity * mesh.vertexCount * 48 > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize)) {
+      throw new Error('BUFFER_BUDGET: shared deformation capacity');
+    }
     const program = compileDeformation(scene.deformation);
     const morphBounds = validateMorphTargets(program, mesh.vertexCount, scene.morphTargets);
     const source = new DataView(mesh.vertices);
@@ -367,16 +410,21 @@ export class Renderer {
     const morphs = this.buffer(scene.name + ' morph targets', morphData.byteLength, GPUBufferUsage.STORAGE, morphData.buffer);
     const output = this.buffer(scene.name + ' shared deformed', capacity * mesh.vertexCount * 48, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     const material = await this.prepareMaterial(scene.material);
-    return {
+    const batch: Batch = {
       ...material, materialRequest: 0,
       scene, rest, indices, params, instances, palettes, output, scalars, program, pipeline, morphBounds, bounds: new Map(),
       compute: this.device.createBindGroup({ layout: this.computeLayout,
         entries: [params, rest, instances, palettes, output, morphs, scalars].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
-      render: this.device.createBindGroup({ layout: this.geometryLayout,
-        entries: [output, instances, params, uvs].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
+      render: undefined as unknown as GPUBindGroup,
       instanceData: new Float32Array(capacity * 56), paletteData: new Float32Array(capacity * program.jointCount * 32),
       scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, lastInstances: [], uploadRanges: [],
     };
+    try {
+      if (scene.geometryLod) batch.geometryLod = this.geometryLod!.addBatch(scene, instances, () => batch.material.program.alphaMode === 'opaque');
+      batch.render = this.device.createBindGroup({ layout: this.geometryLayout,
+        entries: [output, instances, params, uvs, batch.geometryLod?.vertices ?? this.defaultClusterVertices].map((buffer, binding) => ({ binding, resource: { buffer } })) });
+      return batch;
+    } catch (error) { this.materialResources.release(material.material); throw error; }
   }
 
   private upload(batch: Batch): void {
@@ -496,12 +544,16 @@ export class Renderer {
     this.stats.uploadedBytes = 256; this.stats.deformationDispatches = 0;
     this.resize();
     this.worldQueries?.validateSources();
+    this.geometryLod?.validateSources();
     for (const batch of this.batches) this.upload(batch);
     this.stats.uploadedBytes += this.worldQueries?.updateSnapshot(this.stats.frames + 1, this.materialRevision) ?? 0;
     const vp = multiply(perspective(Math.PI / 3.2, this.stats.width / this.stats.height, 0.1, 150), lookAt(eye, target, [0, 1, 0]));
     this.frameData.set(vp); this.frameData.set(this.lastViewProjection ?? vp, 16); this.frameData.set(this.lightMatrix, 32);
     this.frameData.set([...eye, 1], 48); this.frameData.set([...this.sunDirection, 0], 52); this.frameData.set([...this.sunColor, 1], 56);
+    const debug = this.geometryLod?.settings.debug;
+    new Uint32Array(this.frameData.buffer)[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : 0;
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
+    this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
     this.lastViewProjection = vp;
     const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → HDR surface → resolve' });
     this.graph.execute(encoder);
@@ -563,6 +615,7 @@ export class Renderer {
   diagnostics() {
     return { deformationVariants: this.deformationPipelines.size, materialVariants: this.materialPipelines.size,
       worldQueries: this.worldQueries?.diagnostics() ?? null,
+      geometryLod: this.geometryLod?.diagnostics() ?? null,
       output: { sceneFormat: 'rgba16float', exposureEV: this.exposureEV, transfer: 'sRGB', toneMap: 'filmic-fit', maxSceneRadiance: 65504 },
       materials: this.materialResources.diagnostics(), materialRevision: this.materialRevision, passes: this.graph.order,
       lifetimes: Object.fromEntries(this.graph.lifetimes),
@@ -577,7 +630,13 @@ export class Renderer {
   private draw(pass: GPURenderPassEncoder, kind: 'surface' | 'shadow'): void {
     for (const batch of this.batches) {
       if (!batch.scene.instances.length) continue;
-      pass.setPipeline(batch.materialPipelines[kind]); pass.setBindGroup(2, batch.material.bindGroup);
+      const lod = kind === 'surface' && batch.material.program.alphaMode === 'opaque' ? batch.geometryLod : undefined;
+      pass.setPipeline(lod ? batch.materialPipelines.surfaceLod! : batch.materialPipelines[kind]); pass.setBindGroup(2, batch.material.bindGroup);
+      if (lod) {
+        pass.setBindGroup(1, batch.render); pass.setIndexBuffer(lod.indices, 'uint32');
+        pass.drawIndexedIndirect(lod.arguments, 0);
+        continue;
+      }
       pass.setBindGroup(1, batch.render); pass.setIndexBuffer(batch.indices, 'uint32');
       pass.drawIndexed(batch.scene.mesh.indices.length, batch.scene.instances.length);
     }
@@ -589,7 +648,8 @@ export class Renderer {
       this.stats.gpuMs = { deformation: Number(values[1] - values[0]) / 1e6,
         shadow: Number(values[3] - values[2]) / 1e6, surface: Number(values[5] - values[4]) / 1e6,
         resolve: Number(values[7] - values[6]) / 1e6,
-        worldQueryRefit: this.worldQueries ? Number(values[9] - values[8]) / 1e6 : 0 };
+        worldQueryRefit: this.worldQueries ? Number(values[9] - values[8]) / 1e6 : 0,
+        geometryLod: this.geometryLod ? Number(values[this.worldQueries ? 11 : 9] - values[this.worldQueries ? 10 : 8]) / 1e6 : 0 };
       this.stats.gpuSampleFrame = frame;
       this.queryRead!.unmap();
     } catch (error) { if (!this.disposed) this.errors.push('TIMESTAMP_READBACK: ' + String(error)); }
@@ -740,6 +800,7 @@ export class Renderer {
     if (this.disposed) return;
     this.disposed = true;
     this.worldQueries?.dispose();
+    this.geometryLod?.dispose();
     this.materialResources.dispose(); this.materialPipelines.clear();
     for (const buffer of this.buffers) buffer.destroy();
     this.shadow.destroy(); this.depth?.destroy(); this.velocity?.destroy(); this.hdr?.destroy(); this.querySet?.destroy();

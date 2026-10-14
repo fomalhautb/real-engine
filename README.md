@@ -55,7 +55,21 @@ npm run test:browser
 
 第二次运行不启用实验 GPU flags，使用正常硬件适配器。没有兼容 GPU 时测试明确失败，不跳过验证。测试截图和诊断附在 Playwright 输出中，不提交生成文件。
 
-2026-10-14 本地验证：166 项单元测试、TypeScript 与生产构建通过；Chrome 154 正常硬件配置通过 12 项浏览器测试，覆盖 glTF 动画、仿射骨骼、材质覆盖、Compute 材质数值、独立采样器、物理、运动向量、历史、预算、基准时长与错误路径。这些是功能证据，尚未完成性能档位、长期稳定性或跨厂商认证。
+本机 Edge 可显式选择并检查两个硬件适配器；下面是 PowerShell 示例，两次均不使用软件 GPU flags：
+
+```powershell
+$env:PLAYWRIGHT_CHANNEL = 'msedge'
+$env:PLAYWRIGHT_GPU = 'hardware'
+$env:PLAYWRIGHT_EXPECT_GPU_VENDOR = 'intel'
+npm run test:browser
+$env:PLAYWRIGHT_HIGH_PERFORMANCE_GPU = '1'
+$env:PLAYWRIGHT_EXPECT_GPU_VENDOR = 'nvidia'
+npm run test:browser
+```
+
+`--force-high-performance-gpu` 在本机选择 `nvidia / ampere`，默认 Edge 选择 `intel / gen-12lp`。主机安装 RTX 3070 Laptop，但 WebGPU adapter 不报告具体型号。其他机器应按实际 adapter 调整预期厂商；两个浏览器运行之间清理上述环境变量，避免影响之后的默认测试。
+
+2026-10-14 当前本地 `npm run check` 通过 221 项 CPU 单元测试、TypeScript 与生产构建（`artifacts/local-check-final-20261014.log`）；Edge 默认 Intel 与强制高性能 NVIDIA 各通过 28 项浏览器功能测试（最终 NVIDIA 日志为 `artifacts/local-nvidia-browser-final-20261014.log`）。基础压力场景各完成三次 1800 帧短程硬件基准；固定 1080p GI 和几何演示也各完成三次 NVIDIA 短程基准，详情见[实现状态](docs/implementation.md#基准运行器与首轮证据)和[验收协议](docs/benchmarks.md#结果与回归)。几何固定镜头全部选中 LOD0，尚未证明减面收益；这些结果也不代表 30 分钟稳定性、最终画质或大场景性能通过。
 
 同日后续提交 `00f989a` 已通过 [远程 Linux 软件 GPU 回归](https://github.com/fomalhautb/real-engine/actions/runs/38513178363)：188 项单元测试和 18 项浏览器测试。覆盖共享形变 BVH 世界查询、线性 HDR 与曝光/显示转换、设备丢失，以及变化槽位上传和静止姿态复用；均未在用户使用电脑期间进行本机 GPU 压测。这些功能证据不代表阶段 2 的完整系统或性能目标已完成。
 
@@ -70,7 +84,23 @@ npm run benchmark -- --seconds 1800 --warmup 300 --trees 128 --stress --repeat 1
 
 第一条采集固定轨迹；第二条按真实时间运行 30 分钟，循环增删刚体、换材质、重置、调整分辨率和切换镜头。默认以正常 GPU 配置运行独立的 headless Chrome；`--software` 仅用于功能排错，`--headed` 可显示测试窗口，`--channel msedge` 可选 Edge。运行环境和实际启动参数写入报告。
 
-结果保存在 `artifacts/benchmarks/`，包含源码/生产构建哈希、环境清单、逐帧 CSV、统计 JSON、截图和运行期间的内存观察。生产构建复制到独立目录，后续开发不会改变正在测量的版本。rAF 间隔表示浏览器回调节奏，GPU 时间是稀疏异步样本；两者均不等于显示器实际呈现时间。当前仅测基础场景，不代表大型场景、GI、反射或体积雾性能。完整协议与边界见 [实现状态](docs/implementation.md#基准运行器与首轮证据)。
+本机硬件基础压力基准可指定 Edge 与预期厂商：
+
+```sh
+npm run benchmark -- --frames 1800 --warmup 300 --trees 128 --stress --repeat 3 --channel msedge --expect-vendor intel --out artifacts/benchmarks/local-foundation
+npm run benchmark -- --frames 1800 --warmup 300 --trees 128 --stress --repeat 3 --channel msedge --high-performance-gpu --expect-vendor nvidia --out artifacts/benchmarks/local-foundation-nvidia
+```
+
+GI/几何演示使用独立的固定分辨率入口；例如：
+
+```sh
+node scripts/benchmark-demo.mjs --page gi --channel msedge --warmup 300 --frames 1800 --repeat 3 --width 1920 --height 1080 --high-performance-gpu --expect-vendor nvidia --out artifacts/benchmarks/local-gi-nvidia
+node scripts/benchmark-demo.mjs --page geometry --channel msedge --warmup 300 --frames 1800 --repeat 3 --width 1920 --height 1080 --high-performance-gpu --expect-vendor nvidia --out artifacts/benchmarks/local-geometry-nvidia
+```
+
+演示基准在首帧前关闭低频诊断读回、重置相机轨迹，并使用独立生产构建和固定场景；GI 与几何结果不能直接相减解释单个 pass 的代价。预期厂商会对照 Renderer 实际使用的 adapter 检查。输出目录必须是 `artifacts/` 下尚不存在的路径。
+
+结果保存在 `artifacts/benchmarks/`，包含源码/生产构建哈希、环境清单、逐帧 CSV、统计 JSON、截图和运行期间的内存观察。生产构建复制到独立目录，后续开发不会改变正在测量的版本。rAF 间隔表示浏览器回调节奏，GPU 时间是稀疏异步样本；两者均不等于显示器实际呈现时间。当前只测基础场景和小型 GI/几何演示，不代表大型场景、镜面反射、体积雾或长期稳定性。完整协议与边界见 [实现状态](docs/implementation.md#基准运行器与首轮证据)。
 
 ## 离线几何构建
 

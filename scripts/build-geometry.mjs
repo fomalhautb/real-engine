@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { cpSync, renameSync } from 'node:fs';
 import { readFile, stat, lstat, mkdir, mkdtemp, writeFile, rename, rm } from 'node:fs/promises';
 import { basename, dirname, extname, resolve, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 
@@ -48,6 +49,19 @@ async function removeOwnTemporary(temporary, targetParent, output) {
   await rm(absolute, { recursive: true, force: true });
 }
 
+async function publishReplacement(replacement, output) {
+  const retryDelays = [0, 50, 100, 200, 400, 800, 1600, 3200];
+  for (const [attempt, waitMs] of retryDelays.entries()) {
+    if (waitMs) await delay(waitMs);
+    if (await exists(output)) throw new Error(`output already exists: ${output}`);
+    try { renameSync(replacement, output); return; }
+    catch (error) {
+      if (attempt === retryDelays.length - 1 ||
+          !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+    }
+  }
+}
+
 async function publishDirectory(temporary, output) {
   if (await exists(output)) throw new Error(`output already exists: ${output}`);
   try { await rename(temporary, output); return; }
@@ -61,7 +75,7 @@ async function publishDirectory(temporary, output) {
   try {
     cpSync(temporary, replacement, { recursive: true, force: false, errorOnExist: true });
     if (await exists(output)) throw new Error(`output already exists: ${output}`);
-    renameSync(replacement, output);
+    await publishReplacement(replacement, output);
     await removeOwnTemporary(temporary, targetParent, output);
   } finally {
     await removeOwnTemporary(replacement, targetParent, output);

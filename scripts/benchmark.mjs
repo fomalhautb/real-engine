@@ -7,7 +7,8 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { platform, release, arch, cpus, totalmem } from 'node:os';
 
-const args = process.argv.slice(2), options = {}, settings = { channel: 'chrome', repeats: 3, headed: false, software: false };
+const args = process.argv.slice(2), options = {}, settings = { channel: 'chrome', repeats: 3, headed: false, software: false,
+  highPerformanceGpu: false, expectVendor: null };
 let output;
 const numeric = new Map([['--frames', 'frames'], ['--seconds', 'durationSeconds'], ['--warmup', 'warmupFrames'],
   ['--trees', 'trees'], ['--seed', 'seed'], ['--width', 'width'], ['--height', 'height'], ['--budget-ms', 'frameBudgetMs']]);
@@ -16,6 +17,8 @@ for (let i = 0; i < args.length; i++) {
   if (numeric.has(arg)) { const value = Number(args[++i]); if (!Number.isFinite(value)) throw new Error('Invalid ' + arg); options[numeric.get(arg)] = value; }
   else if (arg === '--stress') options.stress = true;
   else if (arg === '--software') settings.software = true;
+  else if (arg === '--high-performance-gpu') settings.highPerformanceGpu = true;
+  else if (arg === '--expect-vendor') settings.expectVendor = args[++i];
   else if (arg === '--headed') settings.headed = true;
   else if (arg === '--channel') settings.channel = args[++i];
   else if (arg === '--repeat') settings.repeats = Number(args[++i]);
@@ -24,6 +27,10 @@ for (let i = 0; i < args.length; i++) {
 }
 if (!Number.isInteger(settings.repeats) || settings.repeats < 1 || settings.repeats > 10) throw new Error('--repeat must be 1..10');
 if (!['chrome', 'msedge', 'chromium'].includes(settings.channel)) throw new Error('--channel must be chrome, msedge, or chromium');
+if (settings.software && settings.highPerformanceGpu) throw new Error('Cannot combine software and high-performance GPU selection');
+if (settings.expectVendor !== null && !['nvidia', 'intel', 'amd', 'apple', 'qualcomm', 'arm'].includes(settings.expectVendor)) {
+  throw new Error('--expect-vendor must be nvidia, intel, amd, apple, qualcomm, or arm');
+}
 const stamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
 const directory = resolve(output ?? `artifacts/benchmarks/${stamp}`);
 if (directory === resolve('.')) throw new Error('Benchmark output directory cannot be the repository root');
@@ -122,7 +129,8 @@ const results = [];
 try {
   const flags = settings.software ? ['--enable-unsafe-webgpu', '--use-webgpu-adapter=swiftshader',
     ...(platform() === 'linux' ? ['--enable-gpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan',
-      '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--use-vulkan=swiftshader'] : [])] : [];
+      '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--use-vulkan=swiftshader'] : [])]
+    : settings.highPerformanceGpu ? ['--force-high-performance-gpu'] : [];
   browser = await chromium.launch({ channel: settings.channel, headless: !settings.headed, args: flags });
   metadata.browserVersion = browser.version(); metadata.browserFlags = flags;
   await writeFile(resolve(directory, 'manifest.json'), JSON.stringify(metadata, null, 2) + '\n');
@@ -136,6 +144,18 @@ try {
     try {
       await page.goto(baseUrl + '/benchmark.html');
       await page.waitForFunction(() => window.__REAL_BENCHMARK__);
+      const adapterSelection = await page.evaluate(async () => {
+        const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
+        if (!adapter) return null;
+        const info = adapter.info;
+        return { vendor: info.vendor, architecture: info.architecture, description: info.description,
+          isFallbackAdapter: info.isFallbackAdapter ?? adapter.isFallbackAdapter ?? null };
+      });
+      // This second request is only corroborating evidence. Renderer.create
+      // obtains its own adapter, whose identity is checked after the run.
+      (metadata.adapterSelections ??= []).push({ repetition, adapter: adapterSelection });
+      await writeFile(resolve(directory, 'manifest.json'), JSON.stringify(metadata, null, 2) + '\n');
+      console.log('BENCHMARK_PREFLIGHT_ADAPTER ' + JSON.stringify({ repetition, adapter: adapterSelection }));
       interval = setInterval(async () => {
         if (sampling) return;
         sampling = true;
@@ -151,12 +171,24 @@ try {
       }, 15000);
       const result = await evaluateWithTimeout(() => page.evaluate(options => window.__REAL_BENCHMARK__.run(options), options),
         runTimeoutMs, repetition);
+      const rendererAdapter = result.environment?.adapterInfo;
+      (metadata.rendererAdapters ??= []).push({ repetition, adapter: rendererAdapter ?? null });
+      await writeFile(resolve(directory, 'manifest.json'), JSON.stringify(metadata, null, 2) + '\n');
+      console.log('BENCHMARK_RENDERER_ADAPTER ' + JSON.stringify({ repetition, adapter: rendererAdapter ?? null }));
+      if (!rendererAdapter || (!settings.software && rendererAdapter.isFallbackAdapter !== false)) {
+        throw new Error('BENCHMARK_RENDERER_ADAPTER_UNCONFIRMED: ' + JSON.stringify(rendererAdapter));
+      }
+      if (settings.expectVendor !== null && rendererAdapter.vendor.toLowerCase() !== settings.expectVendor) {
+        throw new Error('BENCHMARK_RENDERER_ADAPTER_MISMATCH: expected ' + settings.expectVendor + ', actual ' + rendererAdapter.vendor);
+      }
       clearInterval(interval);
       await page.locator('#benchmark').screenshot({ path: resolve(directory, `run-${repetition}.png`) });
       const csv = await page.evaluate(() => window.__REAL_BENCHMARK__.csv());
       const cleanup = await page.evaluate(() => window.__REAL_BENCHMARK__.dispose());
       if (errors.length || cleanup.ownedGpuBytes !== 0) throw new Error('BENCHMARK_CLEANUP_OR_PAGE_ERROR: ' + JSON.stringify({ errors, cleanup }));
-      const report = { ...result, repetition, runTimeoutMs, cleanup, pageErrors: errors, hostSamples, manifest: 'manifest.json' };
+      const report = { ...result, repetition, runTimeoutMs,
+        adapterEvidence: { preflight: adapterSelection, renderer: rendererAdapter },
+        cleanup, pageErrors: errors, hostSamples, manifest: 'manifest.json' };
       await writeFile(resolve(directory, `run-${repetition}.json`), JSON.stringify(report, null, 2) + '\n');
       await writeFile(resolve(directory, `run-${repetition}.csv`), csv);
       results.push({ repetition, measuredDurationMs: result.measuredDurationMs, summary: result.summary, verification: result.verification, cleanup });

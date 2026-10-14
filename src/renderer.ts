@@ -53,12 +53,20 @@ export interface RendererOptions {
   diffuseGi?: DiffuseGiOptions;
 }
 
+export interface RendererAdapterInfo {
+  readonly vendor: string;
+  readonly architecture: string;
+  readonly description: string;
+  /** Null when neither the current nor legacy browser API reports fallback status. */
+  readonly isFallbackAdapter: boolean | null;
+}
+
 /** Stage 1 scheduler: one deformation dispatch per mesh batch, shared by both views. */
 export class Renderer {
   readonly errors: string[] = [];
   readonly stats: FrameStats = { frames: 0, drawCalls: 0, triangles: 0, deformedVertices: 0,
     ownedGpuBytes: 0, width: 0, height: 0, cpuSubmitMs: 0, gpuMs: null, gpuSampleFrame: null, deformationDispatches: 0, uploadedBytes: 0 };
-  readonly info: { adapter: string; features: string[]; userAgent: string; timing: string; limits: Record<string, number> };
+  readonly info: { adapter: string; adapterInfo: RendererAdapterInfo; features: string[]; userAgent: string; timing: string; limits: Record<string, number> };
   private readonly batches: Batch[] = [];
   private readonly buffers: GPUBuffer[] = [];
   private readonly frameData = new Float32Array(64);
@@ -135,8 +143,17 @@ export class Renderer {
     private canvas: HTMLCanvasElement, private context: GPUCanvasContext,
     private device: GPUDevice, adapter: GPUAdapter, timing: boolean, options: RendererOptions, private hasGeometryLod: boolean,
   ) {
+    const legacyFallback = 'isFallbackAdapter' in adapter && typeof adapter.isFallbackAdapter === 'boolean'
+      ? adapter.isFallbackAdapter : null;
+    const adapterInfo: RendererAdapterInfo = Object.freeze({
+      vendor: adapter.info.vendor ?? '', architecture: adapter.info.architecture ?? '',
+      description: adapter.info.description ?? '',
+      isFallbackAdapter: typeof adapter.info.isFallbackAdapter === 'boolean'
+        ? adapter.info.isFallbackAdapter : legacyFallback,
+    });
     this.info = {
-      adapter: [adapter.info.vendor, adapter.info.architecture, adapter.info.description].filter(Boolean).join(' / ') || 'Unreported adapter',
+      adapter: [adapterInfo.vendor, adapterInfo.architecture, adapterInfo.description].filter(Boolean).join(' / ') || 'Unreported adapter',
+      adapterInfo,
       features: Array.from(device.features), userAgent: navigator.userAgent,
       timing: timing ? 'GPU timestamp-query (adapter-dependent precision)' : 'GPU timestamps unavailable',
       limits: { maxBufferSize: device.limits.maxBufferSize, maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,

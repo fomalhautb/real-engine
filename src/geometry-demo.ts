@@ -16,15 +16,17 @@ function element<T extends HTMLElement>(id: string): T {
 const canvas = element<HTMLCanvasElement>('viewport');
 const app = element<HTMLDivElement>('geometry-app');
 const controls = new AbortController();
+const benchmarkMode = new URLSearchParams(location.search).get('benchmark') === '1';
 let scene: GeometryDemoScene | undefined;
 let renderer: Renderer | undefined;
 let raf = 0;
 let disposed = false;
-let paused = false;
+let paused = benchmarkMode;
 let lastTime = performance.now();
 let lastUI = 0;
 let lastProbeRequest = -Infinity;
 let probePending = false;
+let diagnosticsEnabled = !benchmarkMode;
 let probe: Probe | null = null;
 let phase = 0;
 let yaw = 0.35;
@@ -96,7 +98,7 @@ function snapshot() {
       instances: scene.instanceCount, clusters: scene.hierarchy.clusters.length,
       groups: scene.hierarchy.groups.length, roots: scene.hierarchy.roots.length } : null,
     camera: { eye: eye(), target: [...target], yaw, elevation, radius, phase, trajectory },
-    controls: { paused, maxErrorPixels, frustumCulling, frozen, debug: debugView },
+    controls: { paused, diagnosticsEnabled, maxErrorPixels, frustumCulling, frozen, debug: debugView },
     gpuProbe: probe ? structuredClone(probe) : null,
     stats: renderer ? structuredClone(renderer.stats) : null,
     geometryLod: diagnostics?.geometryLod ?? null,
@@ -107,7 +109,7 @@ function snapshot() {
 }
 
 async function maybeProbe(now: number): Promise<void> {
-  if (!renderer || disposed || probePending || now - lastProbeRequest < 500 || renderer.stats.frames === 0) return;
+  if (!diagnosticsEnabled || !renderer || disposed || probePending || now - lastProbeRequest < 500 || renderer.stats.frames === 0) return;
   const active = renderer;
   probePending = true;
   lastProbeRequest = now;
@@ -276,7 +278,7 @@ async function start(): Promise<void> {
   element('adapter').textContent = `${renderer.info.adapter} · ${renderer.info.timing}`;
   applyLod();
   wireControls();
-  window.__GEOMETRY_DEMO__ = { snapshot, pause, step, setDebug, dispose };
+  window.__GEOMETRY_DEMO__ = { get renderer() { return renderer; }, snapshot, pause, step, setDebug, setDiagnosticsEnabled, dispose };
   renderOnce();
   refreshUI();
   lastTime = performance.now();
@@ -284,11 +286,18 @@ async function start(): Promise<void> {
 }
 
 export interface GeometryDemoHarness {
+  readonly renderer: Renderer | undefined;
   snapshot: typeof snapshot;
   pause(value: boolean): void;
   step(dt?: number): void;
   setDebug(value: DebugView): void;
+  setDiagnosticsEnabled(value: boolean): void;
   dispose(): void;
+}
+function setDiagnosticsEnabled(value: boolean): void {
+  if (disposed) throw new Error('GEOMETRY_DEMO_DISPOSED');
+  if (typeof value !== 'boolean') throw new Error('GEOMETRY_DEMO_DIAGNOSTICS');
+  diagnosticsEnabled = value;
 }
 declare global { interface Window { __GEOMETRY_DEMO__?: GeometryDemoHarness } }
 

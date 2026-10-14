@@ -21,6 +21,7 @@ function element<T extends HTMLElement = HTMLElement>(id: string): T {
 const app = element<HTMLDivElement>('gi-app');
 const canvas = element<HTMLCanvasElement>('viewport');
 const events = new AbortController();
+const benchmarkMode = new URLSearchParams(location.search).get('benchmark') === '1';
 const exportUrls = new Set<string>();
 const exportTimers = new Set<number>();
 let renderer: Renderer | undefined;
@@ -28,6 +29,7 @@ let scene: ReturnType<typeof createGiDemoScene> | undefined;
 let latestProbe: GiProbe | null = null;
 let lastProbeRequest = -Infinity;
 let probePending = false;
+let diagnosticsEnabled = !benchmarkMode;
 let lastUi = -Infinity;
 let lastTime = performance.now();
 let phase = 0;
@@ -35,7 +37,7 @@ let yaw = 0.18;
 let elevation = 0.21;
 let distance = 8.7;
 let manualCamera = false;
-let paused = false;
+let paused = benchmarkMode;
 let giEnabled = true;
 let multiBounce = true;
 let wallColor: WallColor = 'coral';
@@ -147,7 +149,7 @@ function snapshot() {
     scene: scene ? { triangles: scene.triangles, batches: scene.batches.map(batch => batch.name) } : null,
     probeGrid: GI_PROBE_GRID,
     camera: { eye: eye(), target: [...target], yaw, elevation, distance, phase, manualCamera },
-    controls: { paused, giEnabled, multiBounce, wallColor, sunAzimuth, sunElevation, sunColor, sunIntensity },
+    controls: { paused, diagnosticsEnabled, giEnabled, multiBounce, wallColor, sunAzimuth, sunElevation, sunColor, sunIntensity },
     probe: latestProbe ? structuredClone(latestProbe) : null,
     diffuseGi: diagnostics?.diffuseGi ?? null,
     stats: renderer ? structuredClone(renderer.stats) : null,
@@ -158,7 +160,7 @@ function snapshot() {
 }
 
 async function maybeProbe(now: number): Promise<void> {
-  if (!renderer || disposed || !giEnabled || probePending || now - lastProbeRequest < 1000 || renderer.stats.frames === 0) return;
+  if (!diagnosticsEnabled || !renderer || disposed || !giEnabled || probePending || now - lastProbeRequest < 1000 || renderer.stats.frames === 0) return;
   const active = renderer;
   lastProbeRequest = now;
   probePending = true;
@@ -315,7 +317,7 @@ async function start(): Promise<void> {
   applySun();
   element('adapter').textContent = `${renderer.info.adapter} · ${renderer.info.timing}`;
   wireControls();
-  window.__GI_DEMO__ = { get renderer() { return renderer; }, snapshot, pause, step, toggleGi, setMultiBounce, setWallColor, dispose };
+  window.__GI_DEMO__ = { get renderer() { return renderer; }, snapshot, pause, step, toggleGi, setMultiBounce, setWallColor, setDiagnosticsEnabled, dispose };
   refreshStageMode();
   renderOnce();
   refreshUi();
@@ -331,7 +333,13 @@ export interface GiDemoHarness {
   toggleGi(enabled?: boolean): void;
   setMultiBounce(enabled: boolean): void;
   setWallColor(value: WallColor): void;
+  setDiagnosticsEnabled(value: boolean): void;
   dispose(): void;
+}
+function setDiagnosticsEnabled(value: boolean): void {
+  if (disposed) throw new Error('GI_DEMO_DISPOSED');
+  if (typeof value !== 'boolean') throw new Error('GI_DEMO_DIAGNOSTICS');
+  diagnosticsEnabled = value;
 }
 declare global { interface Window { __GI_DEMO__?: GiDemoHarness } }
 

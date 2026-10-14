@@ -40,9 +40,11 @@ OBJ 导入器接受位置、法线、UV、正/负索引及三角形或平面凸�
 
 `npm run build:geometry -- --input path.obj --output artifacts/geometry/example --coverage opaque` 提供可重复 OBJ 构建入口，源文件上限 32 MiB。调用方显式声明 Opaque；OBJ 的材质库只记录名称，不自动转换或判断覆盖。工具保留 primitive 名称/材质名、源 SHA-256、构建参数、簇/根页面映射和页面 SHA-256，先写入自有暂存目录，再发布到不存在的输出目录。`hierarchy.json` 含重复的簇索引，明确作为离线审计元数据；不是可直接全部载入生产运行时的驻留清单。
 
+Windows 下目录发布偶发 `EPERM`：工具保留向同一父目录的私有副本发布，再仅对最后一次原子目录重命名作最多八次、总计 6.35 秒的有界重试；每次重查目标不存在，失败清理自身暂存目录。本轮一次完整 `npm run check` 通过，但间歇文件锁是否彻底消除仍需后续重复运行验证；不会覆盖既有输出。
+
 CPU 回归以带属性接缝的曲面网格核对 LOD0 完整性、真实减面、组边界、DAG 单调误差/边界、多个误差阈值下的无孔洞/重复覆盖，以及页面往返、损坏输入、预算与构建可重复性。此证据只覆盖小型正确性用例，未进行本机 GPU 或大型资产压测。运行时选簇接入见下节；压缩页面尚未接入流送/祖先回退，不能把离线产物视作完整虚拟几何。
 
-本轮本地 `npm run check` 通过：200 项 CPU 单元测试、TypeScript 和生产构建；其中 12 项新增用例覆盖上述离线几何与 CLI。浏览器与硬件性能证据仍按各自提交和实际运行结果记录。
+本轮本地 `npm run check` 通过：221 项 CPU 单元测试、TypeScript 和生产构建。浏览器功能与硬件计时证据按下文各自的实际运行范围记录。
 
 ## 驻留 GPU LOD 与可视化
 
@@ -70,7 +72,7 @@ CPU 回归以带属性接缝的曲面网格核对 LOD0 完整性、真实减面�
 
 GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供后续光照直接消费；CPU `traceRays` 仅按需读回有界命中记录，不读取整份几何。同一编码器可按顺序多次查询，但共享 uniform 参数必须相同；改变参数需先提交前一编码器。外部 GPU 射线生产者必须遵守有效输入合约并检查 overflow。当前遍历各实例根边界为线性扫描，三角形部分使用无栈 BVH；材质仍按批次分别 dispatch。新增缓冲均计入应用 GPU 账本并随 renderer 释放。BVH refit 在首末 compute pass 之间计时，静止批次复用缓存；新增元数据/层级参数上传计入当前帧上传统计。额外显式射线查询不在普通 render 帧计时范围内。
 
-提交 `63f2bd8` 已通过本地及远程 TypeScript、176 项 CPU 单元测试、生产构建，以及 [远程 Linux 软件 GPU 的 14 项浏览器回归](https://github.com/fomalhautb/real-engine/actions/runs/38509599939)。GPU 查询覆盖离屏静态/刚体、独立蒙皮＋Morph、重排/删除/generation 复用、Mask 洞口、双面、前帧位置、多层 refit、闭区间命中、Unlit HDR 材质即时修改和预算错误；无 GPU 验证错误，释放后账本归零。这是功能证据，未测查询吞吐。本机按用户要求不执行白天 GPU 测试或压测。30 分钟稳定性测试已预约北京时间 2026-10-15 02:00；此前被用户中止的运行不计为通过。
+提交 `63f2bd8` 已通过本地及远程 TypeScript、176 项 CPU 单元测试、生产构建，以及 [远程 Linux 软件 GPU 的 14 项浏览器回归](https://github.com/fomalhautb/real-engine/actions/runs/38509599939)。GPU 查询覆盖离屏静态/刚体、独立蒙皮＋Morph、重排/删除/generation 复用、Mask 洞口、双面、前帧位置、多层 refit、闭区间命中、Unlit HDR 材质即时修改和预算错误；无 GPU 验证错误，释放后账本归零。这是该提交的功能证据，未测查询吞吐。后续本地硬件测试和短程基准另见本文末节；30 分钟稳定性尚未开始，此前被中止的运行不计为通过。
 
 ## 世界空间漫反射 GI
 
@@ -83,6 +85,8 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供后续光照直�
 这是有界的基础实现：最多 512 探针、每探针 16–256 条射线、单轮至多 65,536 条；每帧两轮查询，各自受 world query 工作预算限制。GI 独立预算默认 32 MiB，包含参数、主命中备份、两份 256 字节/探针记录及诊断读回；共享查询内存另计。任一射线工作量超限会把整颗探针标为无效，表面不采样该探针，`probeDiffuseGi()` 返回无效数、溢出计数与每探针最大辐亮度 RGB。`gpuMs.diffuseGi` 包含射线生成、两轮追踪、命中复制和积分，进入基准总计/CSV；BVH refit 单列，不能把软件 GPU 时间当硬件性能。
 
 当前没有时域平均、单点局部收敛缓存、增量/优先级更新、自动放置或重定位、探针流送及镜面反射。网格由调用方放在自由空间；没有自动检测实体内部探针。六方向距离矩和低阶 SH 都较粗，薄墙漏光、小发光体漏采样、边界截断及动态采样变化仍需进一步处理与定量验收。每帧全部刷新是正确性基线，尚未达到大场景性能目标。不能把它称为完整 Lumen、完整 DDGI 或阶段 2 完成。可见性感知探针插值参考 [JCGT 的 DDGI 论文](https://jcgt.org/published/0008/02/01/)；这里使用较低分辨率的自有实现，并未复用其完整算法。
+
+`src/gi-visibility.ts` 另有 8×8 方向深度图的 CPU 可见性参考及五项单元测试，用于研究近墙插值。它尚未接入 GPU GI 更新或表面采样；当前渲染结果仍使用上述六方向距离矩，不能把这份 CPU 参考计为漏光修复或运行时功能。
 
 `/gi.html` 提供程序化红蓝墙房间、白色物体和发光条，64 颗探针、每颗 64 射线；演示默认开启多次反弹，支持单次/多次切换、GI 开关、墙面参数、太阳方向/颜色、固定镜头运动、暂停逐帧、隐藏面板和诊断导出。实体墙延长到 z=3.75 后，旧探针支撑域仍止于 z=3.6，导致蓝墙前沿最后 15 cm 的间接光截断。网格现扩大为 x±3.4、y−0.2..4.2、z±3.8，保留全部 64 个自由空间探针；新增资产全表面覆盖/探针不入实体的 CPU 检查，以及实际蓝墙前沿命中、HDR 和截图回归。提交 `c54b31e` 的[远程回归](https://github.com/fomalhautb/real-engine/actions/runs/38528108449)通过 216 项 CPU、28 项浏览器测试；z=3.45/3.60/3.68 的蓝通道 HDR 分别为 0.082153/0.082214/0.082214，实际图中的黑色截断条消失。它用于观察和回归，不是阶段 2 后期的大规模最终场景。
 
@@ -153,7 +157,7 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 阶段 1.2 的本地结果（2026-10-14）：156 项单元测试、TypeScript 和构建通过；Chrome 154.0.8037.99 的 SwiftShader 与正常硬件配置各通过 9 项浏览器测试。基础场景检查七批首实例共 512 个顶点；额外形变场景每帧检查四实例共 96 个顶点，并按独立提交快照验证重排后的前帧身份。glTF 用例另检查四实例共 96 个顶点，两帧的位置最大误差约 2.1e-7、法线约 6.8e-8，无边界越界；独立解析预期验证 SimpleSkin 的运动和前帧位置，并用已知逆转置法线验证剪切/非均匀骨骼。材质测试读取主视图/阴影深度，检查波形形变后的遮罩、单/双面、Unlit/太阳光、替换失败、缓存容量、资源预算和异步释放；Compute 材质测试以 11 组数值对照验证参数、覆盖、sRGB/线性采样、独立纹理槽采样器及显式 mip。参数更新复用同一程序，释放后的材质图像和账本归零。这些是功能结果，不是固定场景性能、跨厂商或 30 分钟稳定性验收。
 
-浏览器配置通过 PLAYWRIGHT_CHANNEL 选择已安装通道，通过 PLAYWRIGHT_GPU=hardware 禁用软件测试 flags。默认 Chromium for Testing 下载与系统浏览器是独立安装，测试不修改用户的日常浏览器配置。
+浏览器配置通过 PLAYWRIGHT_CHANNEL 选择已安装通道，通过 PLAYWRIGHT_GPU=hardware 禁用软件测试 flags。默认 Chromium for Testing 下载与系统浏览器是独立安装，测试不修改用户的日常浏览器配置。2026-10-14 本机 Edge 的正常硬件选择为 `intel / gen-12lp`；额外传入 `--force-high-performance-gpu` 后为 `nvidia / ampere`。主机设备列表有 RTX 3070 Laptop，但 WebGPU adapter 报告没有暴露具体型号，因此基准结果按 `nvidia / ampere` 标识，不能把设备列表型号当作 adapter 自报信息。两种配置各通过 28 项浏览器功能测试，日志分别在 `artifacts/local-hardware-browser-20261014.log` 和 `artifacts/local-nvidia-browser-20261014.log`。
 
 Linux 软件 GPU 的 CI 使用 Xvfb、启用 GPU 合成和 Vulkan SwiftShader，避免适配器初始化成功但 canvas 首次获取纹理时设备丢失。该配置依据 [luma.gl 的复现实验](https://github.com/visgl/luma.gl/issues/2874)；必须由本仓库的实际渲染测试验证，不能把获得 adapter 当作渲染通过。
 
@@ -181,3 +185,11 @@ CI 将失败时的运行状态直接输出到日志。截图附件上传属于�
 首轮压力短测使用 Windows 11、i7-11800H、NVIDIA Ampere 适配器（主机列出 RTX 3070 Laptop，驱动 32.0.15.9597）、Chrome 154 无实验 GPU flags 的 headless 配置，128 棵程序树与两份 Khronos 动画资产。3600 帧完成两个压力循环，墙钟约 25.488 秒；rAF p95/p99 为 7.1/13.9 ms，场景更新 p95 为 6.4 ms，120 个 GPU 样本的三个 pass 合计 p95 为 0.65536 ms。时间戳存在量化，零值不代表 pass 没有成本。分辨率在压力序列中变化，这组数据不代表固定 1080p 性能。
 
 两个循环均回到 23,582,532 字节应用 GPU 账本；结束检查 25,016 个顶点，位置最大误差约 9.75e-7，法线约 5.44e-7，无边界越界，释放后账本为零。证据目录为 `artifacts/benchmarks/stress-smoke`，运行时基于 `cf0bd21` 的未提交源码，源码指纹 `fefc9036181e2afbb81923390426f1a9b28a63089ecd09a890993e9f8124cbb5`。该次运行先于构建副本哈希字段增加，仅证明短循环与采集路径有效，不作为发布性能认证或 30 分钟通过证据。后续 2 秒生产短测已验证新增构建指纹及真实时长字段，测得 2006.6 ms，资源释放归零。
+
+本地基础场景后续以 Edge 155、128 棵树、SimpleSkin 与 AnimatedMorphCube、Rapier 刚体执行三次 300 帧预热＋1800 帧测量，压力事件把渲染尺寸在 1920×1080、1440×810、1920×1080 间切换。默认 `intel / gen-12lp` 的 GPU pass 总和 p95 分别为 146.801/137.363/143.000 ms，rAF 间隔 p95 为 208.2/208.3/201.5 ms；强制高性能选择 `nvidia / ampere` 后分别为 1.376/0.918/1.114 ms 与约 7.1 ms。每次只有 60 个稀疏 GPU timestamp 样本，pass 总和不包含浏览器合成和呈现；动态尺寸使它不是固定 1080p 对比，也不能仅据此诊断 Intel 瓶颈。两组结束均核对 25,016 个顶点、无边界越界、应用 GPU 账本释放归零。证据分别在 `artifacts/benchmarks/local-foundation-20261014` 与 `artifacts/benchmarks/local-foundation-nvidia-20261014`，各自 manifest 记录实际源码与构建指纹。
+
+`scripts/benchmark-demo.mjs` 为 `/gi.html` 与 `/geometry.html` 提供固定分辨率的独立生产构建、预热/重复、稀疏 GPU 时间戳、rAF/CPU 提交、应用 GPU 账本及释放检查；`?benchmark=1` 在首帧前暂停演示、关闭低频诊断读回，每次重复都从相机轨迹相位 0 开始并检查一致性，结束才显式读取几何实际选簇。可用 `node scripts/benchmark-demo.mjs --page gi --channel msedge --warmup 300 --frames 1800 --repeat 3 --width 1920 --height 1080 --high-performance-gpu --expect-vendor nvidia --out artifacts/benchmarks/local-gi-example` 运行。预期厂商对照 Renderer 实际使用的 `adapterInfo`，不靠另一次独立 `requestAdapter` 推断；各次构建和源码指纹分别记录，不应假定不同脚本运行共享同一指纹，后续文档编辑也不会改写当时的构建快照。
+
+固定 1920×1080 的 GI 演示在 `nvidia / ampere`、非 fallback adapter 上完成三次 300 帧预热＋1800 帧测量，`--expect-vendor nvidia` 已对照实际 Renderer adapter 验证，同一相机相位 0。GPU pass 总和 p95 为 2.300/2.104/2.425 ms，其中 `diffuseGi` p95 为 0.983/0.996/0.993 ms；rAF 间隔 p95 均约 7.1 ms，CPU 提交 p95 均为 0.4 ms。每次 60 个稀疏 GPU 样本；应用账本在首帧、预热结束、测量首末均为 39,610,444 字节，无变化，释放后为零且没有错误。正式证据在 `artifacts/benchmarks/local-gi-nvidia-20261014-v3`，manifest 源码指纹 `47fa02df219c6f908d7f125b66c8d1b0ecdc622561636ecf8b9cf170dc75ce15`、构建指纹 `0129e1e8851e66dccd752ce76d24bbf6d61e3536592b5bf574e0639414478cbf`；v2 的 CLI 预期厂商解析缺口已由 v3 重跑替代。这是 64 探针×64 射线的小型固定房间，不含大型场景、几何流送、镜面反射或长期稳定性。30 分钟测试尚未开始。
+
+固定 1920×1080 的几何演示在同一 `nvidia / ampere` 验证路径上也完成三次 300 帧预热＋1800 帧测量，相机均从相位 0 的同一视点开始（eye `[4.8295,3.5967,13.2305]`、target `[0,0.15,0]`）。GPU pass 总和 p95 为 0.872/0.852/0.809 ms，`geometryLod` pass 三次均为 0.197 ms；rAF 间隔 p95 均约 7 ms，CPU 提交 p95 均为 0.3 ms，每次 60 个稀疏 GPU 样本。应用账本从首次预热前 29,828,116 字节增至预热后的 38,482,196 字节；测量区间首末、最小和最大均为后者，变化记录为空，释放后为零且没有错误。增长发生在预热阶段，不是测量期漂移；尚未单独测定资源增长的具体原因。雕塑三个实例的源三角形为 15,360；该固定镜头的 GPU 实际选中也为 15,360、165 个簇且全部 LOD0，因而不能据此声称减面降低了绘制量。全场景旧 `stats.triangles` 为 15,398，另含 38 个非 LOD 地面/基座三角形。证据在 `artifacts/benchmarks/local-geometry-nvidia-20261014-v3`；这次与 GI v3 的 manifest 恰好记录相同源码/构建指纹，但不推广为不同运行必然一致。动态拉远时的实际 LOD 减面仍需另用固定轨迹和像素误差验收。

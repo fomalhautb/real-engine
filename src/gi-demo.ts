@@ -124,7 +124,8 @@ function refreshUi(): void {
   element('valid-probes').textContent = latestProbe
     ? `${latestProbe.probes.length - latestProbe.invalidProbes} / ${latestProbe.probes.length}` : '—';
   element('probe-frame').textContent = latestProbe ? String(latestProbe.frame) : '—';
-  element('gpu-gi-ms').textContent = stats.gpuMs ? `${stats.gpuMs.diffuseGi.toFixed(2)} ms` : '—';
+  element('gpu-gi-ms').textContent = stats.gpuMs
+    ? `${(stats.gpuMs.diffuseGi + stats.gpuMs.finalGather).toFixed(2)} ms` : '—';
   element('gpu-sample-frame').textContent = stats.gpuSampleFrame === null ? '—' : String(stats.gpuSampleFrame);
   element('cpu-submit-ms').textContent = `${stats.cpuSubmitMs.toFixed(2)} ms`;
   element('scene-triangles').textContent = scene?.triangles.toLocaleString() ?? '—';

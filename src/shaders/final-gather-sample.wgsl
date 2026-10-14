@@ -1,5 +1,6 @@
 struct FinalGatherParameters {
     inverseViewProjection: mat4x4f,
+    previousViewProjection: mat4x4f,
     eye: vec4f,
     viewport: vec4u,
     settings: vec4u,

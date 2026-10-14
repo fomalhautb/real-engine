@@ -9,7 +9,7 @@ import { WORLD_HIT_BYTES } from './world-query';
 import type { GpuWorldQuery } from './gpu-world-query';
 import type { SceneBatch } from './contracts';
 import { GpuGiEmissiveSampler } from './gpu-gi-emissive';
-import { GpuFinalGather, finalGatherSampleSource } from './gpu-final-gather';
+import { GpuFinalGather, finalGatherSampleSource, type FinalGatherProbeResult } from './gpu-final-gather';
 import type { Mat4 } from './math';
 
 const constants = `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`;
@@ -176,6 +176,11 @@ export class GpuDiffuseGi {
     if (typeof enabled !== 'boolean') throw new Error('FINAL_GATHER_INVALID_ENABLED');
     this.finalGatherEnabled = enabled;
   }
+  async probeFinalGather(indices: readonly number[]): Promise<FinalGatherProbeResult> {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    if (!this.finalGather) throw new Error('FINAL_GATHER_UNCONFIGURED');
+    return this.finalGather.probe(indices);
+  }
   setEnabled(enabled: boolean): void {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
     if (typeof enabled !== 'boolean') throw new Error('DIFFUSE_GI_INVALID_ENABLED');
@@ -294,7 +299,7 @@ export class GpuDiffuseGi {
         + (gather?.queryRaysPerUpdate ?? 0) : 0,
       maxWorkUnitsPerUpdate: this.enabled ? this.queries.options.maxTotalWorkUnits
         * (this.emissiveSampler?.queryRayCount ? 3 : 2) + (gather?.maxWorkUnitsPerUpdate ?? 0) : 0,
-      temporalAccumulation: this.finalGather ? 'surface-static-camera-only' : false,
+      temporalAccumulation: this.finalGather ? 'surface-validated-camera-reprojection' : false,
       automaticRelocation: false, reflections: false };
   }
   dispose(): void {

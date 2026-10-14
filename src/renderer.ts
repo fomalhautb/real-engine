@@ -13,6 +13,7 @@ import { GpuGeometryLod, type GeometryLodBinding, type GeometryLodSettings, type
 import { GpuDiffuseGi, diffuseGiSampleSource, diffuseGiFinalGatherSampleSource, type DiffuseGiProbeResult } from './gpu-diffuse-gi';
 import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
 import { resolveSunShadowOptions, sunShadowProjection, type SunShadowOptions, type ResolvedSunShadowOptions } from './sun-shadow';
+import type { FinalGatherProbeResult } from './gpu-final-gather';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
@@ -461,6 +462,13 @@ export class Renderer {
     if (this.errors.length) throw new Error(this.errors.join('\n'));
     if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
     return this.diffuseGi.probe();
+  }
+  /** Explicit bounded readback of raw and filtered surface-lighting anchors. */
+  async probeDiffuseGiFinalGather(indices: readonly number[]): Promise<FinalGatherProbeResult> {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (this.errors.length) throw new Error(this.errors.join('\n'));
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    return this.diffuseGi.probeFinalGather(indices);
   }
 
   /** Exposure in stops, applied only during final scene-linear HDR resolve. */

@@ -12,7 +12,7 @@ const dist = resolve(root, 'dist');
 const artifacts = resolve(root, 'artifacts');
 const stamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
 const defaults = { page: 'gi', channel: 'chrome', warmup: 60, frames: 300, repeat: 1,
-  width: 1280, height: 720, highPerformanceGpu: false, expectVendor: null, parseOnly: false, finalGather: false,
+  width: 1280, height: 720, highPerformanceGpu: false, expectVendor: null, parseOnly: false, finalGather: false, camera: 'fixed',
   out: resolve(artifacts, 'benchmarks', `demo-${stamp}`) };
 const bounds = { warmup: [0, 10_000], frames: [30, 36_000], repeat: [1, 3],
   width: [320, 3840], height: [240, 2160] };
@@ -24,7 +24,7 @@ function parseArgs(argv) {
     if (key === '--high-performance-gpu') { options.highPerformanceGpu = true; continue; }
     if (key === '--final-gather') { options.finalGather = true; continue; }
     if (key === '--parse-only') { options.parseOnly = true; continue; }
-    if (!['--page', '--channel', '--warmup', '--frames', '--repeat', '--width', '--height', '--out', '--expect-vendor'].includes(key)) {
+    if (!['--page', '--channel', '--warmup', '--frames', '--repeat', '--width', '--height', '--out', '--expect-vendor', '--camera'].includes(key)) {
       throw new Error(`Unknown benchmark argument: ${key}`);
     }
     const raw = argv[++i];
@@ -34,6 +34,8 @@ function parseArgs(argv) {
   }
   if (!['gi', 'geometry'].includes(options.page)) throw new Error('--page must be gi or geometry');
   if (options.finalGather && options.page !== 'gi') throw new Error('--final-gather requires --page gi');
+  if (!['fixed', 'orbit'].includes(options.camera)) throw new Error('--camera must be fixed or orbit');
+  if (options.camera === 'orbit' && options.page !== 'gi') throw new Error('--camera orbit requires --page gi');
   if (!['msedge', 'chrome', 'chromium'].includes(options.channel)) throw new Error('--channel must be msedge, chrome, or chromium');
   if (options.expectVendor !== null && !/^[a-z][a-z0-9-]{0,31}$/.test(options.expectVendor)) {
     throw new Error('--expect-vendor must be an exact lowercase vendor token (1..32 characters)');
@@ -147,8 +149,8 @@ async function withTimeout(promise, milliseconds, label) {
   } finally { clearTimeout(timer); }
 }
 
-// Runs inside a paused demo. The scene and camera stay fixed; one render is submitted per rAF.
-async function measureDemo({ pageName, warmup, frames, width, height, expectVendor, expectedCamera }) {
+// Runs inside a paused demo. One deterministic camera pose is rendered per rAF.
+async function measureDemo({ pageName, warmup, frames, width, height, expectVendor, expectedCamera, cameraMode }) {
   const demo = pageName === 'gi' ? window.__GI_DEMO__ : window.__GEOMETRY_DEMO__;
   if (!demo?.renderer) throw new Error(`${pageName.toUpperCase()}_DEMO_RENDERER_UNAVAILABLE`);
   const initial = demo.snapshot();
@@ -165,7 +167,19 @@ async function measureDemo({ pageName, warmup, frames, width, height, expectVend
   if (canvas.clientWidth !== width || canvas.clientHeight !== height) {
     throw new Error(`BENCHMARK_CANVAS_SIZE: ${canvas.clientWidth}x${canvas.clientHeight} vs ${width}x${height}`);
   }
-  const result = { initial, camera: { eye, target }, warmup, frames, frameSamples: [], gpuSamples: [],
+  const poseAt = index => {
+    if (cameraMode === 'fixed') return { eye, target };
+    const phase = index / 60;
+    const yaw = initialCamera.yaw + 0.1 * Math.sin(phase * 0.3);
+    const elevation = initialCamera.elevation + 0.02 * Math.sin(phase * 0.2);
+    const radius = initialCamera.radius;
+    return { eye: [target[0] + Math.sin(yaw) * Math.cos(elevation) * radius,
+      target[1] + Math.sin(elevation) * radius, target[2] + Math.cos(yaw) * Math.cos(elevation) * radius], target };
+  };
+  const result = { initial, camera: { eye, target, mode: cameraMode,
+    trajectory: cameraMode === 'orbit' ? { nominalStepSeconds: 1 / 60,
+      yawAmplitude: 0.1, yawFrequency: 0.3, elevationAmplitude: 0.02, elevationFrequency: 0.2 } : null },
+    warmup, frames, frameSamples: [], gpuSamples: [],
     memoryChanges: [], measuredDurationMs: 0, final: null, adapterCheck: null };
   const actual = renderer.info.adapterInfo;
   const adapterText = String(renderer.info.adapter);
@@ -201,7 +215,8 @@ async function measureDemo({ pageName, warmup, frames, width, height, expectVend
   };
   for (let index = 0; index < warmup; index++) {
     await waitFrame();
-    renderer.render(eye, target);
+    const pose = poseAt(index);
+    renderer.render(pose.eye, pose.target);
     if (renderer.errors.length) throw new Error(renderer.errors.join('\n'));
   }
   result.warmupLastRenderFrame = renderer.stats.frames;
@@ -215,7 +230,8 @@ async function measureDemo({ pageName, warmup, frames, width, height, expectVend
   const started = performance.now();
   for (let index = 0; index < frames; index++) {
     const rafTime = await waitFrame();
-    renderer.render(eye, target);
+    const pose = poseAt(warmup + index);
+    renderer.render(pose.eye, pose.target);
     const stats = renderer.stats;
     if (stats.width !== width || stats.height !== height) throw new Error('BENCHMARK_RENDER_SIZE_CHANGED');
     result.lastRenderFrame = stats.frames;
@@ -223,7 +239,8 @@ async function measureDemo({ pageName, warmup, frames, width, height, expectVend
     result.frameSamples.push({ index, renderFrame: stats.frames,
       rafDeltaMs: lastRaf === null ? null : rafTime - lastRaf,
       cpuSubmitMs: stats.cpuSubmitMs, ownedGpuBytes: stats.ownedGpuBytes,
-      drawCalls: stats.drawCalls, triangles: stats.triangles, uploadedBytes: stats.uploadedBytes });
+      drawCalls: stats.drawCalls, triangles: stats.triangles, uploadedBytes: stats.uploadedBytes,
+      eyeX: pose.eye[0], eyeY: pose.eye[1], eyeZ: pose.eye[2] });
     if (stats.ownedGpuBytes !== lastMemory) {
       result.memoryChanges.push({ index, renderFrame: stats.frames, from: lastMemory, to: stats.ownedGpuBytes });
       lastMemory = stats.ownedGpuBytes;
@@ -239,6 +256,8 @@ async function measureDemo({ pageName, warmup, frames, width, height, expectVend
     if (renderer.stats.gpuSampleFrame === result.lastRenderFrame) break;
   }
   result.final = demo.snapshot();
+  result.camera.lastRenderedEye = [...poseAt(warmup + frames - 1).eye];
+  result.camera.lastRenderedTarget = [...target];
   if (result.final.camera.eye.some((value, i) => value !== eye[i]) ||
       result.final.camera.target.some((value, i) => value !== target[i])) throw new Error('BENCHMARK_CAMERA_MOVED');
   if (result.final.errors.length) throw new Error(result.final.errors.join('\n'));
@@ -257,7 +276,7 @@ async function main() {
     buildSourceCorrespondence: 'Vite production build from sourceSha256; source verified unchanged after build and snapshot',
     snapshot: `build-${stamp}`, options, scope: 'tiny production demo fixture; not large-scene acceptance',
     timingInterpretation: 'sparse GPU timestamp pass spans; fullGpuMs is their sum, not CPU+GPU or presented-frame latency',
-    pacing: 'headless requestAnimationFrame, one fixed-camera render per callback; rAF interval recorded separately',
+    pacing: 'headless requestAnimationFrame, one selected deterministic camera pose per callback; rAF interval recorded separately',
     os: { platform: platform(), release: release(), architecture: arch(),
       cpu: cpus()[0]?.model ?? null, logicalCpus: cpus().length, memoryBytes: totalmem() },
     diagnosticReadback: 'benchmark=1 starts paused with diagnostics disabled; no initial automatic probe; explicit disable is reasserted before warmup' };
@@ -349,6 +368,7 @@ async function main() {
           pageName: options.page, warmup: options.warmup, frames: options.frames,
           width: options.width, height: options.height, expectVendor: options.expectVendor,
           expectedCamera: referenceCamera,
+          cameraMode: options.camera,
         }), timeoutMs, `BENCHMARK_RUN_${repeat}`);
         if (pageErrors.length) throw new Error('BENCHMARK_PAGE_ERROR: ' + JSON.stringify(pageErrors));
         const passes = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi', 'finalGather'];
@@ -413,7 +433,7 @@ async function main() {
           screenshot: `run-${repeat}.png`, manifest: 'manifest.json' };
         await writeFile(resolve(output, `run-${repeat}.json`), JSON.stringify(report, null, 2) + '\n');
         await writeFile(resolve(output, `run-${repeat}-frames.csv`), csv(result.frameSamples,
-          ['index', 'renderFrame', 'rafDeltaMs', 'cpuSubmitMs', 'ownedGpuBytes', 'drawCalls', 'triangles', 'uploadedBytes']));
+          ['index', 'renderFrame', 'rafDeltaMs', 'cpuSubmitMs', 'ownedGpuBytes', 'drawCalls', 'triangles', 'uploadedBytes', 'eyeX', 'eyeY', 'eyeZ']));
         await writeFile(resolve(output, `run-${repeat}-gpu.csv`), csv(result.gpuSamples,
           ['renderFrame', ...passes, 'fullGpuMs']));
         runs.push({ repeat, metrics, adapter: result.final.adapter, cleanup });

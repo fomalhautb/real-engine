@@ -17,7 +17,7 @@
 
 阶段 2 已建立离线几何簇层级、简化与压缩分页，并接入全部驻留的 GPU LOD、视锥剔除、间接绘制和分簇颜色演示；共享形变的世界空间查询供有界漫反射 GI 使用，另有可选的跨帧多次反弹反馈与实验性 Final Gather。页面流送、遮挡剔除、完整 GI、镜面反射和参与介质仍待实现，路线图中的目标规模与性能门槛仍待验证。当前形变和材质编译器均有明确上限；没有法线贴图、多层材质或透射。阶段 2 后期将通过大规模完整场景联合验收画质和性能；现有小模型用于正确性验证及有限场景的性能基线。完整边界与后续工作见 [实现状态](docs/implementation.md)。
 
-本次画质工作提供代码配置的阴影范围/分辨率、单帧 FXAA、共享形变/材质/遮挡的发光面主动采样，以及可选的实验性 Final Gather。旧地面六点远场参考平均误差由约 8.0% 降至 5.6%，但使用 3 cm 射线起点偏移，不能证明接触区正确。在独立 4096 路径、最多 12 段、0.1 mm 起点偏移的接触区参考中，开启 Final Gather 后五个可比较像素的平均 RGB 相对误差由 52.18% 降至 11.29%，最差仍为 30.77%，尚未达到目标的平均 10% / 单项 20% 门槛。1 cm 目标位置对应的像素命中白块，不参与地面 HDR 对比。最新本地检查通过 250 项 CPU 与 47 项原生 NVIDIA 浏览器回归；接口、数值及性能范围见 [实现状态](docs/implementation.md)。
+本次画质工作提供代码配置的阴影范围/分辨率、单帧 FXAA、共享形变/材质/遮挡的发光面主动采样，以及可选的实验性 Final Gather。旧地面六点远场参考平均误差由约 8.0% 降至 5.6%，但使用 3 cm 射线起点偏移，不能证明接触区正确。在独立 4096 路径、最多 12 段、0.1 mm 起点偏移的接触区参考中，开启 Final Gather 后五个可比较像素的平均 RGB 相对误差由 52.18% 降至 11.29%，最差仍为 30.77%，尚未达到目标的平均 10% / 单项 20% 门槛。1 cm 目标位置对应的像素命中白块，不参与地面 HDR 对比。最新本地检查通过 250 项 CPU 与 50 项原生 NVIDIA 浏览器回归；接口、数值及性能范围见 [实现状态](docs/implementation.md)。
 
 ## 本地运行
 
@@ -36,7 +36,7 @@ npm run dev
 
 `/gi.html` 展示世界空间漫反射 GI：红蓝墙面和发光条通过真实场景查询照亮白色物体，可切换单次/跨帧多次反弹（演示默认多次）、开关 GI、改变墙色及太阳参数、暂停逐帧、按 H 隐藏面板。引擎的 `diffuseGi.multiBounce` 默认 `false`，运行时用 `setDiffuseGiMultiBounce(boolean)` 切换，`invalidateDiffuseGiHistory()` 可显式丢弃旧反馈。探针使用 8×8 八面体方向距离矩和低置信度平滑权重；`visibilityWeightThreshold` 默认 0.2、设 0 可关闭额外曲线。固定网格仍每帧全量更新；无镜面反弹、时域平均、自动布点或探针流送。关闭 GI 时没有旧常量环境补光。
 
-`/gi.html?finalGather=1` 额外开启实验性 Final Gather 预览，起始为固定镜头，持续渲染以积累近场样本；常规 `/gi.html` 保持世界探针路径。代码可通过 `DiffuseGiOptions.finalGather` 配置，并用 `setDiffuseGiFinalGatherEnabled(boolean)` 单独启停；移动镜头会重置其历史。此预览的近场误差和帧间隔仍有未通过门槛，见 [实现状态](docs/implementation.md#实验性屏幕-final-gather)。
+`/gi.html?finalGather=1` 额外开启实验性 Final Gather 预览，起始为固定镜头，持续渲染以积累近场样本；常规 `/gi.html` 保持世界探针路径。代码可通过 `DiffuseGiOptions.finalGather` 配置，并用 `setDiffuseGiFinalGatherEnabled(boolean)` 单独启停。普通镜头运动可将前帧原始锚点重投影；切镜头、动态几何或光照/材质突变仍保守地整体重置。此预览的近场误差和帧间隔仍有未通过门槛，见 [实现状态](docs/implementation.md#实验性屏幕-final-gather)。
 
 ```sh
 npm run check
@@ -103,6 +103,8 @@ node scripts/benchmark-demo.mjs --page geometry --channel msedge --warmup 300 --
 ```
 
 演示基准在首帧前关闭低频诊断读回、重置相机轨迹，并使用独立生产构建和固定场景；GI 与几何结果不能直接相减解释单个 pass 的代价。预期厂商会对照 Renderer 实际使用的 adapter 检查。当前 8×8 GI 的证据在 `artifacts/benchmarks/local-gi-directional-nvidia-20261014`，旧六方向版本在 `local-gi-nvidia-20261014-v3`，两者源码/构建指纹不同。输出目录必须是 `artifacts/` 下尚不存在的路径。
+
+GI 演示基准可用 `--final-gather --camera orbit` 测量实验路径的确定性慢速镜头运动；`--camera fixed` 为默认，`orbit` 仅用于 `--page gi`。报告逐帧保存实际相机位置。当前 orbit 证据在 `artifacts/benchmarks/local-final-gather-camera-final-20261014`；其最差一次 rAF p95 为 20.9 ms，不能视为 60 FPS 达标。
 
 结果保存在 `artifacts/benchmarks/`，包含源码/生产构建哈希、环境清单、逐帧 CSV、统计 JSON、截图和运行期间的内存观察。生产构建复制到独立目录，后续开发不会改变正在测量的版本。rAF 间隔表示浏览器回调节奏，GPU 时间是稀疏异步样本；两者均不等于显示器实际呈现时间。基础压力场景的长测证据在 `artifacts/benchmarks/local-stability-nvidia-20261014`，测得 1,800,000.2 ms、167,349 帧、92 个完整事件循环、无应用 GPU 账本增长或错误且释放归零；rAF p95 34.8 ms、p99 62.5 ms，10,401 帧（6.215%）超过初始预算。压力序列切换 1080p/810p，运行中有少量短 CPU 测试；这不代表固定 1080p、严格无干扰性能认证或大型 GI/LOD/镜面反射/体积雾联合长测。完整协议与边界见 [实现状态](docs/implementation.md#基准运行器与首轮证据)。
 

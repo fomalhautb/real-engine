@@ -1,12 +1,13 @@
 // GI_COMMON
 struct FinalGatherParameters {
     inverseViewProjection: mat4x4f,
+    previousViewProjection: mat4x4f,
     eye: vec4f,
     viewport: vec4u, // width, height, columns, rows
     settings: vec4u, // actual spacing, anchors, rays per anchor, maximum history
     state: vec4u, // frame, enabled, reset history, multiple diffuse bounces
     sampling: vec4f, // independent normal bias, reserved, plane tolerance, maximum filter distance
-    emissive: vec4u, // active source prefix, area query count, reserved
+    emissive: vec4u, // active source prefix, area query count, material revision, camera moving
 }
 struct FinalGatherAnchor {
     position: vec4f,
@@ -239,15 +240,59 @@ fn integrateArea(@builtin(global_invocation_id) id: vec3u) {
 fn accumulate(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= gather.settings.y) { return; }
     var current = anchors[id.x];
-    let previous = oldAnchors[id.x];
-    let historyMatches = gather.state.z == 0u && current.state.x != 0u && previous.state.x != 0u
-        && previous.state.y + 1u == gather.state.x && all(current.identity == previous.identity)
-        && all(current.versions.yzw == previous.versions.yzw)
-        && dot(current.normal.xyz, previous.normal.xyz) > 0.9999
-        && distance(current.position.xyz, previous.position.xyz) < 0.0001;
-    if (historyMatches) {
-        let count = min(previous.irradiance.w + 1.0, f32(gather.settings.w));
-        current.irradiance = vec4f(mix(previous.irradiance.xyz, current.irradiance.xyz, 1.0 / count), count);
+    if (gather.emissive.w == 0u) {
+        // Preserve the stationary estimator exactly, including its strict
+        // triangle identity and 0.1 mm positional checks.
+        let previous = oldAnchors[id.x];
+        let historyMatches = gather.state.z == 0u && current.state.x != 0u && previous.state.x != 0u
+            && previous.state.y + 1u == gather.state.x && all(current.identity == previous.identity)
+            && all(current.versions.yzw == previous.versions.yzw)
+            && dot(current.normal.xyz, previous.normal.xyz) > 0.9999
+            && distance(current.position.xyz, previous.position.xyz) < 0.0001;
+        if (historyMatches) {
+            let count = min(previous.irradiance.w + 1.0, f32(gather.settings.w));
+            current.irradiance = vec4f(mix(previous.irradiance.xyz, current.irradiance.xyz, 1.0 / count), count);
+        }
+        anchors[id.x] = current;
+        return;
+    }
+    if (gather.state.z != 0u || current.state.x == 0u) { return; }
+    let previousPosition = cameraHits[id.x].previous.xyz;
+    let clip = gather.previousViewProjection * vec4f(previousPosition, 1.0);
+    if (!(clip.w > 0.0 && clip.w <= 1e30)) { return; }
+    let ndc = clip.xyz / clip.w;
+    if (!all(ndc >= vec3f(-1.0, -1.0, 0.0)) || !all(ndc <= vec3f(1.0))) { return; }
+    let pixel = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(gather.viewport.xy);
+    if (any(pixel < vec2f(0.0)) || any(pixel >= vec2f(gather.viewport.xy))) { return; }
+    let pixelOffset = f32(gather.settings.x / 2u) + 0.5;
+    let lower = vec2i(floor((pixel - pixelOffset) / f32(gather.settings.x)));
+    let lowerPixel = min(vec2f(lower) * f32(gather.settings.x) + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
+    let upperPixel = min(vec2f(lower + vec2i(1)) * f32(gather.settings.x) + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
+    let fraction = clamp((pixel - lowerPixel) / max(upperPixel - lowerPixel, vec2f(1.0)), vec2f(0.0), vec2f(1.0));
+    var sum = vec3f(0.0);
+    var total = 0.0;
+    var history = 0.0;
+    for (var corner = 0u; corner < 4u; corner++) {
+        let offset = vec2i(i32(corner & 1u), i32((corner >> 1u) & 1u));
+        let coordinate = lower + offset;
+        if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(gather.viewport.zw))) { continue; }
+        let previous = oldAnchors[u32(coordinate.x) + u32(coordinate.y) * gather.viewport.z];
+        if (previous.state.x == 0u || previous.state.y + 1u != gather.state.x
+            || !all(previous.identity.xyz == current.identity.xyz)
+            || !all(previous.versions.yzw == current.versions.yzw)
+            || dot(previous.normal.xyz, current.normal.xyz) <= 0.98) { continue; }
+        let delta = previous.position.xyz - previousPosition;
+        if (length(delta) > 0.10 || abs(dot(delta, current.normal.xyz)) > 0.001
+            || abs(dot(delta, previous.normal.xyz)) > 0.001) { continue; }
+        let axisWeights = select(vec2f(1.0) - fraction, fraction, offset == vec2i(1));
+        let weight = axisWeights.x * axisWeights.y;
+        sum += previous.irradiance.xyz * weight;
+        history += previous.irradiance.w * weight;
+        total += weight;
+    }
+    if (total > 0.00000001) {
+        let count = min(history / total + 1.0, f32(min(gather.settings.w, 8u)));
+        current.irradiance = vec4f(mix(sum / total, current.irradiance.xyz, 1.0 / count), count);
     }
     anchors[id.x] = current;
 }

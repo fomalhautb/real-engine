@@ -12,7 +12,7 @@ const dist = resolve(root, 'dist');
 const artifacts = resolve(root, 'artifacts');
 const stamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
 const defaults = { page: 'gi', channel: 'chrome', warmup: 60, frames: 300, repeat: 1,
-  width: 1280, height: 720, highPerformanceGpu: false, expectVendor: null, parseOnly: false,
+  width: 1280, height: 720, highPerformanceGpu: false, expectVendor: null, parseOnly: false, finalGather: false,
   out: resolve(artifacts, 'benchmarks', `demo-${stamp}`) };
 const bounds = { warmup: [0, 10_000], frames: [30, 36_000], repeat: [1, 3],
   width: [320, 3840], height: [240, 2160] };
@@ -22,6 +22,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
     if (key === '--high-performance-gpu') { options.highPerformanceGpu = true; continue; }
+    if (key === '--final-gather') { options.finalGather = true; continue; }
     if (key === '--parse-only') { options.parseOnly = true; continue; }
     if (!['--page', '--channel', '--warmup', '--frames', '--repeat', '--width', '--height', '--out', '--expect-vendor'].includes(key)) {
       throw new Error(`Unknown benchmark argument: ${key}`);
@@ -32,6 +33,7 @@ function parseArgs(argv) {
     options[name] = name in bounds ? Number(raw) : raw;
   }
   if (!['gi', 'geometry'].includes(options.page)) throw new Error('--page must be gi or geometry');
+  if (options.finalGather && options.page !== 'gi') throw new Error('--final-gather requires --page gi');
   if (!['msedge', 'chrome', 'chromium'].includes(options.channel)) throw new Error('--channel must be msedge, chrome, or chromium');
   if (options.expectVendor !== null && !/^[a-z][a-z0-9-]{0,31}$/.test(options.expectVendor)) {
     throw new Error('--expect-vendor must be an exact lowercase vendor token (1..32 characters)');
@@ -192,7 +194,7 @@ async function measureDemo({ pageName, warmup, frames, width, height, expectVend
     if (stats.gpuSampleFrame <= result.warmupLastRenderFrame ||
         stats.gpuSampleFrame > result.lastRenderFrame || !stats.gpuMs) return;
     const values = { ...stats.gpuMs };
-    const passNames = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi'];
+    const passNames = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi', 'finalGather'];
     if (passNames.some(name => !Number.isFinite(values[name]) || values[name] < 0)) throw new Error('INVALID_GPU_TIMING');
     result.gpuSamples.push({ renderFrame: stats.gpuSampleFrame, ...values,
       fullGpuMs: passNames.reduce((total, name) => total + values[name], 0) });
@@ -310,7 +312,7 @@ async function main() {
       });
       page.on('crash', () => pageErrors.push('page crashed'));
       try {
-        await page.goto(`http://127.0.0.1:${server.address().port}/${options.page}.html?benchmark=1`);
+        await page.goto(`http://127.0.0.1:${server.address().port}/${options.page}.html?benchmark=1${options.finalGather ? '&finalGather=1' : ''}`);
         const harness = options.page === 'gi' ? '__GI_DEMO__' : '__GEOMETRY_DEMO__';
         await page.waitForFunction(name => Boolean(window[name]?.renderer), harness, { timeout: 120_000 });
         const firstSnapshot = await page.evaluate(name => window[name].snapshot(), harness);
@@ -349,7 +351,7 @@ async function main() {
           expectedCamera: referenceCamera,
         }), timeoutMs, `BENCHMARK_RUN_${repeat}`);
         if (pageErrors.length) throw new Error('BENCHMARK_PAGE_ERROR: ' + JSON.stringify(pageErrors));
-        const passes = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi'];
+        const passes = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi', 'finalGather'];
         const metrics = { cpuSubmitMs: summary(result.frameSamples.map(row => row.cpuSubmitMs)),
           rafDeltaMs: summary(result.frameSamples.map(row => row.rafDeltaMs).filter(value => value !== null)),
           fullGpuMs: summary(result.gpuSamples.map(row => row.fullGpuMs)),

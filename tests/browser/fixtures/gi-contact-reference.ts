@@ -134,7 +134,7 @@ function cameraSample(world: Vec3, width: number, height: number) {
   return { world, ndc, pixel, ray: { origin: eye,
     direction: unit(plus(plus(forward, right, x), up, y)) } satisfies WorldRay };
 }
-export async function runGiContactReferenceFixture() {
+export async function runGiContactReferenceFixture(options: { finalGather?: boolean } = {}) {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = 'position:fixed;left:0;top:0;width:1280px;height:720px;';
   document.body.appendChild(canvas);
@@ -142,12 +142,16 @@ export async function runGiContactReferenceFixture() {
   let renderer: Renderer | undefined;
   try {
     renderer = await Renderer.create(canvas, scene.batches, {
-      diffuseGi: GI_PROBE_GRID, worldQueries: { maxRays: 32768 }, antiAliasing: 'fxaa',
+      diffuseGi: options.finalGather ? { ...GI_PROBE_GRID, maxBytes: 64 * 1024 * 1024,
+        finalGather: { pixelSpacing: 4, raysPerAnchor: 1, maxAnchors: 65536,
+          maxHistory: 256, maxBytes: 64 * 1024 * 1024 } } : GI_PROBE_GRID,
+      worldQueries: { maxRays: options.finalGather ? 65536 : 32768 }, antiAliasing: 'fxaa',
       sunShadow: { resolution: 2048,
         focusBounds: { min: [-3.5, -0.25, -4], max: [3.5, 4, 4] },
         maxBytes: 16 * 1024 * 1024 },
     });
     renderer.setSun({ direction: sunDirection, color: sunColor });
+    if (options.finalGather) renderer.setDiffuseGiFinalGatherEnabled(false);
     renderer.setDiffuseGiEnabled(false);
     renderer.render(eye, target);
     const requested = distances.map(distance => [block.center[0], 0, block.frontZ + distance] as Vec3);
@@ -173,6 +177,17 @@ export async function runGiContactReferenceFixture() {
     renderer.setDiffuseGiMultiBounce(true);
     let multi = await capture();
     for (let i = 1; i < 12; i++) multi = await capture(i === 11);
+    let gather: { single: Awaited<ReturnType<typeof capture>>; multi: Awaited<ReturnType<typeof capture>> } | null = null;
+    if (options.finalGather) {
+      renderer.setDiffuseGiFinalGatherEnabled(true);
+      renderer.setDiffuseGiMultiBounce(false);
+      for (let i = 0; i < 256; i++) renderer.render(eye, target);
+      const gatheredSingle = await capture();
+      renderer.setDiffuseGiMultiBounce(true);
+      for (let i = 0; i < 320; i++) renderer.render(eye, target);
+      const gatheredMulti = await capture(true);
+      gather = { single: gatheredSingle, multi: gatheredMulti };
+    }
     const reference: Awaited<ReturnType<typeof traceReference>> = [];
     for (let start = 0; start < floorHits.length; start += 2) reference.push(
       ...await traceReference(renderer, floorHits.slice(start, start + 2), start, primaryBias, bounces));
@@ -210,7 +225,7 @@ export async function runGiContactReferenceFixture() {
             value - floorHits[index].position[axis])) : null,
         pixelReference: pixelReferenceByIndex.get(index) ?? null,
         reference: reference[index] })),
-      biasChecks, cases: { off, single, multi }, errors: [...renderer.errors] };
+      biasChecks, cases: { off, single, multi }, gather, errors: [...renderer.errors] };
     renderer.dispose();
     return { ...result, afterDispose: renderer.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }

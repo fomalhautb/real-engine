@@ -1,5 +1,6 @@
 /** CPU contracts and numerical reference for a bounded diffuse probe grid. */
 import { GI_DISTANCE_CELLS } from './gi-visibility';
+import { resolveFinalGatherOptions, type FinalGatherOptions, type ResolvedFinalGatherOptions } from './final-gather';
 export interface DiffuseGiOptions {
   origin: readonly [number, number, number];
   spacing: readonly [number, number, number];
@@ -15,6 +16,8 @@ export interface DiffuseGiOptions {
   /** Smoothly suppress low-confidence visibility weights; 0 disables the curve. */
   visibilityWeightThreshold?: number;
   maxBytes?: number;
+  /** Optional bounded first-segment queries at visible surfaces, ahead of the world probe cache. */
+  finalGather?: FinalGatherOptions;
 }
 
 export interface ResolvedDiffuseGiOptions {
@@ -31,6 +34,7 @@ export interface ResolvedDiffuseGiOptions {
   readonly maxBytes: number;
   readonly probeCount: number;
   readonly rayCount: number;
+  readonly finalGather?: ResolvedFinalGatherOptions;
 }
 
 /** 9 RGB SH vec4s, one depth-moment vec4 per octahedral cell, and 1 metadata vec4. */
@@ -110,8 +114,9 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
     throw new RangeError('DIFFUSE_GI_OPTIONS');
   }
   if (probeCount * DIFFUSE_GI_PROBE_BYTES > maxBytes) throw new RangeError('DIFFUSE_GI_MEMORY_BUDGET');
+  const finalGather = options.finalGather === undefined ? undefined : resolveFinalGatherOptions(options.finalGather);
   return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias,
-    skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, maxBytes, probeCount, rayCount });
+    skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, maxBytes, probeCount, rayCount, finalGather });
 }
 
 /** Deterministic Fibonacci-sphere direction; rayIndex is zero based. */

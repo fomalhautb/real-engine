@@ -10,7 +10,7 @@ import { compileRenderGraph } from './render-graph';
 import { GpuWorldQuery } from './gpu-world-query';
 import type { WorldQueryOptions, WorldRay, WorldQueryResult } from './world-query';
 import { GpuGeometryLod, type GeometryLodBinding, type GeometryLodSettings, type GeometryLodProbe } from './gpu-geometry-lod';
-import { GpuDiffuseGi, diffuseGiSampleSource, type DiffuseGiProbeResult } from './gpu-diffuse-gi';
+import { GpuDiffuseGi, diffuseGiSampleSource, diffuseGiFinalGatherSampleSource, type DiffuseGiProbeResult } from './gpu-diffuse-gi';
 import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
 import { resolveSunShadowOptions, sunShadowProjection, type SunShadowOptions, type ResolvedSunShadowOptions } from './sun-shadow';
 
@@ -34,7 +34,7 @@ export interface FrameStats {
   /** triangles is source instance-expanded geometry; use probeGeometryLod for actual selected triangles. */
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
-  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number } | null;
+  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number } | null;
   /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
   gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
@@ -129,6 +129,9 @@ export class Renderer {
       if (gi.emissiveSamplesPerProbe && (options.worldQueries.maxTraceParameterSetsPerEncoder ?? 8) < 2) {
         throw new Error('DIFFUSE_GI_QUERY_PARAMETER_BUDGET');
       }
+      if (gi.finalGather && (options.worldQueries.maxTraceParameterSetsPerEncoder ?? 8) < 6) {
+        throw new Error('FINAL_GATHER_QUERY_PARAMETER_BUDGET');
+      }
     }
     if (!navigator.gpu) throw new Error('WEBGPU_UNAVAILABLE: use a WebGPU browser on HTTPS or localhost.');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
@@ -180,7 +183,8 @@ export class Renderer {
     this.materialVariantLimit = options.materialVariantLimit ?? 128;
     this.worldQueryOptions = options.worldQueries;
     this.diffuseGiOptions = options.diffuseGi && resolveDiffuseGiOptions(options.diffuseGi);
-    this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0);
+    this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0)
+      + (this.diffuseGiOptions?.finalGather ? 2 : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -282,6 +286,7 @@ export class Renderer {
       ...(this.geometryLod ? [{ name: 'selected-geometry', kind: 'buffer' as const, source: 'transient' as const }] : []),
       ...(this.diffuseGi ? [{ name: 'diffuse-gi-probes', kind: 'buffer' as const, source: 'imported' as const },
         { name: 'world-query-scratch', kind: 'buffer' as const, source: 'imported' as const }] : []),
+      ...(this.diffuseGiOptions?.finalGather ? [{ name: 'final-gather-anchors', kind: 'buffer' as const, source: 'imported' as const }] : []),
       { name: 'sun-shadow', kind: 'texture', source: 'transient' },
       { name: 'canvas', kind: 'texture', source: 'imported' },
       { name: 'scene-hdr', kind: 'texture', source: 'transient' },
@@ -306,10 +311,21 @@ export class Renderer {
         this.stats.uploadedBytes += this.diffuseGi!.encode(encoder, this.stats.frames + 1, this.materialRevision,
           this.timestamp(10 + (this.geometryLod ? 2 : 0)));
       } }] : []),
+      ...(this.diffuseGiOptions?.finalGather ? [{ name: 'final-gather', uses: [
+        { resource: 'world-query-bounds', access: 'read' as const },
+        { resource: 'shared-geometry', access: 'read' as const },
+        { resource: 'world-query-scratch', access: 'readWrite' as const },
+        { resource: 'diffuse-gi-probes', access: 'read' as const },
+        { resource: 'final-gather-anchors', access: 'readWrite' as const },
+      ], execute: (encoder: GPUCommandEncoder) => {
+        this.stats.uploadedBytes += this.diffuseGi!.encodeFinalGather(encoder, this.materialRevision,
+          this.timestamp(12 + (this.geometryLod ? 2 : 0)));
+      } }] : []),
       { name: 'shadow', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'write' }], execute: encoder => this.encodeShadow(encoder) },
       { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' },
         ...(this.geometryLod ? [{ resource: 'selected-geometry', access: 'read' as const }] : []),
         ...(this.diffuseGi ? [{ resource: 'diffuse-gi-probes', access: 'read' as const }] : []),
+        ...(this.diffuseGiOptions?.finalGather ? [{ resource: 'final-gather-anchors', access: 'read' as const }] : []),
         { resource: 'scene-hdr', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
       { name: 'resolve', uses: [{ resource: 'scene-hdr', access: 'read' }, { resource: 'canvas', access: 'write' }], execute: encoder => this.encodeResolve(encoder) },
     ]);
@@ -328,9 +344,12 @@ export class Renderer {
         }
         this.compilingMaterials.add(program.key);
         pending = (async () => {
-          const module = await this.shader(surfaceSource.replace('// DIFFUSE_GI_PROGRAM', this.diffuseGi ? diffuseGiSampleSource : '')
+          const module = await this.shader(surfaceSource.replace('// DIFFUSE_GI_PROGRAM', this.diffuseGi
+            ? this.diffuseGiOptions?.finalGather ? diffuseGiFinalGatherSampleSource : diffuseGiSampleSource : '')
             .replace('// INDIRECT_LIGHTING', this.diffuseGi
-              ? 'let ambient = diffuseGiIrradiance(input.world, n) * base * (1.0 - metalness) * (0.96 / 3.14159265);'
+              ? this.diffuseGiOptions?.finalGather
+                ? 'let ambient = finalGatherIrradiance(input.position.xy, input.world, n) * base * (1.0 - metalness) * (0.96 / 3.14159265);'
+                : 'let ambient = diffuseGiIrradiance(input.world, n) * base * (1.0 - metalness) * (0.96 / 3.14159265);'
               : 'let ambient = base * (0.045 + 0.065 * max(n.y, 0.0)) * (1.0 - metalness * 0.6);')
             .replace('// MATERIAL_PROGRAM',
             `const MATERIAL_UNLIT = ${program.shading === 'unlit'};\n` + program.wgsl), 'material');
@@ -424,6 +443,12 @@ export class Renderer {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
     this.diffuseGi.setMultiBounce(enabled);
+  }
+  /** Toggle configured surface gathering; disabled gathering uses the world probe field. */
+  setDiffuseGiFinalGatherEnabled(enabled: boolean): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    this.diffuseGi.setFinalGatherEnabled(enabled);
   }
   /** Explicit reset for discontinuities outside the scene/material identity contracts. */
   invalidateDiffuseGiHistory(): void {
@@ -664,6 +689,8 @@ export class Renderer {
     this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
     this.stats.uploadedBytes += this.diffuseGi?.update(this.stats.frames + 1, this.sunDirection, this.sunColor,
       this.materialRevision, this.worldQueries!.historyRevision) ?? 0;
+    this.stats.uploadedBytes += this.diffuseGi?.updateFinalGather(this.stats.frames + 1, this.stats.width, this.stats.height,
+      eye, vp, this.lastViewProjection, this.batches.some(batch => batch.dirty), this.materialRevision) ?? 0;
     this.lastViewProjection = vp;
     const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → HDR surface → resolve' });
     this.graph.execute(encoder);
@@ -767,7 +794,8 @@ export class Renderer {
         resolve: Number(values[7] - values[6]) / 1e6,
         worldQueryRefit: this.worldQueries ? Number(values[9] - values[8]) / 1e6 : 0,
         geometryLod: this.geometryLod ? Number(values[this.worldQueries ? 11 : 9] - values[this.worldQueries ? 10 : 8]) / 1e6 : 0,
-        diffuseGi: this.diffuseGi ? Number(values[this.geometryLod ? 13 : 11] - values[this.geometryLod ? 12 : 10]) / 1e6 : 0 };
+        diffuseGi: this.diffuseGi ? Number(values[this.geometryLod ? 13 : 11] - values[this.geometryLod ? 12 : 10]) / 1e6 : 0,
+        finalGather: this.diffuseGiOptions?.finalGather ? Number(values[this.geometryLod ? 15 : 13] - values[this.geometryLod ? 14 : 12]) / 1e6 : 0 };
       this.stats.gpuSampleFrame = frame;
       this.queryRead!.unmap();
     } catch (error) { if (!this.disposed) this.errors.push('TIMESTAMP_READBACK: ' + String(error)); }

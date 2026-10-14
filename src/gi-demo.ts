@@ -22,6 +22,7 @@ const app = element<HTMLDivElement>('gi-app');
 const canvas = element<HTMLCanvasElement>('viewport');
 const events = new AbortController();
 const benchmarkMode = new URLSearchParams(location.search).get('benchmark') === '1';
+const finalGatherPreview = new URLSearchParams(location.search).get('finalGather') === '1';
 const exportUrls = new Set<string>();
 const exportTimers = new Set<number>();
 let renderer: Renderer | undefined;
@@ -36,7 +37,7 @@ let phase = 0;
 let yaw = 0.18;
 let elevation = 0.21;
 let distance = 8.7;
-let manualCamera = false;
+let manualCamera = finalGatherPreview && !benchmarkMode;
 let paused = benchmarkMode;
 let giEnabled = true;
 let multiBounce = true;
@@ -143,6 +144,7 @@ function snapshot() {
     page: 'diffuse-gi-demo', scope: {
       transport: 'diffuse-only', probePlacement: 'fixed-manual-grid',
       multiBounce,
+      surfaceFinalGather: finalGatherPreview,
       feedback: multiBounce ? 'previous-completed-probe-SH' : 'none',
       temporalFiltering: false, ambientFallback: false,
     },
@@ -311,7 +313,11 @@ async function start(): Promise<void> {
   scene = createGiDemoScene();
   const rayBudget = GI_PROBE_GRID.counts.reduce((a, b) => a * b, 1) * GI_PROBE_GRID.raysPerProbe;
   element('probe-budget').textContent = `${GI_PROBE_GRID.counts.reduce((a, b) => a * b, 1)} 个固定探针，每颗 ${GI_PROBE_GRID.raysPerProbe} 条方向光线＋${GI_PROBE_GRID.emissiveSamplesPerProbe} 个发光面样本`;
-  const options: RendererOptions = { diffuseGi: GI_PROBE_GRID, worldQueries: { maxRays: rayBudget }, antiAliasing: 'fxaa',
+  const options: RendererOptions = { diffuseGi: finalGatherPreview ? { ...GI_PROBE_GRID,
+    maxBytes: 64 * 1024 * 1024,
+    finalGather: { pixelSpacing: 4, maxAnchors: 65536, raysPerAnchor: 1, maxHistory: 256,
+      maxBytes: 64 * 1024 * 1024 } } : GI_PROBE_GRID,
+    worldQueries: { maxRays: finalGatherPreview ? 65536 : rayBudget }, antiAliasing: 'fxaa',
     sunShadow: { resolution: 2048, focusBounds: { min: [-3.5, -0.25, -4], max: [3.5, 4, 4] },
       maxBytes: 16 * 1024 * 1024 } };
   const created = await Renderer.create(canvas, scene.batches, options);

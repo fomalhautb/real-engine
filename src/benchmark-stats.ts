@@ -24,6 +24,7 @@ export interface BenchmarkGpuSample {
   worldQueryRefit?: number;
   geometryLod?: number;
   diffuseGi?: number;
+  finalGather?: number;
 }
 
 export interface BenchmarkQuantiles {
@@ -67,6 +68,7 @@ export interface BenchmarkSummary {
     worldQueryRefit: BenchmarkQuantiles | null;
     geometryLod: BenchmarkQuantiles | null;
     diffuseGi: BenchmarkQuantiles | null;
+    finalGather: BenchmarkQuantiles | null;
     total: BenchmarkQuantiles | null;
   };
   ownedGpuBytes: BenchmarkMemorySummary | null;
@@ -79,7 +81,7 @@ export interface BenchmarkSummary {
 }
 
 const CHUNK_FRAMES = 4096;
-const STRIDE = 19;
+const STRIDE = 20;
 const FIELD = Object.freeze({
   frame: 0,
   elapsedMs: 1,
@@ -99,7 +101,8 @@ const FIELD = Object.freeze({
   gpuWorldQueryRefit: 15,
   gpuGeometryLod: 16,
   gpuDiffuseGi: 17,
-  gpuTotal: 18,
+  gpuFinalGather: 18,
+  gpuTotal: 19,
 });
 type Field = (typeof FIELD)[keyof typeof FIELD];
 
@@ -201,7 +204,8 @@ export class BenchmarkRecorder {
     this.set(index, FIELD.deformedVertices, frame.deformedVertices);
     this.set(index, FIELD.physicsBodies, frame.physicsBodies);
     for (const field of [FIELD.gpuDeformation, FIELD.gpuShadow, FIELD.gpuSurface,
-      FIELD.gpuResolve, FIELD.gpuWorldQueryRefit, FIELD.gpuGeometryLod, FIELD.gpuDiffuseGi, FIELD.gpuTotal]) this.set(index, field, NaN);
+      FIELD.gpuResolve, FIELD.gpuWorldQueryRefit, FIELD.gpuGeometryLod, FIELD.gpuDiffuseGi,
+      FIELD.gpuFinalGather, FIELD.gpuTotal]) this.set(index, field, NaN);
     this.uploadedTotal = nextUploadedTotal;
     this.frames++;
   }
@@ -215,8 +219,10 @@ export class BenchmarkRecorder {
     const worldQueryRefit = nonnegative(sample.worldQueryRefit === undefined ? 0 : sample.worldQueryRefit, 'GPU worldQueryRefit');
     const geometryLod = nonnegative(sample.geometryLod === undefined ? 0 : sample.geometryLod, 'GPU geometryLod');
     const diffuseGi = nonnegative(sample.diffuseGi === undefined ? 0 : sample.diffuseGi, 'GPU diffuseGi');
+    const finalGather = nonnegative(sample.finalGather === undefined ? 0 : sample.finalGather, 'GPU finalGather');
     if (sample.frame <= this.lastGpuFrame) throw new RangeError('GPU sample frames must strictly increase');
-    const total = sample.deformation + sample.shadow + sample.surface + resolve + worldQueryRefit + geometryLod + diffuseGi;
+    const total = sample.deformation + sample.shadow + sample.surface + resolve + worldQueryRefit
+      + geometryLod + diffuseGi + finalGather;
     if (!Number.isFinite(total)) throw new RangeError('GPU timing total must be finite');
     let low = 0, high = this.frames - 1;
     while (low <= high) {
@@ -230,6 +236,7 @@ export class BenchmarkRecorder {
         this.set(middle, FIELD.gpuWorldQueryRefit, worldQueryRefit);
         this.set(middle, FIELD.gpuGeometryLod, geometryLod);
         this.set(middle, FIELD.gpuDiffuseGi, diffuseGi);
+        this.set(middle, FIELD.gpuFinalGather, finalGather);
         this.set(middle, FIELD.gpuTotal, total);
         this.lastGpuFrame = sample.frame;
         this.gpuSamples++;
@@ -305,6 +312,7 @@ export class BenchmarkRecorder {
         worldQueryRefit: quantiles(this.values(FIELD.gpuWorldQueryRefit, true)),
         geometryLod: quantiles(this.values(FIELD.gpuGeometryLod, true)),
         diffuseGi: quantiles(this.values(FIELD.gpuDiffuseGi, true)),
+        finalGather: quantiles(this.values(FIELD.gpuFinalGather, true)),
         total: quantiles(this.values(FIELD.gpuTotal, true)),
       },
       ownedGpuBytes: this.memory(),
@@ -318,7 +326,7 @@ export class BenchmarkRecorder {
   }
 
   toCsv(): string {
-    const rows = ['frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuDiffuseGiMs,gpuTotalMs'];
+    const rows = ['frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuTotalMs'];
     for (let index = 0; index < this.frames; index++) {
       const cells = Array.from({ length: STRIDE }, (_, field) => this.get(index, field as Field));
       rows.push(cells.map(value => Number.isNaN(value) ? '' : String(value)).join(','));

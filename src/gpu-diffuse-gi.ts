@@ -9,11 +9,14 @@ import { WORLD_HIT_BYTES } from './world-query';
 import type { GpuWorldQuery } from './gpu-world-query';
 import type { SceneBatch } from './contracts';
 import { GpuGiEmissiveSampler } from './gpu-gi-emissive';
+import { GpuFinalGather, finalGatherSampleSource } from './gpu-final-gather';
+import type { Mat4 } from './math';
 
 const constants = `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`;
 const giCommon = commonSource.replace('// GI_DISTANCE_CONSTANTS', constants);
 const giSource = (source: string) => source.replace('// GI_COMMON', giCommon).replace('// GI_INTERPOLATE', interpolateSource);
 export const diffuseGiSampleSource = giSource(sampleSource);
+export const diffuseGiFinalGatherSampleSource = diffuseGiSampleSource + '\n' + finalGatherSampleSource;
 export interface DiffuseGiProbeResult {
   frame: number;
   invalidProbes: number;
@@ -30,7 +33,7 @@ export class GpuDiffuseGi {
   private primary!: GPUBuffer;
   private distanceWeights!: GPUBuffer;
   private probeBuffers!: [GPUBuffer, GPUBuffer];
-  private surfaceGroups!: GPUBindGroup[];
+  private surfaceGroups!: GPUBindGroup[][];
   private currentIndex = 1;
   private readback!: GPUBuffer;
   private computeLayout!: GPUBindGroupLayout;
@@ -51,8 +54,10 @@ export class GpuDiffuseGi {
   private resetRequested: string | null = 'initial';
   private previousDependencies?: { material: number; scene: number; sun: number[] };
   private emissiveSampler?: GpuGiEmissiveSampler;
+  private finalGather?: GpuFinalGather;
+  private finalGatherEnabled = true;
 
-  get surfaceGroup(): GPUBindGroup { return this.surfaceGroups[this.currentIndex]; }
+  get surfaceGroup(): GPUBindGroup { return this.surfaceGroups[this.currentIndex][this.finalGather?.currentIndex ?? 0]; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: DiffuseGiOptions,
     account: (bytes: number) => void): Promise<GpuDiffuseGi> {
@@ -61,6 +66,9 @@ export class GpuDiffuseGi {
     if (resolved.rayCount > queries.options.maxRays) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
     if (resolved.emissiveSamplesPerProbe && queries.options.maxTraceParameterSetsPerEncoder < 2) {
       throw new Error('DIFFUSE_GI_QUERY_PARAMETER_BUDGET');
+    }
+    if (resolved.finalGather && queries.options.maxTraceParameterSetsPerEncoder < 6) {
+      throw new Error('FINAL_GATHER_QUERY_PARAMETER_BUDGET');
     }
     if (resolved.rayCount > queries.options.maxTotalWorkUnits) throw new Error('DIFFUSE_GI_QUERY_WORK_BUDGET');
     const sizes = [112, resolved.rayCount * WORLD_HIT_BYTES, resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
@@ -101,10 +109,11 @@ export class GpuDiffuseGi {
     const surfaceLayout = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+      ...(options.finalGather ? [
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' as const } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' as const } },
+      ] : []),
     ] });
-    this.surfaceGroups = this.probeBuffers.map(buffer => device.createBindGroup({ layout: surfaceLayout, entries: [
-      { binding: 0, resource: { buffer: this.parameters } }, { binding: 1, resource: { buffer } },
-    ] }));
     Object.assign(this, { surfaceLayout });
   }
   private buffer(label: string, size: number, usage: GPUBufferUsageFlags): GPUBuffer {
@@ -129,13 +138,43 @@ export class GpuDiffuseGi {
         }, this.options.maxBytes - this.bytes);
       this.checkMemoryBudget();
     }
+    if (this.options.finalGather) {
+      this.finalGather = await GpuFinalGather.create(this.device, this.queries, this.parameters,
+        this.probeBuffers, this.options.finalGather, bytes => { this.bytes += bytes; this.account(bytes); },
+        this.options.maxBytes - this.bytes);
+      this.checkMemoryBudget();
+    }
+    this.surfaceGroups = this.probeBuffers.map(buffer => (this.finalGather?.outputBuffers ?? [undefined]).map(anchors =>
+      this.device.createBindGroup({ layout: this.surfaceLayout, entries: [
+        { binding: 0, resource: { buffer: this.parameters } }, { binding: 1, resource: { buffer } },
+        ...(anchors ? [{ binding: 2, resource: { buffer: this.finalGather!.surfaceParameters } },
+          { binding: 3, resource: { buffer: anchors } }] : []),
+      ] })));
   }
   private checkMemoryBudget(): void {
     if (this.bytes > this.options.maxBytes) throw new Error('DIFFUSE_GI_MEMORY_BUDGET');
   }
   registerEmissiveBatch(scene: SceneBatch, output: GPUBuffer, sourceId: number): void {
     this.emissiveSampler?.addBatch(scene, output, sourceId);
+    this.finalGather?.registerBatch(scene, output, sourceId);
     this.checkMemoryBudget();
+  }
+  updateFinalGather(frame: number, width: number, height: number, eye: readonly [number, number, number],
+    viewProjection: Mat4, previousViewProjection: Mat4 | undefined, geometryChanged: boolean,
+    materialRevision: number): number {
+    return this.finalGather?.update({ frame, width, height, eye, viewProjection, previousViewProjection,
+      reset: geometryChanged || this.historyUpdates === 0, enabled: this.enabled && this.finalGatherEnabled,
+      multiBounce: this.multiBounce, materialRevision }) ?? 0;
+  }
+  encodeFinalGather(encoder: GPUCommandEncoder, materialRevision: number,
+    timing?: GPUComputePassTimestampWrites): number {
+    return this.finalGather?.encode(encoder, materialRevision, this.currentIndex, timing) ?? 0;
+  }
+  setFinalGatherEnabled(enabled: boolean): void {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    if (!this.finalGather) throw new Error('FINAL_GATHER_UNCONFIGURED');
+    if (typeof enabled !== 'boolean') throw new Error('FINAL_GATHER_INVALID_ENABLED');
+    this.finalGatherEnabled = enabled;
   }
   setEnabled(enabled: boolean): void {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
@@ -236,6 +275,7 @@ export class GpuDiffuseGi {
   }
   diagnostics() {
     const emissive = this.emissiveSampler?.diagnostics();
+    const gather = this.finalGather?.diagnostics();
     return { enabled: this.enabled, frame: this.frame, options: this.options, ownedGpuBytes: this.bytes,
       multiBounce: this.multiBounce, historyUpdates: this.historyUpdates, lastHistoryFrame: this.lastHistoryFrame,
       historyResetReason: this.historyResetReason, transport: this.multiBounce ? 'cross-frame-diffuse-feedback' : 'single-diffuse-bounce',
@@ -243,21 +283,25 @@ export class GpuDiffuseGi {
       visibility: 'octahedral-distance-moments', visibilityResolution: GI_DISTANCE_RESOLUTION,
       visibilityCapture: 'normalized-cosine-power-32', distanceCaptureSamplesPerUpdate: GI_DISTANCE_CELLS * this.options.rayCount,
       placement: 'caller-provided-free-space-grid',
+      finalGather: gather ?? null,
       emissiveSampling: emissive ? { ...emissive, enabled: this.enabled && emissive.enabled,
         samplesPerUpdate: this.enabled ? emissive.samplesPerUpdate : 0,
         activeSamplesPerUpdate: this.enabled ? emissive.activeSamplesPerUpdate : 0,
         inactiveBlockRaysPerUpdate: this.enabled ? emissive.inactiveBlockRaysPerUpdate : 0,
         queryRaysPerUpdate: this.enabled ? emissive.queryRaysPerUpdate : 0,
         maxWorkUnitsPerUpdate: this.enabled ? emissive.maxWorkUnitsPerUpdate : 0 } : null,
-      queriesPerUpdate: this.enabled ? this.options.rayCount * 2 + (this.emissiveSampler?.queryRayCount ?? 0) : 0,
+      queriesPerUpdate: this.enabled ? this.options.rayCount * 2 + (this.emissiveSampler?.queryRayCount ?? 0)
+        + (gather?.queryRaysPerUpdate ?? 0) : 0,
       maxWorkUnitsPerUpdate: this.enabled ? this.queries.options.maxTotalWorkUnits
-        * (this.emissiveSampler?.queryRayCount ? 3 : 2) : 0,
-      temporalAccumulation: false, automaticRelocation: false, reflections: false };
+        * (this.emissiveSampler?.queryRayCount ? 3 : 2) + (gather?.maxWorkUnitsPerUpdate ?? 0) : 0,
+      temporalAccumulation: this.finalGather ? 'surface-static-camera-only' : false,
+      automaticRelocation: false, reflections: false };
   }
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.emissiveSampler?.dispose();
+    this.finalGather?.dispose();
     for (const buffer of this.buffers) buffer.destroy();
     this.account(-this.bytes); this.bytes = 0;
   }

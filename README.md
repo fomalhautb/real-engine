@@ -17,6 +17,8 @@
 
 阶段 2 已建立离线几何簇层级、简化与压缩分页，并接入全部驻留的 GPU LOD、视锥剔除、间接绘制和分簇颜色演示；共享形变的世界空间查询供有界漫反射 GI 使用，新增可选的跨帧多次反弹反馈。页面流送、遮挡剔除、完整 GI、镜面反射和参与介质仍待实现，路线图中的目标规模与性能门槛仍待验证。当前形变和材质编译器均有明确上限；没有法线贴图、多层材质或透射。阶段 2 后期将通过大规模完整场景联合验收画质和性能；现有小模型用于正确性验证及有限场景的性能基线。完整边界与后续工作见 [实现状态](docs/implementation.md)。
 
+本次画质修正提供代码配置的阴影范围/分辨率、单帧 FXAA，以及共享形变/材质/遮挡的发光面主动采样。GI 房间使用 216 探针×128 方向射线，每颗另采 32 个发光面样本，减轻小亮光源被偶然命中后扩散成大光斑的问题。地面六点相对独立有限多次反弹参考的平均误差由约 8.0% 降至 5.6%；当前蓝墙参考仍有约 23% 偏差，不能视为完整物理光照验收。本地最新检查为 244 项 CPU 与 41 项 NVIDIA 浏览器回归；接口、数值及性能范围见 [实现状态](docs/implementation.md)。
+
 ## 本地运行
 
 需要 Node.js 24 与支持 WebGPU 的浏览器。使用 localhost 或 HTTPS。
@@ -69,7 +71,7 @@ npm run test:browser
 
 `--force-high-performance-gpu` 在本机选择 `nvidia / ampere`，默认 Edge 选择 `intel / gen-12lp`。主机安装 RTX 3070 Laptop，但 WebGPU adapter 不报告具体型号。其他机器应按实际 adapter 调整预期厂商；两个浏览器运行之间清理上述环境变量，避免影响之后的默认测试。
 
-2026-10-14 最新本地 `npm run check` 通过 222 项 CPU 单元测试、TypeScript 与生产构建（`artifacts/local-check-gi-confidence-final-20261014.log`）；Edge 默认 Intel 通过 28 项浏览器功能测试，强制高性能 NVIDIA 的最新 8×8 GI 路径通过 31 项（`artifacts/local-nvidia-gi-confidence-final-20261014.log`）。基础压力场景各完成三次 1800 帧短程硬件基准，固定 1080p 几何演示及旧/新 GI 版本也各完成三次 NVIDIA 短程基准。另一次基础压力场景的 NVIDIA 30 分钟运行通过资源/功能稳定性检查，但 rAF p95 为 34.8 ms，未达到初始 33.3 ms 帧间隔预算。详情见[实现状态](docs/implementation.md#基准运行器与首轮证据)和[验收协议](docs/benchmarks.md#结果与回归)。几何固定镜头全部选中 LOD0，尚未证明减面收益；30 分钟结果也不代表 GI/LOD/雾的联合长测、最终画质或大场景性能通过。
+2026-10-14 阴影/GI 修正前的本地 `npm run check` 通过 222 项 CPU 单元测试、TypeScript 与生产构建（`artifacts/local-check-gi-confidence-final-20261014.log`）；Edge 默认 Intel 通过 28 项浏览器功能测试，强制高性能 NVIDIA 的最新 8×8 GI 路径通过 31 项（`artifacts/local-nvidia-gi-confidence-final-20261014.log`）。基础压力场景各完成三次 1800 帧短程硬件基准，固定 1080p 几何演示及旧/新 GI 版本也各完成三次 NVIDIA 短程基准。另一次基础压力场景的 NVIDIA 30 分钟运行通过资源/功能稳定性检查，但 rAF p95 为 34.8 ms，未达到初始 33.3 ms 帧间隔预算。详情见[实现状态](docs/implementation.md#基准运行器与首轮证据)和[验收协议](docs/benchmarks.md#结果与回归)。几何固定镜头全部选中 LOD0，尚未证明减面收益；30 分钟结果也不代表 GI/LOD/雾的联合长测、最终画质或大场景性能通过。
 
 同日后续提交 `00f989a` 已通过 [远程 Linux 软件 GPU 回归](https://github.com/fomalhautb/real-engine/actions/runs/38513178363)：188 项单元测试和 18 项浏览器测试。覆盖共享形变 BVH 世界查询、线性 HDR 与曝光/显示转换、设备丢失，以及变化槽位上传和静止姿态复用；均未在用户使用电脑期间进行本机 GPU 压测。这些功能证据不代表阶段 2 的完整系统或性能目标已完成。
 

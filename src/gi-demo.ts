@@ -310,7 +310,10 @@ function wireControls(): void {
 async function start(): Promise<void> {
   scene = createGiDemoScene();
   const rayBudget = GI_PROBE_GRID.counts.reduce((a, b) => a * b, 1) * GI_PROBE_GRID.raysPerProbe;
-  const options: RendererOptions = { diffuseGi: GI_PROBE_GRID, worldQueries: { maxRays: rayBudget } };
+  element('probe-budget').textContent = `${GI_PROBE_GRID.counts.reduce((a, b) => a * b, 1)} 个固定探针，每颗 ${GI_PROBE_GRID.raysPerProbe} 条方向光线＋${GI_PROBE_GRID.emissiveSamplesPerProbe} 个发光面样本`;
+  const options: RendererOptions = { diffuseGi: GI_PROBE_GRID, worldQueries: { maxRays: rayBudget }, antiAliasing: 'fxaa',
+    sunShadow: { resolution: 2048, focusBounds: { min: [-3.5, -0.25, -4], max: [3.5, 4, 4] },
+      maxBytes: 16 * 1024 * 1024 } };
   const created = await Renderer.create(canvas, scene.batches, options);
   if (disposed) { created.dispose(); return; }
   renderer = created;

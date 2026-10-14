@@ -32,6 +32,10 @@ export interface InstanceState {
   historyVersion: number;
 }
 export interface SceneBatch {
+  /** Immutable opt-in for GI area importance sampling. Samples the shared
+   * deformed triangles and evaluates emission/coverage through world queries.
+   * This is a sampling hint, not a separate light or material representation. */
+  emissiveSampling?: 'triangle-area';
   /** Optional fully resident LOD for a static primitive. mesh must be hierarchy.source.
    * Opaque materials use GPU selection; Masked keeps the full-detail path. */
   geometryLod?: GeometryHierarchy;

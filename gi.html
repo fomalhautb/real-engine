@@ -36,7 +36,7 @@
             <div class="section-title"><h3>间接光</h3><span>01 / GI</span></div>
             <label class="switch-row" for="gi-enabled"><span><strong>启用漫反射 GI</strong><small>关闭时无间接补光</small></span><input id="gi-enabled" type="checkbox" checked /></label>
             <label class="switch-row bounce-row" for="gi-multi-bounce"><span><strong>多次反弹</strong><small>关闭后仅保留单次表面反弹</small></span><input id="gi-multi-bounce" type="checkbox" checked /></label>
-            <p class="note">64 个固定探针 × 64 条光线。每帧更新；多次反弹读取上一已完成探针场，切换模式时清空历史。</p>
+            <p class="note"><span id="probe-budget">—</span>。每帧更新；多次反弹读取上一已完成探针场，切换模式时清空历史。</p>
           </section>
           <section class="panel-section">
             <div class="section-title"><h3>改变场景</h3><span>02 / MATERIAL</span></div>

@@ -12,6 +12,7 @@ import type { WorldQueryOptions, WorldRay, WorldQueryResult } from './world-quer
 import { GpuGeometryLod, type GeometryLodBinding, type GeometryLodSettings, type GeometryLodProbe } from './gpu-geometry-lod';
 import { GpuDiffuseGi, diffuseGiSampleSource, type DiffuseGiProbeResult } from './gpu-diffuse-gi';
 import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
+import { resolveSunShadowOptions, sunShadowProjection, type SunShadowOptions, type ResolvedSunShadowOptions } from './sun-shadow';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
@@ -43,6 +44,10 @@ export interface DeformationVerification {
   samples: { batch: string; entityId: number; vertexIndex: number; current: number[]; previous: number[] }[];
 }
 export interface RendererOptions {
+  /** Single-frame display-space edge filtering. HDR and motion/depth attachments stay unfiltered. */
+  antiAliasing?: 'none' | 'fxaa';
+  /** Directional shadow budget and world bounds, including off-screen casters. Defaults to the legacy 1024 / 50 m map. */
+  sunShadow?: SunShadowOptions;
   /** Includes pending/resident definitions. Two render pipelines, plus a LOD variant when enabled. */
   materialVariantLimit?: number;
   /** Shared material images, all mips. Atomic replacements require overlap with their old images. */
@@ -72,6 +77,8 @@ export class Renderer {
   private readonly frameData = new Float32Array(64);
   private readonly frameBuffer: GPUBuffer;
   private readonly shadow: GPUTexture;
+  private sunShadowOptions: ResolvedSunShadowOptions;
+  private sunShadowProjection!: ReturnType<typeof sunShadowProjection>;
   private readonly frameBindGroup: GPUBindGroup;
   private readonly shadowFrameBindGroup: GPUBindGroup;
   private depth?: GPUTexture;
@@ -82,6 +89,7 @@ export class Renderer {
   private resolveLayout!: GPUBindGroupLayout;
   private readonly exposureBuffer: GPUBuffer;
   private exposureEV = 0;
+  private antiAliasing: 'none' | 'fxaa' = 'none';
   private lastViewProjection?: Mat4;
   private lightMatrix: Mat4 = identity();
   private sunDirection: [number, number, number] = [-18, 30, 19];
@@ -110,6 +118,8 @@ export class Renderer {
   private geometryLayout!: GPUBindGroupLayout;
 
   static async create(canvas: HTMLCanvasElement, scene: SceneBatch[], options: RendererOptions = {}): Promise<Renderer> {
+    if (options.antiAliasing !== undefined && options.antiAliasing !== 'none' && options.antiAliasing !== 'fxaa') throw new Error('INVALID_ANTI_ALIASING');
+    resolveSunShadowOptions(options.sunShadow);
     const limit = options.materialVariantLimit ?? 128;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 4096) throw new Error('INVALID_MATERIAL_VARIANT_LIMIT');
     if (options.textureBudgetBytes !== undefined && (!Number.isSafeInteger(options.textureBudgetBytes) || options.textureBudgetBytes < 0)) throw new Error('INVALID_TEXTURE_BUDGET');
@@ -171,10 +181,13 @@ export class Renderer {
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    this.antiAliasing = options.antiAliasing ?? 'none';
     this.setExposure(0);
-    this.shadow = device.createTexture({ label: 'sun shadow', size: [1024, 1024], format: 'depth32float',
+    this.sunShadowOptions = resolveSunShadowOptions(options.sunShadow, device.limits.maxTextureDimension2D);
+    const shadowResolution = this.sunShadowOptions.resolution;
+    this.shadow = device.createTexture({ label: 'sun shadow', size: [shadowResolution, shadowResolution], format: 'depth32float',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
-    this.stats.ownedGpuBytes += 1024 * 1024 * 4;
+    this.stats.ownedGpuBytes += this.sunShadowOptions.bytes;
     const frameLayout = device.createBindGroupLayout({ label: 'frame and lighting contract', entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
@@ -257,6 +270,7 @@ export class Renderer {
       this.batches.push(batch);
       this.worldQueries?.addBatch({ scene: batch.scene, output: batch.output, instances: batch.instances,
         getMaterial: () => batch.material, getPipeline: () => batch.materialPipelines.query!, getDirty: () => batch.dirty });
+      this.diffuseGi?.registerEmissiveBatch(batch.scene, batch.output, this.batches.length);
     }
     this.graph = compileRenderGraph<GPUCommandEncoder>([
       { name: 'scene-input', kind: 'buffer', source: 'imported' },
@@ -426,7 +440,18 @@ export class Renderer {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!Number.isFinite(ev) || ev < -16 || ev > 16) throw new Error('INVALID_EXPOSURE');
     this.exposureEV = ev;
-    this.device.queue.writeBuffer(this.exposureBuffer, 0, new Float32Array([2 ** ev, 0, 0, 0]));
+    this.writeOutputSettings();
+  }
+
+  setAntiAliasing(mode: 'none' | 'fxaa'): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (mode !== 'none' && mode !== 'fxaa') throw new Error('INVALID_ANTI_ALIASING');
+    this.antiAliasing = mode;
+    this.writeOutputSettings();
+  }
+
+  private writeOutputSettings(): void {
+    this.device.queue.writeBuffer(this.exposureBuffer, 0, new Float32Array([2 ** this.exposureEV, this.antiAliasing === 'fxaa' ? 1 : 0, 0, 0]));
   }
 
   /** A directional light points from the surface towards the light. Linear RGB radiance. */
@@ -436,12 +461,20 @@ export class Renderer {
         Math.hypot(...sun.direction) < 1e-6 || sun.color.some(value => value < 0 || !Number.isFinite(Math.fround(value)))) throw new Error('INVALID_SUN');
     const length = Math.hypot(...sun.direction);
     const d = sun.direction.map(value => value / length) as [number, number, number];
+    const projection = sunShadowProjection(d, this.sunShadowOptions);
     this.sunDirection = d; this.sunColor = [...sun.color];
-    const target: [number, number, number] = [0, 0, -3];
-    const eye = target.map((value, axis) => value + d[axis] * 40) as [number, number, number];
-    const ortho = identity();
-    ortho[0] = 1 / 25; ortho[5] = 1 / 25; ortho[10] = -1 / 70; ortho[14] = -0.1 / 70;
-    this.lightMatrix = multiply(ortho, lookAt(eye, target, Math.abs(d[1]) > 0.99 ? [0, 0, 1] : [0, 1, 0]));
+    this.sunShadowProjection = projection;
+    this.lightMatrix = projection.matrix;
+  }
+
+  /** Update world bounds without reallocating the map. Include all casters that can shadow the receivers. */
+  setSunShadowFocus(focusBounds: SunShadowOptions['focusBounds']): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    const options = resolveSunShadowOptions({ ...this.sunShadowOptions, focusBounds }, this.device.limits.maxTextureDimension2D);
+    const projection = sunShadowProjection(this.sunDirection, options);
+    this.sunShadowOptions = options;
+    this.sunShadowProjection = projection;
+    this.lightMatrix = projection.matrix;
   }
 
   private async createBatch(scene: SceneBatch): Promise<Batch> {
@@ -692,7 +725,12 @@ export class Renderer {
       worldQueries: this.worldQueries?.diagnostics() ?? null,
       geometryLod: this.geometryLod?.diagnostics() ?? null,
       diffuseGi: this.diffuseGi?.diagnostics() ?? null,
-      output: { sceneFormat: 'rgba16float', exposureEV: this.exposureEV, transfer: 'sRGB', toneMap: 'filmic-fit', maxSceneRadiance: 65504 },
+      sunShadow: { resolution: this.sunShadowOptions.resolution, bytes: this.sunShadowOptions.bytes,
+        focusBounds: this.sunShadowOptions.focusBounds ?? null, width: this.sunShadowProjection.width,
+        depth: this.sunShadowProjection.depth, texelWorldSize: this.sunShadowProjection.texelWorldSize,
+        projection: this.sunShadowOptions.focusBounds ? 'world-bounds-snapped' : 'legacy-fixed', cascades: 1 },
+      output: { sceneFormat: 'rgba16float', exposureEV: this.exposureEV, antiAliasing: this.antiAliasing,
+        transfer: 'sRGB', toneMap: 'filmic-fit', maxSceneRadiance: 65504 },
       materials: this.materialResources.diagnostics(), materialRevision: this.materialRevision, passes: this.graph.order,
       lifetimes: Object.fromEntries(this.graph.lifetimes),
       bounds: this.batches.flatMap(batch => Array.from(batch.bounds, ([entityId, bounds]) => ({ entityId, ...bounds }))) };
@@ -741,7 +779,7 @@ export class Renderer {
     const encoder = this.device.createCommandEncoder({ label: 'diagnostic depth readback' });
     const sources = [
       { texture: this.depth, width: this.stats.width, height: this.stats.height, matrix: this.frameData.slice(0, 16) },
-      { texture: this.shadow, width: 1024, height: 1024, matrix: this.frameData.slice(32, 48) },
+      { texture: this.shadow, width: this.sunShadowOptions.resolution, height: this.sunShadowOptions.resolution, matrix: this.frameData.slice(32, 48) },
     ];
     const reads = sources.map(source => {
       const stride = Math.ceil(source.width * 4 / 256) * 256;

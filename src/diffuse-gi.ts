@@ -10,6 +10,8 @@ export interface DiffuseGiOptions {
   skyRadiance?: readonly [number, number, number];
   /** Feed the previous completed probe field into this frame's diffuse capture. */
   multiBounce?: boolean;
+  /** Bounded area samples for emissive geometry at each probe; zero disables them. */
+  emissiveSamplesPerProbe?: number;
   /** Smoothly suppress low-confidence visibility weights; 0 disables the curve. */
   visibilityWeightThreshold?: number;
   maxBytes?: number;
@@ -24,6 +26,7 @@ export interface ResolvedDiffuseGiOptions {
   readonly normalBias: number;
   readonly skyRadiance: readonly [number, number, number];
   readonly multiBounce: boolean;
+  readonly emissiveSamplesPerProbe: number;
   readonly visibilityWeightThreshold: number;
   readonly maxBytes: number;
   readonly probeCount: number;
@@ -88,6 +91,10 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
     throw new RangeError('DIFFUSE_GI_MULTI_BOUNCE');
   }
   const multiBounce = options.multiBounce ?? false;
+  const emissiveSamplesPerProbe = options.emissiveSamplesPerProbe === undefined ? 0 : options.emissiveSamplesPerProbe;
+  if (!Number.isSafeInteger(emissiveSamplesPerProbe) || emissiveSamplesPerProbe < 0 || emissiveSamplesPerProbe > 64) {
+    throw new RangeError('DIFFUSE_GI_EMISSIVE_SAMPLES_PER_PROBE');
+  }
   const visibilityWeightThreshold = options.visibilityWeightThreshold ?? 0.2;
   if (options.visibilityWeightThreshold === null || !Number.isFinite(visibilityWeightThreshold)
     || visibilityWeightThreshold < 0 || visibilityWeightThreshold > 1) {
@@ -104,7 +111,7 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   }
   if (probeCount * DIFFUSE_GI_PROBE_BYTES > maxBytes) throw new RangeError('DIFFUSE_GI_MEMORY_BUDGET');
   return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias,
-    skyRadiance, multiBounce, visibilityWeightThreshold, maxBytes, probeCount, rayCount });
+    skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, maxBytes, probeCount, rayCount });
 }
 
 /** Deterministic Fibonacci-sphere direction; rayIndex is zero based. */

@@ -26,6 +26,7 @@ describe('diffuse GI probe contract', () => {
     expect(value.maxDistance).toBe(30);
     expect(value.normalBias).toBe(0.03);
     expect(value.multiBounce).toBe(false);
+    expect(value.emissiveSamplesPerProbe).toBe(0);
     expect(value.visibilityWeightThreshold).toBe(0.2);
     expect(value.maxBytes).toBe(32 * 1024 * 1024);
     expect(DIFFUSE_GI_PROBE_BYTES).toBe((9 + GI_DISTANCE_CELLS + 1) * 16);
@@ -49,6 +50,23 @@ describe('diffuse GI probe contract', () => {
     for (const invalid of [null, 0, 1, 'true', NaN]) {
       expect(() => resolveDiffuseGiOptions({ ...grid, multiBounce: invalid as unknown as boolean }))
         .toThrow('DIFFUSE_GI_MULTI_BOUNCE');
+    }
+  });
+
+  it('bounds emissive area samples per probe and freezes the resolved value', () => {
+    expect(resolveDiffuseGiOptions(grid).emissiveSamplesPerProbe).toBe(0);
+    for (const samples of [0, 1, 32, 64]) {
+      expect(resolveDiffuseGiOptions({ ...grid, emissiveSamplesPerProbe: samples }).emissiveSamplesPerProbe)
+        .toBe(samples);
+    }
+    const input: DiffuseGiOptions = { ...grid, emissiveSamplesPerProbe: 16 };
+    const resolved = resolveDiffuseGiOptions(input);
+    input.emissiveSamplesPerProbe = 1;
+    expect(resolved.emissiveSamplesPerProbe).toBe(16);
+    expect(Object.isFrozen(resolved)).toBe(true);
+    for (const invalid of [-1, 65, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, null, '4']) {
+      expect(() => resolveDiffuseGiOptions({ ...grid,
+        emissiveSamplesPerProbe: invalid as number })).toThrow('DIFFUSE_GI_EMISSIVE_SAMPLES_PER_PROBE');
     }
   });
 

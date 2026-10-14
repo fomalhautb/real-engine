@@ -7,6 +7,8 @@ import { DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, buildGiDistanceWeights } from './gi-visibility';
 import { WORLD_HIT_BYTES } from './world-query';
 import type { GpuWorldQuery } from './gpu-world-query';
+import type { SceneBatch } from './contracts';
+import { GpuGiEmissiveSampler } from './gpu-gi-emissive';
 
 const constants = `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`;
 const giCommon = commonSource.replace('// GI_DISTANCE_CONSTANTS', constants);
@@ -15,7 +17,7 @@ export const diffuseGiSampleSource = giSource(sampleSource);
 export interface DiffuseGiProbeResult {
   frame: number;
   invalidProbes: number;
-  probes: { coefficients: number[][]; moments: number[][]; maxRadiance: number[]; valid: boolean; primaryOverflows: number; shadowOverflows: number }[];
+  probes: { coefficients: number[][]; moments: number[][]; maxRadiance: number[]; valid: boolean; primaryOverflows: number; shadowOverflows: number; emissiveOverflows: number }[];
 }
 
 /** Fixed world-space probes with optional cross-frame diffuse transport. Each
@@ -48,6 +50,7 @@ export class GpuDiffuseGi {
   private historyResetReason = 'initial';
   private resetRequested: string | null = 'initial';
   private previousDependencies?: { material: number; scene: number; sun: number[] };
+  private emissiveSampler?: GpuGiEmissiveSampler;
 
   get surfaceGroup(): GPUBindGroup { return this.surfaceGroups[this.currentIndex]; }
 
@@ -116,6 +119,20 @@ export class GpuDiffuseGi {
     [this.generate, this.generateShadows, this.integrate, this.integrateVisibility] = await Promise.all(
       ['generate', 'generateShadows', 'integrate', 'integrateVisibility'].map(entryPoint =>
       this.device.createComputePipelineAsync({ label: 'diffuse GI ' + entryPoint, layout, compute: { module, entryPoint } })));
+    if (this.options.emissiveSamplesPerProbe) {
+      this.emissiveSampler = await GpuGiEmissiveSampler.create(this.device, this.queries, this.parameters,
+        this.probeBuffers, this.options.rayCount, this.options.emissiveSamplesPerProbe, bytes => {
+          this.bytes += bytes; this.account(bytes);
+        }, this.options.maxBytes - this.bytes);
+      this.checkMemoryBudget();
+    }
+  }
+  private checkMemoryBudget(): void {
+    if (this.bytes > this.options.maxBytes) throw new Error('DIFFUSE_GI_MEMORY_BUDGET');
+  }
+  registerEmissiveBatch(scene: SceneBatch, output: GPUBuffer, sourceId: number): void {
+    this.emissiveSampler?.addBatch(scene, output, sourceId);
+    this.checkMemoryBudget();
   }
   setEnabled(enabled: boolean): void {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
@@ -154,8 +171,9 @@ export class GpuDiffuseGi {
     integers[24] = frame;
     integers[25] = this.lastHistoryFrame;
     integers[26] = this.lastHistoryFrame ? 1 : 0;
+    integers[27] = this.emissiveSampler?.enabled ? 1 : 0;
     this.device.queue.writeBuffer(this.parameters, 0, data);
-    return data.byteLength;
+    return data.byteLength + (this.emissiveSampler?.update() ?? 0);
   }
   encode(encoder: GPUCommandEncoder, frame: number, materialRevision: number, timing?: GPUComputePassTimestampWrites): number {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
@@ -168,11 +186,12 @@ export class GpuDiffuseGi {
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     };
     dispatch('generate world-space GI rays', this.generate, count, timing && { querySet: timing.querySet, beginningOfPassWriteIndex: timing.beginningOfPassWriteIndex });
-    const uploaded = this.queries.encodeTrace(encoder, count, 0, materialRevision);
+    let uploaded = this.queries.encodeTrace(encoder, count, 0, materialRevision);
     encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.primary, 0, count * WORLD_HIT_BYTES);
     dispatch('generate GI sun visibility rays', this.generateShadows, count);
     this.queries.encodeTrace(encoder, count, 0, materialRevision);
     dispatch('integrate world-space GI radiance', this.integrate, this.options.probeCount);
+    uploaded += this.emissiveSampler?.encode(encoder, outputIndex, materialRevision) ?? 0;
     dispatch('integrate GI directional visibility', this.integrateVisibility, this.options.probeCount * GI_DISTANCE_CELLS,
       timing && { querySet: timing.querySet, endOfPassWriteIndex: timing.endOfPassWriteIndex });
     this.frame = frame;
@@ -200,9 +219,13 @@ export class GpuDiffuseGi {
           const coefficients = Array.from({ length: 9 }, (_, j) => Array.from(data.slice(base + j * 4, base + j * 4 + 3)));
           const moments = Array.from({ length: GI_DISTANCE_CELLS }, (_, j) => Array.from(data.slice(base + 36 + j * 4, base + 39 + j * 4)));
           const maxRadiance = [data[base + 3], data[base + 7], data[base + 11]];
-          if (![...coefficients.flat(), ...moments.flat(), ...maxRadiance].every(Number.isFinite)) throw new Error('DIFFUSE_GI_NONFINITE');
+          const emissiveOverflows = data[base + 39];
+          if (![...coefficients.flat(), ...moments.flat(), ...maxRadiance].every(Number.isFinite)
+            || !Number.isInteger(emissiveOverflows) || emissiveOverflows < 0
+            || emissiveOverflows > this.options.raysPerProbe) throw new Error('DIFFUSE_GI_NONFINITE');
           probes.push({ coefficients, moments, maxRadiance, valid: u32[state] === 1,
-            primaryOverflows: u32[state + 2], shadowOverflows: u32[state + 3] });
+            primaryOverflows: u32[state + 2], shadowOverflows: u32[state + 3],
+            emissiveOverflows });
         }
         return { frame, probes, invalidProbes: probes.filter(probe => !probe.valid).length };
       } finally { this.readback.unmap(); }
@@ -216,12 +239,15 @@ export class GpuDiffuseGi {
       visibility: 'octahedral-distance-moments', visibilityResolution: GI_DISTANCE_RESOLUTION,
       visibilityCapture: 'normalized-cosine-power-32', distanceCaptureSamplesPerUpdate: GI_DISTANCE_CELLS * this.options.rayCount,
       placement: 'caller-provided-free-space-grid',
-      queriesPerUpdate: this.options.rayCount * 2, maxWorkUnitsPerUpdate: this.queries.options.maxTotalWorkUnits * 2,
+      emissiveSampling: this.emissiveSampler?.diagnostics() ?? null,
+      queriesPerUpdate: this.options.rayCount * (this.emissiveSampler?.enabled ? 3 : 2),
+      maxWorkUnitsPerUpdate: this.queries.options.maxTotalWorkUnits * (this.emissiveSampler?.enabled ? 3 : 2),
       temporalAccumulation: false, automaticRelocation: false, reflections: false };
   }
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.emissiveSampler?.dispose();
     for (const buffer of this.buffers) buffer.destroy();
     this.account(-this.bytes); this.bytes = 0;
   }

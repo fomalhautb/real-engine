@@ -18,6 +18,7 @@ interface QuerySource {
 type QueryBatch = {
   source: QuerySource; mesh: SceneBatch['mesh']; name: string; capacity: number; identity: string;
   topologyVersion: number; nodeCount: number; offsets: number[]; count: number; dirty: boolean;
+  emissiveSampling: SceneBatch['emissiveSampling'];
   vertexCount: number; vertices: ArrayBuffer; indices: Uint32Array; uvs?: Float32Array;
   identities: GPUBuffer; metadata: Uint32Array<ArrayBuffer>; params: GPUBuffer; trace: GPUBindGroup;
   levels: { params: GPUBuffer; bindGroup: GPUBindGroup; count: number; offset: number }[];
@@ -148,6 +149,7 @@ export class GpuWorldQuery {
   addBatch(source: QuerySource): void {
     if (this.disposed || this.frame) throw new Error('WORLD_QUERY_REGISTRATION_CLOSED');
     const { scene } = source, { mesh } = scene;
+    if (scene.emissiveSampling !== undefined && scene.emissiveSampling !== 'triangle-area') throw new Error('WORLD_QUERY_EMISSIVE_SAMPLING');
     if (this.batches.length >= 256) throw new Error('WORLD_QUERY_BATCH_BUDGET');
     if (!Number.isSafeInteger(scene.capacity) || scene.capacity < 1 || scene.capacity > this.options.maxInstancesPerBatch) throw new Error('WORLD_QUERY_INSTANCE_BUDGET');
     const sourceIdentity = identity(scene);
@@ -179,6 +181,7 @@ export class GpuWorldQuery {
           entries: [params, source.output, data, bounds].map((buffer, binding) => ({ binding, resource: { buffer } })) }) };
     });
     this.batches.push({ source, mesh, name: scene.name, capacity: scene.capacity, identity: sourceIdentity,
+      emissiveSampling: scene.emissiveSampling,
       topologyVersion: scene.queryIdentity?.topologyVersion ?? 0, nodeCount: topology.nodeCount, offsets, count: 0, dirty: true,
       vertexCount: mesh.vertexCount, vertices: mesh.vertices, indices: mesh.indices, uvs: mesh.uvs,
       identities, metadata: new Uint32Array(scene.capacity * 4), params, trace, levels });
@@ -189,7 +192,7 @@ export class GpuWorldQuery {
       const scene = batch.source.scene;
       if (scene.mesh !== batch.mesh || scene.mesh.vertexCount !== batch.vertexCount || scene.mesh.vertices !== batch.vertices
         || scene.mesh.indices !== batch.indices || scene.mesh.uvs !== batch.uvs || scene.capacity !== batch.capacity
-        || scene.name !== batch.name || identity(scene) !== batch.identity) {
+        || scene.name !== batch.name || identity(scene) !== batch.identity || scene.emissiveSampling !== batch.emissiveSampling) {
         throw new Error('WORLD_QUERY_TOPOLOGY_CHANGED: recreate the renderer for a new immutable mesh/topology');
       }
     }
@@ -291,7 +294,8 @@ export class GpuWorldQuery {
       if (previous === undefined) {
         const params = new ArrayBuffer(80);
         new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
-          ...batch.offsets, 0, count, workPerRay, this.frame, batch.topologyVersion, materialRevision]);
+          ...batch.offsets, 0, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
+          batch.emissiveSampling === 'triangle-area' ? 1 : 0]);
         new Float32Array(params)[16] = textureLod;
         this.device.queue.writeBuffer(batch.params, 0, params);
         uploadedBytes += 80;

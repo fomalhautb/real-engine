@@ -14,7 +14,7 @@ struct Params {
     shape: vec4u, // node count, vertex count, instance count, batch ID
     offsets: vec4u, // triangle IDs, indices, UVs, unused
     limits: vec4u, // ray count, work limit, frame, topology version
-    material: vec4u, // material revision
+    material: vec4u, // material revision, GI area-sampling source flag
     textureLod: vec4f,
 }
 @group(0) @binding(0) var<uniform> params: Params;
@@ -131,6 +131,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 hit.emissive = vec4f(surface.emissive, select(0.0, 1.0, MATERIAL_UNLIT));
                 hit.versions = vec4u(params.limits.z, identity.z, params.limits.w, params.material.x);
                 hit.uvInfo = vec4f(uv, params.textureLod.x, 0.0);
+                hit.work.w = params.material.y;
             }
             if (hit.work.z != 0u) { break; }
             node++;

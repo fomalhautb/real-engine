@@ -54,9 +54,12 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
         let direction = giDirection(i, gi.counts.w);
         var radiance = gi.sky.xyz;
         if (hit.identity.x != 0u) {
-            radiance = hit.emissive.xyz;
+            // Explicit area sampling replaces only emission from opted-in
+            // geometry. Its reflected sun/GI still belongs to the sphere rays.
+            let sampleEmission = gi.state.w == 0u || hit.work.w == 0u;
+            radiance = select(vec3f(0.0), hit.emissive.xyz, sampleEmission);
             if (hit.emissive.w != 0.0) {
-                radiance += hit.baseColor.xyz;
+                radiance += select(vec3f(0.0), hit.baseColor.xyz, sampleEmission);
             } else {
                 let nl = max(0.0, dot(hit.normal.xyz, gi.sunDirection.xyz));
                 let visible = select(0.0, 1.0, shadow.identity.x == 0u && shadow.work.z == 0u);
@@ -84,6 +87,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
         probes[id.x].coefficients[coefficient] = coefficients[coefficient];
     }
     probes[id.x].state = vec4u(select(0u, 1u, primaryOverflows + shadowOverflows == 0u), gi.state.x, primaryOverflows, shadowOverflows);
+    probes[id.x].moments[0].w = 0.0;
 }
 
 // Separate texel invocations avoid a large private GiProbe copy, and all surface
@@ -104,5 +108,7 @@ fn integrateVisibility(@builtin(global_invocation_id) id: vec3u) {
         moments += vec2f(distance, distance * distance) * weight;
         total += weight;
     }
-    probes[probeIndex].moments[cell] = vec4f(moments / max(total, 0.00000001), total, 0.0);
+    var emissiveFailures = 0.0;
+    if (cell == 0u) { emissiveFailures = probes[probeIndex].moments[0].w; }
+    probes[probeIndex].moments[cell] = vec4f(moments / max(total, 0.00000001), total, emissiveFailures);
 }

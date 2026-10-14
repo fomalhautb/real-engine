@@ -66,18 +66,23 @@ export function createGiDemoScene(): { batches: SceneBatch[]; triangles: number 
     batch('white-forms', cube, objects, white),
     batch('emissive-strip', plane, [luminousStrip], lamp),
   ];
+  batches[batches.length - 1].emissiveSampling = 'triangle-area';
   return { batches, triangles: batches.reduce((count, item) => count + item.mesh.indices.length / 3 * item.instances.length, 0) };
 }
 
+const probeSpacing: Vec3 = [6.8 / 6, 4.4 / 6, 7.6 / 6];
 export const GI_PROBE_GRID = Object.freeze({
-  // Half-cell support covers the complete solid walls plus normal bias:
-  // x +/-3.4, y -0.2..4.2, z +/-3.8. Centers stay inside the open room.
-  origin: [-2.55, 0.35, -2.85] as [number, number, number],
-  spacing: [1.7, 1.1, 1.9] as [number, number, number],
-  counts: [4, 4, 4] as [number, number, number],
-  raysPerProbe: 64,
+  // Half-cell support covers all walls and their normal bias:
+  // x +/-3.4, y -0.2..4.2, z +/-3.8. Probe centers stay in free space.
+  // More local samples reduce the bright-wall spatial interpolation bias.
+  // This demo quality choice is measured against an independent one-bounce reference.
+  origin: [-3.4 + probeSpacing[0] / 2, -0.2 + probeSpacing[1] / 2, -3.8 + probeSpacing[2] / 2] as Vec3,
+  spacing: probeSpacing,
+  counts: [6, 6, 6] as Vec3,
+  raysPerProbe: 128,
   maxDistance: 12,
   normalBias: 0.03,
   skyRadiance: [0.045, 0.055, 0.075] as [number, number, number],
   multiBounce: true,
+  emissiveSamplesPerProbe: 32,
 });

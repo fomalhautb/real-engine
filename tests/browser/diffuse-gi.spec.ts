@@ -166,12 +166,26 @@ test('GI demonstration captures comparable enabled and disabled frames', async (
       window.__GI_DEMO__!.pause(true);
       return window.__GI_DEMO__!.snapshot();
     });
-    await testInfo.attach('diffuse-gi-enabled', { body: await page.screenshot(), contentType: 'image/png' });
+    // Save explicit output files: attachments supplied only as buffers are not
+    // retained by the default line reporter's successful-test artifact path.
+    const capture = async (name: string) => {
+      // Complete the GPU work before asking the compositor for its image.
+      await page.evaluate(async () => {
+        const renderer = window.__GI_DEMO__!.renderer!;
+        await renderer.probeHdr([{ x: Math.floor(renderer.stats.width / 2), y: Math.floor(renderer.stats.height / 2) }]);
+      });
+      const path = testInfo.outputPath(name + '.png');
+      await page.screenshot({ path });
+      await testInfo.attach(name, { path, contentType: 'image/png' });
+    };
+    await capture('diffuse-gi-enabled-ui');
+    await page.keyboard.press('h');
+    await capture('diffuse-gi-enabled');
     const disabled = await page.evaluate(() => {
       window.__GI_DEMO__!.toggleGi(false);
       return window.__GI_DEMO__!.snapshot();
     });
-    await testInfo.attach('diffuse-gi-disabled', { body: await page.screenshot(), contentType: 'image/png' });
+    await capture('diffuse-gi-disabled');
     expect(before.controls.giEnabled).toBe(true);
     expect(disabled.controls.giEnabled).toBe(false);
     expect(disabled.camera).toEqual(before.camera);

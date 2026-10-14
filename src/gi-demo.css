@@ -60,7 +60,7 @@ button{cursor:pointer}
 .footer{border-width:1px 0 0;color:#7d918c;justify-content:space-between}
 .footer button{border:0;background:none;color:#c9d7cd;font-size:10px;letter-spacing:.1em}
 .error-panel{position:absolute;left:20px;right:20px;bottom:75px;background:#4e1f1f;color:white;padding:15px;border:1px solid #ff8b7c;font-size:12px;white-space:pre-wrap}
-.ui-hidden .panel,.ui-hidden .stage-heading,.ui-hidden .stage-label,.ui-hidden .stage-hint{display:none}
+.ui-hidden .panel,.ui-hidden .stage-heading,.ui-hidden .stage-label,.ui-hidden .stage-hint,.ui-hidden .stage-shade{display:none}
 .ui-hidden .layout{grid-template-columns:1fr}
 @media(max-width:900px){.layout{display:block}
 .stage{height:min(66vh,640px);min-height:430px}

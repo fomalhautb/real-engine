@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DIFFUSE_GI_PROBE_BYTES, evaluateGiIrradiance, giRayDirection, giShBasis,
+  DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET,
+  evaluateGiIrradiance, giRayDirection, giShBasis,
   resolveDiffuseGiOptions, type DiffuseGiOptions,
 } from '../src/diffuse-gi';
+import { GI_DISTANCE_CELLS } from '../src/gi-visibility';
 
 const grid: DiffuseGiOptions = { origin: [0, 0, 0], spacing: [0.5, 0.5, 0.5], counts: [2, 2, 2] };
 
@@ -24,8 +26,11 @@ describe('diffuse GI probe contract', () => {
     expect(value.maxDistance).toBe(30);
     expect(value.normalBias).toBe(0.03);
     expect(value.multiBounce).toBe(false);
+    expect(value.visibilityWeightThreshold).toBe(0.2);
     expect(value.maxBytes).toBe(32 * 1024 * 1024);
-    expect(DIFFUSE_GI_PROBE_BYTES).toBe(256);
+    expect(DIFFUSE_GI_PROBE_BYTES).toBe((9 + GI_DISTANCE_CELLS + 1) * 16);
+    expect(DIFFUSE_GI_PROBE_FLOATS).toBe(DIFFUSE_GI_PROBE_BYTES / 4);
+    expect(DIFFUSE_GI_STATE_FLOAT_OFFSET).toBe((9 + GI_DISTANCE_CELLS) * 4);
     expect([value, value.origin, value.spacing, value.counts, value.skyRadiance].every(Object.isFrozen)).toBe(true);
   });
 
@@ -44,6 +49,16 @@ describe('diffuse GI probe contract', () => {
     for (const invalid of [null, 0, 1, 'true', NaN]) {
       expect(() => resolveDiffuseGiOptions({ ...grid, multiBounce: invalid as unknown as boolean }))
         .toThrow('DIFFUSE_GI_MULTI_BOUNCE');
+    }
+  });
+
+  it('bounds the visibility confidence curve and permits an explicit disabled curve', () => {
+    for (const threshold of [0, 0.2, 1]) {
+      expect(resolveDiffuseGiOptions({ ...grid, visibilityWeightThreshold: threshold }).visibilityWeightThreshold).toBe(threshold);
+    }
+    for (const invalid of [-0.001, 1.001, NaN, Infinity, null, '0.2']) {
+      expect(() => resolveDiffuseGiOptions({ ...grid, visibilityWeightThreshold: invalid as unknown as number }))
+        .toThrow('DIFFUSE_GI_VISIBILITY_WEIGHT_THRESHOLD');
     }
   });
 
@@ -68,10 +83,12 @@ describe('diffuse GI probe contract', () => {
     expect(() => resolveDiffuseGiOptions({ ...grid, skyRadiance: [-1, 0, 0] })).toThrow();
     expect(() => resolveDiffuseGiOptions({ ...grid, skyRadiance: [0, 0, 1025] })).toThrow();
     expect(() => resolveDiffuseGiOptions({ ...grid, skyRadiance: new Array(3) as [number, number, number] })).toThrow();
-    expect(() => resolveDiffuseGiOptions({ ...grid, maxBytes: 2047 })).toThrow('DIFFUSE_GI_MEMORY_BUDGET');
-    expect(resolveDiffuseGiOptions({ ...grid, maxBytes: 2048 }).maxBytes).toBe(2048);
+    const minimumBytes = 8 * DIFFUSE_GI_PROBE_BYTES;
+    expect(() => resolveDiffuseGiOptions({ ...grid, maxBytes: minimumBytes - 1 }))
+      .toThrow('DIFFUSE_GI_MEMORY_BUDGET');
+    expect(resolveDiffuseGiOptions({ ...grid, maxBytes: minimumBytes }).maxBytes).toBe(minimumBytes);
     expect(() => resolveDiffuseGiOptions({ ...grid, maxBytes: 128 * 1024 * 1024 + 1 })).toThrow();
-    expect(() => resolveDiffuseGiOptions({ ...grid, maxBytes: 2048.5 })).toThrow();
+    expect(() => resolveDiffuseGiOptions({ ...grid, maxBytes: minimumBytes + 0.5 })).toThrow();
   });
 });
 

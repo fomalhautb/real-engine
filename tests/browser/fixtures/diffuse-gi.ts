@@ -3,6 +3,7 @@ import type { MeshData } from '../../../src/geometry';
 import { identity } from '../../../src/math';
 import { DEFAULT_MATERIAL_DEFINITION, m } from '../../../src/material';
 import { Renderer } from '../../../src/renderer';
+import { DIFFUSE_GI_PROBE_BYTES } from '../../../src/diffuse-gi';
 import type { TextureAsset } from '../../../src/texture-assets';
 
 type Vec3 = [number, number, number];
@@ -109,7 +110,9 @@ export async function runDiffuseGiSkyFixture() {
       worldQueries: { maxRays: 511 }, diffuseGi: skyGrid,
     }));
     const overMemoryBudget = await rejection(() => Renderer.create(element, [], {
-      worldQueries: { maxRays: 512 }, diffuseGi: { ...skyGrid, maxBytes: 2048 },
+      // The CPU contract accepts one field, but all GPU-owned fields, hit
+      // backup, capture weights and readback must fit the complete budget.
+      worldQueries: { maxRays: 512 }, diffuseGi: { ...skyGrid, maxBytes: 8 * DIFFUSE_GI_PROBE_BYTES },
     }));
     const overWorkBudget = await rejection(() => Renderer.create(element, [], {
       worldQueries: { maxRays: 512, maxTotalWorkUnits: 511 }, diffuseGi: skyGrid,

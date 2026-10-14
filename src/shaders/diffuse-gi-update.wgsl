@@ -11,6 +11,7 @@ struct Hit {
 @group(0) @binding(3) var<storage, read> shadows: array<Hit>;
 @group(0) @binding(4) var<storage, read_write> probes: array<GiProbe>;
 @group(0) @binding(5) var<storage, read> giProbes: array<GiProbe>;
+@group(0) @binding(6) var<storage, read> distanceWeights: array<f32>;
 
 // GI_INTERPOLATE
 
@@ -40,7 +41,7 @@ fn generateShadows(@builtin(global_invocation_id) id: vec3u) {
 @compute @workgroup_size(64)
 fn integrate(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= gi.counts.x * gi.counts.y * gi.counts.z) { return; }
-    var probe: GiProbe;
+    var coefficients: array<vec4f, 9>;
     var primaryOverflows = 0u;
     var shadowOverflows = 0u;
     var maximum = vec3f(0.0);
@@ -52,9 +53,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
         shadowOverflows += select(0u, 1u, shadow.work.z != 0u);
         let direction = giDirection(i, gi.counts.w);
         var radiance = gi.sky.xyz;
-        var distance = gi.spacing.w;
         if (hit.identity.x != 0u) {
-            distance = hit.metric.x;
             radiance = hit.emissive.xyz;
             if (hit.emissive.w != 0.0) {
                 radiance += hit.baseColor.xyz;
@@ -75,18 +74,35 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
         maximum = max(maximum, radiance);
         let basis = giBasis(direction);
         for (var coefficient = 0u; coefficient < 9u; coefficient++) {
-            probe.coefficients[coefficient] += vec4f(radiance * basis[coefficient] * (12.56637061 / f32(gi.counts.w)), 0.0);
+            coefficients[coefficient] += vec4f(radiance * basis[coefficient] * (12.56637061 / f32(gi.counts.w)), 0.0);
         }
-        let face = giFace(direction);
-        probe.moments[face] += vec4f(distance, distance * distance, 1.0, 0.0);
     }
-    for (var face = 0u; face < 6u; face++) {
-        let count = probe.moments[face].z;
-        if (count > 0.0) { probe.moments[face] = vec4f(probe.moments[face].xy / count, count, 0.0); }
+    coefficients[0].w = maximum.x;
+    coefficients[1].w = maximum.y;
+    coefficients[2].w = maximum.z;
+    for (var coefficient = 0u; coefficient < 9u; coefficient++) {
+        probes[id.x].coefficients[coefficient] = coefficients[coefficient];
     }
-    probe.state = vec4u(select(0u, 1u, primaryOverflows + shadowOverflows == 0u), gi.state.x, primaryOverflows, shadowOverflows);
-    probe.coefficients[0].w = maximum.x;
-    probe.coefficients[1].w = maximum.y;
-    probe.coefficients[2].w = maximum.z;
-    probes[id.x] = probe;
+    probes[id.x].state = vec4u(select(0u, 1u, primaryOverflows + shadowOverflows == 0u), gi.state.x, primaryOverflows, shadowOverflows);
+}
+
+// Separate texel invocations avoid a large private GiProbe copy, and all surface
+// and feedback reads see this map only after the complete pass has finished.
+@compute @workgroup_size(64)
+fn integrateVisibility(@builtin(global_invocation_id) id: vec3u) {
+    let probeCount = gi.counts.x * gi.counts.y * gi.counts.z;
+    if (id.x >= probeCount * GI_DISTANCE_CELLS) { return; }
+    let probeIndex = id.x / GI_DISTANCE_CELLS;
+    let cell = id.x % GI_DISTANCE_CELLS;
+    var moments = vec2f(0.0);
+    var total = 0.0;
+    for (var i = 0u; i < gi.counts.w; i++) {
+        let index = probeIndex * gi.counts.w + i;
+        var distance = gi.spacing.w;
+        if (primary[index].identity.x != 0u) { distance = primary[index].metric.x; }
+        let weight = distanceWeights[cell * gi.counts.w + i];
+        moments += vec2f(distance, distance * distance) * weight;
+        total += weight;
+    }
+    probes[probeIndex].moments[cell] = vec4f(moments / max(total, 0.00000001), total, 0.0);
 }

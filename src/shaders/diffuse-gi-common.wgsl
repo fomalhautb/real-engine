@@ -1,15 +1,16 @@
+// GI_DISTANCE_CONSTANTS
 struct GiParameters {
     origin: vec4f, // xyz world origin, w enabled
     spacing: vec4f, // xyz spacing, w maximum ray distance
     counts: vec4u, // xyz grid dimensions, w rays per probe
     sunDirection: vec4f, // xyz unit vector, w world-space normal bias
     sunColor: vec4f,
-    sky: vec4f,
+    sky: vec4f, // xyz radiance, w low-confidence visibility weight threshold
     state: vec4u, // rendered frame, usable history frame, feedback enabled, reserved
 }
 struct GiProbe {
     coefficients: array<vec4f, 9>, // RGB incoming radiance SH; first three w values store sampled RGB maxima
-    moments: array<vec4f, 6>, // mean distance, mean squared distance, sample count
+    moments: array<vec4f, GI_DISTANCE_CELLS>, // octahedral texels: mean distance, mean squared distance, normalized weight sum
     state: vec4u, // valid, frame, primary overflows, shadow overflows
 }
 fn giDirection(index: u32, count: u32) -> vec3f {
@@ -23,12 +24,25 @@ fn giBasis(d: vec3f) -> array<f32, 9> {
         1.09254843 * d.x * d.y, 1.09254843 * d.y * d.z, 0.31539157 * (3.0 * d.z * d.z - 1.0),
         1.09254843 * d.x * d.z, 0.546274215 * (d.x * d.x - d.y * d.y));
 }
-fn giFace(d: vec3f) -> u32 {
-    let a = abs(d);
-    var axis = 0u;
-    if (a.y > a.x) { axis = 1u; }
-    if (a.z > a[axis]) { axis = 2u; }
-    return axis * 2u + select(1u, 0u, d[axis] >= 0.0);
+fn giOctaEncode(d: vec3f) -> vec2f {
+    let projected = d / max(dot(abs(d), vec3f(1.0)), 0.00000001);
+    var uv = projected.xy;
+    if (projected.z < 0.0) {
+        let signs = select(vec2f(-1.0), vec2f(1.0), uv >= vec2f(0.0));
+        uv = (vec2f(1.0) - abs(uv.yx)) * signs;
+    }
+    return uv * 0.5 + 0.5;
+}
+// Reflect one-texel bilinear padding across each octahedral fold.
+fn giDistanceTexel(coordinate: vec2i) -> u32 {
+    let size = i32(GI_DISTANCE_RESOLUTION);
+    var x = coordinate.x;
+    var y = coordinate.y;
+    if (x < 0) { x = 0; y = size - 1 - y; }
+    else if (x >= size) { x = size - 1; y = size - 1 - y; }
+    if (y < 0) { y = 0; x = size - 1 - x; }
+    else if (y >= size) { y = size - 1; x = size - 1 - x; }
+    return u32(y) * GI_DISTANCE_RESOLUTION + u32(x);
 }
 fn giCoordinate(index: u32, counts: vec3u) -> vec3u {
     return vec3u(index % counts.x, (index / counts.x) % counts.y, index / (counts.x * counts.y));

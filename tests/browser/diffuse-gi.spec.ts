@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { evaluateGiIrradiance } from '../../src/diffuse-gi';
+import { GI_DISTANCE_CELLS } from '../../src/gi-visibility';
 import type { runDiffuseGiSkyFixture, runDiffuseGiSceneFixture,
   runDiffuseGiOverflowFixture } from './fixtures/diffuse-gi';
 
@@ -68,10 +69,11 @@ test('empty-world GI probes recover constant sky irradiance and honor bounded li
       near(evaluateGiIrradiance(probe.coefficients.flat(), normal),
         [0.1 * Math.PI, 0.2 * Math.PI, 0.3 * Math.PI], 0.025);
     }
-    for (const face of probe.moments) {
-      expect(face[0]).toBeCloseTo(12, 4);
-      expect(face[1]).toBeCloseTo(144, 3);
-      expect(face[2]).toBeGreaterThan(0);
+    expect(probe.moments).toHaveLength(GI_DISTANCE_CELLS);
+    for (const cell of probe.moments) {
+      expect(cell[0]).toBeCloseTo(12, 4);
+      expect(cell[1]).toBeCloseTo(144, 3);
+      expect(cell[2]).toBeCloseTo(1, 4);
     }
   }
   expect(result.initial?.enabled).toBe(true);

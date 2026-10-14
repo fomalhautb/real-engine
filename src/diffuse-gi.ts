@@ -1,4 +1,5 @@
 /** CPU contracts and numerical reference for a bounded diffuse probe grid. */
+import { GI_DISTANCE_CELLS } from './gi-visibility';
 export interface DiffuseGiOptions {
   origin: readonly [number, number, number];
   spacing: readonly [number, number, number];
@@ -9,6 +10,8 @@ export interface DiffuseGiOptions {
   skyRadiance?: readonly [number, number, number];
   /** Feed the previous completed probe field into this frame's diffuse capture. */
   multiBounce?: boolean;
+  /** Smoothly suppress low-confidence visibility weights; 0 disables the curve. */
+  visibilityWeightThreshold?: number;
   maxBytes?: number;
 }
 
@@ -21,13 +24,16 @@ export interface ResolvedDiffuseGiOptions {
   readonly normalBias: number;
   readonly skyRadiance: readonly [number, number, number];
   readonly multiBounce: boolean;
+  readonly visibilityWeightThreshold: number;
   readonly maxBytes: number;
   readonly probeCount: number;
   readonly rayCount: number;
 }
 
-/** 9 RGB SH vec4s, 6 directional depth-moment vec4s, and 1 metadata vec4. */
-export const DIFFUSE_GI_PROBE_BYTES = 256;
+/** 9 RGB SH vec4s, one depth-moment vec4 per octahedral cell, and 1 metadata vec4. */
+export const DIFFUSE_GI_PROBE_BYTES = (9 + GI_DISTANCE_CELLS + 1) * 16;
+export const DIFFUSE_GI_PROBE_FLOATS = DIFFUSE_GI_PROBE_BYTES / 4;
+export const DIFFUSE_GI_STATE_FLOAT_OFFSET = (9 + GI_DISTANCE_CELLS) * 4;
 const MAX_BYTES = 128 * 1024 * 1024;
 const DEFAULT_BYTES = 32 * 1024 * 1024;
 const GOLDEN_ANGLE = 2.399963229728653;
@@ -82,6 +88,11 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
     throw new RangeError('DIFFUSE_GI_MULTI_BOUNCE');
   }
   const multiBounce = options.multiBounce ?? false;
+  const visibilityWeightThreshold = options.visibilityWeightThreshold ?? 0.2;
+  if (options.visibilityWeightThreshold === null || !Number.isFinite(visibilityWeightThreshold)
+    || visibilityWeightThreshold < 0 || visibilityWeightThreshold > 1) {
+    throw new RangeError('DIFFUSE_GI_VISIBILITY_WEIGHT_THRESHOLD');
+  }
   const normalBiasLimit = Math.min(...spacing) * 0.25;
   // A millimetre-scale grid must remain legal when the caller omits the bias.
   const normalBias = options.normalBias ?? Math.min(0.03, normalBiasLimit);
@@ -93,7 +104,7 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   }
   if (probeCount * DIFFUSE_GI_PROBE_BYTES > maxBytes) throw new RangeError('DIFFUSE_GI_MEMORY_BUDGET');
   return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias,
-    skyRadiance, multiBounce, maxBytes, probeCount, rayCount });
+    skyRadiance, multiBounce, visibilityWeightThreshold, maxBytes, probeCount, rayCount });
 }
 
 /** Deterministic Fibonacci-sphere direction; rayIndex is zero based. */

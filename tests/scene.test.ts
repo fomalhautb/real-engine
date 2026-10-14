@@ -116,6 +116,30 @@ describe('DemoScene', () => {
     }
   });
 
+  it('replays spawned body positions after a reset', async () => {
+    const scene = await DemoScene.create(0);
+    try {
+      const positions: number[][] = [];
+      const firstIds: number[] = [];
+      for (let i = 0; i < 16; i++) {
+        expect(scene.spawnBox()).toBe(true);
+        const id = scene.batches[3].instances.at(-1)!.entityId;
+        firstIds.push(id);
+        positions.push([...scene.physics.pose(id, 0)!.position]);
+      }
+      for (let i = 0; i < 16; i++) expect(scene.removeBox()).toBe(true);
+      scene.advance(1 / 10);
+      scene.reset();
+      for (let i = 0; i < 16; i++) {
+        expect(scene.spawnBox()).toBe(true);
+        const id = scene.batches[3].instances.at(-1)!.entityId;
+        expect(id).toBeGreaterThan(firstIds.at(-1)!);
+        expect(scene.physics.pose(id, 0)!.position).toEqual(positions[i]);
+      }
+      expect(scene.physics.bodyCount).toBe(22);
+    } finally { scene.dispose(); }
+  });
+
   it('enforces instance capacities and validates tree counts', async () => {
     await expect(DemoScene.create(257)).rejects.toThrow(RangeError);
     const scene = await DemoScene.create(256);

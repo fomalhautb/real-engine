@@ -6,7 +6,7 @@
 
 WebGPU 是图形与计算 API，Unreal 是包含资源构建、渲染、物理、内容工具和运行时的引擎，两者不能直接按材质数量或画质百分比比较。本项目实际要建设的是 WebGPU 上的引擎系统，借鉴 Nanite 的虚拟几何、Lumen 的世界空间动态光照及 Unreal 的材质组织能力。
 
-项目面向角色与大量动态物体，不能沿用“主要静态室内场景，角色以后再说”的范围。几何、形变、材质和光照应共同立项；代码优先免去编辑器产品线，但不会使资源流送、编译优化和跨系统一致性自动成立。80% 采用 [验收协议](benchmarks.md) 中的加权用例矩阵，而不是对 Unreal 整体能力的无定义承诺。
+项目面向角色与大量动态物体，不能沿用“主要静态室内场景，角色以后再说”的范围。几何、形变、材质和光照应共同立项；代码优先免去编辑器产品线，但不会使资源流送、编译优化和跨系统一致性自动成立。功能范围与完成条件按 [验收协议](benchmarks.md) 中的用例矩阵、P0 门槛及质量、预算、兼容要求界定。
 
 ## Nanite：价值、优先级与边界
 
@@ -85,6 +85,6 @@ Three.js 已提供 WebGPURenderer、计算和间接能力，不能简单说它�
 
 ## 基准与待验证结论
 
-本次没有发现一个可直接计算“Nanite/Lumen 完成 80%”的官方通用分数。采用公开资产、自建微场景和固定动态轨迹：几何看原始 LOD0，光学看收敛参考，产品能力看冻结的 UE 配置。[Intel Sponza](https://www.intel.com/content/www/us/en/developer/topic-technology/graphics-research/samples.html)、[Blender 示例](https://www.blender.org/download/demo-files/) 可作为资产来源；[FLIP](https://research.nvidia.com/publication/flip) 可辅助图像差异分析，但不能替代动态和局部错误检查。
+采用公开资产、自建微场景和固定动态轨迹验证各项能力：几何看原始 LOD0，光学看收敛参考，产品能力看冻结的 UE 配置。分别报告通过、未通过和未支持的用例，不以单个百分比代表 Nanite/Lumen 的整体能力。[Intel Sponza](https://www.intel.com/content/www/us/en/developer/topic-technology/graphics-research/samples.html)、[Blender 示例](https://www.blender.org/download/demo-files/) 可作为资产来源；[FLIP](https://research.nvidia.com/publication/flip) 可辅助图像差异分析，但不能替代动态和局部错误检查。
 
 优先验证四件事：共享形变能否减少跨 pass 重算；动态世界查询能否保留帧预算；独特资产流送能否稳定限内存；材质变化是否正确更新所有消费者。详细场景、目标与统计协议见 [benchmarks.md](benchmarks.md)，阶段交付见 [roadmap.md](roadmap.md)。

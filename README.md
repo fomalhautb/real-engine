@@ -51,7 +51,20 @@ npm run test:browser
 
 第二次运行不启用实验 GPU flags，使用正常硬件适配器。没有兼容 GPU 时测试明确失败，不跳过验证。测试截图和诊断附在 Playwright 输出中，不提交生成文件。
 
-2026-10-14 本地验证：156 项单元测试、TypeScript 与生产构建通过；Chrome 154 的 SwiftShader 和正常硬件配置各通过 9 项浏览器测试，覆盖 glTF 动画、仿射骨骼、材质覆盖、Compute 材质数值、独立采样器、物理、历史、预算与错误路径。这些是功能证据，尚未完成性能档位、长期稳定性或跨厂商认证。
+2026-10-14 本地验证：166 项单元测试、TypeScript 与生产构建通过；Chrome 154 正常硬件配置通过 12 项浏览器测试，覆盖 glTF 动画、仿射骨骼、材质覆盖、Compute 材质数值、独立采样器、物理、运动向量、历史、预算、基准时长与错误路径。这些是功能证据，尚未完成性能档位、长期稳定性或跨厂商认证。
+
+## 可重复基准
+
+安装系统 Chrome 后可执行：
+
+```sh
+npm run benchmark -- --frames 1800 --warmup 300 --trees 128 --repeat 3
+npm run benchmark -- --seconds 1800 --warmup 300 --trees 128 --stress --repeat 1
+```
+
+第一条采集固定轨迹；第二条按真实时间运行 30 分钟，循环增删刚体、换材质、重置、调整分辨率和切换镜头。默认以正常 GPU 配置运行独立的 headless Chrome；`--software` 仅用于功能排错，`--headed` 可显示测试窗口，`--channel msedge` 可选 Edge。运行环境和实际启动参数写入报告。
+
+结果保存在 `artifacts/benchmarks/`，包含源码/生产构建哈希、环境清单、逐帧 CSV、统计 JSON、截图和运行期间的内存观察。生产构建复制到独立目录，后续开发不会改变正在测量的版本。rAF 间隔表示浏览器回调节奏，GPU 时间是稀疏异步样本；两者均不等于显示器实际呈现时间。当前仅测基础场景，不代表大型场景、GI、反射或体积雾性能。完整协议与边界见 [实现状态](docs/implementation.md#基准运行器与首轮证据)。
 
 ## 材质接口示例
 
@@ -112,3 +125,5 @@ renderer.render([4, 3, 6], [0, 1, 0]);
 | src/shaders/surface.wgsl | 直接光 PBR、阴影与运动向量 |
 | src/physics.ts | Rapier 适配与固定步姿态快照 |
 | src/scene.ts | 用代码组合通用能力的测试场景 |
+| src/benchmark.ts、src/benchmark-scenario.ts、src/benchmark-stats.ts | 固定轨迹/事件、真实时长运行与有界逐帧统计 |
+| scripts/benchmark.mjs | 独立生产构建、浏览器运行、环境/构建指纹与结果导出 |

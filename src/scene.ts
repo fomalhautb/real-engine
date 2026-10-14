@@ -254,6 +254,7 @@ export class DemoScene {
 
   reset(): void {
     this.assertAlive();
+    this.nextBoxOrdinal = this.batches[3].instances.length;
     this.time = 0;
     this.droppedSeconds = 0;
     this.stepper.reset();

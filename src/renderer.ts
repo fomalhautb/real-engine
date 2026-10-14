@@ -24,6 +24,8 @@ export interface FrameStats {
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
   gpuMs: { deformation: number; shadow: number; surface: number } | null;
+  /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
+  gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
 }
 export interface DeformationVerification {
@@ -41,8 +43,8 @@ export interface RendererOptions {
 export class Renderer {
   readonly errors: string[] = [];
   readonly stats: FrameStats = { frames: 0, drawCalls: 0, triangles: 0, deformedVertices: 0,
-    ownedGpuBytes: 0, width: 0, height: 0, cpuSubmitMs: 0, gpuMs: null, deformationDispatches: 0, uploadedBytes: 0 };
-  readonly info: { adapter: string; features: string[]; userAgent: string; timing: string };
+    ownedGpuBytes: 0, width: 0, height: 0, cpuSubmitMs: 0, gpuMs: null, gpuSampleFrame: null, deformationDispatches: 0, uploadedBytes: 0 };
+  readonly info: { adapter: string; features: string[]; userAgent: string; timing: string; limits: Record<string, number> };
   private readonly batches: Batch[] = [];
   private readonly buffers: GPUBuffer[] = [];
   private readonly frameData = new Float32Array(64);
@@ -106,6 +108,9 @@ export class Renderer {
       adapter: [adapter.info.vendor, adapter.info.architecture, adapter.info.description].filter(Boolean).join(' / ') || 'Unreported adapter',
       features: Array.from(device.features), userAgent: navigator.userAgent,
       timing: timing ? 'GPU timestamp-query (adapter-dependent precision)' : 'GPU timestamps unavailable',
+      limits: { maxBufferSize: device.limits.maxBufferSize, maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
+        maxTextureDimension2D: device.limits.maxTextureDimension2D, maxComputeWorkgroupsPerDimension: device.limits.maxComputeWorkgroupsPerDimension,
+        maxStorageBuffersPerShaderStage: device.limits.maxStorageBuffersPerShaderStage, maxSampledTexturesPerShaderStage: device.limits.maxSampledTexturesPerShaderStage },
     };
     device.addEventListener('uncapturederror', event => this.errors.push(event.error.message));
     void device.lost.then(loss => {
@@ -388,6 +393,12 @@ export class Renderer {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     this.stats.width = width; this.stats.height = height;
     this.stats.ownedGpuBytes += width * height * 8;
+    this.invalidateHistory();
+  }
+
+  /** Reject camera and object history for a cut, teleport, or topology change. */
+  invalidateHistory(): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
     this.lastViewProjection = undefined;
     for (const batch of this.batches) batch.history.clear();
   }
@@ -412,7 +423,7 @@ export class Renderer {
       this.timingPending = true;
     }
     this.device.queue.submit([encoder.finish()]);
-    if (readTiming) void this.readTiming();
+    if (readTiming) void this.readTiming(this.stats.frames + 1);
     this.stats.frames++;
     this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2;
     this.stats.triangles = this.batches.reduce((sum, batch) => sum + batch.scene.mesh.indices.length / 3 * batch.scene.instances.length, 0);
@@ -466,12 +477,13 @@ export class Renderer {
       pass.drawIndexed(batch.scene.mesh.indices.length, batch.scene.instances.length);
     }
   }
-  private async readTiming(): Promise<void> {
+  private async readTiming(frame: number): Promise<void> {
     try {
       await this.queryRead!.mapAsync(GPUMapMode.READ);
       const values = new BigUint64Array(this.queryRead!.getMappedRange());
       this.stats.gpuMs = { deformation: Number(values[1] - values[0]) / 1e6,
         shadow: Number(values[3] - values[2]) / 1e6, surface: Number(values[5] - values[4]) / 1e6 };
+      this.stats.gpuSampleFrame = frame;
       this.queryRead!.unmap();
     } catch (error) { if (!this.disposed) this.errors.push('TIMESTAMP_READBACK: ' + String(error)); }
     finally { this.timingPending = false; }
@@ -512,6 +524,42 @@ export class Renderer {
       const values = results.map(result => (result as PromiseFulfilledResult<number[]>).value);
       return points.map((_, i) => ({ surface: values[0][i], shadow: values[1][i] }));
     } finally { for (const read of reads) read.buffer.destroy(); }
+  }
+
+  /** Diagnostic only: exact top-left-origin pixel indices, returning current-minus-previous UV deltas. */
+  async probeVelocity(points: readonly { x: number; y: number }[]): Promise<number[][]> {
+    if (this.disposed || !this.velocity || !this.lastViewProjection) throw new Error('NO_RENDERED_VELOCITY');
+    const width = this.stats.width, height = this.stats.height;
+    if (points.length > 1024 || points.some(point => !Number.isSafeInteger(point.x) || !Number.isSafeInteger(point.y)
+      || point.x < 0 || point.y < 0 || point.x >= width || point.y >= height)) throw new Error('INVALID_VELOCITY_PROBES');
+    if (!points.length) return [];
+    // A one-pixel copy occupies one 256-byte row. This keeps readback bounded by
+    // the requested sample count instead of copying the entire viewport texture.
+    const read = this.device.createBuffer({ label: 'diagnostic velocity readback', size: points.length * 256,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    try {
+      const encoder = this.device.createCommandEncoder({ label: 'diagnostic velocity readback' });
+      for (let i = 0; i < points.length; i++) {
+        encoder.copyTextureToBuffer({ texture: this.velocity, origin: { x: points[i].x, y: points[i].y } },
+          { buffer: read, offset: i * 256, bytesPerRow: 256, rowsPerImage: 1 }, { width: 1, height: 1 });
+      }
+      this.device.queue.submit([encoder.finish()]);
+      await read.mapAsync(GPUMapMode.READ);
+      try {
+        const words = new Uint16Array(read.getMappedRange());
+        const half = (bits: number): number => {
+          const sign = bits & 0x8000 ? -1 : 1, exponent = (bits >>> 10) & 31, fraction = bits & 1023;
+          if (exponent === 0) return sign * fraction * 2 ** -24;
+          if (exponent === 31) return fraction ? NaN : sign * Infinity;
+          return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
+        };
+        return points.map((_, i) => {
+          const result = [half(words[i * 128]), half(words[i * 128 + 1])];
+          if (!result.every(Number.isFinite)) throw new Error('NONFINITE_VELOCITY');
+          return result;
+        });
+      } finally { read.unmap(); }
+    } finally { read.destroy(); }
   }
 
   /** Explicit diagnostic readback only; never used by the production frame loop. */

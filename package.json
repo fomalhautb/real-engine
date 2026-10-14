@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:browser": "playwright test",
+    "benchmark": "node scripts/benchmark.mjs",
     "check": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {

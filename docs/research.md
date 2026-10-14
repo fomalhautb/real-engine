@@ -27,6 +27,8 @@ Nanite 的核心组合是分层几何簇、屏幕误差驱动的细节选择、G
 
 资产构建优先调查并复用 [meshoptimizer](https://github.com/zeux/meshoptimizer) 的簇、简化与压缩能力；[vk_lod_clusters](https://github.com/nvpro-samples/vk_lod_clusters) 可参考层级与流送组织；[nanite-webgpu](https://github.com/Scthe/nanite-webgpu) 可参考浏览器实现和作者公开的限制。它们不是已验证满足本项目动态材质与光照需求的整体解决方案。
 
+离线构建基线固定使用 MIT 许可的 meshoptimizer 1.3.0 JS/WASM 簇、属性简化和无损压缩 API，参考其 [官方 JS 接口](https://github.com/zeux/meshoptimizer/blob/v1.3/js/README.md) 和 [clusterlod 示例合约](https://github.com/zeux/meshoptimizer/blob/v1.3/demo/clusterlod.h)。本项目自行组织边界锁定、重分组、累计误差与页面格式；简化器返回的是近似误差，`ErrorAbsolute` 只改变单位，不能据此宣称严格的 Hausdorff 上界。当前离线代码的支持范围与剩余验收见 [实现状态](implementation.md#离线几何构建与页面)。
+
 ## Lumen：必须保住离屏世界
 
 Lumen 的价值是动态漫反射反弹、天空遮蔽、自发光贡献和反射；离开画面的物体仍然能够参与照明和遮挡。应区分三个系统：几何追踪回答命中位置，Surface Cache 提供表面材质/光照，探针及辐射缓存降低采样开销。屏幕空间追踪只能补充细节，不能替代完整离屏贡献。[Lumen 功能](https://dev.epicgames.com/documentation/en-us/unreal-engine/lumen-global-illumination-and-reflections-in-unreal-engine)
@@ -39,15 +41,15 @@ Lumen Medium/Lite 使用更便宜的探针插值；平滑表面采用 SSR，不�
 
 Virtual Shadow Maps、虚拟纹理、时域超分和世界流送是相邻独立系统，不应全部计入“实现 Lumen”。直接阴影先建立正确性基线，再依据测量升级。[Virtual Shadow Maps](https://dev.epicgames.com/documentation/en-us/unreal-engine/virtual-shadow-maps-in-unreal-engine)
 
-## Volumetric Fog：独立介质模块，共享光照数据
+## 参与介质与光路合成
 
-2026-10-14 追加调研。Epic 的体积雾文档描述局部密度、体积材质、灯光/阴影和时序重投影，并指出快速变化灯光可能留下拖影；Lumen 文档另说明其为雾提供较低精度的 GI。[Epic Volumetric Fog](https://dev.epicgames.com/documentation/en-us/unreal-engine/volumetric-fog-in-unreal-engine)、[Lumen GI](https://dev.epicgames.com/documentation/en-us/unreal-engine/lumen-global-illumination-and-reflections-in-unreal-engine)
+Epic 的体积雾文档描述局部密度、体积材质、灯光/阴影和时序重投影，并指出快速变化灯光可能留下拖影；Lumen 文档另说明其为雾提供较低精度的 GI。[Epic Volumetric Fog](https://dev.epicgames.com/documentation/en-us/unreal-engine/volumetric-fog-in-unreal-engine)、[Lumen GI](https://dev.epicgames.com/documentation/en-us/unreal-engine/lumen-global-illumination-and-reflections-in-unreal-engine)
 
 技术起点采用视锥体积网格，把密度、照明、沿射线积分与合成分开；参考 [Wronski：Volumetric Fog，SIGGRAPH 2014](https://bartwronski.com/wp-content/uploads/2014/08/bwronski_volumetric_fog_siggraph2014.pdf)。资料中的旧平台耗时不能作为本引擎或浏览器预算的实测依据。
 
-本项目的工程决策：阶段 1 预留共享合约，阶段 2 中期先接直接光/阴影，再接 GI、反射与时序重建，后期进入大场景视觉验收；阶段 3 扩大规模和硬件覆盖，阶段 4 处理高级介质光学。这样窗洞光柱与林间雾能在阶段 2 出现，也避免把相机视锥内的缓存当成整个世界的雾。高性能目标通过有界网格、灯光/体积列表和分档测量落实，不预设“体积雾几乎免费”。
+本项目采用共享世界单位、灯光、遮挡和历史版本的参与介质合约，随几何、GI 和反射进入完整场景验收。相机视锥内的缓存不能代表整个世界的介质定义；成本通过有界网格、灯光/体积列表和分档测量控制。具体依赖与交付顺序统一见 [路线图](roadmap.md)。
 
-首版范围为薄雾单次散射、几何遮挡及低频 GI 输入；浓烟、体积自阴影、多重散射、介质对表面间接光的双向反馈另行验收。天空大气、体积云和烟火模拟是可复用部分基础的相邻系统，不能因支持 Volumetric Fog 就一并宣称实现。架构见 [介质合约](architecture.md#体积雾与共享光照)，验收见 [体积雾验收](benchmarks.md#体积雾验收与预算)。
+首版范围为薄雾单次散射、几何遮挡及低频 GI 输入；浓烟、体积自阴影、多重散射、介质对表面间接光的双向反馈另行验收。天空大气、体积云和烟火模拟是可复用部分基础的相邻系统，不能因支持 Volumetric Fog 就一并宣称实现。架构见 [统一光照合约](architecture.md#光照反射与参与介质的统一合约)，数值预算与其他系统一同列在 [初始验收目标](benchmarks.md#初始验收目标)。
 
 ## 材质差距要分三层看
 

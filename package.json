@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
+    "build:geometry": "node scripts/build-geometry.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:browser": "playwright test",
@@ -13,7 +14,8 @@
     "check": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
-    "@dimforge/rapier3d-compat": "^0.21.0"
+    "@dimforge/rapier3d-compat": "^0.21.0",
+    "meshoptimizer": "1.3.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.0",

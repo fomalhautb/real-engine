@@ -1,5 +1,6 @@
 import deformationSource from './shaders/deform.wgsl?raw';
 import surfaceSource from './shaders/surface.wgsl?raw';
+import resolveSource from './shaders/resolve.wgsl?raw';
 import { identity, lookAt, multiply, perspective, transformPoint, type Mat4 } from './math';
 import type { InstanceState, SceneBatch, MaterialBinding } from './contracts';
 import { MaterialResources, type GpuMaterial } from './gpu-material';
@@ -25,7 +26,7 @@ type Batch = {
 export interface FrameStats {
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
-  gpuMs: { deformation: number; shadow: number; surface: number } | null;
+  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number } | null;
   /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
   gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
@@ -58,6 +59,12 @@ export class Renderer {
   private readonly shadowFrameBindGroup: GPUBindGroup;
   private depth?: GPUTexture;
   private velocity?: GPUTexture;
+  private hdr?: GPUTexture;
+  private resolveGroup?: GPUBindGroup;
+  private resolvePipeline!: GPURenderPipeline;
+  private resolveLayout!: GPUBindGroupLayout;
+  private readonly exposureBuffer: GPUBuffer;
+  private exposureEV = 0;
   private lastViewProjection?: Mat4;
   private lightMatrix: Mat4 = identity();
   private sunDirection: [number, number, number] = [-18, 30, 19];
@@ -65,6 +72,7 @@ export class Renderer {
   private querySet?: GPUQuerySet;
   private queryResolve?: GPUBuffer;
   private queryRead?: GPUBuffer;
+  private readonly timestampCount: number;
   private timingPending = false;
   private disposed = false;
   private readonly deformationPipelines = new Map<string, GPUComputePipeline>();
@@ -124,8 +132,11 @@ export class Renderer {
     });
     this.materialVariantLimit = options.materialVariantLimit ?? 128;
     this.worldQueryOptions = options.worldQueries;
+    this.timestampCount = options.worldQueries ? 10 : 8;
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    this.setExposure(0);
     this.shadow = device.createTexture({ label: 'sun shadow', size: [1024, 1024], format: 'depth32float',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
     this.stats.ownedGpuBytes += 1024 * 1024 * 4;
@@ -149,9 +160,9 @@ export class Renderer {
     this.shadowFrameLayout = shadowFrameLayout;
     this.setSun({ direction: this.sunDirection, color: this.sunColor });
     if (timing) {
-      this.querySet = device.createQuerySet({ type: 'timestamp', count: 6 });
-      this.queryResolve = this.buffer('timestamp resolve', 48, GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC);
-      this.queryRead = this.buffer('timestamp readback', 48, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+      this.querySet = device.createQuerySet({ type: 'timestamp', count: this.timestampCount });
+      this.queryResolve = this.buffer('timestamp resolve', this.timestampCount * 8, GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC);
+      this.queryRead = this.buffer('timestamp readback', this.timestampCount * 8, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     }
   }
   private frameLayout: GPUBindGroupLayout;
@@ -175,6 +186,16 @@ export class Renderer {
 
   private async initialize(format: GPUTextureFormat, scene: SceneBatch[]): Promise<void> {
     this.format = format;
+    this.resolveLayout = this.device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    ] });
+    const resolveModule = await this.shader(resolveSource, 'HDR resolve');
+    this.resolvePipeline = await this.device.createRenderPipelineAsync({ label: 'HDR exposure and display transfer',
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.resolveLayout] }),
+      vertex: { module: resolveModule, entryPoint: 'vertexMain' },
+      fragment: { module: resolveModule, entryPoint: 'fragmentMain', targets: [{ format: this.format }] },
+    });
     this.computeLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5, 6].map(binding => ({
       binding, visibility: GPUShaderStage.COMPUTE,
       buffer: { type: binding === 0 ? 'uniform' : binding === 4 ? 'storage' : 'read-only-storage' },
@@ -200,6 +221,7 @@ export class Renderer {
       ...(this.worldQueries ? [{ name: 'world-query-bounds', kind: 'buffer' as const, source: 'imported' as const }] : []),
       { name: 'sun-shadow', kind: 'texture', source: 'transient' },
       { name: 'canvas', kind: 'texture', source: 'imported' },
+      { name: 'scene-hdr', kind: 'texture', source: 'transient' },
       { name: 'depth', kind: 'texture', source: 'transient' },
       { name: 'velocity', kind: 'texture', source: 'transient' },
     ], [
@@ -207,10 +229,11 @@ export class Renderer {
       ...(this.worldQueries ? [{ name: 'world-query-refit', uses: [
         { resource: 'shared-geometry' as const, access: 'read' as const },
         { resource: 'world-query-bounds' as const, access: 'write' as const },
-      ], after: ['deformation'], execute: (encoder: GPUCommandEncoder) => this.worldQueries!.encodeRefit(encoder) }] : []),
+      ], after: ['deformation'], execute: (encoder: GPUCommandEncoder) => this.worldQueries!.encodeRefit(encoder, this.timestamp(8)) }] : []),
       { name: 'shadow', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'write' }], execute: encoder => this.encodeShadow(encoder) },
       { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' },
-        { resource: 'canvas', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
+        { resource: 'scene-hdr', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
+      { name: 'resolve', uses: [{ resource: 'scene-hdr', access: 'read' }, { resource: 'canvas', access: 'write' }], execute: encoder => this.encodeResolve(encoder) },
     ]);
   }
 
@@ -233,7 +256,7 @@ export class Renderer {
           const surface = await this.device.createRenderPipelineAsync({ label: 'material surface and velocity',
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout, this.materialResources.layout] }),
             vertex: { module, entryPoint: 'vertexMain' },
-            fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: this.format }, { format: 'rg16float' }] },
+            fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: 'rgba16float' }, { format: 'rg16float' }] },
             primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
           });
           const shadow = await this.device.createRenderPipelineAsync({ label: 'shared material shadow coverage',
@@ -285,6 +308,14 @@ export class Renderer {
     if (!batch) throw new Error('BATCH_NOT_FOUND: ' + batchName);
     this.materialResources.updateParameters(batch.material, values);
     this.materialRevision++;
+  }
+
+  /** Exposure in stops, applied only during final scene-linear HDR resolve. */
+  setExposure(ev: number): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!Number.isFinite(ev) || ev < -16 || ev > 16) throw new Error('INVALID_EXPOSURE');
+    this.exposureEV = ev;
+    this.device.queue.writeBuffer(this.exposureBuffer, 0, new Float32Array([2 ** ev, 0, 0, 0]));
   }
 
   /** A directional light points from the surface towards the light. Linear RGB radiance. */
@@ -409,15 +440,20 @@ export class Renderer {
     const height = Math.max(1, Math.min(this.device.limits.maxTextureDimension2D, Math.round(this.canvas.clientHeight * ratio)));
     if (width === this.stats.width && height === this.stats.height) return;
     if (this.depth) {
-      this.stats.ownedGpuBytes -= this.stats.width * this.stats.height * 8;
-      this.depth.destroy(); this.velocity!.destroy();
+      this.stats.ownedGpuBytes -= this.stats.width * this.stats.height * 16;
+      this.depth.destroy(); this.velocity!.destroy(); this.hdr!.destroy();
     }
     this.canvas.width = width; this.canvas.height = height;
-    this.depth = this.device.createTexture({ size: [width, height], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    this.depth = this.device.createTexture({ size: [width, height], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING });
     this.velocity = this.device.createTexture({ size: [width, height], format: 'rg16float',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    this.hdr = this.device.createTexture({ label: 'scene-linear HDR', size: [width, height], format: 'rgba16float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING });
+    this.resolveGroup = this.device.createBindGroup({ layout: this.resolveLayout, entries: [
+      { binding: 0, resource: this.hdr.createView() }, { binding: 1, resource: { buffer: this.exposureBuffer } },
+    ] });
     this.stats.width = width; this.stats.height = height;
-    this.stats.ownedGpuBytes += width * height * 8;
+    this.stats.ownedGpuBytes += width * height * 16;
     this.invalidateHistory();
   }
 
@@ -435,24 +471,24 @@ export class Renderer {
     this.resize();
     this.worldQueries?.validateSources();
     for (const batch of this.batches) this.upload(batch);
-    this.worldQueries?.updateSnapshot(this.stats.frames + 1, this.materialRevision);
+    this.stats.uploadedBytes += this.worldQueries?.updateSnapshot(this.stats.frames + 1, this.materialRevision) ?? 0;
     const vp = multiply(perspective(Math.PI / 3.2, this.stats.width / this.stats.height, 0.1, 150), lookAt(eye, target, [0, 1, 0]));
     this.frameData.set(vp); this.frameData.set(this.lastViewProjection ?? vp, 16); this.frameData.set(this.lightMatrix, 32);
     this.frameData.set([...eye, 1], 48); this.frameData.set([...this.sunDirection, 0], 52); this.frameData.set([...this.sunColor, 1], 56);
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
     this.lastViewProjection = vp;
-    const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → surface' });
+    const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → HDR surface → resolve' });
     this.graph.execute(encoder);
     const readTiming = !!this.querySet && !this.timingPending && this.stats.frames % 30 === 0;
     if (readTiming) {
-      encoder.resolveQuerySet(this.querySet!, 0, 6, this.queryResolve!, 0);
-      encoder.copyBufferToBuffer(this.queryResolve!, 0, this.queryRead!, 0, 48);
+      encoder.resolveQuerySet(this.querySet!, 0, this.timestampCount, this.queryResolve!, 0);
+      encoder.copyBufferToBuffer(this.queryResolve!, 0, this.queryRead!, 0, this.timestampCount * 8);
       this.timingPending = true;
     }
     this.device.queue.submit([encoder.finish()]);
     if (readTiming) void this.readTiming(this.stats.frames + 1);
     this.stats.frames++;
-    this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2;
+    this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2 + 1;
     this.stats.triangles = this.batches.reduce((sum, batch) => sum + batch.scene.mesh.indices.length / 3 * batch.scene.instances.length, 0);
     this.stats.deformedVertices = this.batches.reduce((sum, batch) => sum + (batch.dirty ? batch.scene.mesh.vertexCount * batch.scene.instances.length : 0), 0);
     this.stats.cpuSubmitMs = performance.now() - started;
@@ -486,15 +522,22 @@ export class Renderer {
   }
   private encodeSurface(encoder: GPUCommandEncoder): void {
     const pass = encoder.beginRenderPass({ label: 'PBR and velocity', timestampWrites: this.timestamp(4), colorAttachments: [
-      { view: this.context.getCurrentTexture().createView(), clearValue: [0.035, 0.055, 0.065, 1], loadOp: 'clear', storeOp: 'store' },
+      { view: this.hdr!.createView(), clearValue: [0.0035, 0.0055, 0.0065, 1], loadOp: 'clear', storeOp: 'store' },
       { view: this.velocity!.createView(), clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
     ], depthStencilAttachment: { view: this.depth!.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
     pass.setBindGroup(0, this.frameBindGroup);
     this.draw(pass, 'surface'); pass.end();
   }
+  private encodeResolve(encoder: GPUCommandEncoder): void {
+    const pass = encoder.beginRenderPass({ label: 'HDR exposure and display transfer', timestampWrites: this.timestamp(6), colorAttachments: [
+      { view: this.context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] },
+    ] });
+    pass.setPipeline(this.resolvePipeline); pass.setBindGroup(0, this.resolveGroup!); pass.draw(3); pass.end();
+  }
   diagnostics() {
     return { deformationVariants: this.deformationPipelines.size, materialVariants: this.materialPipelines.size,
       worldQueries: this.worldQueries?.diagnostics() ?? null,
+      output: { sceneFormat: 'rgba16float', exposureEV: this.exposureEV, transfer: 'sRGB', toneMap: 'filmic-fit', maxSceneRadiance: 65504 },
       materials: this.materialResources.diagnostics(), materialRevision: this.materialRevision, passes: this.graph.order,
       lifetimes: Object.fromEntries(this.graph.lifetimes),
       bounds: this.batches.flatMap(batch => Array.from(batch.bounds, ([entityId, bounds]) => ({ entityId, ...bounds }))) };
@@ -518,7 +561,9 @@ export class Renderer {
       await this.queryRead!.mapAsync(GPUMapMode.READ);
       const values = new BigUint64Array(this.queryRead!.getMappedRange());
       this.stats.gpuMs = { deformation: Number(values[1] - values[0]) / 1e6,
-        shadow: Number(values[3] - values[2]) / 1e6, surface: Number(values[5] - values[4]) / 1e6 };
+        shadow: Number(values[3] - values[2]) / 1e6, surface: Number(values[5] - values[4]) / 1e6,
+        resolve: Number(values[7] - values[6]) / 1e6,
+        worldQueryRefit: this.worldQueries ? Number(values[9] - values[8]) / 1e6 : 0 };
       this.stats.gpuSampleFrame = frame;
       this.queryRead!.unmap();
     } catch (error) { if (!this.disposed) this.errors.push('TIMESTAMP_READBACK: ' + String(error)); }
@@ -565,18 +610,29 @@ export class Renderer {
   /** Diagnostic only: exact top-left-origin pixel indices, returning current-minus-previous UV deltas. */
   async probeVelocity(points: readonly { x: number; y: number }[]): Promise<number[][]> {
     if (this.disposed || !this.velocity || !this.lastViewProjection) throw new Error('NO_RENDERED_VELOCITY');
+    return this.readFloat16Pixels(this.velocity, points, 2, 'VELOCITY');
+  }
+
+  /** Diagnostic only: linear scene radiance before exposure and display transfer. */
+  async probeHdr(points: readonly { x: number; y: number }[]): Promise<number[][]> {
+    if (this.disposed || !this.hdr || !this.lastViewProjection) throw new Error('NO_RENDERED_HDR');
+    return this.readFloat16Pixels(this.hdr, points, 4, 'HDR');
+  }
+
+  private async readFloat16Pixels(texture: GPUTexture, points: readonly { x: number; y: number }[],
+    channels: number, label: string): Promise<number[][]> {
     const width = this.stats.width, height = this.stats.height;
     if (points.length > 1024 || points.some(point => !Number.isSafeInteger(point.x) || !Number.isSafeInteger(point.y)
-      || point.x < 0 || point.y < 0 || point.x >= width || point.y >= height)) throw new Error('INVALID_VELOCITY_PROBES');
+      || point.x < 0 || point.y < 0 || point.x >= width || point.y >= height)) throw new Error('INVALID_' + label + '_PROBES');
     if (!points.length) return [];
     // A one-pixel copy occupies one 256-byte row. This keeps readback bounded by
     // the requested sample count instead of copying the entire viewport texture.
-    const read = this.device.createBuffer({ label: 'diagnostic velocity readback', size: points.length * 256,
+    const read = this.device.createBuffer({ label: 'diagnostic ' + label + ' readback', size: points.length * 256,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     try {
-      const encoder = this.device.createCommandEncoder({ label: 'diagnostic velocity readback' });
+      const encoder = this.device.createCommandEncoder({ label: 'diagnostic ' + label + ' readback' });
       for (let i = 0; i < points.length; i++) {
-        encoder.copyTextureToBuffer({ texture: this.velocity, origin: { x: points[i].x, y: points[i].y } },
+        encoder.copyTextureToBuffer({ texture, origin: { x: points[i].x, y: points[i].y } },
           { buffer: read, offset: i * 256, bytesPerRow: 256, rowsPerImage: 1 }, { width: 1, height: 1 });
       }
       this.device.queue.submit([encoder.finish()]);
@@ -590,8 +646,8 @@ export class Renderer {
           return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
         };
         return points.map((_, i) => {
-          const result = [half(words[i * 128]), half(words[i * 128 + 1])];
-          if (!result.every(Number.isFinite)) throw new Error('NONFINITE_VELOCITY');
+          const result = Array.from({ length: channels }, (_, channel) => half(words[i * 128 + channel]));
+          if (!result.every(Number.isFinite)) throw new Error('NONFINITE_' + label);
           return result;
         });
       } finally { read.unmap(); }
@@ -660,7 +716,7 @@ export class Renderer {
     this.worldQueries?.dispose();
     this.materialResources.dispose(); this.materialPipelines.clear();
     for (const buffer of this.buffers) buffer.destroy();
-    this.shadow.destroy(); this.depth?.destroy(); this.velocity?.destroy(); this.querySet?.destroy();
+    this.shadow.destroy(); this.depth?.destroy(); this.velocity?.destroy(); this.hdr?.destroy(); this.querySet?.destroy();
     this.context.unconfigure(); this.device.destroy();
     this.stats.ownedGpuBytes = 0;
   }

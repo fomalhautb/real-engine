@@ -23,7 +23,7 @@ test('shared deformation, lifetime, physics controls, resize, and GPU validation
   expect(first.stats!.drawCalls).toBe(14);
   expect(first.physics.bodies).toBe(6);
   expect(first.errors).toEqual([]);
-  expect(first.renderGraph!.passes).toEqual(['deformation', 'shadow', 'surface']);
+  expect(first.renderGraph!.passes).toEqual(['deformation', 'shadow', 'surface', 'resolve']);
   expect(first.renderGraph!.deformationVariants).toBe(5);
   expect(first.renderGraph!.bounds.length).toBe(23);
   expect(first.renderGraph!.materialVariants).toBe(4);

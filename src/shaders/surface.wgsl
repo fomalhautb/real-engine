@@ -101,9 +101,6 @@ fn visibility(light: vec4f, ndotl: f32) -> f32 {
     }
     return sum / 9.0;
 }
-fn tonemap(color: vec3f) -> vec3f {
-    return clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
-}
 struct FragmentOutput { @location(0) color: vec4f, @location(1) velocity: vec2f }
 @fragment
 fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> FragmentOutput {
@@ -135,11 +132,11 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     let direct = (diffuse + specular) * frame.sunColor.rgb * nl * visibility(input.light, nl);
     // Constant ambient fill is explicitly not world-space GI.
     let ambient = base * (0.045 + 0.065 * max(n.y, 0.0)) * (1.0 - metalness * 0.6);
-    let distanceFog = 1.0 - exp(-distance(frame.camera.xyz, input.world) * 0.008);
     let lighting = select(direct + ambient + surface.emissive, base + surface.emissive, MATERIAL_UNLIT);
-    let radiance = mix(lighting, vec3f(0.055, 0.085, 0.10), distanceFog);
     var output: FragmentOutput;
-    output.color = vec4f(pow(tonemap(radiance), vec3f(1.0 / 2.2)), 1.0);
+    // rgba16float is the bounded scene-linear transport buffer. Exposure and
+    // display transfer belong to the final resolve, after lighting and media.
+    output.color = vec4f(clamp(lighting, vec3f(0.0), vec3f(65504.0)), 1.0);
     output.velocity = vec2f(0.0);
     if (input.current.w > 0.0001 && input.previous.w > 0.0001) {
         output.velocity = clamp((input.current.xy / input.current.w - input.previous.xy / input.previous.w) * vec2f(0.5, -0.5), vec2f(-2.0), vec2f(2.0));

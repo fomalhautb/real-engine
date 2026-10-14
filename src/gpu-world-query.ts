@@ -204,28 +204,43 @@ export class GpuWorldQuery {
       }
     }
   }
-  updateSnapshot(frame: number, _materialRevision: number): void {
+  updateSnapshot(frame: number, _materialRevision: number): number {
     this.frame = u32(frame, 'FRAME');
+    let uploadedBytes = 0;
     for (const batch of this.batches) {
       batch.dirty = batch.source.getDirty?.() ?? true;
       batch.count = batch.source.scene.instances.length;
+      if (!batch.dirty || !batch.count) continue;
       batch.source.scene.instances.forEach((state, i) => batch.metadata.set(
         [state.entityId, state.entityGeneration ?? 0, state.historyVersion, 0], i * 4));
-      if (batch.count) this.device.queue.writeBuffer(batch.identities, 0, batch.metadata, 0, batch.count * 4);
-      if (batch.dirty) for (const level of batch.levels) this.device.queue.writeBuffer(level.params, 0, new Uint32Array([
+      this.device.queue.writeBuffer(batch.identities, 0, batch.metadata, 0, batch.count * 4);
+      uploadedBytes += batch.count * 16 + batch.levels.length * 48;
+      for (const level of batch.levels) this.device.queue.writeBuffer(level.params, 0, new Uint32Array([
         batch.nodeCount, batch.mesh.vertexCount, batch.count, 0,
         ...batch.offsets, level.offset, level.count, 0, 0, 0,
       ]));
     }
+    return uploadedBytes;
   }
-  encodeRefit(encoder: GPUCommandEncoder): void {
+  encodeRefit(encoder: GPUCommandEncoder, timing?: GPUComputePassTimestampWrites): void {
+    let remaining = this.batches.reduce((sum, batch) => sum + (batch.count && batch.dirty ? batch.levels.length : 0), 0);
+    let first = true;
+    if (!remaining && timing) {
+      encoder.beginComputePass({ label: 'cached world BVH refit', timestampWrites: timing }).end();
+    }
     for (const batch of this.batches) {
       if (!batch.count || !batch.dirty) continue;
       for (let depth = batch.levels.length - 1; depth >= 0; depth--) {
         const level = batch.levels[depth];
-        const pass = encoder.beginComputePass({ label: `world BVH refit ${batch.name} depth ${depth}` });
+        const timestampWrites = timing && (first || remaining === 1) ? {
+          querySet: timing.querySet,
+          beginningOfPassWriteIndex: first ? timing.beginningOfPassWriteIndex : undefined,
+          endOfPassWriteIndex: remaining === 1 ? timing.endOfPassWriteIndex : undefined,
+        } : undefined;
+        const pass = encoder.beginComputePass({ label: `world BVH refit ${batch.name} depth ${depth}`, timestampWrites });
         pass.setPipeline(this.refitPipeline); pass.setBindGroup(0, level.bindGroup);
         pass.dispatchWorkgroups(Math.ceil(level.count * batch.count / 64)); pass.end();
+        first = false; remaining--;
       }
     }
   }
@@ -283,7 +298,7 @@ export class GpuWorldQuery {
     return { frame: this.frame, batches: this.batches.length, ownedGpuBytes: this.bytes,
       topologyNodes: this.batches.reduce((sum, batch) => sum + batch.nodeCount, 0),
       instances: this.batches.reduce((sum, batch) => sum + batch.count, 0), options: { ...this.options },
-      instanceAcceleration: 'linear-root-scan', refit: 'changed-batches', timingIncludedInFrameStats: false };
+      instanceAcceleration: 'linear-root-scan', refit: 'changed-batches', refitTiming: 'provided-by-caller', externalTraceTiming: false };
   }
   dispose(): void {
     if (this.disposed) return;

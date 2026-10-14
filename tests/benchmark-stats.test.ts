@@ -37,6 +37,8 @@ describe('BenchmarkRecorder', () => {
     expect(result.cpuSubmitMs?.max).toBe(12.5);
     expect(result.gpuMs.total).toEqual({ count: 2, mean: 8.5, p50: 6, p95: 11, p99: 11, max: 11 });
     expect(result.gpuMs.deformation?.mean).toBe(3);
+    expect(result.gpuMs.resolve?.max).toBe(0);
+    expect(result.gpuMs.worldQueryRefit?.max).toBe(0);
     expect(result.uploadedBytesTotal).toBe(5050);
     expect(result.workload?.triangles).toEqual({ mean: 5050, max: 10000, last: 10000 });
   });
@@ -59,6 +61,8 @@ describe('BenchmarkRecorder', () => {
     expect(empty.elapsedMs).toBeNull();
     expect(empty.frameIntervalMs).toBeNull();
     expect(empty.gpuMs.total).toBeNull();
+    expect(empty.gpuMs.resolve).toBeNull();
+    expect(empty.gpuMs.worldQueryRefit).toBeNull();
     expect(empty.ownedGpuBytes).toBeNull();
     expect(empty.uploadedBytesTotal).toBeNull();
     recorder.record(frame(1, { elapsedMs: 0, frameIntervalMs: 0, updateMs: 0, eventMs: 0, cpuSubmitMs: 0,
@@ -67,10 +71,28 @@ describe('BenchmarkRecorder', () => {
     recorder.recordGpu({ frame: 2, deformation: 0, shadow: 1, surface: 2 });
     expect(recorder.summary().frameIntervalMs?.p50).toBe(0);
     expect(recorder.toCsv()).toBe(
-      'frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuTotalMs\n'
-      + '1,0,0,0,0,0,0,0,0,0,0,,,,\n'
-      + '2,32,2,1,0.5,0.25,20,2,200,4,2,0,1,2,3\n',
+      'frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuTotalMs\n'
+      + '1,0,0,0,0,0,0,0,0,0,0,,,,,,\n'
+      + '2,32,2,1,0.5,0.25,20,2,200,4,2,0,1,2,0,0,3\n',
     );
+  });
+
+  it('includes resolve and world-query refit in sparse GPU totals, quantiles, and CSV', () => {
+    const recorder = new BenchmarkRecorder(3, 16);
+    recorder.record(frame(1));
+    recorder.record(frame(2));
+    recorder.record(frame(3));
+    recorder.recordGpu({ frame: 1, deformation: 1, shadow: 2, surface: 3, resolve: 4, worldQueryRefit: 5 });
+    recorder.recordGpu({ frame: 3, deformation: 0, shadow: 0, surface: 1, resolve: 2, worldQueryRefit: 3 });
+    const { gpuMs } = recorder.summary();
+    expect(gpuMs.resolve).toEqual({ count: 2, mean: 3, p50: 2, p95: 4, p99: 4, max: 4 });
+    expect(gpuMs.worldQueryRefit).toEqual({ count: 2, mean: 4, p50: 3, p95: 5, p99: 5, max: 5 });
+    expect(gpuMs.total).toEqual({ count: 2, mean: 10.5, p50: 6, p95: 15, p99: 15, max: 15 });
+    const rows = recorder.toCsv().trimEnd().split('\n');
+    expect(rows[0]).toContain('gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuTotalMs');
+    expect(rows[1]).toMatch(/,1,2,3,4,5,15$/);
+    expect(rows[2]).toMatch(/,,,,,,$/); // No GPU sample on frame 2.
+    expect(rows[3]).toMatch(/,0,0,1,2,3,6$/);
   });
 
   it('rejects invalid limits, frames, GPU samples, and byte-total overflow', () => {
@@ -85,6 +107,8 @@ describe('BenchmarkRecorder', () => {
     expect(() => recorder.record(frame(1))).toThrow(/strictly increase/);
     expect(() => recorder.record(frame(2, { elapsedMs: 16 }))).toThrow(/strictly increase/);
     expect(() => recorder.recordGpu({ frame: 2, deformation: 1, shadow: 1, surface: 1 })).toThrow(/recorded frame/);
+    expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, resolve: -1 })).toThrow(/GPU resolve/);
+    expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, worldQueryRefit: Infinity })).toThrow(/GPU worldQueryRefit/);
     recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1 });
     expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1 })).toThrow(/strictly increase/);
     recorder.record(frame(2));

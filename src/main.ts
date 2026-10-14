@@ -52,11 +52,14 @@ function frame(now: number): void {
   } catch (error) { fail(error); }
 }
 function updateUI(): void {
-  const stats = renderer!.stats, gpu = stats.gpuMs;
+  const stats = renderer!.stats;
+  const gpu = stats.gpuMs;
   element('instances').textContent = String(scene!.batches.reduce((sum, batch) => sum + batch.instances.length, 0));
   element('vertices').textContent = stats.deformedVertices.toLocaleString();
   element('cpu').textContent = stats.cpuSubmitMs.toFixed(2) + ' ms';
-  element('gpu').textContent = gpu ? (gpu.deformation + gpu.shadow + gpu.surface).toFixed(2) + ' ms' : '不可用 / 等待采样';
+  element('gpu').textContent = gpu
+    ? (gpu.deformation + gpu.shadow + gpu.surface + gpu.resolve + gpu.worldQueryRefit).toFixed(2) + ' ms'
+    : '不可用 / 等待采样';
   element('memory').textContent = (stats.ownedGpuBytes / 1048576).toFixed(1) + ' MiB';
   element('physics').textContent = scene!.physics.activeCount + '/' + scene!.physics.bodyCount + ' active · 60 Hz';
   element('status').innerHTML = '<i></i>' + (scene!.paused ? 'PAUSED' : 'WEBGPU LIVE');

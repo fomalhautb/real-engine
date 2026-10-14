@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#12171a" />
+    <title>Real Engine — Diffuse light field</title>
+  </head>
+  <body>
+    <div class="gi-app" id="gi-app">
+      <header class="topbar">
+        <a class="brand" href="./"><span class="brand-mark">r.</span> REAL ENGINE</a>
+        <span class="topbar-label">LIGHT FIELD / 001</span>
+        <span class="live" id="status" role="status">INITIALIZING WEBGPU</span>
+      </header>
+      <main class="layout">
+        <section class="stage" aria-label="WebGPU 漫反射 GI 演示">
+          <canvas id="viewport" aria-label="可拖拽的开放式室内场景" tabindex="0"></canvas>
+          <div class="stage-shade" aria-hidden="true"></div>
+          <div class="stage-heading">
+            <span class="eyebrow">REAL-TIME / ONE BOUNCE</span>
+            <h1>Light finds<br /><em>its way around.</em></h1>
+            <p>阳光照亮侧墙，颜色再反射到白色形体。关闭 GI，观察少了什么。</p>
+          </div>
+          <div class="stage-label"><span class="live-dot"></span><span id="stage-mode">GI ON · INDIRECT DIFFUSE</span></div>
+          <div class="stage-hint">拖拽观察 · 滚轮推近 · H 隐藏界面</div>
+          <div id="error" class="error-panel" role="alert" hidden></div>
+        </section>
+        <aside class="panel" aria-label="GI 演示控制与诊断">
+          <div class="panel-intro">
+            <span class="eyebrow">FIELD EXPERIMENT / 01</span>
+            <h2>在光抵达之前</h2>
+            <p>固定世界网格采样一次间接漫反射。白色表面让墙面色彩回弹更易辨认。</p>
+          </div>
+          <section class="panel-section">
+            <div class="section-title"><h3>间接光</h3><span>01 / GI</span></div>
+            <label class="switch-row" for="gi-enabled"><span><strong>启用漫反射 GI</strong><small>关闭时无间接补光</small></span><input id="gi-enabled" type="checkbox" checked /></label>
+            <p class="note">64 个固定探针 × 64 条光线。每帧更新；无时域累积或多次反弹。</p>
+          </section>
+          <section class="panel-section">
+            <div class="section-title"><h3>改变场景</h3><span>02 / MATERIAL</span></div>
+            <div class="swatches" role="group" aria-label="左侧墙颜色">
+              <button type="button" data-wall="coral" class="active" aria-pressed="true"><i style="--swatch:#d23824"></i>珊瑚红</button>
+              <button type="button" data-wall="gold" aria-pressed="false"><i style="--swatch:#c99738"></i>赭金</button>
+              <button type="button" data-wall="mint" aria-pressed="false"><i style="--swatch:#3aa887"></i>青绿</button>
+            </div>
+            <p class="note">仅更新墙面参数，下一帧的探针重新采样。</p>
+          </section>
+          <section class="panel-section">
+            <div class="section-title"><h3>太阳</h3><span>03 / LIGHT</span></div>
+            <label class="range-row" for="sun-azimuth"><span>方位</span><output id="azimuth-value">72°</output></label>
+            <input id="sun-azimuth" type="range" min="-180" max="180" step="1" value="72" />
+            <label class="range-row" for="sun-elevation"><span>高度</span><output id="elevation-value">52°</output></label>
+            <input id="sun-elevation" type="range" min="5" max="85" step="1" value="52" />
+            <div class="sun-row"><label for="sun-color">色彩 <input id="sun-color" type="color" value="#fff1dc" /></label><label for="sun-intensity">强度 <output id="intensity-value">3.2</output></label></div>
+            <input id="sun-intensity" type="range" min="0" max="6" step="0.1" value="3.2" />
+          </section>
+          <section class="panel-section">
+            <div class="section-title"><h3>相机与时间</h3><span>04 / VIEW</span></div>
+            <div class="button-row"><button id="pause" type="button">暂停轨迹</button><button id="step" type="button">逐帧前进</button></div>
+            <p class="note">暂停后调整光照或材质仍会提交新帧。</p>
+          </section>
+          <section class="panel-section metrics">
+            <div class="section-title"><h3>运行诊断</h3><span>GPU READBACK · ≤ 1 HZ</span></div>
+            <dl>
+              <div><dt>有效 / 总探针</dt><dd id="valid-probes">—</dd></div>
+              <div><dt>探针采样帧</dt><dd id="probe-frame">—</dd></div>
+              <div><dt>GPU GI 更新</dt><dd id="gpu-gi-ms">—</dd></div>
+              <div><dt>GPU 计时帧</dt><dd id="gpu-sample-frame">—</dd></div>
+              <div><dt>CPU 提交</dt><dd id="cpu-submit-ms">—</dd></div>
+              <div><dt>场景三角形</dt><dd id="scene-triangles">—</dd></div>
+              <div><dt>GPU 资源</dt><dd id="gpu-memory">—</dd></div>
+              <div><dt>视口</dt><dd id="viewport-size">—</dd></div>
+            </dl>
+            <p class="probe-status" id="probe-status">等待第一帧探针诊断…</p>
+          </section>
+          <div class="panel-footer">
+            <button id="export" type="button">导出诊断 JSON <span>↗</span></button>
+            <p>当前为固定世界网格、SH9 漫反射、单次反弹原型；不包含多次反弹或时域累积。</p>
+            <small id="adapter">等待 WebGPU 适配器…</small>
+          </div>
+        </aside>
+      </main>
+      <footer class="footer"><span>CODE-FIRST LIGHTING SYSTEM</span><span id="footer-frame">FRAME —</span><button id="toggle-ui" type="button">H / 隐藏界面</button></footer>
+    </div>
+    <script type="module" src="/src/gi-demo.ts"></script>
+  </body>
+</html>

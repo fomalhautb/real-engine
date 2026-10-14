@@ -120,7 +120,7 @@ export class FoundationBenchmark {
         if (gpuSampleFrame !== null && gpuMs && gpuSampleFrame > lastGpuFrame) {
           this.recorder.recordGpu({ frame: gpuSampleFrame, deformation: gpuMs.deformation,
             shadow: gpuMs.shadow, surface: gpuMs.surface, resolve: gpuMs.resolve,
-            worldQueryRefit: gpuMs.worldQueryRefit, geometryLod: gpuMs.geometryLod });
+            worldQueryRefit: gpuMs.worldQueryRefit, geometryLod: gpuMs.geometryLod, diffuseGi: gpuMs.diffuseGi });
           lastGpuFrame = gpuSampleFrame;
         }
       };

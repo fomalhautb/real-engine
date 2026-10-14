@@ -68,6 +68,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let ray = rays[id.x];
     var hit = hits[id.x];
     if (hit.work.z != 0u) { return; }
+    // GPU consumers use an empty interval for inactive work (e.g. sky rays
+    // needing no sun-visibility query). Preserve the reset miss at zero cost.
+    if (ray.direction.w < ray.origin.w) { return; }
     // Instance roots are currently scanned linearly; per-instance triangle
     // traversal is accelerated by a refitted, stackless preorder BVH.
     for (var instance = 0u; instance < params.shape.z; instance++) {

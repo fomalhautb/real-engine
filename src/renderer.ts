@@ -10,6 +10,8 @@ import { compileRenderGraph } from './render-graph';
 import { GpuWorldQuery } from './gpu-world-query';
 import type { WorldQueryOptions, WorldRay, WorldQueryResult } from './world-query';
 import { GpuGeometryLod, type GeometryLodBinding, type GeometryLodSettings, type GeometryLodProbe } from './gpu-geometry-lod';
+import { GpuDiffuseGi, diffuseGiSampleSource, type DiffuseGiProbeResult } from './gpu-diffuse-gi';
+import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
@@ -31,7 +33,7 @@ export interface FrameStats {
   /** triangles is source instance-expanded geometry; use probeGeometryLod for actual selected triangles. */
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
-  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number } | null;
+  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number } | null;
   /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
   gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
@@ -47,6 +49,8 @@ export interface RendererOptions {
   textureBudgetBytes?: number;
   /** Optional GPU world-space ray queries; disabled unless explicitly configured. */
   worldQueries?: WorldQueryOptions;
+  /** Fixed world-space probe grid; requires worldQueries with sufficient ray capacity. */
+  diffuseGi?: DiffuseGiOptions;
 }
 
 /** Stage 1 scheduler: one deformation dispatch per mesh batch, shared by both views. */
@@ -89,6 +93,8 @@ export class Renderer {
   private readonly worldQueryOptions?: WorldQueryOptions;
   private worldQueries?: GpuWorldQuery;
   private geometryLod?: GpuGeometryLod;
+  private diffuseGi?: GpuDiffuseGi;
+  private readonly diffuseGiOptions?: DiffuseGiOptions;
   private defaultClusterVertices!: GPUBuffer;
   private materialRevision = 0;
   private format!: GPUTextureFormat;
@@ -99,6 +105,10 @@ export class Renderer {
     const limit = options.materialVariantLimit ?? 128;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 4096) throw new Error('INVALID_MATERIAL_VARIANT_LIMIT');
     if (options.textureBudgetBytes !== undefined && (!Number.isSafeInteger(options.textureBudgetBytes) || options.textureBudgetBytes < 0)) throw new Error('INVALID_TEXTURE_BUDGET');
+    if (options.diffuseGi) {
+      const gi = resolveDiffuseGiOptions(options.diffuseGi);
+      if (!options.worldQueries || (options.worldQueries.maxRays ?? 1024) < gi.rayCount) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
+    }
     if (!navigator.gpu) throw new Error('WEBGPU_UNAVAILABLE: use a WebGPU browser on HTTPS or localhost.');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('ADAPTER_UNAVAILABLE: no compatible WebGPU adapter.');
@@ -139,7 +149,8 @@ export class Renderer {
     });
     this.materialVariantLimit = options.materialVariantLimit ?? 128;
     this.worldQueryOptions = options.worldQueries;
-    this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0);
+    this.diffuseGiOptions = options.diffuseGi && resolveDiffuseGiOptions(options.diffuseGi);
+    this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -222,6 +233,8 @@ export class Renderer {
       this.worldQueries = await GpuWorldQuery.create(this.device, this.materialResources.layout,
         bytes => { this.stats.ownedGpuBytes += bytes; }, this.worldQueryOptions);
     }
+    if (this.diffuseGiOptions) this.diffuseGi = await GpuDiffuseGi.create(this.device, this.worldQueries!, this.diffuseGiOptions,
+      bytes => { this.stats.ownedGpuBytes += bytes; });
     for (const entry of scene) {
       const batch = await this.createBatch(entry);
       this.batches.push(batch);
@@ -233,6 +246,8 @@ export class Renderer {
       { name: 'shared-geometry', kind: 'buffer', source: 'imported' },
       ...(this.worldQueries ? [{ name: 'world-query-bounds', kind: 'buffer' as const, source: 'imported' as const }] : []),
       ...(this.geometryLod ? [{ name: 'selected-geometry', kind: 'buffer' as const, source: 'transient' as const }] : []),
+      ...(this.diffuseGi ? [{ name: 'diffuse-gi-probes', kind: 'buffer' as const, source: 'imported' as const },
+        { name: 'world-query-scratch', kind: 'buffer' as const, source: 'imported' as const }] : []),
       { name: 'sun-shadow', kind: 'texture', source: 'transient' },
       { name: 'canvas', kind: 'texture', source: 'imported' },
       { name: 'scene-hdr', kind: 'texture', source: 'transient' },
@@ -248,9 +263,19 @@ export class Renderer {
         { resource: 'scene-input' as const, access: 'read' as const },
         { resource: 'selected-geometry' as const, access: 'write' as const },
       ], execute: (encoder: GPUCommandEncoder) => this.geometryLod!.encode(encoder, this.timestamp(this.worldQueries ? 10 : 8)) }] : []),
+      ...(this.diffuseGi ? [{ name: 'diffuse-gi', uses: [
+        { resource: 'world-query-bounds', access: 'read' as const },
+        { resource: 'shared-geometry', access: 'read' as const },
+        { resource: 'world-query-scratch', access: 'readWrite' as const },
+        { resource: 'diffuse-gi-probes', access: 'write' as const },
+      ], execute: (encoder: GPUCommandEncoder) => {
+        this.stats.uploadedBytes += this.diffuseGi!.encode(encoder, this.stats.frames + 1, this.materialRevision,
+          this.timestamp(10 + (this.geometryLod ? 2 : 0)));
+      } }] : []),
       { name: 'shadow', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'write' }], execute: encoder => this.encodeShadow(encoder) },
       { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' },
         ...(this.geometryLod ? [{ resource: 'selected-geometry', access: 'read' as const }] : []),
+        ...(this.diffuseGi ? [{ resource: 'diffuse-gi-probes', access: 'read' as const }] : []),
         { resource: 'scene-hdr', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
       { name: 'resolve', uses: [{ resource: 'scene-hdr', access: 'read' }, { resource: 'canvas', access: 'write' }], execute: encoder => this.encodeResolve(encoder) },
     ]);
@@ -269,17 +294,23 @@ export class Renderer {
         }
         this.compilingMaterials.add(program.key);
         pending = (async () => {
-          const module = await this.shader(surfaceSource.replace('// MATERIAL_PROGRAM',
+          const module = await this.shader(surfaceSource.replace('// DIFFUSE_GI_PROGRAM', this.diffuseGi ? diffuseGiSampleSource : '')
+            .replace('// INDIRECT_LIGHTING', this.diffuseGi
+              ? 'let ambient = diffuseGiIrradiance(input.world, n) * base * (1.0 - metalness) * (0.96 / 3.14159265);'
+              : 'let ambient = base * (0.045 + 0.065 * max(n.y, 0.0)) * (1.0 - metalness * 0.6);')
+            .replace('// MATERIAL_PROGRAM',
             `const MATERIAL_UNLIT = ${program.shading === 'unlit'};\n` + program.wgsl), 'material');
           const primitive: GPUPrimitiveState = { topology: 'triangle-list', cullMode: program.doubleSided ? 'none' : 'back' };
           const surface = await this.device.createRenderPipelineAsync({ label: 'material surface and velocity',
-            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout, this.materialResources.layout] }),
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout, this.materialResources.layout,
+              ...(this.diffuseGi ? [this.diffuseGi.surfaceLayout] : [])] }),
             vertex: { module, entryPoint: 'vertexMain' },
             fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: 'rgba16float' }, { format: 'rg16float' }] },
             primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
           });
           const surfaceLod = this.hasGeometryLod ? await this.device.createRenderPipelineAsync({ label: 'material GPU LOD surface and velocity',
-            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout, this.materialResources.layout] }),
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout, this.materialResources.layout,
+              ...(this.diffuseGi ? [this.diffuseGi.surfaceLayout] : [])] }),
             vertex: { module, entryPoint: 'clusterVertexMain' },
             fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: 'rgba16float' }, { format: 'rg16float' }] },
             primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
@@ -347,6 +378,19 @@ export class Renderer {
     if (this.errors.length) throw new Error(this.errors.join('\n'));
     if (!this.geometryLod) throw new Error('GEOMETRY_LOD_DISABLED');
     return this.geometryLod.probe(batchName);
+  }
+
+  /** Disabling GI removes indirect lighting; it does not restore the legacy ambient fill. */
+  setDiffuseGiEnabled(enabled: boolean): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    this.diffuseGi.setEnabled(enabled);
+  }
+  async probeDiffuseGi(): Promise<DiffuseGiProbeResult> {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (this.errors.length) throw new Error(this.errors.join('\n'));
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    return this.diffuseGi.probe();
   }
 
   /** Exposure in stops, applied only during final scene-linear HDR resolve. */
@@ -554,6 +598,7 @@ export class Renderer {
     new Uint32Array(this.frameData.buffer)[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : 0;
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
     this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
+    this.stats.uploadedBytes += this.diffuseGi?.update(this.stats.frames + 1, this.sunDirection, this.sunColor) ?? 0;
     this.lastViewProjection = vp;
     const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → HDR surface → resolve' });
     this.graph.execute(encoder);
@@ -604,6 +649,7 @@ export class Renderer {
       { view: this.velocity!.createView(), clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
     ], depthStencilAttachment: { view: this.depth!.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
     pass.setBindGroup(0, this.frameBindGroup);
+    if (this.diffuseGi) pass.setBindGroup(3, this.diffuseGi.surfaceGroup);
     this.draw(pass, 'surface'); pass.end();
   }
   private encodeResolve(encoder: GPUCommandEncoder): void {
@@ -616,6 +662,7 @@ export class Renderer {
     return { deformationVariants: this.deformationPipelines.size, materialVariants: this.materialPipelines.size,
       worldQueries: this.worldQueries?.diagnostics() ?? null,
       geometryLod: this.geometryLod?.diagnostics() ?? null,
+      diffuseGi: this.diffuseGi?.diagnostics() ?? null,
       output: { sceneFormat: 'rgba16float', exposureEV: this.exposureEV, transfer: 'sRGB', toneMap: 'filmic-fit', maxSceneRadiance: 65504 },
       materials: this.materialResources.diagnostics(), materialRevision: this.materialRevision, passes: this.graph.order,
       lifetimes: Object.fromEntries(this.graph.lifetimes),
@@ -649,7 +696,8 @@ export class Renderer {
         shadow: Number(values[3] - values[2]) / 1e6, surface: Number(values[5] - values[4]) / 1e6,
         resolve: Number(values[7] - values[6]) / 1e6,
         worldQueryRefit: this.worldQueries ? Number(values[9] - values[8]) / 1e6 : 0,
-        geometryLod: this.geometryLod ? Number(values[this.worldQueries ? 11 : 9] - values[this.worldQueries ? 10 : 8]) / 1e6 : 0 };
+        geometryLod: this.geometryLod ? Number(values[this.worldQueries ? 11 : 9] - values[this.worldQueries ? 10 : 8]) / 1e6 : 0,
+        diffuseGi: this.diffuseGi ? Number(values[this.geometryLod ? 13 : 11] - values[this.geometryLod ? 12 : 10]) / 1e6 : 0 };
       this.stats.gpuSampleFrame = frame;
       this.queryRead!.unmap();
     } catch (error) { if (!this.disposed) this.errors.push('TIMESTAMP_READBACK: ' + String(error)); }
@@ -799,6 +847,7 @@ export class Renderer {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.diffuseGi?.dispose();
     this.worldQueries?.dispose();
     this.geometryLod?.dispose();
     this.materialResources.dispose(); this.materialPipelines.clear();

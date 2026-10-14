@@ -66,6 +66,8 @@ export class GpuWorldQuery {
   private frame = 0;
   private disposed = false;
   private pending = false;
+  /** Uniform buffers are shared by every dispatch recorded into one encoder. */
+  private readonly traceParameters = new WeakMap<GPUCommandEncoder, string>();
   private readonly refitLayout: GPUBindGroupLayout;
   private readonly traceLayout: GPUBindGroupLayout;
   private resetParams!: GPUBuffer;
@@ -244,35 +246,53 @@ export class GpuWorldQuery {
       }
     }
   }
-  /** Encode GPU-resident rays -> hits. Call once per submitted encoder; callers
-   * own ray generation and inspect hit.work.z for an explicit overflow. */
-  encodeTrace(encoder: GPUCommandEncoder, count: number, textureLod: number, materialRevision: number): void {
+  /** Encode GPU-resident rays -> hits. The same encoder may trace more than once
+   * with identical uniforms while the caller rewrites rayBuffer between traces.
+   * Submit it before encoding another encoder with different parameters: GPU
+   * snapshots and uniform buffers assume serial encode/submit. Callers own ray
+   * generation and inspect hit.work.z for an explicit overflow. Returns the
+   * number of uniform bytes actually queued for upload. */
+  encodeTrace(encoder: GPUCommandEncoder, count: number, textureLod: number, materialRevision: number): number {
     if (this.disposed || !this.frame) throw new Error('WORLD_QUERY_NO_RENDERED_FRAME');
     this.validateTopology();
     if (!Number.isSafeInteger(count) || count < 0 || count > this.options.maxRays) throw new Error('WORLD_QUERY_RAY_BUDGET');
     if (!Number.isFinite(textureLod) || textureLod < 0 || textureLod > 32) throw new Error('WORLD_QUERY_TEXTURE_LOD');
     u32(materialRevision, 'MATERIAL_REVISION');
-    if (!count) return;
+    if (!count) return 0;
     const workPerRay = Math.min(this.options.maxNodeVisits, Math.floor(this.options.maxTotalWorkUnits / count));
     if (workPerRay < 1) throw new Error('WORLD_QUERY_WORK_BUDGET: total budget cannot cover every ray');
-    this.device.queue.writeBuffer(this.resetParams, 0, new Uint32Array([count, this.frame, materialRevision, 0]));
+    const parameters = JSON.stringify([this.frame, count, textureLod, materialRevision, workPerRay,
+      this.batches.map((batch, index) => [index + 1, batch.nodeCount, batch.mesh.vertexCount, batch.count,
+        ...batch.offsets, batch.topologyVersion])]);
+    const previous = this.traceParameters.get(encoder);
+    if (previous !== undefined && previous !== parameters) throw new Error('WORLD_QUERY_ENCODER_PARAMETERS_CHANGED');
+    if (previous === undefined) this.traceParameters.set(encoder, parameters);
+    let uploadedBytes = 0;
+    if (previous === undefined) {
+      this.device.queue.writeBuffer(this.resetParams, 0, new Uint32Array([count, this.frame, materialRevision, 0]));
+      uploadedBytes += 16;
+    }
     const reset = encoder.beginComputePass({ label: 'world ray reset' });
     reset.setPipeline(this.resetPipeline); reset.setBindGroup(0, this.resetGroup);
     reset.dispatchWorkgroups(Math.ceil(count / 64)); reset.end();
     for (let index = 0; index < this.batches.length; index++) {
       const batch = this.batches[index];
       if (!batch.count) continue;
-      const params = new ArrayBuffer(80);
-      new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
-        ...batch.offsets, 0, count, workPerRay, this.frame, batch.topologyVersion, materialRevision]);
-      new Float32Array(params)[16] = textureLod;
-      this.device.queue.writeBuffer(batch.params, 0, params);
+      if (previous === undefined) {
+        const params = new ArrayBuffer(80);
+        new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
+          ...batch.offsets, 0, count, workPerRay, this.frame, batch.topologyVersion, materialRevision]);
+        new Float32Array(params)[16] = textureLod;
+        this.device.queue.writeBuffer(batch.params, 0, params);
+        uploadedBytes += 80;
+      }
       // Distinct passes provide ordering for closest-hit updates between batches.
       const pass = encoder.beginComputePass({ label: 'world rays ' + batch.name });
       pass.setPipeline(batch.source.getPipeline()); pass.setBindGroup(0, batch.trace);
       pass.setBindGroup(1, batch.source.getMaterial().bindGroup);
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     }
+    return uploadedBytes;
   }
   async traceRays(rays: readonly WorldRay[], options: { textureLod?: number } = {}, materialRevision = 0): Promise<WorldQueryResult> {
     if (this.disposed || !this.frame) throw new Error('WORLD_QUERY_NO_RENDERED_FRAME');

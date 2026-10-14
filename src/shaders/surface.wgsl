@@ -40,6 +40,7 @@ fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSample(materia
 fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage2, materialSampler2, uv); }
 fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage3, materialSampler3, uv); }
 // MATERIAL_PROGRAM
+// DIFFUSE_GI_PROGRAM
 
 struct Varyings {
     @builtin(position) position: vec4f,
@@ -152,8 +153,8 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     let specular = distribution * geometry * fresnel / max(4.0 * nv * nl, 0.001);
     let diffuse = (1.0 - fresnel) * (1.0 - metalness) * base / 3.14159265;
     let direct = (diffuse + specular) * frame.sunColor.rgb * nl * visibility(input.light, nl);
-    // Constant ambient fill is explicitly not world-space GI.
-    let ambient = base * (0.045 + 0.065 * max(n.y, 0.0)) * (1.0 - metalness * 0.6);
+    // Compiled world-space irradiance, or the legacy fill when GI is unconfigured.
+    // INDIRECT_LIGHTING
     let lighting = select(direct + ambient + surface.emissive, base + surface.emissive, MATERIAL_UNLIT);
     var output: FragmentOutput;
     // rgba16float is the bounded scene-linear transport buffer. Exposure and

@@ -1,0 +1,80 @@
+// GI_COMMON
+struct Ray { origin: vec4f, direction: vec4f, ignore: vec4u }
+struct Hit {
+    identity: vec4u, metric: vec4f, position: vec4f, normal: vec4f,
+    previous: vec4f, baseColor: vec4f, emissive: vec4f, versions: vec4u,
+    uvInfo: vec4f, work: vec4u,
+}
+@group(0) @binding(0) var<uniform> gi: GiParameters;
+@group(0) @binding(1) var<storage, read_write> rays: array<Ray>;
+@group(0) @binding(2) var<storage, read> primary: array<Hit>;
+@group(0) @binding(3) var<storage, read> shadows: array<Hit>;
+@group(0) @binding(4) var<storage, read_write> probes: array<GiProbe>;
+
+@compute @workgroup_size(64)
+fn generate(@builtin(global_invocation_id) id: vec3u) {
+    let count = gi.counts.x * gi.counts.y * gi.counts.z;
+    if (id.x >= count * gi.counts.w) { return; }
+    let coordinate = giCoordinate(id.x / gi.counts.w, gi.counts.xyz);
+    let origin = gi.origin.xyz + vec3f(coordinate) * gi.spacing.xyz;
+    rays[id.x] = Ray(vec4f(origin, 0.0001), vec4f(giDirection(id.x % gi.counts.w, gi.counts.w), gi.spacing.w), vec4u(0u));
+}
+
+@compute @workgroup_size(64)
+fn generateShadows(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= gi.counts.x * gi.counts.y * gi.counts.z * gi.counts.w) { return; }
+    let hit = primary[id.x];
+    var ray = Ray(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(gi.sunDirection.xyz, 0.0), vec4u(0u));
+    if (hit.identity.x != 0u && hit.work.z == 0u && hit.emissive.w == 0.0
+        && dot(hit.normal.xyz, gi.sunDirection.xyz) > 0.0 && any(gi.sunColor.xyz > vec3f(0.0))) {
+        // Keep other triangles of this entity eligible for self-shadowing.
+        ray.origin = vec4f(hit.position.xyz + hit.normal.xyz * gi.sunDirection.w, 0.0001);
+        ray.direction.w = gi.spacing.w;
+    }
+    rays[id.x] = ray;
+}
+
+@compute @workgroup_size(64)
+fn integrate(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= gi.counts.x * gi.counts.y * gi.counts.z) { return; }
+    var probe: GiProbe;
+    var primaryOverflows = 0u;
+    var shadowOverflows = 0u;
+    for (var i = 0u; i < gi.counts.w; i++) {
+        let index = id.x * gi.counts.w + i;
+        let hit = primary[index];
+        let shadow = shadows[index];
+        primaryOverflows += select(0u, 1u, hit.work.z != 0u);
+        shadowOverflows += select(0u, 1u, shadow.work.z != 0u);
+        let direction = giDirection(i, gi.counts.w);
+        var radiance = gi.sky.xyz;
+        var distance = gi.spacing.w;
+        if (hit.identity.x != 0u) {
+            distance = hit.metric.x;
+            radiance = hit.emissive.xyz;
+            if (hit.emissive.w != 0.0) {
+                radiance += hit.baseColor.xyz;
+            } else {
+                let nl = max(0.0, dot(hit.normal.xyz, gi.sunDirection.xyz));
+                let visible = select(0.0, 1.0, shadow.identity.x == 0u && shadow.work.z == 0u);
+                // Diffuse-only capture: dielectric F0=.04, no specular bounce.
+                radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)
+                    * gi.sunColor.xyz * nl * visible;
+            }
+        }
+        // Bounded linear HDR transport; bad/incomplete probes are never sampled.
+        radiance = clamp(radiance, vec3f(0.0), vec3f(65504.0));
+        let basis = giBasis(direction);
+        for (var coefficient = 0u; coefficient < 9u; coefficient++) {
+            probe.coefficients[coefficient] += vec4f(radiance * basis[coefficient] * (12.56637061 / f32(gi.counts.w)), 0.0);
+        }
+        let face = giFace(direction);
+        probe.moments[face] += vec4f(distance, distance * distance, 1.0, 0.0);
+    }
+    for (var face = 0u; face < 6u; face++) {
+        let count = probe.moments[face].z;
+        if (count > 0.0) { probe.moments[face] = vec4f(probe.moments[face].xy / count, count, 0.0); }
+    }
+    probe.state = vec4u(select(0u, 1u, primaryOverflows + shadowOverflows == 0u), gi.state.x, primaryOverflows, shadowOverflows);
+    probes[id.x] = probe;
+}

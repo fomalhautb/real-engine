@@ -1,7 +1,7 @@
 import type { InstanceState, SceneBatch } from '../../../src/contracts';
 import type { MeshData } from '../../../src/geometry';
 import { DEFAULT_MATERIAL_DEFINITION } from '../../../src/material';
-import { identity, lookAt, multiply, perspective, transformPoint } from '../../../src/math';
+import { identity, inverseAffine, lookAt, multiply, perspective, transformPoint } from '../../../src/math';
 import { Renderer } from '../../../src/renderer';
 
 type Vec3 = [number, number, number];
@@ -71,6 +71,41 @@ function pixelsForWorldPoints(width: number, height: number, cameraEye: Vec3,
   });
 }
 
+function lightProjection(direction: Vec3): Float32Array {
+  const target: Vec3 = [0, 0, -3];
+  const lightEye: Vec3 = target.map((value, axis) => value + direction[axis] * 40) as Vec3;
+  const orthographic = identity();
+  orthographic[0] = 1 / 25;
+  orthographic[5] = 1 / 25;
+  orthographic[10] = -1 / 70;
+  orthographic[14] = -0.1 / 70;
+  return multiply(orthographic, lookAt(lightEye, target, [0, 1, 0]));
+}
+
+function shadowTexelExpectation(matrix: Float32Array, point: Vec3, slope: number) {
+  const ndc = transformPoint(matrix, point);
+  const x = Math.floor((ndc[0] * 0.5 + 0.5) * 1024);
+  const y = Math.floor((0.5 - ndc[1] * 0.5) * 1024);
+  const inverse = inverseAffine(matrix);
+  const depthOnReceiver = (texelX: number, texelY: number): number => {
+    const ndcCenter: Vec3 = [2 * (texelX + 0.5) / 1024 - 1,
+      1 - 2 * (texelY + 0.5) / 1024, 0.5];
+    const onLightRay = transformPoint(inverse, ndcCenter);
+    const travel = (slope * onLightRay[0] - onLightRay[2]) /
+      (sunDirection[2] - slope * sunDirection[0]);
+    const onReceiver: Vec3 = [onLightRay[0] + travel * sunDirection[0],
+      onLightRay[1] + travel * sunDirection[1],
+      onLightRay[2] + travel * sunDirection[2]];
+    return transformPoint(matrix, onReceiver)[2];
+  };
+  const center = depthOnReceiver(x, y);
+  const perTexelX = depthOnReceiver(x + 1, y) - center;
+  const perTexelY = depthOnReceiver(x, y + 1) - center;
+  return { x, y, world: point, projectedAtPoint: ndc[2],
+    projectedAtTexelCenter: center, perTexelX, perTexelY,
+    oneSixteenthTexelBound: (Math.abs(perTexelX) + Math.abs(perTexelY)) / 16 + 0.000002 };
+}
+
 function pose(entityId: number): InstanceState {
   return { entityId, model: identity(), normalMatrix: identity(), bones: [], deformScalars: [],
     color: [...baseColor, 1], metalness: 0, roughness, historyVersion: 0 };
@@ -107,10 +142,25 @@ export async function runShadowQualityFixture() {
     };
     const lowBaseline = await capture(0);
     const lowLit = await capture(1);
+    const depthPoints = (slope: number): Vec3[] => [-0.8, 0, 0.8].map(x => [x, 0, slope * x] as Vec3);
+    const depthDiagnostic = async (slope: number) => {
+      const points = depthPoints(slope);
+      const measured = await renderer!.probeDepth(points);
+      const matrix = lightProjection(sunDirection);
+      return points.map((point, index) => {
+        const expected = shadowTexelExpectation(matrix, point, slope);
+        return { ...expected, rawShadowDepth: measured[index].shadow,
+          rawSurfaceDepth: measured[index].surface,
+          texelCenterResidual: expected.projectedAtTexelCenter - measured[index].shadow,
+          pointResidual: expected.projectedAtPoint - measured[index].shadow };
+      });
+    };
+    const lowDepth = await depthDiagnostic(0);
     low.instances = [];
     high.instances = [pose(2)];
     const highBaseline = await capture(0);
     const highLit = await capture(1);
+    const highDepth = await depthDiagnostic(0.5);
     high.instances = [];
     low.instances = [pose(1)];
     caster.instances = [pose(3)];
@@ -131,8 +181,8 @@ export async function runShadowQualityFixture() {
       samplePoints.map((point, index) => ({ ...point, baseline: baseline[index], lit: lit[index] }));
     const result = { width: renderer.stats.width, height: renderer.stats.height,
       eye, sunDirection, sunColor, baseColor, roughness,
-      low: { slope: 0, samples: samples(lowBaseline, lowLit) },
-      high: { slope: 0.5, samples: samples(highBaseline, highLit) },
+      low: { slope: 0, samples: samples(lowBaseline, lowLit), depth: lowDepth },
+      high: { slope: 0.5, samples: samples(highBaseline, highLit), depth: highDepth },
       contact, wallContact: { points: wallPoints, openBaseline: wallOpenBaseline,
         openLit: wallOpenLit, sealedBaseline: wallSealedBaseline, sealedLit: wallSealedLit },
       frames: renderer.stats.frames, errors: [...renderer.errors] };

@@ -130,6 +130,10 @@ fn visibility(light: vec4f) -> f32 {
     let texel = uv * vec2f(size) - 0.5;
     let base = vec2i(floor(texel));
     let fraction = fract(texel);
+    // Rasterization snaps projected vertices to a subpixel grid. Its depth
+    // plane can differ from the unsnapped receiver even when both are planar.
+    // Reserve 1/16 of a shadow texel for that error, not whole PCF texels.
+    let residualBias = 0.000002 + dot(abs(gradient), 1.0 / vec2f(size)) * 0.0625;
     var sum = 0.0;
     // Equivalent weights to 3x3 bilinear PCF, using the 16 unique texels.
     // Compare at each texel center: hardware linear compare uses a single
@@ -147,7 +151,7 @@ fn visibility(light: vec4f) -> f32 {
             var lit = 1.0;
             if (all(coordinate >= vec2i(0)) && all(coordinate < size)) {
                 let depth = textureLoad(shadowMap, coordinate, 0);
-                lit = select(0.0, 1.0, receiverDepth - 0.000002 <= depth);
+                lit = select(0.0, 1.0, receiverDepth - residualBias <= depth);
             }
             sum += lit * weight.x * weight.y;
         }

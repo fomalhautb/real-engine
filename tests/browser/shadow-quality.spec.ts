@@ -74,6 +74,7 @@ test('shadow PCF preserves direct light across low and steep unoccluded receiver
       mean: ratios.reduce((a, b) => a + b, 0) / ratios.length };
   }
   console.log('SHADOW_QUALITY_GPU_DIAGNOSTIC ' + JSON.stringify({ diagnostic,
+    lowDepth: result.low.depth, highDepth: result.high.depth,
     contact: result.contact, wallContact: result.wallContact, frames: result.frames, errors: result.errors }));
   for (const receiver of [result.low, result.high]) {
     expect(receiver.samples).toHaveLength(35);

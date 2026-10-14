@@ -70,10 +70,10 @@ export function createGiDemoScene(): { batches: SceneBatch[]; triangles: number 
 }
 
 export const GI_PROBE_GRID = Object.freeze({
-  // Half-cell support reaches the room's x ±3.2, y 0..3.7 and z ±3.6 surfaces.
-  // All 64 probe centers remain clear of the white forms and emissive strip.
-  origin: [-2.4, 0.35, -2.7] as [number, number, number],
-  spacing: [1.6, 1.0, 1.8] as [number, number, number],
+  // Half-cell support covers the complete solid walls plus normal bias:
+  // x +/-3.4, y -0.2..4.2, z +/-3.8. Centers stay inside the open room.
+  origin: [-2.55, 0.35, -2.85] as [number, number, number],
+  spacing: [1.7, 1.1, 1.9] as [number, number, number],
   counts: [4, 4, 4] as [number, number, number],
   raysPerProbe: 64,
   maxDistance: 12,

@@ -20,7 +20,7 @@ test('shared deformation, lifetime, physics controls, resize, and GPU validation
   await page.waitForFunction(() => (window.__REAL_ENGINE__?.snapshot().stats?.frames ?? 0) >= 5 || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
   const first = await page.evaluate(() => window.__REAL_ENGINE__!.snapshot());
-  expect(first.stats!.drawCalls).toBe(14);
+  expect(first.stats!.drawCalls).toBe(15); // Seven batches in two views, plus HDR resolve.
   expect(first.physics.bodies).toBe(6);
   expect(first.errors).toEqual([]);
   expect(first.renderGraph!.passes).toEqual(['deformation', 'shadow', 'surface', 'resolve']);

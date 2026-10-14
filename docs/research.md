@@ -39,6 +39,16 @@ Lumen Medium/Lite 使用更便宜的探针插值；平滑表面采用 SSR，不�
 
 Virtual Shadow Maps、虚拟纹理、时域超分和世界流送是相邻独立系统，不应全部计入“实现 Lumen”。直接阴影先建立正确性基线，再依据测量升级。[Virtual Shadow Maps](https://dev.epicgames.com/documentation/en-us/unreal-engine/virtual-shadow-maps-in-unreal-engine)
 
+## Volumetric Fog：独立介质模块，共享光照数据
+
+2026-10-14 追加调研。Epic 的体积雾文档描述局部密度、体积材质、灯光/阴影和时序重投影，并指出快速变化灯光可能留下拖影；Lumen 文档另说明其为雾提供较低精度的 GI。[Epic Volumetric Fog](https://dev.epicgames.com/documentation/en-us/unreal-engine/volumetric-fog-in-unreal-engine)、[Lumen GI](https://dev.epicgames.com/documentation/en-us/unreal-engine/lumen-global-illumination-and-reflections-in-unreal-engine)
+
+技术起点采用视锥体积网格，把密度、照明、沿射线积分与合成分开；参考 [Wronski：Volumetric Fog，SIGGRAPH 2014](https://bartwronski.com/wp-content/uploads/2014/08/bwronski_volumetric_fog_siggraph2014.pdf)。资料中的旧平台耗时不能作为本引擎或浏览器预算的实测依据。
+
+本项目的工程决策：阶段 1 预留共享合约，阶段 2 中期先接直接光/阴影，再接 GI、反射与时序重建，后期进入大场景视觉验收；阶段 3 扩大规模和硬件覆盖，阶段 4 处理高级介质光学。这样窗洞光柱与林间雾能在阶段 2 出现，也避免把相机视锥内的缓存当成整个世界的雾。高性能目标通过有界网格、灯光/体积列表和分档测量落实，不预设“体积雾几乎免费”。
+
+首版范围为薄雾单次散射、几何遮挡及低频 GI 输入；浓烟、体积自阴影、多重散射、介质对表面间接光的双向反馈另行验收。天空大气、体积云和烟火模拟是可复用部分基础的相邻系统，不能因支持 Volumetric Fog 就一并宣称实现。架构见 [介质合约](architecture.md#体积雾与共享光照)，验收见 [体积雾验收](benchmarks.md#体积雾验收与预算)。
+
 ## 材质差距要分三层看
 
 **视觉公式层**：PBR、法线、Clear Coat、各向异性、布料 Fuzz、薄膜等可用着色器实现，WebGPU 没有天然禁止这些外观。皮肤、发丝、眼睛和透明则往往需要专用空间算法、几何约定和额外 pass；仅完成 BRDF 不能代表对应完整系统。UE 有 Unlit、Default Lit、SSS/Skin、Clear Coat、Foliage、Hair、Cloth、Eye、Water、Thin Translucent 等模型。[Shading Models](https://dev.epicgames.com/documentation/unreal-engine/shading-models-in-unreal-engine?lang=en-US)、[皮肤散射](https://dev.epicgames.com/documentation/en-us/unreal-engine/subsurface-profile-shading-model-in-unreal-engine)

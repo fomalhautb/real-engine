@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { importGltf } from '../src/gltf-import';
+import { importGltf, prepareGltfTangents } from '../src/gltf-import';
 import { GltfSceneInstance } from '../src/gltf-scene';
 import type { GltfBinaryDocument } from '../src/gltf-binary';
 import { transformPoint, translation } from '../src/math';
@@ -200,7 +200,7 @@ describe('Khronos glTF 2.0 reference assets', () => {
     }
   });
 
-  it('ignores source and morph tangents without NORMAL, including for normal textures', () => {
+  it('ignores source and morph tangents without NORMAL, then generates flat-normal tangents for normal textures', async () => {
     const { json, buffers } = fixture('AnimatedMorphCube');
     const altered = structuredClone(json);
     const primitive = altered.meshes[0].primitives[0];
@@ -220,12 +220,22 @@ describe('Khronos glTF 2.0 reference assets', () => {
 
     const withNormalMap = { ...altered, images: [{ uri: 'normal.png' }], textures: [{ source: 0 }],
       materials: [{ ...altered.materials![0], normalTexture: { index: 0 } }] };
-    const mapped = importGltf(withNormalMap, buffers, { images: new Map([[0, {
+    const uv = new Float32Array(24 * 2), quad = [[0, 0], [1, 0], [1, 1], [0, 1]];
+    for (let vertex = 0; vertex < 24; vertex++) uv.set(quad[vertex % 4], vertex * 2);
+    const uvBuffer = withNormalMap.buffers!.length, uvView = withNormalMap.bufferViews!.length;
+    const uvAccessor = withNormalMap.accessors!.length;
+    withNormalMap.buffers!.push({ byteLength: uv.byteLength });
+    withNormalMap.bufferViews!.push({ buffer: uvBuffer, byteLength: uv.byteLength });
+    withNormalMap.accessors!.push({ bufferView: uvView, componentType: 5126, count: 24, type: 'VEC2' });
+    primitive.attributes.TEXCOORD_0 = uvAccessor;
+    await prepareGltfTangents();
+    const mapped = importGltf(withNormalMap, [...buffers, uv.buffer], { images: new Map([[0, {
       width: 1, height: 1, pixels: new Uint8Array([128, 128, 255, 255]), colorSpace: 'linear' as const,
     }]]) });
-    expect(mapped.meshes[0].primitives[0].mesh.tangents).toBeUndefined();
-    expect(mapped.meshes[0].primitives[0].morphTargets.every(target => target.tangents === undefined)).toBe(true);
-    expect(mapped.warnings.some(warning => /normal texture has no effective authored TANGENT.*triangle UV-derivative frame fallback/.test(warning))).toBe(true);
+    const generated = mapped.meshes[0].primitives[0];
+    expect(generated.mesh.tangents).toHaveLength(generated.mesh.vertexCount * 4);
+    expect(generated.morphTargets.every(target => target.tangents?.length === generated.mesh.vertexCount * 3)).toBe(true);
+    expect(mapped.warnings.some(warning => /triangle UV-derivative frame fallback/.test(warning))).toBe(false);
   });
 
   it('rejects node morph weights without a mesh', () => {

@@ -1,5 +1,5 @@
 import { parseGlb } from './gltf-binary';
-import { importGltf, type GltfAsset, type GltfImportOptions } from './gltf-import';
+import { importGltf, prepareGltfTangents, type GltfAsset, type GltfImportOptions } from './gltf-import';
 import { decodeTexture, type TextureAsset } from './texture-assets';
 
 export interface GltfLoadOptions extends Omit<GltfImportOptions, 'images'> {
@@ -9,6 +9,34 @@ export interface GltfLoadOptions extends Omit<GltfImportOptions, 'images'> {
   /** Cumulative decoded RGBA8 image bytes, separate from the download budget. */
   maxDecodedImageBytes?: number;
   fetch?: typeof fetch;
+}
+
+/** A bounded hint for async preparation; importGltf performs the authoritative validation. */
+function mayNeedGeneratedTangents(json: Record<string, unknown>): boolean {
+  const meshes = json.meshes, materials = json.materials;
+  if (!Array.isArray(meshes) || meshes.length > 65536 || !Array.isArray(materials) || materials.length > 65536) return false;
+  if (!materials.some(value => value && typeof value === 'object' && !Array.isArray(value)
+    && (value as Record<string, unknown>).normalTexture !== undefined)) return false;
+  let inspected = 0;
+  for (const mesh of meshes) {
+    if (!mesh || typeof mesh !== 'object' || Array.isArray(mesh)) continue;
+    const primitives: unknown = (mesh as Record<string, unknown>).primitives;
+    if (!Array.isArray(primitives) || primitives.length > 4096) continue;
+    for (const value of primitives) {
+      if (++inspected > 1_000_000) return true;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const primitive = value as Record<string, unknown>;
+      const materialIndex = primitive.material;
+      if (typeof materialIndex !== 'number' || !Number.isSafeInteger(materialIndex) || materialIndex < 0 || materialIndex >= materials.length) continue;
+      const material = materials[materialIndex];
+      if (!material || typeof material !== 'object' || Array.isArray(material) || (material as Record<string, unknown>).normalTexture === undefined) continue;
+      const attrs = primitive.attributes;
+      if (!attrs || typeof attrs !== 'object' || Array.isArray(attrs)) continue;
+      const attributes = attrs as Record<string, unknown>;
+      if (attributes.NORMAL === undefined || attributes.TANGENT === undefined) return true;
+    }
+  }
+  return false;
 }
 
 /** Bounded network loading. Import and texture decoding remain explicit CPU work for now. */
@@ -51,6 +79,11 @@ export async function loadGltf(url: string | URL, options: GltfLoadOptions = {})
     ? parseGlb(data) : { json: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(data)) as Record<string, unknown>, bin: undefined };
   const json = container.json;
   if (!json || typeof json !== 'object' || Array.isArray(json)) throw new Error('GLTF_ROOT_OBJECT');
+  if (mayNeedGeneratedTangents(json)) {
+    options.signal?.throwIfAborted();
+    await prepareGltfTangents();
+    options.signal?.throwIfAborted();
+  }
   const list = (value: unknown, name: string): Record<string, unknown>[] => {
     if (value === undefined) return [];
     if (!Array.isArray(value) || value.length > 4096 || value.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('GLTF_RESOURCE_LIST: ' + name);

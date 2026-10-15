@@ -7,6 +7,9 @@ import { m, type Vec4Expr } from './material';
 import { identity, inverseAffine, type Mat4 } from './math';
 import { buildMorphTarget } from './morph-assets';
 import type { TextureAsset } from './texture-assets';
+import { generateGltfTangents } from './gltf-tangents';
+
+export { prepareGltfTangents } from './gltf-tangents';
 
 type Json = Record<string, unknown>;
 export interface GltfPrimitive { mesh: MeshData; morphTargets: MorphTarget[]; material: MaterialBinding; hasSkin: boolean }
@@ -22,6 +25,8 @@ export interface GltfImportOptions {
   /** A decoded image has a separate sRGB/linear view when required by different texture roles. */
   images?: ReadonlyMap<number, TextureAsset>;
   maxVertices?: number; maxIndices?: number;
+  /** Conservative tangent preparation-work estimate per primitive, not a runtime RSS ceiling (default 256 MiB, hard limit 512 MiB). */
+  maxTangentBytes?: number;
   /** Cumulative animation channels (default 65,536, matching AnimationRig). */
   maxAnimationTracks?: number;
   /** Cumulative timestamp and output scalar references, including reused accessors (default 16 million). */
@@ -137,6 +142,8 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
   let vertexTotal = 0, indexTotal = 0;
   const maxVertices = number(options.maxVertices, 1_000_000, 'maxVertices', 1, 10_000_000);
   const maxIndices = number(options.maxIndices, 3_000_000, 'maxIndices', 3, 30_000_000);
+  const maxTangentBytes = number(options.maxTangentBytes, 256 * 1024 * 1024, 'maxTangentBytes', 1, 512 * 1024 * 1024);
+  if (![maxVertices, maxIndices, maxTangentBytes].every(Number.isSafeInteger)) throw new Error('GLTF_IMPORT_BUDGET_INTEGER');
   const access = (value: unknown, type: string, label: string) => {
     const result = readAccessor(binary, buffers, index(value, accessorCount, label));
     if (result.type !== type) throw new Error('GLTF_ACCESSOR_TYPE: ' + label + ' must be ' + type);
@@ -147,6 +154,7 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       const primitive = object(primitiveValue, 'primitive');
       if ((primitive.mode ?? 4) !== 4) throw new Error('GLTF_UNSUPPORTED_PRIMITIVE: triangles required');
       if (primitive.extensions !== undefined) throw new Error('GLTF_UNSUPPORTED_PRIMITIVE_EXTENSION');
+      const binding = primitive.material === undefined ? defaultMaterial : materials[index(primitive.material, materials.length, 'primitive.material')];
       const attrs = object(primitive.attributes, 'attributes');
       for (const attribute of Object.keys(attrs)) if (!['POSITION', 'NORMAL', 'TANGENT', 'TEXCOORD_0', 'JOINTS_0', 'WEIGHTS_0'].includes(attribute)) throw new Error('GLTF_UNSUPPORTED_ATTRIBUTE: ' + attribute);
       const position = access(attrs.POSITION, 'VEC3', 'POSITION');
@@ -160,6 +168,8 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       };
       const normal = attribute(attrs.NORMAL, 'VEC3', 'NORMAL'), tangent = attribute(attrs.TANGENT, 'VEC4', 'TANGENT');
       const uv = attribute(attrs.TEXCOORD_0, 'VEC2', 'TEXCOORD_0');
+      const generateTangents = binding.definition.normal !== undefined && !(normal && tangent);
+      if (binding.definition.normal !== undefined && !uv) throw new Error('GLTF_NORMAL_TEXTURE_REQUIRES_UV0');
       const joints = attribute(attrs.JOINTS_0, 'VEC4', 'JOINTS_0'), weights = attribute(attrs.WEIGHTS_0, 'VEC4', 'WEIGHTS_0');
       if (!!joints !== !!weights) throw new Error('GLTF_SKIN_ATTRIBUTES_PAIRED');
       if (normal && normal.componentType !== 5126) throw new Error('GLTF_NORMAL_FLOAT_REQUIRED');
@@ -250,17 +260,19 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       const mesh: MeshData = { vertices, indices, vertexCount: outputCount, bounds,
         uvs: uv ? remap(uv.values, 2) : undefined,
         tangents: normal && tangent ? remap(tangent.values, 4) : undefined };
+      let ignoredAuthoredMorphTangents = false;
       const morphTargets = array(primitive.targets ?? [], 'targets', joints ? 31 : 32).map((targetValue): MorphTarget => {
         const target = object(targetValue, 'target');
+        if (generateTangents && target.TANGENT !== undefined) ignoredAuthoredMorphTangents = true;
         if (Object.keys(target).some(key => key !== 'POSITION' && key !== 'NORMAL' && key !== 'TANGENT')) throw new Error('GLTF_UNSUPPORTED_MORPH_ATTRIBUTE');
         if (target.NORMAL !== undefined && !normal) throw new Error('GLTF_MORPH_NORMAL_REQUIRES_BASE_NORMAL');
-        if (target.TANGENT !== undefined && !tangent) throw new Error('GLTF_MORPH_TANGENT_REQUIRES_BASE_TANGENT');
+        if (target.TANGENT !== undefined && !tangent && !generateTangents) throw new Error('GLTF_MORPH_TANGENT_REQUIRES_BASE_TANGENT');
         const positions = attribute(target.POSITION, 'VEC3', 'target.POSITION');
         const normals = attribute(target.NORMAL, 'VEC3', 'target.NORMAL');
         const tangents = attribute(target.TANGENT, 'VEC3', 'target.TANGENT');
         if ([positions, normals, tangents].some(data => data && data.componentType !== 5126)) throw new Error('GLTF_MORPH_FLOAT_REQUIRED');
         const delta = positions ? remap(positions.values, 3) : new Float32Array(outputCount * 3);
-        const tangentDeltas = normal && tangent
+        const tangentDeltas = !generateTangents && normal && tangent
           ? tangents ? remap(tangents.values, 3) : new Float32Array(outputCount * 3)
           : undefined;
         if (normal) return { positions: delta,
@@ -269,9 +281,17 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
         if (!positions) return { positions: delta, normals: new Float32Array(outputCount * 3), tangents: tangentDeltas };
         return { ...buildMorphTarget(mesh, (_, i) => [delta[i * 3], delta[i * 3 + 1], delta[i * 3 + 2]]), tangents: tangentDeltas };
       });
-      const binding = primitive.material === undefined ? defaultMaterial : materials[index(primitive.material, materials.length, 'primitive.material')];
-      if (binding.definition.normal !== undefined && !(normal && tangent)) {
-        warnings.push(`mesh ${meshIndex} primitive ${primitiveIndex}: normal texture has no effective authored TANGENT; backend uses a triangle UV-derivative frame fallback, which is not guaranteed to match MikkTSpace.`);
+      if (generateTangents) {
+        if (ignoredAuthoredMorphTangents) {
+          warnings.push(`mesh ${meshIndex} primitive ${primitiveIndex}: authored morph TANGENT deltas ignored while generating tangents.`);
+        }
+        const generated = generateGltfTangents(mesh, morphTargets, {
+          maxVertices: maxVertices - vertexTotal + outputCount, maxTangentBytes,
+        });
+        vertexTotal += generated.mesh.vertexCount - outputCount;
+        if (vertexTotal > maxVertices) throw new Error('GLTF_VERTEX_BUDGET');
+        warnings.push(`mesh ${meshIndex} primitive ${primitiveIndex}: MikkTSpace-compatible tangents generated for normal texture${generated.mesh.vertexCount !== outputCount ? ' with vertex splits' : ''}.`);
+        return { mesh: generated.mesh, morphTargets: generated.morphTargets, hasSkin: !!joints, material: binding };
       }
       return { mesh, morphTargets, hasSkin: !!joints, material: binding };
     });

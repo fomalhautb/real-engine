@@ -2,6 +2,12 @@ import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadGltf } from '../src/gltf-load';
 
+const tangentPreparation = vi.hoisted(() => vi.fn<() => Promise<void>>());
+vi.mock('../src/gltf-tangents', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/gltf-tangents')>(),
+  prepareGltfTangents: tangentPreparation,
+}));
+
 const rootUrl = 'https://assets.example.test/scenes/SimpleSkin.gltf';
 const directory = new URL('../public/assets/gltf/SimpleSkin/glTF/', import.meta.url);
 const names = [
@@ -56,7 +62,7 @@ function glbWithExternalBuffers(): Uint8Array {
 }
 
 describe('loadGltf bounded resource loading', () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => { vi.unstubAllGlobals(); tangentPreparation.mockReset(); });
   it('resolves each Khronos buffer relative to the document and imports its skin', async () => {
     const requests: URL[] = [];
     const signal = new AbortController().signal;
@@ -67,6 +73,88 @@ describe('loadGltf bounded resource loading', () => {
     expect(asset.skins[0].joints).toEqual([1, 2]);
     expect(asset.meshes[0].primitives[0].mesh.vertexCount).toBe(24);
     expect(asset.rig.clips[0].tracks[0].times).toHaveLength(12);
+    expect(tangentPreparation).not.toHaveBeenCalled();
+  });
+
+  it('awaits tangent preparation only for a normal-mapped primitive needing generation and honors abort afterward', async () => {
+    const json = sourceJson() as FixtureJson & {
+      materials: Array<Record<string, unknown>>;
+      meshes: Array<{ primitives: Array<Record<string, unknown>> }>;
+    };
+    json.materials = [{ normalTexture: { index: 0 } }];
+    json.meshes[0].primitives[0].material = 0;
+    const requests: URL[] = [];
+    const controller = new AbortController();
+    tangentPreparation.mockImplementationOnce(async () => { controller.abort(); });
+    await expect(loadGltf(rootUrl, {
+      fetch: fixtureFetch(requests, new TextEncoder().encode(JSON.stringify(json))), signal: controller.signal,
+    })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(tangentPreparation).toHaveBeenCalledOnce();
+    expect(requests.map(url => url.pathname.split('/').at(-1))).toEqual(['SimpleSkin.gltf']);
+  });
+
+  it('skips tangent preparation when a normal-mapped primitive declares both source streams', async () => {
+    const json = sourceJson() as FixtureJson & {
+      materials: Array<Record<string, unknown>>;
+      meshes: Array<{ primitives: Array<{ attributes: Record<string, number>; material?: number }> }>;
+    };
+    json.materials = [{ normalTexture: { index: 0 } }];
+    const primitive = json.meshes[0].primitives[0];
+    primitive.material = 0;
+    primitive.attributes.NORMAL = primitive.attributes.POSITION;
+    primitive.attributes.TANGENT = primitive.attributes.POSITION;
+    await expect(loadGltf(rootUrl, {
+      fetch: fixtureFetch([], new TextEncoder().encode(JSON.stringify(json))),
+    })).rejects.toThrow(/GLTF_INDEX: textureInfo.index/);
+    expect(tangentPreparation).not.toHaveBeenCalled();
+  });
+
+  it('prepares and generates tangents while loading a normal-mapped triangle without authored TANGENT', async () => {
+    const realTangents = await vi.importActual<typeof import('../src/gltf-tangents')>('../src/gltf-tangents');
+    tangentPreparation.mockImplementationOnce(() => realTangents.prepareGltfTangents());
+    const geometry = new Float32Array(24);
+    geometry.set([0, 0, 0, 1, 0, 0, 0, 1, 0], 0);
+    geometry.set([0, 0, 1, 0, 0, 1, 0, 0, 1], 9);
+    geometry.set([0, 0, 1, 0, 0, 1], 18);
+    const json = {
+      asset: { version: '2.0' },
+      buffers: [{ uri: 'triangle.bin', byteLength: geometry.byteLength }],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: 36 },
+        { buffer: 0, byteOffset: 36, byteLength: 36 },
+        { buffer: 0, byteOffset: 72, byteLength: 24 },
+      ],
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' },
+        { bufferView: 1, componentType: 5126, count: 3, type: 'VEC3' },
+        { bufferView: 2, componentType: 5126, count: 3, type: 'VEC2' },
+      ],
+      images: [{ uri: 'normal.png', mimeType: 'image/png' }], textures: [{ source: 0 }],
+      materials: [{ normalTexture: { index: 0 } }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 }, material: 0 }] }],
+      nodes: [{ mesh: 0 }], scenes: [{ nodes: [0] }],
+    };
+    const close = vi.fn();
+    vi.stubGlobal('createImageBitmap', vi.fn().mockResolvedValue({ width: 1, height: 1, close }));
+    vi.stubGlobal('OffscreenCanvas', class {
+      getContext() { return { drawImage: () => {}, getImageData: () => ({ data: new Uint8ClampedArray([128, 128, 255, 255]) }) }; }
+    });
+    const root = new TextEncoder().encode(JSON.stringify(json));
+    const fetcher: typeof fetch = async input => {
+      const name = new URL(String(input)).pathname.split('/').at(-1);
+      if (name === 'SimpleSkin.gltf') return response(root);
+      if (name === 'triangle.bin') return response(new Uint8Array(geometry.buffer));
+      if (name === 'normal.png') return response(new Uint8Array([137, 80, 78, 71]));
+      return new Response('missing', { status: 404 });
+    };
+    const asset = await loadGltf(rootUrl, { fetch: fetcher });
+    const mesh = asset.meshes[0].primitives[0].mesh;
+    expect(tangentPreparation).toHaveBeenCalledOnce();
+    expect(mesh.tangents).toHaveLength(mesh.vertexCount * 4);
+    expect(mesh.tangents![0]).toBeCloseTo(1, 5);
+    expect(mesh.tangents![1]).toBeCloseTo(0, 5);
+    expect(asset.warnings.some(warning => /UV-derivative frame fallback/.test(warning))).toBe(false);
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it('loads a data URI buffer through the same bounded fetch contract', async () => {

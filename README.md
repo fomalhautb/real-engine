@@ -13,11 +13,11 @@
 
 ## 当前状态
 
-阶段 1.2 进行中：代码定义的 Morph/蒙皮/wave 算子编译为共享 GPU 程序，主视图与阴影共用当前/前帧形变；动态包围盒、generation 场景句柄、增量帧提交和 Render Graph 已接入实际场景。现有代码生成材质表达式支持 PBR/Unlit、Opaque/Masked、双面、纹理与共享阴影覆盖；glTF/GLB 蒙皮与 Morph 动画、OBJ 卡片、纹理地面及 Rapier 固定步刚体同场运行。
+阶段 1.2 进行中：代码定义的 Morph/蒙皮/wave 算子编译为共享 GPU 程序，主视图与阴影共用当前/前帧形变；动态包围盒、generation 场景句柄、增量帧提交和 Render Graph 已接入实际场景。现有代码生成材质表达式支持 PBR/Unlit、Opaque/Masked、双面、纹理与共享阴影覆盖；glTF/GLB 蒙皮与 Morph 动画、缺失切线时的按需生成、OBJ 卡片、纹理地面及 Rapier 固定步刚体同场运行。
 
-阶段 2 已建立离线几何簇层级、简化与压缩分页，并接入全部驻留的 GPU LOD、视锥剔除、间接绘制和分簇颜色演示；共享形变的世界空间查询供有界漫反射 GI 使用，另有可选的跨帧多次反弹反馈与实验性 Final Gather。页面流送、遮挡剔除、完整 GI、镜面反射和参与介质仍待实现，路线图中的目标规模与性能门槛仍待验证。当前形变和材质编译器均有明确上限；本轮加入基础法线贴图及 glTF `normalTexture`，仍无多层材质或透射。阶段 2 后期将通过大规模完整场景联合验收画质和性能；现有小模型用于正确性验证及有限场景的性能基线。完整边界与后续工作见 [实现状态](docs/implementation.md)。
+阶段 2 已建立离线几何簇层级、简化与压缩分页，并接入全部驻留的 GPU LOD、视锥剔除、间接绘制和分簇颜色演示；共享形变的世界空间查询供有界漫反射 GI 使用，另有可选的跨帧多次反弹反馈与实验性 Final Gather。页面流送、遮挡剔除、完整 GI、镜面反射和参与介质仍待实现，路线图中的目标规模与性能门槛仍待验证。当前形变和材质编译器均有明确上限；现有基础法线贴图及 glTF `normalTexture`，仍无多层材质或透射。阶段 2 后期将通过大规模完整场景联合验收画质和性能；现有小模型用于正确性验证及有限场景的性能基线。完整边界与后续工作见 [实现状态](docs/implementation.md)。
 
-此前画质快照提供代码配置的阴影范围/分辨率、单帧 FXAA、共享形变/材质/遮挡的发光面主动采样，以及可选的实验性 Final Gather。旧地面六点远场参考平均误差由约 8.0% 降至 5.6%，但使用 3 cm 射线起点偏移，不能证明接触区正确。在独立 4096 路径、最多 12 段、0.1 mm 起点偏移的接触区参考中，开启 Final Gather 后五个可比较像素的平均 RGB 相对误差由 52.18% 降至 11.29%，最差仍为 30.77%，尚未达到目标的平均 10% / 单项 20% 门槛。1 cm 目标位置对应的像素命中白块，不参与地面 HDR 对比。此前本地 250 项 CPU 与 50 项原生 NVIDIA 浏览器回归是旧快照。本轮法线贴图版本的 `npm run check` 通过 262 项 CPU 测试（34 文件）、TypeScript 与生产构建，原生 NVIDIA `npm run test:browser` 全部 55 项通过，释放后账本归零且无 GPU validation 错误。有限平面联合测试验证了法线贴图、共享形变、世界查询、几何半球和实际减面 LOD；结果不外推到复杂资产。日志及三轮硬件镜头基准的边界见 [实现状态](docs/implementation.md)。
+此前画质快照提供代码配置的阴影范围/分辨率、单帧 FXAA、共享形变/材质/遮挡的发光面主动采样，以及可选的实验性 Final Gather。旧地面六点远场参考平均误差由约 8.0% 降至 5.6%，但使用 3 cm 射线起点偏移，不能证明接触区正确。在独立 4096 路径、最多 12 段、0.1 mm 起点偏移的接触区参考中，开启 Final Gather 后五个可比较像素的平均 RGB 相对误差由 52.18% 降至 11.29%，最差仍为 30.77%，尚未达到目标的平均 10% / 单项 20% 门槛。1 cm 目标位置对应的像素命中白块，不参与地面 HDR 对比。此前本地 250 项 CPU 与 50 项原生 NVIDIA 浏览器回归，以及法线贴图版本的 262 项 CPU（34 文件）与 55 项原生 NVIDIA 浏览器回归，均为历史快照。本轮 glTF 切线生成版本的 `npm run check` 通过 280 项 CPU 测试（36 文件）、TypeScript 与生产构建；原生 Edge `nvidia / ampere` 非 fallback 浏览器回归 56 项全部通过，GPU validation 错误为空且释放后应用账本归零。实际 glTF 的 GPU 联合用例覆盖生成切线、Morph/仿射蒙皮、法线贴图 PBR、世界查询和几何法线；位置/法线/切线误差小于 `3e-4`，边界越界为零。证据见 `artifacts/mikk-tangents-check-20261015.log` 与 `artifacts/mikk-tangents-browser-native-20261015.log`。此结果只覆盖测试资产；此前三轮硬件镜头基准未启用该 glTF 生成路径，不能证明复杂资产导入成本或大场景性能。完整边界见 [实现状态](docs/implementation.md)。
 
 ## 本地运行
 
@@ -104,7 +104,7 @@ node scripts/benchmark-demo.mjs --page geometry --channel msedge --warmup 300 --
 
 演示基准在首帧前关闭低频诊断读回、重置相机轨迹，并使用独立生产构建和固定场景；GI 与几何结果不能直接相减解释单个 pass 的代价。预期厂商会对照 Renderer 实际使用的 adapter 检查。此前 8×8 GI 的证据在 `artifacts/benchmarks/local-gi-directional-nvidia-20261014`，旧六方向版本在 `local-gi-nvidia-20261014-v3`，两者源码/构建指纹不同。输出目录必须是 `artifacts/` 下尚不存在的路径。
 
-GI 演示基准可用 `--final-gather --camera orbit` 测量实验路径的确定性慢速镜头运动；`--camera fixed` 为默认，`orbit` 仅用于 `--page gi`。报告逐帧保存实际相机位置。此前 orbit 证据在 `artifacts/benchmarks/local-final-gather-camera-final-20261014`；其最差一次 rAF p95 为 20.9 ms，不能视为 60 FPS 达标。本轮最终共享布局回归在 `artifacts/benchmarks/local-normal-layout-release-camera-20261015`，相同 orbit 与 Final Gather 下三次 GPU pass 总和 p95 为 4.5907968/4.5252608/4.718592 ms，rAF p95 为 7.0/7.0/13.9 ms；该 GI 房间未启用 `normalTexture`，不能据此推断复杂法线贴图成本或跨构建加速。
+GI 演示基准可用 `--final-gather --camera orbit` 测量实验路径的确定性慢速镜头运动；`--camera fixed` 为默认，`orbit` 仅用于 `--page gi`。报告逐帧保存实际相机位置。此前 orbit 证据在 `artifacts/benchmarks/local-final-gather-camera-final-20261014`；其最差一次 rAF p95 为 20.9 ms，不能视为 60 FPS 达标。此前共享布局回归在 `artifacts/benchmarks/local-normal-layout-release-camera-20261015`，相同 orbit 与 Final Gather 下三次 GPU pass 总和 p95 为 4.5907968/4.5252608/4.718592 ms，rAF p95 为 7.0/7.0/13.9 ms；该 GI 房间未启用 `normalTexture` 或 glTF 切线生成，不能据此推断新导入成本、复杂法线贴图成本或跨构建加速。
 
 结果保存在 `artifacts/benchmarks/`，包含源码/生产构建哈希、环境清单、逐帧 CSV、统计 JSON、截图和运行期间的内存观察。生产构建复制到独立目录，后续开发不会改变正在测量的版本。rAF 间隔表示浏览器回调节奏，GPU 时间是稀疏异步样本；两者均不等于显示器实际呈现时间。基础压力场景的长测证据在 `artifacts/benchmarks/local-stability-nvidia-20261014`，测得 1,800,000.2 ms、167,349 帧、92 个完整事件循环、无应用 GPU 账本增长或错误且释放归零；rAF p95 34.8 ms、p99 62.5 ms，10,401 帧（6.215%）超过初始预算。压力序列切换 1080p/810p，运行中有少量短 CPU 测试；这不代表固定 1080p、严格无干扰性能认证或大型 GI/LOD/镜面反射/体积雾联合长测。完整协议与边界见 [实现状态](docs/implementation.md#基准运行器与首轮证据)。
 
@@ -141,7 +141,7 @@ renderer.setMaterialParameters('card', new Float32Array([0.8, 1, 1, 1]));
 
 `await renderer.setMaterial('card', binding)` 异步准备后原子替换整套材质；`renderer.setSun({ direction, color })` 更新太阳方向与线性 RGB 辐亮度。详见 [实现状态](docs/implementation.md)。
 
-材质定义可选 `normal: Vec4Expr` 提供 RGB 编码的切线空间法线，`normalScale: ScalarExpr` 缩放其 XY 分量（允许负值）；未配置时沿用原法线。glTF `normalTexture` 占线性纹理槽 3，`scale` 放入参数槽 3 的 x 分量。缺失有效 authored `TANGENT` 时，消费端按已变形三角形的 UV 导数回退；尚未生成 MikkTSpace 切线，不能保证完整 glTF 法线贴图保真。详细边界与验证见 [实现状态](docs/implementation.md)。
+材质定义可选 `normal: Vec4Expr` 提供 RGB 编码的切线空间法线，`normalScale: ScalarExpr` 缩放其 XY 分量（允许负值）；未配置时沿用原法线。glTF `normalTexture` 占线性纹理槽 3，`scale` 放入参数槽 3 的 x 分量。导入带 `normalTexture` 且缺失有效 `NORMAL`＋`TANGENT` 的 glTF primitive 时，加载器按需准备 WASM，导入器生成 MikkTSpace-compatible 基础和 Morph 目标切线，必要时拆分镜像 UV 接缝并重映射顶点流；同步调用 `importGltf` 前可显式 `await prepareGltfTangents()`。法线贴图需要 `TEXCOORD_0`。代码构建的网格未提供切线时仍可使用已变形三角形的 UV 导数回退。生成结果不保证与任意烘焙器逐位相同，复杂资产保真仍需验证。详细边界与验证见 [实现状态](docs/implementation.md)。
 
 ## glTF 动画接口示例
 
@@ -175,7 +175,7 @@ renderer.render([4, 3, 6], [0, 1, 0]);
 | src/geometry-lod-data.ts、src/gpu-geometry-lod.ts | 层级验证/打包、GPU 选簇、索引压紧和间接绘制参数 |
 | src/geometry-demo.ts、src/geometry-demo-scene.ts | 实际簇分色、LOD 层级及可重复镜头演示 |
 | scripts/build-geometry.mjs | 静态 Opaque OBJ 构建、来源/页面哈希与原子输出 |
-| src/gltf-binary.ts、src/gltf-import.ts、src/gltf-load.ts | 有界 glTF/GLB 解码、网格/蒙皮/材质导入与资源加载 |
+| src/gltf-binary.ts、src/gltf-import.ts、src/gltf-tangents.ts、src/gltf-load.ts | 有界 glTF/GLB 解码、网格/蒙皮/材质导入、按需切线生成与资源加载 |
 | src/animation.ts、src/gltf-scene.ts | TRS/Morph 动画采样、层级姿态和统一场景输入 |
 | src/shaders/deform.wgsl | 融合算子的当前/前帧执行模板 |
 | src/shaders/surface.wgsl | 直接光 PBR、阴影与运动向量 |

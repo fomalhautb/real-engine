@@ -1,5 +1,5 @@
 // GI_COMMON
-struct Deformed { position: vec4f, normal: vec4f, previous: vec4f }
+struct Deformed { position: vec4f, normal: vec4f, previous: vec4f, tangent: vec4f }
 struct Ray { origin: vec4f, direction: vec4f, ignore: vec4u }
 struct Hit {
     identity: vec4u, metric: vec4f, position: vec4f, normal: vec4f,

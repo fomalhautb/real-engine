@@ -42,13 +42,13 @@ function triangle(): SceneBatch {
 }
 
 function gpuScene(device: GPUDevice): { output: GPUBuffer; instances: GPUBuffer } {
-  const output = device.createBuffer({ size: 3 * 48, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const output = device.createBuffer({ size: 3 * 64, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   let instanceBuffer: GPUBuffer | undefined;
   try {
   instanceBuffer = device.createBuffer({ size: 224, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  const data = new Float32Array(3 * 12);
+  const data = new Float32Array(3 * 16);
   [[-1, -1, 0], [1, -1, 0], [0, 1, 0]].forEach((point, vertex) => {
-    const at = vertex * 12;
+    const at = vertex * 16;
     data.set([...point, 1], at);
     data.set([0, 0, 1, 0], at + 4);
     data.set([...point, 1], at + 8);

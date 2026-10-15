@@ -18,12 +18,37 @@ function hitRecord(): ArrayBuffer {
   f(20, 0.2); f(21, 0.3); f(22, 0.4); f(23, 0.8);
   f(24, 2); f(25, 1); f(26, 0); f(27, 1);
   u(28, 19); u(29, 23); u(30, 29); u(31, 31);
-  f(32, 0.75); f(33, 0.125); f(34, 2);
+  f(32, 0.75); f(33, 0.125); f(34, 2); f(35, 1);
   u(36, 14); u(37, 6);
   return data;
 }
 
 describe('world query wire contract', () => {
+  it('decodes independent geometric normals from reserved octahedral lanes without expanding the hit', () => {
+    const cases = [
+      { encoded: [0, 0], expected: [0, 0, 1] },
+      { encoded: [1, 0], expected: [1, 0, 0] },
+      { encoded: [0, 1], expected: [0, 1, 0] },
+      { encoded: [-1, 0], expected: [-1, 0, 0] },
+      { encoded: [0, -1], expected: [0, -1, 0] },
+      { encoded: [1, 1], expected: [0, 0, -1] },
+      { encoded: [-0.5, 0.5], expected: [-Math.SQRT1_2, Math.SQRT1_2, 0] },
+    ];
+    for (const { encoded, expected } of cases) {
+      const data = hitRecord(), view = new DataView(data);
+      view.setFloat32(11 * 4, encoded[0], true);
+      view.setFloat32(35 * 4, encoded[1], true);
+      const hit = decodeWorldHits(data, ['ground', 'character'], 1, 19, 31).hits[0]!;
+      expect(data.byteLength).toBe(160);
+      expect(hit.normal).toEqual([0, 1, 0]);
+      expected.forEach((value, axis) => expect(hit.geometricNormal[axis]).toBeCloseTo(value, 7));
+    }
+    for (const invalid of [1.01, -1.01, Infinity, NaN]) {
+      const data = hitRecord();
+      new DataView(data).setFloat32(11 * 4, invalid, true);
+      expect(() => decodeWorldHits(data, ['ground', 'character'], 1, 19, 31)).toThrow(/geometricNormal|finite/);
+    }
+  });
   it('resolves defaults and rejects invalid or excessive allocations', () => {
     expect(resolveWorldQueryOptions()).toEqual({
       maxRays: 1024, maxBytes: 128 * 1024 * 1024, maxTrianglesPerMesh: 65536,
@@ -96,7 +121,7 @@ describe('world query wire contract', () => {
     expect(result.materialRevision).toBe(31);
     expect(result.hits[0]).toEqual({
       batch: 'character', entityId: 42, entityGeneration: 3, triangleIndex: 7, distance: 5,
-      position: [1, 2, 3], normal: [0, 1, 0], previousPosition: [0.5, 2, 3],
+      position: [1, 2, 3], normal: [0, 1, 0], geometricNormal: [0, 1, 0], previousPosition: [0.5, 2, 3],
       uv: [0.75, 0.125], baseColor: [Math.fround(0.2), Math.fround(0.3), Math.fround(0.4)],
       opacity: Math.fround(0.8), metallic: Math.fround(0.6), roughness: Math.fround(0.4),
       emissive: [2, 1, 0], shading: 'unlit', historyVersion: 23, topologyVersion: 29,

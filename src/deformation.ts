@@ -1,4 +1,5 @@
 import type { Mat4 } from './math';
+import { validateTangent } from './tangent-frame';
 
 export type Vec3 = readonly [number, number, number];
 export interface Bounds3 { min: [number, number, number]; max: [number, number, number] }
@@ -13,6 +14,8 @@ export interface MorphTarget { positions: Float32Array; normals: Float32Array; t
 export interface DeformationVertex {
   position: Vec3;
   normal: Vec3;
+  /** Authored local tangent; w is signed bitangent orientation, never a vector component. */
+  tangent?: readonly [number, number, number, number];
   joints: readonly [number, number, number, number];
   weights: readonly [number, number, number, number];
 }
@@ -45,9 +48,10 @@ function floatLiteral(value: number): string {
 
 /**
  * Compile a bounded, ordered deformation graph into one fused compute function body.
- * The caller supplies p/n (var vec3f), vertexIndex/paletteBase/scalarBase (u32),
+ * The caller supplies p/n (var vec3f), t (var vec4f), vertexIndex/paletteBase/scalarBase (u32),
  * vertex.joints (vec4u), vertex.weights (vec4f), params.vertexCount (u32), and storage
- * arrays palettes:mat4x4f, scalars:f32, morphs:MorphDelta {position/normal:vec4f}.
+ * arrays palettes:mat4x4f, scalars:f32, morphs:MorphDelta {position/normal/tangent:vec4f},
+ * and deformationOrthogonalTangent/deformationOrientation helpers from deform.wgsl.
  * Morph storage is target-major, with one delta per original vertex. A mesh's
  * instance/model transform is applied by the caller after this local-space graph.
  *
@@ -96,11 +100,13 @@ export function compileDeformation(graph: DeformationGraph): CompiledDeformation
     let weight = scalars[scalarBase + ${node.weight}u];
     p += delta.position.xyz * weight;
     n += delta.normal.xyz * weight;
+    t = vec4f(t.xyz + delta.tangent.xyz * weight, t.w);
 }`;
       case 'skin': return node.normalMode === 'affine' ? `{
     let weights = vertex.weights / dot(vertex.weights, vec4f(1.0));
     var skinnedPosition = vec3f(0.0);
     var rotatedNormal = vec3f(0.0);
+    var skinnedTangent = vec3f(0.0);
     var c0 = vec3f(0.0);
     var c1 = vec3f(0.0);
     var c2 = vec3f(0.0);
@@ -109,11 +115,13 @@ export function compileDeformation(graph: DeformationGraph): CompiledDeformation
         let weight = weights[influence];
         skinnedPosition += (bone * vec4f(p, 1.0)).xyz * weight;
         rotatedNormal += (bone * vec4f(n, 0.0)).xyz * weight;
+        skinnedTangent += (bone * vec4f(t.xyz, 0.0)).xyz * weight;
         c0 += bone[0].xyz * weight;
         c1 += bone[1].xyz * weight;
         c2 += bone[2].xyz * weight;
     }
     p = skinnedPosition;
+    t = vec4f(skinnedTangent, t.w * deformationOrientation(c0, c1, c2));
     let matrixScale = max(
         max(max(abs(c0.x), abs(c0.y)), abs(c0.z)),
         max(max(max(abs(c1.x), abs(c1.y)), abs(c1.z)), max(max(abs(c2.x), abs(c2.y)), abs(c2.z))));
@@ -137,19 +145,29 @@ export function compileDeformation(graph: DeformationGraph): CompiledDeformation
     let weights = vertex.weights / dot(vertex.weights, vec4f(1.0));
     var skinnedPosition = vec3f(0.0);
     var skinnedNormal = vec3f(0.0);
+    var skinnedTangent = vec3f(0.0);
+    var c0 = vec3f(0.0);
+    var c1 = vec3f(0.0);
+    var c2 = vec3f(0.0);
     for (var influence = 0u; influence < 4u; influence++) {
         let bone = palettes[paletteBase + vertex.joints[influence]];
         skinnedPosition += (bone * vec4f(p, 1.0)).xyz * weights[influence];
         skinnedNormal += (bone * vec4f(n, 0.0)).xyz * weights[influence];
+        skinnedTangent += (bone * vec4f(t.xyz, 0.0)).xyz * weights[influence];
+        c0 += bone[0].xyz * weights[influence];
+        c1 += bone[1].xyz * weights[influence];
+        c2 += bone[2].xyz * weights[influence];
     }
     p = skinnedPosition;
     n = skinnedNormal;
+    t = vec4f(skinnedTangent, t.w * deformationOrientation(c0, c1, c2));
 }`;
       case 'wave': return `{
     let angle = p.y * ${floatLiteral(node.frequency)} + scalars[scalarBase + ${node.phase}u];
     let slope = ${floatLiteral(node.amplitude)} * ${floatLiteral(node.frequency)} * cos(angle);
     p.x += ${floatLiteral(node.amplitude)} * sin(angle);
     n.y -= slope * n.x;
+    t.x += slope * t.y;
 }`;
     }
   }).join('\n');
@@ -157,8 +175,10 @@ export function compileDeformation(graph: DeformationGraph): CompiledDeformation
   const normalization = `
 {
     let magnitude = max(abs(n.x), max(abs(n.y), abs(n.z)));
-    if (magnitude > 0.0) { n = normalize(n / magnitude); }
+    if (magnitude > 0.0 && all(abs(n) <= vec3f(3.402823e38f))) { n = normalize(n / magnitude); }
     else { n = vec3f(0.0, 1.0, 0.0); }
+    if (t.w != 0.0) { t = vec4f(deformationOrthogonalTangent(t.xyz, n), t.w); }
+    else { t = vec4f(0.0); }
 }`;
   return Object.freeze({
     key: `deformation-v1:${JSON.stringify({ jointCount: graph.jointCount, nodes })}`,
@@ -214,6 +234,7 @@ export function validateDeformationVertex(program: CompiledDeformation, vertex: 
     finite(vertex.position[i], `position[${i}]`);
     finite(vertex.normal[i], `normal[${i}]`);
   }
+  if (vertex.tangent !== undefined) validateTangent(vertex.tangent);
   if (!program.nodes.some((node) => node.kind === 'skin')) return;
   let sum = 0;
   for (let i = 0; i < 4; i++) {
@@ -235,10 +256,14 @@ export function validateMorphTargets(
     if (target.positions.length !== vertexCount * 3 || target.normals.length !== vertexCount * 3) {
       throw new RangeError(`morph target ${targetIndex} must contain vertexCount packed xyz position and normal deltas`);
     }
+    if (target.tangents !== undefined && target.tangents.length !== vertexCount * 3) {
+      throw new RangeError(`morph target ${targetIndex} tangents must contain vertexCount packed xyz deltas`);
+    }
     const bounds: Bounds3 = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
     for (let i = 0; i < target.positions.length; i++) {
       finite(target.positions[i], `morph[${targetIndex}].positions[${i}]`);
       finite(target.normals[i], `morph[${targetIndex}].normals[${i}]`);
+      if (target.tangents !== undefined) finite(target.tangents[i], `morph[${targetIndex}].tangents[${i}]`);
       const axis = i % 3;
       bounds.min[axis] = Math.min(bounds.min[axis], target.positions[i]);
       bounds.max[axis] = Math.max(bounds.max[axis], target.positions[i]);
@@ -253,6 +278,27 @@ function normalize(value: Vec3): [number, number, number] {
 }
 function transform(matrix: ArrayLike<number>, value: Vec3, w: number): [number, number, number] {
   return [0, 1, 2].map((r) => matrix[r] * value[0] + matrix[4 + r] * value[1] + matrix[8 + r] * value[2] + matrix[12 + r] * w) as [number, number, number];
+}
+
+function blendOrientation(columns: readonly number[]): number {
+  const magnitude = Math.max(...columns.map(Math.abs));
+  if (!(magnitude > 0) || !columns.every(value => Number.isFinite(Math.fround(value)))) return 1;
+  const [a, d, g, b, e, h, c, f, i] = columns.map(value => value / magnitude);
+  return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g) < 0 ? -1 : 1;
+}
+
+function orthogonalTangent(value: Vec3, normal: Vec3): [number, number, number] {
+  const magnitude = Math.max(...value.map(Math.abs));
+  if (magnitude > 0 && value.every(component => Number.isFinite(Math.fround(component)))) {
+    const scaled = value.map(component => component / magnitude);
+    const projection = scaled.reduce((sum, component, axis) => sum + component * normal[axis], 0);
+    const orthogonal = scaled.map((component, axis) => component - normal[axis] * projection) as [number, number, number];
+    if (orthogonal.reduce((sum, component) => sum + component * component, 0) > 1e-12) return normalize(orthogonal);
+  }
+  // Select the least-aligned cardinal direction to avoid an unstable fallback near a pole.
+  const axis = Math.abs(normal[0]) <= Math.abs(normal[1]) && Math.abs(normal[0]) <= Math.abs(normal[2]) ? 0
+    : Math.abs(normal[1]) <= Math.abs(normal[2]) ? 1 : 2;
+  return normalize(normal.map((component, componentAxis) => Number(componentAxis === axis) - component * normal[axis]) as [number, number, number]);
 }
 
 /** Inverse transpose of the vertex's weighted blend; a singular blend uses its finite rotated normal. */
@@ -279,12 +325,14 @@ function affineSkinNormal(columns: readonly number[], normal: Vec3, rotatedNorma
 export function evaluateDeformation(
   program: CompiledDeformation, vertex: DeformationVertex, vertexIndex: number,
   targets: readonly MorphTarget[], palette: readonly Mat4[], scalars: ArrayLike<number>,
-): { position: [number, number, number]; normal: [number, number, number] } {
+): { position: [number, number, number]; normal: [number, number, number]; tangent?: [number, number, number, number] } {
   validateDeformationVertex(program, vertex);
   validateDeformationState(program, palette, scalars);
   if (!Number.isSafeInteger(vertexIndex) || vertexIndex < 0) throw new RangeError('vertexIndex must be a nonnegative integer');
   let p: [number, number, number] = [...vertex.position];
   let n: [number, number, number] = [...vertex.normal];
+  let t: [number, number, number] | undefined = vertex.tangent ? vertex.tangent.slice(0, 3) as [number, number, number] : undefined;
+  let orientation = vertex.tangent?.[3] ?? 0;
   for (const node of program.nodes) {
     switch (node.kind) {
       case 'morph': {
@@ -292,42 +340,53 @@ export function evaluateDeformation(
         if (!target || target.positions.length <= offset + 2 || target.normals.length <= offset + 2) {
           throw new RangeError('morph target does not contain the requested vertex');
         }
+        if (target.tangents !== undefined && target.tangents.length !== target.positions.length) {
+          throw new RangeError('morph tangent deltas must contain packed xyz for every target vertex');
+        }
         for (let axis = 0; axis < 3; axis++) {
           finite(target.positions[offset + axis], 'morph position');
           finite(target.normals[offset + axis], 'morph normal');
+          if (target.tangents !== undefined) finite(target.tangents[offset + axis], 'morph tangent');
           p[axis] += target.positions[offset + axis] * scalars[node.weight];
           n[axis] += target.normals[offset + axis] * scalars[node.weight];
+          if (t && target.tangents !== undefined) t[axis] += target.tangents[offset + axis] * scalars[node.weight];
         }
         break;
       }
       case 'skin': {
         const position: [number, number, number] = [0, 0, 0], normal: [number, number, number] = [0, 0, 0];
-        const columns = node.normalMode === 'affine' ? new Array<number>(9).fill(0) : undefined;
+        const tangent: [number, number, number] = [0, 0, 0];
+        const columns = node.normalMode === 'affine' || t ? new Array<number>(9).fill(0) : undefined;
         const sum = vertex.weights.reduce((total, weight) => total + weight, 0);
         for (let influence = 0; influence < 4; influence++) {
           const bone = palette[vertex.joints[influence]], weight = vertex.weights[influence] / sum;
           const bp = transform(bone, p, 1), bn = transform(bone, n, 0);
+          const bt = t ? transform(bone, t, 0) : undefined;
           for (let axis = 0; axis < 3; axis++) {
             position[axis] += bp[axis] * weight;
             normal[axis] += bn[axis] * weight;
+            if (bt) tangent[axis] += bt[axis] * weight;
           }
           if (columns) for (let col = 0; col < 3; col++) for (let row = 0; row < 3; row++) {
             columns[col * 3 + row] += bone[col * 4 + row] * weight;
           }
         }
-        p = position; n = columns ? affineSkinNormal(columns, n, normal) : normal;
+        p = position; n = node.normalMode === 'affine' && columns ? affineSkinNormal(columns, n, normal) : normal;
+        if (t && columns) { t = tangent; orientation *= blendOrientation(columns); }
         break;
       }
       case 'wave': {
         const angle = p[1] * node.frequency + scalars[node.phase];
         p[0] += node.amplitude * Math.sin(angle);
         n[1] -= node.amplitude * node.frequency * Math.cos(angle) * n[0];
+        if (t) t[0] += node.amplitude * node.frequency * Math.cos(angle) * t[1];
         break;
       }
     }
   }
   for (const value of [...p, ...n]) finite(value, 'deformation result');
-  return { position: p, normal: normalize(n) };
+  const normal = normalize(n);
+  return t ? { position: p, normal, tangent: [...orthogonalTangent(t, normal), orientation] } : { position: p, normal };
 }
 
 function validateBounds(bounds: Bounds3, label: string): void {

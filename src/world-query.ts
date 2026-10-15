@@ -28,6 +28,8 @@ export interface WorldHit {
   distance: number;
   position: [number, number, number];
   normal: [number, number, number];
+  /** Oriented triangle normal; independent of smoothed vertices and material detail. */
+  geometricNormal: [number, number, number];
   previousPosition: [number, number, number];
   uv: [number, number];
   baseColor: [number, number, number];
@@ -50,6 +52,8 @@ export interface WorldQueryResult {
 
 export const WORLD_RAY_BYTES = 48;
 export const WORLD_HIT_BYTES = 160;
+// Geometry normal is octahedrally encoded in the two formerly reserved f32s:
+// position.w (word 11) and uvInfo.w (word 35). No hit stride/budget increase.
 
 const UINT32_MAX = 0xffff_ffff;
 const MAX_RAYS = 65_536;
@@ -191,7 +195,7 @@ export function decodeWorldHits(
     const baryV = f32(6);
     const frontFace = f32(7);
     const position: [number, number, number] = [f32(8), f32(9), f32(10)];
-    f32(11);
+    const geometryX = f32(11);
     const normal: [number, number, number] = [f32(12), f32(13), f32(14)];
     const roughness = f32(15);
     const previousPosition: [number, number, number] = [f32(16), f32(17), f32(18)];
@@ -205,7 +209,8 @@ export function decodeWorldHits(
     const topologyVersion = u32(30);
     const recordMaterialRevision = u32(31);
     const uv: [number, number] = [f32(32), f32(33)];
-    f32(34); f32(35);
+    f32(34);
+    const geometryY = f32(35);
     const overflow = u32(38);
     if (overflow !== 0) throw new RangeError(`WORLD_QUERY_WORK_BUDGET: hits[${i}] exceeded traversal budget`);
     if (recordFrame !== frame || recordMaterialRevision !== materialRevision) {
@@ -238,9 +243,17 @@ export function decodeWorldHits(
     if (Math.abs(Math.hypot(...normal) - 1) > 0.01) {
       throw new RangeError(`hits[${i}].normal must have unit length`);
     }
+    if (Math.abs(geometryX) > 1 || Math.abs(geometryY) > 1) {
+      throw new RangeError(`hits[${i}].geometricNormal encoding must be in [-1, 1]`);
+    }
+    const z = 1 - Math.abs(geometryX) - Math.abs(geometryY);
+    const x = z < 0 ? (1 - Math.abs(geometryY)) * (geometryX >= 0 ? 1 : -1) : geometryX;
+    const y = z < 0 ? (1 - Math.abs(geometryX)) * (geometryY >= 0 ? 1 : -1) : geometryY;
+    const geometryLength = Math.hypot(x, y, z);
+    const geometricNormal: [number, number, number] = [x / geometryLength, y / geometryLength, z / geometryLength];
     hits.push({
       batch: batchNames[batchId - 1], entityId, entityGeneration: generation, triangleIndex,
-      distance, position, normal, previousPosition, uv, baseColor, opacity, metallic,
+      distance, position, normal, geometricNormal, previousPosition, uv, baseColor, opacity, metallic,
       roughness, emissive, shading: isUnlit === 1 ? 'unlit' : 'pbr',
       historyVersion, topologyVersion,
     });

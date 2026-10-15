@@ -15,6 +15,10 @@ struct Hit {
 
 // GI_INTERPOLATE
 
+fn giHitGeometry(hit: Hit) -> vec3f {
+    return surfaceOctDecode(vec2f(hit.position.w, hit.uvInfo.w));
+}
+
 @compute @workgroup_size(64)
 fn generate(@builtin(global_invocation_id) id: vec3u) {
     let count = gi.counts.x * gi.counts.y * gi.counts.z;
@@ -30,9 +34,10 @@ fn generateShadows(@builtin(global_invocation_id) id: vec3u) {
     let hit = primary[id.x];
     var ray = Ray(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(gi.sunDirection.xyz, 0.0), vec4u(0u));
     if (hit.identity.x != 0u && hit.work.z == 0u && hit.emissive.w == 0.0
-        && dot(hit.normal.xyz, gi.sunDirection.xyz) > 0.0 && any(gi.sunColor.xyz > vec3f(0.0))) {
+        && dot(hit.normal.xyz, gi.sunDirection.xyz) > 0.0
+        && dot(giHitGeometry(hit), gi.sunDirection.xyz) > 0.0 && any(gi.sunColor.xyz > vec3f(0.0))) {
         // Keep other triangles of this entity eligible for self-shadowing.
-        ray.origin = vec4f(hit.position.xyz + hit.normal.xyz * gi.sunDirection.w, 0.0001);
+        ray.origin = vec4f(hit.position.xyz + giHitGeometry(hit) * gi.sunDirection.w, 0.0001);
         ray.direction.w = gi.spacing.w;
     }
     rays[id.x] = ray;
@@ -61,14 +66,14 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
             if (hit.emissive.w != 0.0) {
                 radiance += select(vec3f(0.0), hit.baseColor.xyz, sampleEmission);
             } else {
-                let nl = max(0.0, dot(hit.normal.xyz, gi.sunDirection.xyz));
+                let nl = select(0.0, max(0.0, dot(hit.normal.xyz, gi.sunDirection.xyz)), dot(giHitGeometry(hit), gi.sunDirection.xyz) > 0.0);
                 let visible = select(0.0, 1.0, shadow.identity.x == 0u && shadow.work.z == 0u);
                 // Diffuse-only capture: dielectric F0=.04, no specular bounce.
                 radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)
                     * gi.sunColor.xyz * nl * visible;
                 if (gi.state.z != 0u) {
                     radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)
-                        * giSampleIrradiance(hit.position.xyz, hit.normal.xyz, gi.state.y);
+                        * giSampleSurfaceIrradiance(hit.position.xyz, hit.normal.xyz, giHitGeometry(hit), gi.state.y);
                 }
             }
         }

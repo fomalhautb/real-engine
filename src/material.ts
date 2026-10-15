@@ -18,6 +18,10 @@ export interface MaterialDefinition {
   readonly roughness: ScalarExpr;
   readonly emissive: Vec4Expr;
   readonly alphaCutoff: ScalarExpr;
+  /** Encoded tangent-space RGB in [0, 1]; omitted means [0, 0, 1]. */
+  readonly normal?: Vec4Expr;
+  /** Scales tangent-space X and Y, including negative values; defaults to 1. */
+  readonly normalScale?: ScalarExpr;
 }
 export const MATERIAL_LIMITS = Object.freeze({ nodes: 128, depth: 32, parameters: 16, textures: 4 });
 
@@ -47,6 +51,7 @@ export interface MaterialProgram {
   readonly shading: MaterialDefinition['shading'];
   readonly alphaMode: MaterialDefinition['alphaMode'];
   readonly doubleSided: boolean;
+  readonly normalMapped: boolean;
 }
 type Node =
   | Readonly<{ kind: 'constant'; value: Vec4 }>
@@ -63,6 +68,8 @@ interface CompiledGraph {
   readonly roughness: number;
   readonly emissive: number;
   readonly alphaCutoff: number;
+  readonly normal?: number;
+  readonly normalScale: number;
 }
 const graphs = new WeakMap<MaterialProgram, CompiledGraph>();
 
@@ -209,22 +216,33 @@ export function compileMaterial(definition: MaterialDefinition): MaterialProgram
     roughness: read(definition.roughness, true, 1, 'roughness').id,
     emissive: read(definition.emissive, false, 1, 'emissive').id,
     alphaCutoff: read(definition.alphaCutoff, true, 1, 'alphaCutoff').id,
+    normal: definition.normal === undefined ? undefined : read(definition.normal, false, 1, 'normal').id,
+    normalScale: read(definition.normalScale ?? 1, true, 1, 'normalScale').id,
   });
   Object.freeze(nodes);
-  const surfaceNodes = reachable(nodes, [graph.baseColor, graph.metallic, graph.roughness, graph.emissive, graph.alphaCutoff]);
+  const surfaceNodes = reachable(nodes, [graph.baseColor, graph.metallic, graph.roughness, graph.emissive,
+    graph.alphaCutoff, graph.normalScale, ...(graph.normal === undefined ? [] : [graph.normal])]);
   const coverageNodes = reachable(nodes, definition.alphaMode === 'mask' ? [graph.baseColor, graph.alphaCutoff] : []);
   const coverageWgsl = `fn evaluateCoverage(${argumentsWGSL}) -> bool {\n${emitNodes(nodes, coverageNodes)}\n    return ${definition.alphaMode === 'opaque' ? 'true' : `clamp(v${graph.baseColor}.a, 0.0, 1.0) >= max(v${graph.alphaCutoff}, 0.0)`};\n}`;
   const baseColorWgsl = definition.shading === 'pbr'
     ? `clamp(v${graph.baseColor}.rgb, vec3f(0.0), vec3f(1.0))`
     : `max(v${graph.baseColor}.rgb, vec3f(0.0))`;
-  const wgsl = `struct MaterialSurface {\n    baseColor: vec3f,\n    opacity: f32,\n    metallic: f32,\n    roughness: f32,\n    emissive: vec3f,\n    alphaCutoff: f32,\n}\nfn evaluateMaterial(${argumentsWGSL}) -> MaterialSurface {\n${emitNodes(nodes, surfaceNodes)}\n    return MaterialSurface(\n        ${baseColorWgsl}, clamp(v${graph.baseColor}.a, 0.0, 1.0),\n        clamp(v${graph.metallic}, 0.0, 1.0), clamp(v${graph.roughness}, 0.04, 1.0),\n        max(v${graph.emissive}.rgb, vec3f(0.0)), max(v${graph.alphaCutoff}, 0.0)\n    );\n}\n${coverageWgsl}`;
+  const normalWgsl = graph.normal === undefined ? '    let tangentNormal = vec3f(0.0, 0.0, 1.0);' :
+    `    let tangentRaw = vec3f((v${graph.normal}.rgb * 2.0 - vec3f(1.0)).xy * v${graph.normalScale}, v${graph.normal}.b * 2.0 - 1.0);\n` +
+    `    var tangentNormal = vec3f(0.0, 0.0, 1.0);\n` +
+    `    if (all(abs(tangentRaw) < vec3f(1e18))) {\n` +
+    `        let tangentLengthSquared = dot(tangentRaw, tangentRaw);\n` +
+    `        if (tangentLengthSquared > 1e-20) { tangentNormal = tangentRaw * inverseSqrt(tangentLengthSquared); }\n` +
+    `    }`;
+  const wgsl = `struct MaterialSurface {\n    baseColor: vec3f,\n    opacity: f32,\n    metallic: f32,\n    roughness: f32,\n    emissive: vec3f,\n    alphaCutoff: f32,\n    tangentNormal: vec3f,\n}\nfn evaluateMaterial(${argumentsWGSL}) -> MaterialSurface {\n${emitNodes(nodes, surfaceNodes)}\n${normalWgsl}\n    return MaterialSurface(\n        ${baseColorWgsl}, clamp(v${graph.baseColor}.a, 0.0, 1.0),\n        clamp(v${graph.metallic}, 0.0, 1.0), clamp(v${graph.roughness}, 0.04, 1.0),\n        max(v${graph.emissive}.rgb, vec3f(0.0)), max(v${graph.alphaCutoff}, 0.0), tangentNormal\n    );\n}\n${coverageWgsl}`;
   const surfaceResources = resources(nodes, surfaceNodes), coverageResources = resources(nodes, coverageNodes);
   const program: MaterialProgram = Object.freeze({
-    key: `material-v2:${JSON.stringify([definition.shading, definition.alphaMode, definition.doubleSided, graph])}`,
+    key: `material-v3:${JSON.stringify([definition.shading, definition.alphaMode, definition.doubleSided, graph])}`,
     wgsl, coverageWgsl, ...surfaceResources,
     coverageParameterCount: coverageResources.parameterCount,
     coverageTextureSlots: coverageResources.textureSlots,
     shading: definition.shading, alphaMode: definition.alphaMode, doubleSided: definition.doubleSided,
+    normalMapped: graph.normal !== undefined,
   });
   graphs.set(program, graph);
   return program;
@@ -245,6 +263,7 @@ export interface MaterialEvaluation {
   readonly roughness: number;
   readonly emissive: readonly [number, number, number];
   readonly alphaCutoff: number;
+  readonly tangentNormal: readonly [number, number, number];
   readonly covered: boolean;
 }
 
@@ -283,12 +302,27 @@ export function evaluateMaterial(program: MaterialProgram, inputs: MaterialEvalu
   const clamp = (v: number, low = 0, high = 1) => Math.min(high, Math.max(low, v));
   const color = vec(graph.baseColor), emissive = vec(graph.emissive);
   const opacity = clamp(color[3]), alphaCutoff = Math.max(0, scalar(graph.alphaCutoff));
+  let tangentNormal: readonly [number, number, number] = [0, 0, 1];
+  if (graph.normal !== undefined) {
+    const encoded = vec(graph.normal), scale = scalar(graph.normalScale);
+    const raw = [Math.fround(Math.fround(Math.fround(encoded[0] * 2) - 1) * scale),
+      Math.fround(Math.fround(Math.fround(encoded[1] * 2) - 1) * scale),
+      Math.fround(Math.fround(encoded[2] * 2) - 1)];
+    if (raw.every(value => Number.isFinite(value) && Math.abs(value) < 1e18)) {
+      const lengthSquared = raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2];
+      if (lengthSquared > 1e-20 && Number.isFinite(lengthSquared)) {
+        const invLength = 1 / Math.sqrt(lengthSquared);
+        tangentNormal = [Math.fround(raw[0] * invLength), Math.fround(raw[1] * invLength), Math.fround(raw[2] * invLength)];
+      }
+    }
+  }
   return {
     baseColor: [clamp(color[0], 0, program.shading === 'pbr' ? 1 : Infinity),
       clamp(color[1], 0, program.shading === 'pbr' ? 1 : Infinity),
       clamp(color[2], 0, program.shading === 'pbr' ? 1 : Infinity)], opacity,
     metallic: clamp(scalar(graph.metallic)), roughness: clamp(scalar(graph.roughness), Math.fround(0.04)),
     emissive: [Math.max(emissive[0], 0), Math.max(emissive[1], 0), Math.max(emissive[2], 0)], alphaCutoff,
+    tangentNormal,
     covered: program.alphaMode === 'opaque' || opacity >= alphaCutoff,
   };
 }

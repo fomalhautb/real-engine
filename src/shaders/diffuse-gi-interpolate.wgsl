@@ -10,9 +10,9 @@ fn giDistanceMoments(index: u32, direction: vec3f) -> vec2f {
     return mix(bottom, top, fraction.y);
 }
 
-fn giSampleIrradiance(position: vec3f, normal: vec3f, expectedFrame: u32) -> vec3f {
+fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: vec3f, expectedFrame: u32) -> vec3f {
     if (gi.origin.w == 0.0) { return vec3f(0.0); }
-    let biased = position + normal * gi.sunDirection.w;
+    let biased = position + geometricNormal * gi.sunDirection.w;
     let grid = (biased - gi.origin.xyz) / gi.spacing.xyz;
     // A half-cell fringe allows the first free-space probes to light boundaries.
     if (any(grid < vec3f(-0.5)) || any(grid > vec3f(gi.counts.xyz - vec3u(1u)) + 0.5)) { return vec3f(0.0); }
@@ -36,7 +36,7 @@ fn giSampleIrradiance(position: vec3f, normal: vec3f, expectedFrame: u32) -> vec
         let beyond = max(0.0, distance - moment.x);
         let visibility = variance / (variance + beyond * beyond);
         let trilinear = select(vec3f(1.0) - fraction, fraction, offset == vec3u(1u));
-        let facing = max(0.05, (1.0 - dot(direction, normal)) * 0.5);
+        let facing = max(0.05, (1.0 - dot(direction, geometricNormal)) * 0.5);
         var confidence = facing * facing * visibility * visibility * visibility;
         // A continuous curve suppresses weak occluded contributors before
         // spatial weighting, without introducing a hard visibility cutoff.
@@ -61,4 +61,9 @@ fn giSampleIrradiance(position: vec3f, normal: vec3f, expectedFrame: u32) -> vec
     // Visible probes can legitimately have very small facing weights. Preserve
     // a uniform field instead of darkening it with a large normalization floor.
     return sum / max(total, 0.000000000001);
+}
+
+// Compatibility for diagnostics that intentionally use one surface direction.
+fn giSampleIrradiance(position: vec3f, normal: vec3f, expectedFrame: u32) -> vec3f {
+    return giSampleSurfaceIrradiance(position, normal, normal, expectedFrame);
 }

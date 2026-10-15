@@ -23,7 +23,7 @@ struct Hit {
     previous: vec4f, baseColor: vec4f, emissive: vec4f, versions: vec4u,
     uvInfo: vec4f, work: vec4u,
 }
-struct Deformed { position: vec4f, normal: vec4f, previous: vec4f }
+struct Deformed { position: vec4f, normal: vec4f, previous: vec4f, tangent: vec4f }
 struct FinalGatherAreaParameters {
     shape: vec4u, // vertices, triangles, instances, source
     limits: vec4u, // area prefix query count, anchors, reserved, source block offset
@@ -49,6 +49,13 @@ struct FinalGatherAreaSample {
 @group(0) @binding(13) var<storage, read_write> areaSamples: array<FinalGatherAreaSample>;
 
 // GI_INTERPOLATE
+
+fn gatherHitGeometry(hit: Hit) -> vec3f {
+    return surfaceOctDecode(vec2f(hit.position.w, hit.uvInfo.w));
+}
+fn gatherAnchorGeometry(anchor: FinalGatherAnchor) -> vec3f {
+    return surfaceOctDecode(vec2f(anchor.position.w, anchor.normal.w));
+}
 
 fn gatherHash(value: u32) -> u32 {
     var v = value;
@@ -99,8 +106,12 @@ fn generateHemisphere(@builtin(global_invocation_id) id: vec3u) {
     let hit = cameraHits[anchor];
     var ray = gatherEmptyRay();
     if (hit.identity.x != 0u && hit.work.z == 0u) {
-        ray = Ray(vec4f(hit.position.xyz + hit.normal.xyz * gather.sampling.x, 0.00001),
-            vec4f(gatherDirection(anchor, id.x % gather.settings.z, hit.normal.xyz), gi.spacing.w), vec4u(0u));
+        let direction = gatherDirection(anchor, id.x % gather.settings.z, hit.normal.xyz);
+        let geometryNormal = gatherHitGeometry(hit);
+        if (dot(direction, geometryNormal) > 0.0) {
+            ray = Ray(vec4f(hit.position.xyz + geometryNormal * gather.sampling.x, 0.00001),
+                vec4f(direction, gi.spacing.w), vec4u(0u));
+        }
     }
     rays[id.x] = ray;
 }
@@ -111,8 +122,9 @@ fn generateShadows(@builtin(global_invocation_id) id: vec3u) {
     let hit = primaryHits[id.x];
     var ray = gatherEmptyRay();
     if (hit.identity.x != 0u && hit.work.z == 0u && hit.emissive.w == 0.0
-        && dot(hit.normal.xyz, gi.sunDirection.xyz) > 0.0 && any(gi.sunColor.xyz > vec3f(0.0))) {
-        ray = Ray(vec4f(hit.position.xyz + hit.normal.xyz * gather.sampling.x, 0.00001),
+        && dot(hit.normal.xyz, gi.sunDirection.xyz) > 0.0
+        && dot(gatherHitGeometry(hit), gi.sunDirection.xyz) > 0.0 && any(gi.sunColor.xyz > vec3f(0.0))) {
+        ray = Ray(vec4f(hit.position.xyz + gatherHitGeometry(hit) * gather.sampling.x, 0.00001),
             vec4f(gi.sunDirection.xyz, gi.spacing.w), vec4u(0u));
     }
     rays[id.x] = ray;
@@ -124,7 +136,9 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     let camera = cameraHits[id.x];
     var result: FinalGatherAnchor;
     result.position = camera.position;
-    result.normal = camera.normal;
+    // Keep material direction for irradiance matching and store oct geometry
+    // in the two unused w lanes for plane checks, without growing the anchor.
+    result.normal = vec4f(camera.normal.xyz, camera.uvInfo.w);
     result.identity = camera.identity;
     result.versions = camera.versions;
     let cameraSnapshotValid = camera.versions.x == gather.state.x && camera.versions.w == gather.emissive.z;
@@ -133,6 +147,8 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     var irradiance = vec3f(0.0);
     if (camera.identity.x != 0u && camera.work.z == 0u && cameraSnapshotValid) {
         for (var sample = 0u; sample < gather.settings.z; sample++) {
+            let direction = gatherDirection(id.x, sample, camera.normal.xyz);
+            if (dot(direction, gatherHitGeometry(camera)) <= 0.0) { continue; }
             let index = id.x * gather.settings.z + sample;
             let hit = primaryHits[index];
             let shadow = hits[index];
@@ -148,9 +164,11 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
                     incoming += select(vec3f(0.0), hit.baseColor.xyz, includeEmission);
                 } else {
                     let visible = select(0.0, 1.0, shadow.identity.x == 0u && shadow.work.z == 0u);
-                    var hitIrradiance = gi.sunColor.xyz * max(0.0, dot(hit.normal.xyz, gi.sunDirection.xyz)) * visible;
+                    let cosine = select(0.0, max(0.0, dot(hit.normal.xyz, gi.sunDirection.xyz)),
+                        dot(gatherHitGeometry(hit), gi.sunDirection.xyz) > 0.0);
+                    var hitIrradiance = gi.sunColor.xyz * cosine * visible;
                     if (gather.state.w != 0u) {
-                        hitIrradiance += giSampleIrradiance(hit.position.xyz, hit.normal.xyz, gi.state.x);
+                        hitIrradiance += giSampleSurfaceIrradiance(hit.position.xyz, hit.normal.xyz, gatherHitGeometry(hit), gi.state.x);
                     }
                     incoming += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265359) * hitIrradiance;
                 }
@@ -191,11 +209,12 @@ fn generateArea(@builtin(global_invocation_id) id: vec3u) {
     let root = sqrt(gatherRandom(seed ^ 0x63d83595u));
     let v = gatherRandom(seed ^ 0x91e10da5u);
     let point = a * (1.0 - root) + b * (root * (1.0 - v)) + c * (root * v);
-    let origin = camera.position.xyz + camera.normal.xyz * gather.sampling.x;
+    let origin = camera.position.xyz + gatherHitGeometry(camera) * gather.sampling.x;
     let delta = point - origin;
     let distance = length(delta);
     if (distance < 0.00001 || distance > gi.spacing.w) { return; }
     let direction = delta / distance;
+    if (dot(gatherHitGeometry(camera), direction) <= 0.0) { return; }
     let receiverCosine = max(0.0, dot(camera.normal.xyz, direction));
     let emitterCosine = abs(dot(crossEdges / twiceArea, -direction));
     let weight = receiverCosine * emitterCosine * twiceArea * 0.5 * f32(area.shape.y) * f32(area.shape.z)
@@ -282,8 +301,8 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
             || !all(previous.versions.yzw == current.versions.yzw)
             || dot(previous.normal.xyz, current.normal.xyz) <= 0.98) { continue; }
         let delta = previous.position.xyz - previousPosition;
-        if (length(delta) > 0.10 || abs(dot(delta, current.normal.xyz)) > 0.001
-            || abs(dot(delta, previous.normal.xyz)) > 0.001) { continue; }
+        if (length(delta) > 0.10 || abs(dot(delta, gatherAnchorGeometry(current))) > 0.001
+            || abs(dot(delta, gatherAnchorGeometry(previous))) > 0.001) { continue; }
         let axisWeights = select(vec2f(1.0) - fraction, fraction, offset == vec2i(1));
         let weight = axisWeights.x * axisWeights.y;
         sum += previous.irradiance.xyz * weight;
@@ -322,8 +341,8 @@ fn denoise(@builtin(global_invocation_id) id: vec3u) {
                 || !all(neighbor.versions.yzw == center.versions.yzw)
                 || dot(neighbor.normal.xyz, center.normal.xyz) <= 0.98) { continue; }
             let delta = neighbor.position.xyz - center.position.xyz;
-            if (length(delta) > 0.10 || abs(dot(delta, center.normal.xyz)) > 0.001
-                || abs(dot(delta, neighbor.normal.xyz)) > 0.001) { continue; }
+            if (length(delta) > 0.10 || abs(dot(delta, gatherAnchorGeometry(center))) > 0.001
+                || abs(dot(delta, gatherAnchorGeometry(neighbor))) > 0.001) { continue; }
             let weight = exp(-f32(x * x + y * y) * 0.25);
             sum += neighbor.irradiance.xyz * weight;
             total += weight;

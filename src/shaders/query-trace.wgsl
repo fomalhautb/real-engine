@@ -1,4 +1,4 @@
-struct Deformed { position: vec4f, normal: vec4f, previous: vec4f }
+struct Deformed { position: vec4f, normal: vec4f, previous: vec4f, tangent: vec4f }
 struct Bounds { low: vec4f, high: vec4f }
 struct Instance {
     model: mat4x4f, previousModel: mat4x4f, normalMatrix: mat4x4f,
@@ -119,18 +119,25 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 let inst = instances[instance];
                 if (!evaluateCoverage(uv, params.textureLod.x, inst.color, inst.material.xy)) { continue; }
                 let surface = evaluateMaterial(uv, params.textureLod.x, inst.color, inst.material.xy);
-                var normal = a.normal.xyz * weights.x + b.normal.xyz * weights.y + c.normal.xyz * weights.z;
-                if (dot(normal, normal) < 1e-20) { normal = cross(edge1, edge2); }
-                normal = normalize(normal) * select(-1.0, 1.0, determinant > 0.0);
+                let geometricNormal = surfaceUnit(cross(edge1, edge2), vec3f(0.0, 1.0, 0.0)) * select(-1.0, 1.0, determinant > 0.0);
+                let vertexNormal = a.normal.xyz * weights.x + b.normal.xyz * weights.y + c.normal.xyz * weights.z;
+                var normal = surfaceUnit(vertexNormal, geometricNormal);
+                normal *= select(-1.0, 1.0, dot(normal, geometricNormal) >= 0.0);
+                if (MATERIAL_NORMAL_MAPPED) {
+                    let tangent = a.tangent * weights.x + b.tangent * weights.y + c.tangent * weights.z;
+                    normal = surfaceMappedNormal(vertexNormal, geometricNormal, tangent, edge1, edge2,
+                        uvAt(v1) - uvAt(v0), uvAt(v2) - uvAt(v0), surface.tangentNormal);
+                }
+                let encodedGeometry = surfaceOctEncode(geometricNormal);
                 hit.identity = vec4u(params.shape.w, identity.x, identity.y, triangle);
                 hit.metric = vec4f(distance, u, v, select(0.0, 1.0, determinant > 0.0));
-                hit.position = vec4f(ray.origin.xyz + distance * ray.direction.xyz, 0.0);
+                hit.position = vec4f(ray.origin.xyz + distance * ray.direction.xyz, encodedGeometry.x);
                 hit.normal = vec4f(normal, surface.roughness);
                 hit.previous = vec4f(a.previous.xyz * weights.x + b.previous.xyz * weights.y + c.previous.xyz * weights.z, surface.metallic);
                 hit.baseColor = vec4f(surface.baseColor, surface.opacity);
                 hit.emissive = vec4f(surface.emissive, select(0.0, 1.0, MATERIAL_UNLIT));
                 hit.versions = vec4u(params.limits.z, identity.z, params.limits.w, params.material.x);
-                hit.uvInfo = vec4f(uv, params.textureLod.x, 0.0);
+                hit.uvInfo = vec4f(uv, params.textureLod.x, encodedGeometry.y);
                 hit.work.w = params.material.y;
             }
             if (hit.work.z != 0u) { break; }

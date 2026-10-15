@@ -5,12 +5,12 @@ import { DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import type { GpuWorldQuery } from './gpu-world-query';
 import { WORLD_HIT_BYTES, WORLD_RAY_BYTES } from './world-query';
+import { DEFORMED_VERTEX_BYTES } from './geometry';
 
 const SAMPLE_BYTES = 48;
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 const HARD_MAX_BYTES = 128 * 1024 * 1024;
 const PARAMETER_BYTES = 32;
-const DEFORMED_VERTEX_BYTES = 48;
 interface EmissiveBatch {
   scene: SceneBatch;
   mesh: SceneBatch['mesh'];

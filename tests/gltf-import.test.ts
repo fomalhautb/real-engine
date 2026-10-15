@@ -200,16 +200,32 @@ describe('Khronos glTF 2.0 reference assets', () => {
     }
   });
 
-  it('ignores tangent streams when source normals are absent', () => {
+  it('ignores source and morph tangents without NORMAL, including for normal textures', () => {
     const { json, buffers } = fixture('AnimatedMorphCube');
     const altered = structuredClone(json);
     const primitive = altered.meshes[0].primitives[0];
     delete primitive.attributes.NORMAL;
     for (const target of primitive.targets ?? []) delete target.NORMAL;
     const asset = importGltf(altered, buffers);
-    expect(asset.meshes[0].primitives[0].mesh.tangents).toBeUndefined();
-    expect(asset.meshes[0].primitives[0].morphTargets.every(target => target.tangents === undefined)).toBe(true);
-    expect(asset.warnings.filter(warning => warning.includes('tangents are ignored'))).toHaveLength(1);
+    const { mesh, morphTargets } = asset.meshes[0].primitives[0];
+    expect(mesh.tangents).toBeUndefined();
+    expect(morphTargets.every(target => target.tangents === undefined)).toBe(true);
+    expect(asset.warnings).toContain('mesh 0: missing normals generated as flat face normals.');
+    expect(asset.warnings.some(warning => /TANGENT.*ignored because NORMAL is absent/.test(warning))).toBe(true);
+    const view = new DataView(mesh.vertices);
+    const firstNormal = [0, 1, 2].map(axis => view.getFloat32(16 + axis * 4, true));
+    expect(Math.hypot(...firstNormal)).toBeCloseTo(1);
+    for (const corner of [1, 2]) expect([0, 1, 2].map(axis => view.getFloat32(corner * 80 + 16 + axis * 4, true)))
+      .toEqual(firstNormal);
+
+    const withNormalMap = { ...altered, images: [{ uri: 'normal.png' }], textures: [{ source: 0 }],
+      materials: [{ ...altered.materials![0], normalTexture: { index: 0 } }] };
+    const mapped = importGltf(withNormalMap, buffers, { images: new Map([[0, {
+      width: 1, height: 1, pixels: new Uint8Array([128, 128, 255, 255]), colorSpace: 'linear' as const,
+    }]]) });
+    expect(mapped.meshes[0].primitives[0].mesh.tangents).toBeUndefined();
+    expect(mapped.meshes[0].primitives[0].morphTargets.every(target => target.tangents === undefined)).toBe(true);
+    expect(mapped.warnings.some(warning => /normal texture has no effective authored TANGENT.*triangle UV-derivative frame fallback/.test(warning))).toBe(true);
   });
 
   it('rejects node morph weights without a mesh', () => {

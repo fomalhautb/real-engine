@@ -2,6 +2,7 @@ import commonSource from './shaders/diffuse-gi-common.wgsl?raw';
 import updateSource from './shaders/diffuse-gi-update.wgsl?raw';
 import sampleSource from './shaders/diffuse-gi-sample.wgsl?raw';
 import interpolateSource from './shaders/diffuse-gi-interpolate.wgsl?raw';
+import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET,
   giRayDirection, resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, buildGiDistanceWeights } from './gi-visibility';
@@ -124,7 +125,7 @@ export class GpuDiffuseGi {
   private async initialize(): Promise<void> {
     // Allocate inside create()'s try/finally ownership boundary.
     this.initializeResources();
-    const module = this.device.createShaderModule({ label: 'diffuse GI', code: giSource(updateSource) });
+    const module = this.device.createShaderModule({ label: 'diffuse GI', code: surfaceFrameSource + '\n' + giSource(updateSource) });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `diffuse GI:${error.lineNum}: ${error.message}`).join('\n'));
     const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });

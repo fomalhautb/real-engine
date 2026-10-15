@@ -82,7 +82,7 @@ describe('glTF mesh conversion', () => {
     expect(Array.from(morphTargets[0].tangents!)).toEqual([0, 1, 0, 0, 1, 0, 0, 1, 0]);
     expect(Array.from(morphTargets[0].normals)).toEqual(new Array(9).fill(0));
     expect(Array.from(morphTargets[1].normals)).toEqual(new Array(9).fill(0));
-    expect(asset.warnings.filter(warning => warning.includes('tangent streams'))).toHaveLength(1);
+    expect(asset.warnings.some(warning => warning.includes('current isotropic material path'))).toBe(false);
   });
 
   it('rejects morph normal/tangent attributes without corresponding base attributes', () => {

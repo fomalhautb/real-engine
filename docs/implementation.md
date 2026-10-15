@@ -1,6 +1,6 @@
 # 阶段 1–2 实现状态
 
-更新日期：2026-10-14。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询及可选跨帧反馈的漫反射 GI 基础；完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何或 Lumen 类光照。
+更新日期：2026-10-15。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询及可选跨帧反馈的漫反射 GI 基础；本轮基础法线贴图路径已通过限定场景的本地 CPU 与原生 GPU 回归。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何或 Lumen 类光照。
 
 ## 已实现的运行路径
 
@@ -10,7 +10,7 @@
 
 蒙皮默认刚性模式；显式 `normalMode: 'affine'` 支持非均匀缩放、剪切和反射骨骼，以混合线性变换的逆转置处理法线。这是在顶点固定权重下的 LBS 法线近似，不是包含权重空间梯度的精确微分。各骨骼须非奇异；混合结果接近奇异时使用有界、有限的混合法线回退，CPU 与 WGSL 一致。导入的 glTF 蒙皮使用此模式；网格实例整体反射变换尚未实现绕序修正，会明确报错。
 
-每个变化的批次执行一次 Compute，输出当前世界位置、法线和上一渲染帧位置，供主视图和太阳阴影共用。Morph 包含位置与法线增量；wave 使用解析雅可比修正法线。动态包围盒在 CPU 按算子传播保守边界，不遍历运行时顶点，也不做 GPU 几何读回；蒙皮边界取各骨骼变换后的并集，目前偏宽松。
+每个变化的批次执行一次 Compute，输出当前世界位置、法线、切线和上一渲染帧位置，供主视图、太阳阴影与世界查询共用。Morph 包含位置、法线及切线增量；有效 authored 切线随共享 Morph → skin（线性部分变换切线、逆转置变换法线）→ wave（解析雅可比变换切线）顺序求值，并结合实例变换的 handedness。缺失有效 authored `TANGENT` 时，消费端按已变形三角形的 UV 导数回退，退化情况使用有限的稳定回退；这不是 MikkTSpace 一致性保证。GPU source 保持 80 字节/顶点，另有 16 字节/顶点的 rest tangent；Morph delta 从 32 增至 48 字节，shared deformed 从 48 增至 64 字节，相关 storage 绑定为 7 个（不超过 8），新增资源计入应用账本并在释放时清理。动态包围盒在 CPU 按算子传播保守边界，不遍历运行时顶点，也不做 GPU 几何读回；蒙皮边界取各骨骼变换后的并集，目前偏宽松。
 
 SceneStore 使用 index/generation 句柄和按影响分类的资源版本，显式提交增删、变换、形变和历史失效事件。DemoScene 的模拟数据与 renderBatches 分离；commitFrame 仅应用增量事件。渲染历史使用事件携带的 historyVersion，重置和尺寸变化拒绝旧历史。已提交的实例对象在变化时替换：相同数据静止一帧、使前帧追上当前帧后，可复用形变结果。SceneStore 在提交边界隔离输入，包括更新回调保留的草稿和插入的外部嵌套对象；drainChanges 复用内部已提交值，对外 getter 仍返回防御性副本。
 
@@ -19,6 +19,8 @@ CPU 打包和实例/骨骼/标量上传按变化的槽位执行，相邻槽位�
 实际 deformation、shadow、surface、resolve pass 通过 Render Graph 执行，编译时检查读写依赖、未初始化读取、纹理同 pass 读写和环路，记录资源使用区间。开启世界查询时还执行 BVH refit。当前 GPU 分配仍由 Renderer 持有，没有自动资源别名分配器。
 
 材质由有界、无副作用的表达式图定义，支持常量、vec4 参数、实例颜色/金属度/粗糙度、RGBA8 纹理、加法、乘法与插值。编译上限为 128 个节点、深度 32、16 个 vec4 参数和 4 个纹理槽。当前覆盖金属度/粗糙度 PBR 与 Unlit、Opaque 与 Masked、单面与双面；同一材质定义产生主视图和阴影 pass 的覆盖函数，Masked 丢弃在两条路径一致。材质 shader/pipeline 按静态图缓存，默认至多 128 个变体；达到上限时仅按最近使用顺序淘汰未被引用且不在编译的变体。`setMaterial(batchName, binding)` 异步准备并原子替换，多个并发请求以最后一次为准；失败保留旧材质。`setMaterialParameters` 更新运行时数据，不重新编译 shader。
+
+`MaterialDefinition.normal?: Vec4Expr` 接收 RGB 编码的切线空间法线，`normalScale?: ScalarExpr` 缩放解码后的 XY 分量且允许负值；CPU 与 WGSL 使用一致的有界、有限解码。编译结果以 `program.normalMapped` 标记静态变体；法线表达式只影响表面着色，不进入 Masked 的覆盖计算。映射后的着色法线被限制在可见几何面半球内，最小余弦约为 `1e-4`；此限制不改动源几何。未提供法线表达式时保持原法线。glTF `normalTexture` 使用线性纹理槽 3，`scale` 放在 vec4 参数槽 3 的 x 分量；继续沿用已有的 UV0 与独立采样器约束。glTF occlusion、额外 UV 集、高级层叠与透射仍显式拒绝或未支持。
 
 纹理资产支持 sRGB 或线性 RGBA8，CPU 生成完整 mip 链；sRGB 的 RGB 在线性光下滤波并量化回 RGBA8，alpha 在线性值下滤波。四个纹理槽各自使用独立采样器，可设置重复/镜像/夹边、最近/线性过滤和 LOD 范围；非法配置在分配材质资源前报错。Masked 阈值保持非负值，超过 1 时丢弃全部覆盖，符合 glTF 语义。当前使用面积平均 mip，不包含 alpha 覆盖率保持；主视图和阴影的纹理足迹不同，细小遮罩的边缘可能因过滤出现差异，共享覆盖公式并不保证跨分辨率逐像素相同。默认材质图像预算为 256 MiB，统计实际引用图像的全部 mip，排除 1×1 后备纹理；原子材质替换期间新旧图像必须同时容纳在预算中。`Renderer.create` 可配置纹理字节预算和材质变体上限。这是当前材质资源限制，不是逐帧上传预算、纹理流送或设备真实显存占用量。
 
@@ -44,11 +46,11 @@ GI 房间显式采用 2048 平方、16 MiB 阴影图，世界范围 `[-3.5,-0.25
 
 `npm run build:geometry -- --input path.obj --output artifacts/geometry/example --coverage opaque` 提供可重复 OBJ 构建入口，源文件上限 32 MiB。调用方显式声明 Opaque；OBJ 的材质库只记录名称，不自动转换或判断覆盖。工具保留 primitive 名称/材质名、源 SHA-256、构建参数、簇/根页面映射和页面 SHA-256，先写入自有暂存目录，再发布到不存在的输出目录。`hierarchy.json` 含重复的簇索引，明确作为离线审计元数据；不是可直接全部载入生产运行时的驻留清单。
 
-Windows 下目录发布偶发 `EPERM`：工具保留向同一父目录的私有副本发布，再仅对最后一次原子目录重命名作最多八次、总计 6.35 秒的有界重试；每次重查目标不存在，失败清理自身暂存目录。本轮一次完整 `npm run check` 通过，但间歇文件锁是否彻底消除仍需后续重复运行验证；不会覆盖既有输出。
+Windows 下目录发布偶发 `EPERM`：工具保留向同一父目录的私有副本发布，再仅对最后一次原子目录重命名作最多八次、总计 6.35 秒的有界重试；每次重查目标不存在，失败清理自身暂存目录。此前一次完整 `npm run check` 通过，但间歇文件锁是否彻底消除仍需后续重复运行验证；不会覆盖既有输出。
 
 CPU 回归以带属性接缝的曲面网格核对 LOD0 完整性、真实减面、组边界、DAG 单调误差/边界、多个误差阈值下的无孔洞/重复覆盖，以及页面往返、损坏输入、预算与构建可重复性。此证据只覆盖小型正确性用例，未进行本机 GPU 或大型资产压测。运行时选簇接入见下节；压缩页面尚未接入流送/祖先回退，不能把离线产物视作完整虚拟几何。
 
-本轮最新本地 `npm run check` 通过：250 项 CPU 单元测试（32 个文件）、TypeScript 和生产构建。浏览器功能与硬件计时证据按下文各自的实际运行范围记录。
+法线贴图加入前的本地 `npm run check` 通过：250 项 CPU 单元测试（32 个文件）、TypeScript 和生产构建。本轮结果为 262 项 CPU 单元测试（34 个文件）、TypeScript 和生产构建通过，证据见下文；浏览器功能与硬件计时按各自运行范围记录。
 
 ## 驻留 GPU LOD 与可视化
 
@@ -68,9 +70,9 @@ CPU 回归以带属性接缝的曲面网格核对 LOD0 完整性、真实减面�
 
 `Renderer.create(canvas, batches, { worldQueries: {} })` 显式启用软件 BVH 查询。禁用时不分配查询缓存，也不执行 refit。CPU 对不可变网格建立确定性、中位数划分的先序 BVH；每叶默认至多四个三角形。GPU 从光栅与阴影共享的当前世界空间形变缓冲计算叶边界，再按深度从下到上更新内部节点，每层独立 compute pass，避免依赖跨工作组屏障。静止、已缓存的批次跳过 refit。此处是可验证的基线实现，不是 GPU 层级构建、TLAS 或针对大规模动态场景优化后的查询器。
 
-`traceRays(rays, { textureLod: 0 })` 返回最近命中的批次/实体/generation/三角形、距离、当前与前帧位置、法线、UV、PBR/Unlit 参数和拓扑/历史版本。输入方向归一化，距离按世界单位，`tMin`/`tMax` 为闭区间；可以忽略指定实体及 generation。几何来自最近一次 `render` 提交，与相机可见范围无关；返回的 `frame` 标识这份几何。材质程序和参数使用查询开始时已原子发布的状态，返回独立 `materialRevision`，无需为了更换材质重复形变。两者构成显式版本对，不承诺所有数据都是同一历史帧。实例增删、变换及形变变化需先提交 `render`。
+`traceRays(rays, { textureLod: 0 })` 返回最近命中的批次/实体/generation/三角形、距离、当前与前帧位置、着色法线 `normal`、实际三角面的 `geometricNormal`、UV、PBR/Unlit 参数和拓扑/历史版本。输入方向归一化，距离按世界单位，`tMin`/`tMax` 为闭区间；可以忽略指定实体及 generation。几何来自最近一次 `render` 提交，与相机可见范围无关；返回的 `frame` 标识这份几何。材质程序和参数使用查询开始时已原子发布的状态，返回独立 `materialRevision`，无需为了更换材质重复形变。两者构成显式版本对，不承诺所有数据都是同一历史帧。实例增删、变换及形变变化需先提交 `render`。GPU `WorldHit` 仍为 160 字节，几何法线经八面体编码复用 `position.w` 和 `uvInfo.w`，没有扩大命中记录。
 
-查询复用同一 Material IR、图像、采样器、参数与 coverage 函数，Masked 不覆盖时继续遍历；双面与背面剔除遵循当前材质。纹理使用调用方给出的显式 mip LOD，尚无射线锥/微分，不能声称所有距离下与光栅滤波逐像素相同。Unlit 保留非负 HDR 颜色。当前不支持任意拓扑就地改写：替换网格、顶点/索引/UV 流引用、容量或 queryIdentity 会明确报错，需重新创建 renderer。数组内容依不可变资产合约使用，不每帧全量哈希。
+查询复用同一 Material IR、图像、采样器、参数与 coverage 函数，Masked 不覆盖时继续遍历；双面与背面剔除遵循当前材质。纹理使用调用方给出的显式 mip LOD，尚无射线锥/微分，不能声称所有距离下与光栅滤波逐像素相同。Unlit 保留非负 HDR 颜色。当前不支持任意拓扑就地改写：替换网格、顶点/索引/UV/切线流引用、容量或 queryIdentity 会明确报 `WORLD_QUERY_TOPOLOGY_CHANGED`，需恢复原引用或重新创建 renderer；恢复引用后查询可继续正常运行。数组内容依不可变资产合约使用，不每帧全量哈希。
 
 默认限制为 1,024 条射线、每网格 65,536 三角形、每批次 256 个实例、总查询分配 128 MiB，批次数硬上限 256。单条遍历上限默认 262,144 个工作单位；一次提交默认至多 16,777,216 个工作单位，平均分配到射线并与单条上限取小值。工作单位包括实例检查、BVH 节点与三角形测试，跨全部批次累计；超预算显式返回 overflow，诊断 API 抛错，不以不完整命中或 miss 冒充正确结果。此上限限制算法工作量，不保证所有硬件都满足帧预算。
 
@@ -82,9 +84,9 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供后续光照直�
 
 `RendererOptions.diffuseGi` 配置固定世界空间探针网格（origin/spacing/counts）、每探针射线数、查询距离、法线偏移、天空辐亮度、可选 `multiBounce` 与可见性低置信度阈值。`multiBounce` 默认 `false` 且须严格为布尔值；`visibilityWeightThreshold` 默认 0.2、范围为 `[0,1]`，设为 0 关闭额外的低置信度曲线。必须同时配置足够 `maxRays` 的 `worldQueries`；开启发光面采样时 `maxTraceParameterSetsPerEncoder` 至少为 2。每帧先复用当前共享形变的 BVH，生成固定 Fibonacci 球面射线并查询材质，再从命中点向太阳查询遮挡，最后累积九项入射辐亮度 SH 系数，以及 8×8 八面体方向深度图的距离一、二阶矩。方向深度图每格用确定性的归一化余弦 32 次幂权重捕获。射线与命中留在 GPU，不读回几何或可见列表；镜头外物体仍参与照明。多轮 trace 在同一 encoder 中依次执行，独立参数槽位保留不同查询的 count/LOD。
 
-命中着色使用同一 Material IR、纹理、Opaque/Masked 覆盖和共享形变。每帧的基础捕获为一次漫反射表面反弹：PBR 使用漫反射率乘太阳辐亮度及世界查询遮挡，发光项直接参与，Unlit 使用 baseColor+emissive 作为出射辐亮度。开启 `multiBounce` 时，两份 SH 探针场交替读写，本帧命中点通过与表面相同的可见性感知插值读取上一已完成场，再把间接漫反射辐亮度加入本帧捕获；采样按探针记录的最大 RGB 辐亮度约束反馈，避免无界增亮。这是跨帧反弹，不是同帧递归追踪或时域平均。金属不产生漫反射反弹，不捕获镜面光路。天空仅在射线未命中时贡献。太阳射线也受 `maxDistance` 限制，超过该距离的遮挡不计入本次捕获。
+命中着色使用同一 Material IR、纹理、Opaque/Masked 覆盖和共享形变；法线贴图产生着色法线，真实三角面提供几何法线。每帧的基础捕获为一次漫反射表面反弹：PBR 使用漫反射率乘太阳辐亮度及世界查询遮挡，太阳贡献用几何半球阻挡背侧方向，再用着色法线求 BRDF 余弦；发光项直接参与，Unlit 使用 baseColor+emissive 作为出射辐亮度。射线起点偏移用几何法线，避免强法线贴图把起点推向错误侧。开启 `multiBounce` 时，两份 SH 探针场交替读写，本帧命中点通过与表面相同的可见性感知插值读取上一已完成场，再把间接漫反射辐亮度加入本帧捕获；采样按探针记录的最大 RGB 辐亮度约束反馈，避免无界增亮。这是跨帧反弹，不是同帧递归追踪或时域平均。金属不产生漫反射反弹，不捕获镜面光路。天空仅在射线未命中时贡献。太阳射线也受 `maxDistance` 限制，超过该距离的遮挡不计入本次捕获。
 
-表面按法线对 SH 做余弦卷积得到 irradiance，使用八邻点三线性权重、法线方向权重及八面体四纹素双线性距离矩插值，再乘接收材质的漫反射率；反馈采样复用同一个 GPU 插值 helper。基础置信度为 `facing² × visibility³`；低于阈值时再乘 `(confidence / threshold)²`，然后与三线性权重相乘。最终按权重和归一化，分母下限 `1e-12` 保持均匀辐照场在弱置信度位置不被整体压暗。阈值经 `gi.sky.w` uniform 传给两条路径，不改变材质程序。GI 不修改生产材质、阴影覆盖或 LOD 调试身份。探针范围向各轴延伸半格；范围外返回零间接光。`setDiffuseGiEnabled(false)` 去掉间接光并停止探针更新，不恢复旧常量补光，便于公平截图对照。`setDiffuseGiMultiBounce(boolean)` 切换反馈模式，`invalidateDiffuseGiHistory()` 显式失效历史；启停模式、太阳或材质编辑、实体身份/generation/historyVersion 或实例数量变化时，在下一 render 帧拒绝旧反馈。连续模型变换与蒙皮运动查询当帧几何，允许上一已完成探针场逐帧收敛；相机变化不使世界空间 GI 历史失效。诊断公开模式、失效原因、最近历史帧及失效后的更新次数。
+表面按着色法线对 SH 做完整余弦卷积得到 irradiance，使用八邻点三线性权重、法线方向权重及八面体四纹素双线性距离矩插值，再乘接收材质的漫反射率；反馈采样复用同一个 GPU 插值 helper。这个世界 SH 路径尚未精确截掉几何法线背侧的半球，法线贴图下不能据此宣称完整 GI 正确。基础置信度为 `facing² × visibility³`；低于阈值时再乘 `(confidence / threshold)²`，然后与三线性权重相乘。最终按权重和归一化，分母下限 `1e-12` 保持均匀辐照场在弱置信度位置不被整体压暗。阈值经 `gi.sky.w` uniform 传给两条路径，不改变材质程序。GI 不修改生产材质、阴影覆盖或 LOD 调试身份。探针范围向各轴延伸半格；范围外返回零间接光。`setDiffuseGiEnabled(false)` 去掉间接光并停止探针更新，不恢复旧常量补光，便于公平截图对照。`setDiffuseGiMultiBounce(boolean)` 切换反馈模式，`invalidateDiffuseGiHistory()` 显式失效历史；启停模式、太阳或材质编辑、实体身份/generation/historyVersion 或实例数量变化时，在下一 render 帧拒绝旧反馈。连续模型变换与蒙皮运动查询当帧几何，允许上一已完成探针场逐帧收敛；相机变化不使世界空间 GI 历史失效。诊断公开模式、失效原因、最近历史帧及失效后的更新次数。
 
 可选 `DiffuseGiOptions.emissiveSamplesPerProbe`（默认 0，整数 0–64）配合不可变的 `SceneBatch.emissiveSampling: 'triangle-area'`，主动采样该批次的实际发光几何。样本从共享的当前形变三角形生成，按三角形面积、实例/三角形选择概率、发光面余弦和距离平方转换成立体角权重；世界查询验证目标三角形/实体/generation/距离，并求当前材质、Mask 和双面覆盖。普通方向射线只排除这些批次的发光项，仍捕获 PBR 的太阳反射和 GI 反馈；面积样本只补发光，避免重复计光。同方向的反射和发光最大值采用加法保守上限，两个捕获分量各限 65504，合并上限至多 131008，最终表面 HDR 仍限 65504。没有独立灯光颜色副本、CPU 几何读回或按对象类别复制管线。
 
@@ -104,9 +106,9 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供后续光照直�
 
 ### 实验性屏幕 Final Gather
 
-`DiffuseGiOptions.finalGather` 可选；未配置时沿用世界空间探针插值。配置后从实际屏幕像素中心发出相机射线取得锚点命中，再以余弦半球射线查询共享世界表示和太阳遮挡。首段出射辐亮度使用天空、材质发光与漫反射太阳贡献；仅在多次反弹模式下读取本帧已完成的世界 GI 作为后续反弹。注册为面积采样的发光批次从普通半球命中中排除直接发光，再按每个源、每个锚点、每次更新一个面积样本补入，并验证 Mask、面向、实体身份和命中端点，避免直接发光重复计入。表面仍使用原材质漫反射率乘所得 irradiance；Final Gather 不回写世界探针场。
+`DiffuseGiOptions.finalGather` 可选；未配置时沿用世界空间探针插值。配置后从实际屏幕像素中心发出相机射线取得锚点命中，再以余弦半球射线查询共享世界表示和太阳遮挡。法线贴图下以着色法线定向 BRDF/余弦采样，但显式截掉几何法线背侧射线；几何法线还用于射线偏移和历史/过滤平面判定。均匀天空的解析辐照度为 `E = π × L × (1 + dot(ns, ng)) / 2`，其中 `ns`、`ng` 分别是着色和几何法线；本轮 60° 夹角下四个原始锚点相对 `E = π × L × 0.75`、五个 HDR 点相对 `.96 × baseColor × L × 0.75` 的误差各小于 5%，范围见下文验证记录。首段出射辐亮度使用天空、材质发光与漫反射太阳贡献；仅在多次反弹模式下读取本帧已完成的世界 GI 作为后续反弹。注册为面积采样的发光批次从普通半球命中中排除直接发光，再按每个源、每个锚点、每次更新一个面积样本补入，并验证 Mask、面向、实体身份和命中端点，避免直接发光重复计入。表面仍使用原材质漫反射率乘所得 irradiance；Final Gather 不回写世界探针场。
 
-默认像素间距 8、锚点容量 16,384、每锚点 2 条半球射线、历史上限 64 次、法线偏移 0.0001 m、独立预算 16 MiB；配置硬上限依次为 128、65,536、16、256、0.01 m、64 MiB。整数网格在查询 ray/工作量和发光源活跃前缀预算内自动加粗；启用前要求 `worldQueries.maxTraceParameterSetsPerEncoder >= 6`。Final Gather 参数 uniform 现为 224 字节，包含与上一已渲染帧一致的 float32 视投影矩阵；缺失前帧矩阵触发历史重置，提供的矩阵不匹配或非法则报错。两份每锚点 96 字节原始历史与独立 96 字节过滤输出分离：有界 25 邻域 Gaussian 仅混合 irradiance，要求同一实体/generation、历史/拓扑/材质版本，法线点积大于 0.98、平面差不超过 0.001 m、世界距离不超过 0.1 m；过滤结果不回灌原始历史。表面最多双线性混合四锚点，法线/平面/0.25 m 距离不符或无有效锚点时回退到已完成的世界 GI。
+默认像素间距 8、锚点容量 16,384、每锚点 2 条半球射线、历史上限 64 次、法线偏移 0.0001 m、独立预算 16 MiB；配置硬上限依次为 128、65,536、16、256、0.01 m、64 MiB。整数网格在查询 ray/工作量和发光源活跃前缀预算内自动加粗；启用前要求 `worldQueries.maxTraceParameterSetsPerEncoder >= 6`。Final Gather 参数 uniform 现为 224 字节，包含与上一已渲染帧一致的 float32 视投影矩阵；缺失前帧矩阵触发历史重置，提供的矩阵不匹配或非法则报错。两份每锚点 96 字节原始历史与独立 96 字节过滤输出分离，几何法线编码复用记录的 `position.w` 与 `normal.w`，不增加记录尺寸。有界 25 邻域 Gaussian 仅混合 irradiance，要求同一实体/generation、历史/拓扑/材质版本，法线点积大于 0.98、几何平面差不超过 0.001 m、世界距离不超过 0.1 m；过滤结果不回灌原始历史。表面最多双线性混合四锚点，法线/几何平面/0.25 m 距离不符或无有效锚点时回退到已完成的世界 GI。
 
 固定镜头沿用原先同一三角形、位置差小于 0.0001 m 的严格历史匹配。普通镜头运动将当前相机命中的前帧世界位置投影到实际前帧视图，从四个原始邻锚点中按实体/generation、历史/拓扑/材质版本、前帧帧号、法线点积大于 0.98、两侧平面差不超过 0.001 m 和世界距离不超过 0.1 m 过滤，再归一化有效双线性权重；移动时 GPU 有效历史最多 8 次。动态几何、太阳/材质变更和全局切镜头仍保守地清除全部历史，尚无按运动对象局部保留、自适应接触锚点或完整时序 GI。诊断 `historyUpdates`/`nominalHistoryUpdates` 只是全局重置后的名义更新次数，实际每锚点有效次数须用显式 `Renderer.probeDiffuseGiFinalGather(indices)` 读取。该接口最多接收 1024 个互异且在当前网格内的索引，按需同时捕获原始与过滤锚点并校验帧号、元数据和有限能量；不逐帧自动读回。新增 196,608 字节 staging 缓冲与 64 字节 uniform 使持有资源增加 196,672 字节。`Renderer.setDiffuseGiFinalGatherEnabled(boolean)` 可独立切换该选项，GI 总开关仍控制两者。
 
@@ -138,7 +140,7 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供后续光照直�
 
 `loadGltf` 读取 glTF 2.0 JSON 或 GLB v2，支持相对 URI、外部 buffer、data URI、GLB BIN、PNG/JPEG 图像。二进制读取检查 component 对齐、步长、矩阵列填充、normalized 整数和 sparse accessor。默认下载累计上限 128 MiB，解码后 RGBA8 图像累计上限 256 MiB；图像尺寸由浏览器解码得知后，在创建 canvas/读取像素前检查剩余预算并关闭 bitmap。该预算不能阻止浏览器自身解码阶段的一次暂存分配。未被纹理引用的图像不解码；所有图像源元数据仍校验。嵌入图像必须声明 PNG/JPEG MIME，范围不得越过 buffer 声明长度。加载支持 AbortSignal；转换和动画采样目前仍在主线程。
 
-三角网格支持位置/法线/UV0、四权重蒙皮、多 Morph 和 inverse bind matrices。缺失法线时按 glTF 规范展开三角形生成平面法线，同时重映射权重、UV 和 Morph；已有法线时缺失的目标法线增量为零。切线流保留供后续材质使用；缺失基础法线时按规范忽略切线。当前材质不消费切线，无法线贴图。材质映射基础颜色、金属度 B/粗糙度 G、发光纹理/因子、sRGB/线性角色、Unlit、Mask、双面和 glTF 采样器。透明混合、法线/AO 贴图、额外 UV/权重集、压缩网格和未支持的材质扩展明确报错，不静默删除效果。
+三角网格支持位置/法线/UV0、四权重蒙皮、多 Morph 和 inverse bind matrices。缺失源 `NORMAL` 时按 glTF 规范展开三角形生成平面法线，同时重映射权重、UV 和 Morph，并忽略提供的 authored `TANGENT` 与 Morph 切线；已有法线时缺失的目标法线增量为零。有效的 authored `TANGENT` 和 Morph 切线增量实际进入共享形变与法线贴图着色；缺失有效切线时按三角形 UV 导数回退，法线贴图因此给出保真警告。尚未实现 MikkTSpace 切线生成，回退不能保证与按 MikkTSpace 烘焙的贴图一致，也不能宣称完整 glTF 法线映射保真。材质映射基础颜色、金属度 B/粗糙度 G、发光纹理/因子、线性槽 3 的 `normalTexture` 与可负的 `scale`、sRGB/线性角色、Unlit、Mask、双面和 glTF 采样器。透明混合、occlusion 贴图、额外 UV/权重集、压缩网格和未支持的材质扩展明确报错，不静默删除效果；glTF 实例整体负行列式变换仍因绕序未修正而显式拒绝，核心双面镜像 TBN 测试不代表导入器已经支持该情况。
 
 动画支持节点 TRS 和 Morph 权重的 STEP、LINEAR、CUBICSPLINE；旋转 LINEAR 用四元数球面插值，三次插值按 glTF 时间间隔处理切线并归一化旋转。层级、节点矩阵、通道唯一性、时间顺序和数据类型均验证。默认/硬上限为 4096 节点、65,536 通道和累计 1600 万个动画标量（含时间）；动画解码前计入每个重复引用的通道，可配置更低预算。几何默认上限为输出 100 万顶点、300 万索引。
 
@@ -155,9 +157,9 @@ Rapier 以独立适配器提供盒子刚体和地面碰撞、最近命中射线�
 | 能力 | 当前状态 |
 | --- | --- |
 | 统一形变执行 | 有界顺序算子编译；多 Morph、可变骨骼数蒙皮、wave；刚性或显式仿射骨骼模式 |
-| 法线 | Morph 目标法线增量、蒙皮混合、wave 雅可比、实例逆转置；尚无通用切线重建 |
+| 法线 | Morph 目标法线/切线增量、蒙皮线性切线与逆转置法线、wave 雅可比、实例 handedness；authored 切线或三角形 UV 导数回退、基础法线贴图；回退不保证 MikkTSpace 一致性 |
 | 渲染调度 | 依赖编译和实际执行；默认四个 pass，可选世界查询 BVH refit 和 GPU LOD 选择/完成；尚无资源自动分配/别名 |
-| 材质 | 有界表达式图；PBR/Unlit、Opaque/Masked、双面、纹理与参数；无法线贴图、多层材质、透射或通用透明 |
+| 材质 | 有界表达式图；PBR/Unlit、Opaque/Masked、双面、纹理与参数，基础法线贴图；无多层材质、透射或通用透明 |
 | 资源 | 固定容量批次；材质变体和纹理预算；无逐帧上传预算、资产流送或自动几何驻留管理 |
 | 几何/动画资产 | OBJ、glTF/GLB、蒙皮/Morph；静态 Opaque 离线簇层级、压缩页面、驻留 GPU LOD/视锥剔除/间接绘制与分簇演示；无运行时页面流送、遮挡剔除或动态形变简化 |
 | 光照 | 可更新的单方向太阳光、直接光与阴影；共享形变世界查询上的固定探针漫反射 GI、可选跨帧反馈和实验性屏幕 Final Gather；无镜面反射或完整 GI |
@@ -170,9 +172,15 @@ Rapier 以独立适配器提供盒子刚体和地面碰撞、最近命中射线�
 
 Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分包和 WASM 单独加载是后续加载性能任务，不能通过提高构建警告阈值当作解决。
 
-最新镜头重投影与显式锚点诊断已通过本地 TypeScript、250 项 CPU 测试（32 文件）、生产构建及 50 项原生 NVIDIA 浏览器回归，完整输出在 `artifacts/gather-reprojection-browser-native-20261014`；这不是阶段 1–2 完整出口。密集接触区画质捕获及运动质量用例只在 `PLAYWRIGHT_GPU=hardware` 运行；软件 GPU CI 保留天空、发光材质、遮挡和有界历史功能测试。此前固定镜头 Final Gather 的 47 项回归在 `artifacts/final-gather-browser-native-20261014`，world-query 参数槽位和面积查询的 44 项回归在 `artifacts/query-slots-browser-native-final-20261014`。[Linux 软件 GPU CI run 38573629581](https://github.com/fomalhautb/real-engine/actions/runs/38573629581) 已成功，但只覆盖前一固定镜头 Final Gather 提交；本轮重投影提交的远程 CI 待验证。CI 浏览器作业超时上限从 15 分钟调至 25 分钟，因为此前耗时 13 分 33 秒且新增用例；该设置不是开发或团队工时估算。
+此前镜头重投影与显式锚点诊断已通过本地 TypeScript、250 项 CPU 测试（32 文件）、生产构建及 50 项原生 NVIDIA 浏览器回归，完整输出在 `artifacts/gather-reprojection-browser-native-20261014`；这是法线贴图加入之前的快照，不是阶段 1–2 完整出口。密集接触区画质捕获及运动质量用例只在 `PLAYWRIGHT_GPU=hardware` 运行；软件 GPU CI 保留天空、发光材质、遮挡和有界历史功能测试。此前固定镜头 Final Gather 的 47 项回归在 `artifacts/final-gather-browser-native-20261014`，world-query 参数槽位和面积查询的 44 项回归在 `artifacts/query-slots-browser-native-final-20261014`。[Linux 软件 GPU CI run 38573629581](https://github.com/fomalhautb/real-engine/actions/runs/38573629581) 覆盖前一固定镜头 Final Gather 提交并已成功；后续提交 `e808c6f7` 的 [远程 CI run 38581979007](https://github.com/fomalhautb/real-engine/actions/runs/38581979007) 也已完成并成功。这两次均不覆盖本轮法线贴图代码；本轮提交的远程 CI 仍待验证。CI 浏览器作业超时上限从 15 分钟调至 25 分钟，因为此前耗时 13 分 33 秒且新增用例；该设置不是开发或团队工时估算。
+
+本轮 release 法线贴图回归：`npm run check` 通过 262 项 CPU 测试（34 文件）、TypeScript 与生产构建；原生 NVIDIA `npm run test:browser` 全部 55 项通过，约 2.3 分钟，GPU validation 错误为空，资源释放后应用账本为零。日志为 `artifacts/normal-map-check-release-20261015.log` 和 `artifacts/normal-map-browser-release-native-20261015.log`；原生像素截图为 `artifacts/normal-map-browser-release-native-20261015/material-normal-authored-n-e8268-eserve-geometric-visibility/normal-map-neutral.png` 与同目录的 `normal-map-tilted.png`。这些是功能与有限场景数值证据，不代表大型资产或性能验收。
+
+本轮新增 GPU 用例覆盖真实像素相机 FOV、光栅与世界查询法线及解析 PBR 对照；背面、镜像、核心 Morph＋仿射蒙皮＋wave 和已变形三角形 UV 回退；`normalScale` 热更新不增 pipeline 数，深度与阴影覆盖不变；本轮法线 fixture 的 `verifyDeformation({ allInstances: true })` 各实例位置、法线、切线误差均小于 `3e-4`，包围盒越界为零；边长 `1e-14` 的微小三角形仍给出有限单位法线。几何背侧太阳不产生直接光、世界 GI 或 Final Gather 注入。60° 着色/几何法线夹角的均匀天空测试在四个原始锚点各积累 128 次、每次 8 条射线；四个原始点相对 `E = π × L × 0.75`、五个 HDR 点相对 `.96 × baseColor × L × 0.75` 的误差各小于 5%。实际 Opaque 平面 LOD 从 512 个源三角形选出 102 个三角形、5 个簇；法线参数切换不改变选簇，世界查询仍读取完整源几何，HDR PBR 数值与参考吻合。新增不可变资产检查在替换 `mesh.tangents` 引用时报 `WORLD_QUERY_TOPOLOGY_CHANGED`，恢复原引用后查询正常，无 GPU 错误且释放归零。这个联合回归只覆盖有限平面，不推广到任意复杂法线贴图资产。世界 SH 未精确截几何半球、MikkTSpace 生成缺失和 glTF 负行列式实例拒绝仍是已知边界。
 
 最终组合为 216×128 方向采样、每探针 32 个发光面样本、2048 聚焦阴影和 FXAA。在 Edge 155、实际非 fallback `nvidia / ampere`、固定 1920×1080 和相位 0 镜头下测量三次，各预热 300 帧、测量 1800 帧。已接入 GPU pass 总和 p95 为 2.818/3.346/3.408 ms，GI 为 1.835/2.107/2.425 ms，resolve 均为 0.197 ms；每次 60 个稀疏 GPU 样本。rAF p95 均为 7.0 ms，CPU 提交 p95 均为 0.4 ms，应用 GPU 账本恒为 66,706,868 字节，释放为零且无错误。比加入发光面采样前增加 1,327,208 字节，等于本例面积元数据、索引、身份和参数；这不是驱动显存统计。证据为 `artifacts/benchmarks/local-floor-area-final-20261014`，源码指纹 `b8a594f65d56482d65d5e82d6e658759d58c98333f62f2f6be1f528110ce65c3`、构建/副本指纹 `09610f83b5262bd0f4402442426a26a338e1419d8339ad9f671ad15fbfe47580`。这是小房间短测，不含浏览器呈现、大型内容或后续反射/参与介质；不同运行的 pass 分位数不能直接相减归因。此前没有面积采样、早期 FXAA 的三次 3.277/2.949/3.149 ms 仅为历史证据（`local-shadow-aa-gi-quality-20261014`），不替代当前结果。
+
+最终 64 字节 shared deformed 布局与镜头 GI 基础回归保存在 `artifacts/benchmarks/local-normal-layout-release-camera-20261015`。Edge 155、Renderer 实际非 fallback `nvidia / ampere`、1920×1080，相同 orbit 镜头与 Final Gather 配置下，各轮预热 300 帧、测量 1800 帧，共三轮，每轮 60 个稀疏 GPU 样本。GPU pass 总和 p95 为 4.5907968/4.5252608/4.718592 ms，Final Gather p95 为 2.1659648/2.031616/2.031616 ms，世界 GI p95 为 1.96608/1.96608/2.031616 ms；rAF p95 为 7.0/7.0/13.9 ms，CPU 提交 p95 为 0.9/0.8/0.5 ms。应用持有 GPU 账本三轮稳定在 123,856,236 字节，释放归零且错误为空。manifest 源码指纹为 `2ae6912c024d3bbadd7b3493d9df54c6c24dbf656a101c0910dda779d796cdc7`，构建与快照指纹为 `a55f5804cb48137e238bfad18abc5c0327be49787cc8a126efe8b6d4bbd3cd4f`。这个 GI 房间未启用 `normalTexture`，数值只验证新共享布局与原有镜头 GI 的有限性能回归；不能据此声称复杂法线贴图开销低、大场景性能或稳定 60 FPS 达标，也不能跨旧构建的分位数推断加速。
 
 ## 验证入口
 

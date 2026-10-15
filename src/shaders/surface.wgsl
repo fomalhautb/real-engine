@@ -14,7 +14,7 @@ struct Instance {
     color: vec4f,
     material: vec4f,
 }
-struct Deformed { position: vec4f, normal: vec4f, previous: vec4f }
+struct Deformed { position: vec4f, normal: vec4f, previous: vec4f, tangent: vec4f }
 struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, padding: u32 }
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var shadowMap: texture_depth_2d;
@@ -53,6 +53,7 @@ struct Varyings {
     @location(6) current: vec4f,
     @location(7) uv: vec2f,
     @location(8) @interpolate(flat) clusterDebug: vec3u,
+    @location(9) tangent: vec4f,
 }
 fn makeVaryings(index: u32, instanceIndex: u32) -> Varyings {
     let vertex = vertices[instanceIndex * params.vertexCount + index];
@@ -63,6 +64,7 @@ fn makeVaryings(index: u32, instanceIndex: u32) -> Varyings {
     result.previous = frame.previousViewProjection * vertex.previous;
     result.world = vertex.position.xyz;
     result.normal = vertex.normal.xyz;
+    result.tangent = vertex.tangent;
     result.color = instance.color;
     result.material = instance.material.xy;
     result.light = frame.lightViewProjection * vertex.position;
@@ -162,15 +164,24 @@ struct FragmentOutput { @location(0) color: vec4f, @location(1) velocity: vec2f 
 @fragment
 fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> FragmentOutput {
     let shadowVisibility = visibility(input.light);
+    let edge1 = dpdx(input.world);
+    let edge2 = dpdy(input.world);
+    let uv1 = dpdx(input.uv);
+    let uv2 = dpdy(input.uv);
+    let geometricNormal = surfaceUnit(cross(edge2, edge1), surfaceUnit(input.normal, vec3f(0.0, 1.0, 0.0)) * select(-1.0, 1.0, front));
     let surface = evaluateMaterial(input.uv, 0.0, input.color, input.material);
     let covered = evaluateCoverage(input.uv, 0.0, input.color, input.material);
     if (!covered) { discard; }
-    let n = normalize(input.normal) * select(-1.0, 1.0, front);
+    var n = surfaceUnit(input.normal, geometricNormal);
+    n *= select(-1.0, 1.0, dot(n, geometricNormal) >= 0.0);
+    if (MATERIAL_NORMAL_MAPPED) {
+        n = surfaceMappedNormal(input.normal, geometricNormal, input.tangent, edge1, edge2, uv1, uv2, surface.tangentNormal);
+    }
     let v = normalize(frame.camera.xyz - input.world);
     let l = normalize(frame.sunDirection.xyz);
     let h = (l + v) / max(length(l + v), 0.00001);
     let nv = max(dot(n, v), 0.001);
-    let nl = max(dot(n, l), 0.0);
+    let nl = select(0.0, max(dot(n, l), 0.0), dot(geometricNormal, l) > 0.0);
     let nh = max(dot(n, h), 0.0);
     let vh = max(dot(v, h), 0.0);
     let metalness = surface.metallic;

@@ -1,5 +1,6 @@
 import deformationSource from './shaders/deform.wgsl?raw';
 import surfaceSource from './shaders/surface.wgsl?raw';
+import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import resolveSource from './shaders/resolve.wgsl?raw';
 import { identity, lookAt, multiply, perspective, transformPoint, type Mat4 } from './math';
 import type { InstanceState, SceneBatch, MaterialBinding } from './contracts';
@@ -14,6 +15,8 @@ import { GpuDiffuseGi, diffuseGiSampleSource, diffuseGiFinalGatherSampleSource, 
 import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
 import { resolveSunShadowOptions, sunShadowProjection, type SunShadowOptions, type ResolvedSunShadowOptions } from './sun-shadow';
 import type { FinalGatherProbeResult } from './gpu-final-gather';
+import { DEFORMED_VERTEX_BYTES } from './geometry';
+import { snapshotMeshTangents } from './tangent-frame';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
@@ -24,6 +27,7 @@ type Batch = {
   geometryLod?: GeometryLodBinding;
   program: ReturnType<typeof compileDeformation>; pipeline: GPUComputePipeline;
   instanceData: Float32Array<ArrayBuffer>; paletteData: Float32Array<ArrayBuffer>; scalarData: Float32Array<ArrayBuffer>;
+  tangentData: Float32Array<ArrayBuffer>;
   morphBounds: Bounds3[]; bounds: Map<number, Bounds3>;
   history: Map<number, Previous>;
   dirty: boolean; lastInstances: InstanceState[]; lastInputMode?: SceneBatch['inputMode'];
@@ -41,7 +45,7 @@ export interface FrameStats {
   deformationDispatches: number; uploadedBytes: number;
 }
 export interface DeformationVerification {
-  vertices: number; maxError: number; maxNormalError: number; boundsViolations: number;
+  vertices: number; maxError: number; maxNormalError: number; maxTangentError: number; boundsViolations: number;
   samples: { batch: string; entityId: number; vertexIndex: number; current: number[]; previous: number[] }[];
 }
 export interface RendererOptions {
@@ -256,7 +260,7 @@ export class Renderer {
       vertex: { module: resolveModule, entryPoint: 'vertexMain' },
       fragment: { module: resolveModule, entryPoint: 'fragmentMain', targets: [{ format: this.format }] },
     });
-    this.computeLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5, 6].map(binding => ({
+    this.computeLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5, 6, 7].map(binding => ({
       binding, visibility: GPUShaderStage.COMPUTE,
       buffer: { type: binding === 0 ? 'uniform' : binding === 4 ? 'storage' : 'read-only-storage' },
     })) });
@@ -345,15 +349,15 @@ export class Renderer {
         }
         this.compilingMaterials.add(program.key);
         pending = (async () => {
-          const module = await this.shader(surfaceSource.replace('// DIFFUSE_GI_PROGRAM', this.diffuseGi
+          const module = await this.shader((surfaceFrameSource + '\n' + surfaceSource).replace('// DIFFUSE_GI_PROGRAM', this.diffuseGi
             ? this.diffuseGiOptions?.finalGather ? diffuseGiFinalGatherSampleSource : diffuseGiSampleSource : '')
             .replace('// INDIRECT_LIGHTING', this.diffuseGi
               ? this.diffuseGiOptions?.finalGather
-                ? 'let ambient = finalGatherIrradiance(input.position.xy, input.world, n) * base * (1.0 - metalness) * (0.96 / 3.14159265);'
-                : 'let ambient = diffuseGiIrradiance(input.world, n) * base * (1.0 - metalness) * (0.96 / 3.14159265);'
+                ? 'let ambient = finalGatherIrradiance(input.position.xy, input.world, n, geometricNormal) * base * (1.0 - metalness) * (0.96 / 3.14159265);'
+                : 'let ambient = diffuseGiSurfaceIrradiance(input.world, n, geometricNormal) * base * (1.0 - metalness) * (0.96 / 3.14159265);'
               : 'let ambient = base * (0.045 + 0.065 * max(n.y, 0.0)) * (1.0 - metalness * 0.6);')
             .replace('// MATERIAL_PROGRAM',
-            `const MATERIAL_UNLIT = ${program.shading === 'unlit'};\n` + program.wgsl), 'material');
+            `const MATERIAL_UNLIT = ${program.shading === 'unlit'};\nconst MATERIAL_NORMAL_MAPPED = ${program.normalMapped};\n` + program.wgsl), 'material');
           const primitive: GPUPrimitiveState = { topology: 'triangle-list', cullMode: program.doubleSided ? 'none' : 'back' };
           const surface = await this.device.createRenderPipelineAsync({ label: 'material surface and velocity',
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout, this.materialResources.layout,
@@ -519,7 +523,7 @@ export class Renderer {
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('INVALID_BATCH_CAPACITY');
     if (!Number.isSafeInteger(mesh.vertexCount) || mesh.vertexCount < 1
       || Math.ceil(capacity * mesh.vertexCount / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('DEFORMATION_DISPATCH_BUDGET');
-    if (capacity * mesh.vertexCount * 48 > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize)) {
+    if (capacity * mesh.vertexCount * DEFORMED_VERTEX_BYTES > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize)) {
       throw new Error('BUFFER_BUDGET: shared deformation capacity');
     }
     const program = compileDeformation(scene.deformation);
@@ -543,19 +547,23 @@ export class Renderer {
     const palettes = this.buffer(scene.name + ' palettes', Math.max(1, capacity * program.jointCount * 2) * 64, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const scalarStride = Math.max(1, program.scalarCount);
     const scalars = this.buffer(scene.name + ' scalars', capacity * scalarStride * 2 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    const morphData = new Float32Array(Math.max(1, program.morphTargetCount * mesh.vertexCount) * 8);
+    const tangentData = snapshotMeshTangents(mesh.tangents, mesh.vertexCount);
+    const tangents = this.buffer(scene.name + ' source tangents', tangentData.byteLength, GPUBufferUsage.STORAGE, tangentData.buffer);
+    const morphData = new Float32Array(Math.max(1, program.morphTargetCount * mesh.vertexCount) * 12);
     for (let t = 0; t < program.morphTargetCount; t++) for (let i = 0; i < mesh.vertexCount; i++) {
-      morphData.set(scene.morphTargets[t].positions.subarray(i * 3, i * 3 + 3), (t * mesh.vertexCount + i) * 8);
-      morphData.set(scene.morphTargets[t].normals.subarray(i * 3, i * 3 + 3), (t * mesh.vertexCount + i) * 8 + 4);
+      morphData.set(scene.morphTargets[t].positions.subarray(i * 3, i * 3 + 3), (t * mesh.vertexCount + i) * 12);
+      morphData.set(scene.morphTargets[t].normals.subarray(i * 3, i * 3 + 3), (t * mesh.vertexCount + i) * 12 + 4);
+      const delta = scene.morphTargets[t].tangents;
+      if (delta) morphData.set(delta.subarray(i * 3, i * 3 + 3), (t * mesh.vertexCount + i) * 12 + 8);
     }
     const morphs = this.buffer(scene.name + ' morph targets', morphData.byteLength, GPUBufferUsage.STORAGE, morphData.buffer);
-    const output = this.buffer(scene.name + ' shared deformed', capacity * mesh.vertexCount * 48, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const output = this.buffer(scene.name + ' shared deformed', capacity * mesh.vertexCount * DEFORMED_VERTEX_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     const material = await this.prepareMaterial(scene.material);
     const batch: Batch = {
       ...material, materialRequest: 0,
-      scene, rest, indices, params, instances, palettes, output, scalars, program, pipeline, morphBounds, bounds: new Map(),
+      scene, rest, indices, params, instances, palettes, output, scalars, program, pipeline, morphBounds, bounds: new Map(), tangentData,
       compute: this.device.createBindGroup({ layout: this.computeLayout,
-        entries: [params, rest, instances, palettes, output, morphs, scalars].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
+        entries: [params, rest, instances, palettes, output, morphs, scalars, tangents].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
       render: undefined as unknown as GPUBindGroup,
       instanceData: new Float32Array(capacity * 56), paletteData: new Float32Array(capacity * program.jointCount * 32),
       scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, lastInstances: [], uploadRanges: [],
@@ -773,11 +781,12 @@ export class Renderer {
       lifetimes: Object.fromEntries(this.graph.lifetimes),
       bounds: this.batches.flatMap(batch => Array.from(batch.bounds, ([entityId, bounds]) => ({ entityId, ...bounds }))) };
   }
-  private readVertex(source: DataView, vertex: number) {
+  private readVertex(source: DataView, vertex: number, tangents?: Float32Array) {
     const floats = (offset: number, count: number) => Array.from({ length: count }, (_, axis) => source.getFloat32(vertex * 80 + offset + axis * 4, true));
     return { position: floats(0, 3) as [number, number, number], normal: floats(16, 3) as [number, number, number],
       joints: Array.from({ length: 4 }, (_, axis) => source.getUint32(vertex * 80 + 32 + axis * 4, true)) as [number, number, number, number],
-      weights: floats(48, 4) as [number, number, number, number] };
+      weights: floats(48, 4) as [number, number, number, number],
+      ...(tangents?.[vertex * 4 + 3] ? { tangent: Array.from(tangents.subarray(vertex * 4, vertex * 4 + 4)) as [number, number, number, number] } : {}) };
   }
   private draw(pass: GPURenderPassEncoder, kind: 'surface' | 'shadow'): void {
     for (const batch of this.batches) {
@@ -898,19 +907,19 @@ export class Renderer {
   async verifyDeformation(options: { allInstances?: boolean; sampleVertices?: readonly number[] } = {}): Promise<DeformationVerification> {
     if (options.sampleVertices && (options.sampleVertices.length > 1024 || options.sampleVertices.some(index => !Number.isSafeInteger(index) || index < 0))) throw new Error('INVALID_SAMPLE_VERTICES');
     const sampleVertices = new Set([0, ...options.sampleVertices ?? []]);
-    let maxError = 0, vertices = 0, maxNormalError = 0, boundsViolations = 0;
+    let maxError = 0, vertices = 0, maxNormalError = 0, maxTangentError = 0, boundsViolations = 0;
     const samples: DeformationVerification['samples'] = [];
     for (const batch of this.batches) {
       if (!batch.scene.instances.length) continue;
       const instanceCount = options.allInstances ? batch.scene.instances.length : 1;
       const count = batch.scene.mesh.vertexCount * instanceCount;
-      const read = this.device.createBuffer({ size: count * 48, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const read = this.device.createBuffer({ size: count * DEFORMED_VERTEX_BYTES, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const joints = batch.program.jointCount, scalarCount = Math.max(1, batch.program.scalarCount);
       const instances = batch.instanceData.slice(0, instanceCount * 56), palette = batch.paletteData.slice(0, instanceCount * joints * 32), scalars = batch.scalarData.slice(0, instanceCount * scalarCount * 2);
       const entityIds = batch.scene.instances.slice(0, instanceCount).map(state => state.entityId);
       const instanceBounds = entityIds.map(id => structuredClone(batch.bounds.get(id)!));
       const encoder = this.device.createCommandEncoder();
-      encoder.copyBufferToBuffer(batch.output, 0, read, 0, count * 48);
+      encoder.copyBufferToBuffer(batch.output, 0, read, 0, count * DEFORMED_VERTEX_BYTES);
       this.device.queue.submit([encoder.finish()]);
       try {
         await read.mapAsync(GPUMapMode.READ);
@@ -919,14 +928,14 @@ export class Renderer {
           const instanceIndex = Math.floor(vertex / batch.scene.mesh.vertexCount), vertexIndex = vertex % batch.scene.mesh.vertexCount;
           const instance = instances.subarray(instanceIndex * 56, instanceIndex * 56 + 56), bounds = instanceBounds[instanceIndex];
           if (sampleVertices.has(vertexIndex)) samples.push({ batch: batch.scene.name, entityId: entityIds[instanceIndex], vertexIndex,
-            current: Array.from(result.subarray(vertex * 12, vertex * 12 + 3)), previous: Array.from(result.subarray(vertex * 12 + 8, vertex * 12 + 11)) });
+            current: Array.from(result.subarray(vertex * 16, vertex * 16 + 3)), previous: Array.from(result.subarray(vertex * 16 + 8, vertex * 16 + 11)) });
           for (let history = 0; history < 2; history++) {
             const paletteOffset = instanceIndex * joints * 32 + history * joints * 16;
             const bones = Array.from({ length: joints }, (_, j) => palette.subarray(paletteOffset + j * 16, paletteOffset + j * 16 + 16));
-            const reference = evaluateDeformation(batch.program, this.readVertex(source, vertexIndex), vertexIndex, batch.scene.morphTargets, bones, scalars.subarray(instanceIndex * scalarCount * 2 + history * scalarCount));
+            const reference = evaluateDeformation(batch.program, this.readVertex(source, vertexIndex, batch.tangentData), vertexIndex, batch.scene.morphTargets, bones, scalars.subarray(instanceIndex * scalarCount * 2 + history * scalarCount));
             const expected = transformPoint(instance.subarray(history * 16, history * 16 + 16), reference.position);
             for (let axis = 0; axis < 3; axis++) {
-              const actual = result[vertex * 12 + history * 8 + axis];
+              const actual = result[vertex * 16 + history * 8 + axis];
               if (!Number.isFinite(actual)) throw new Error('NONFINITE_DEFORMATION');
               maxError = Math.max(maxError, Math.abs(actual - expected[axis]));
               if (history === 0 && (actual < bounds.min[axis] - 0.0002 || actual > bounds.max[axis] + 0.0002)) boundsViolations++;
@@ -936,10 +945,29 @@ export class Renderer {
               const worldNormal = [0, 1, 2].map(row => m[row] * n[0] + m[4 + row] * n[1] + m[8 + row] * n[2]);
               const length = Math.hypot(...worldNormal);
               for (let axis = 0; axis < 3; axis++) {
-                const actual = result[vertex * 12 + 4 + axis];
+                const actual = result[vertex * 16 + 4 + axis];
                 if (!Number.isFinite(actual)) throw new Error('NONFINITE_NORMAL');
                 maxNormalError = Math.max(maxNormalError, Math.abs(actual - worldNormal[axis] / length));
               }
+              const actualTangent = Array.from(result.subarray(vertex * 16 + 12, vertex * 16 + 16));
+              if (!actualTangent.every(Number.isFinite)) throw new Error('NONFINITE_TANGENT');
+              let expectedTangent = [0, 0, 0, 0];
+              if (reference.tangent) {
+                const model = instance.subarray(0, 16), t = reference.tangent;
+                const direction = [0, 1, 2].map(row => model[row] * t[0] + model[row + 4] * t[1] + model[row + 8] * t[2]);
+                const nUnit = worldNormal.map(value => value / length);
+                const projection = direction.reduce((sum, value, axis) => sum + value * nUnit[axis], 0);
+                let projected = direction.map((value, axis) => value - nUnit[axis] * projection);
+                if (Math.hypot(...projected) < 1e-12) {
+                  const axis = nUnit.map(Math.abs).indexOf(Math.min(...nUnit.map(Math.abs)));
+                  projected = nUnit.map((value, i) => Number(i === axis) - value * nUnit[axis]);
+                }
+                const magnitude = Math.hypot(...projected);
+                const determinant = model[0] * (model[5] * model[10] - model[9] * model[6])
+                  - model[4] * (model[1] * model[10] - model[9] * model[2]) + model[8] * (model[1] * model[6] - model[5] * model[2]);
+                expectedTangent = [...projected.map(value => value / magnitude), t[3] * (determinant < 0 ? -1 : 1)];
+              }
+              for (let axis = 0; axis < 4; axis++) maxTangentError = Math.max(maxTangentError, Math.abs(actualTangent[axis] - expectedTangent[axis]));
             }
           }
           vertices++;
@@ -947,7 +975,7 @@ export class Renderer {
         read.unmap();
       } finally { read.destroy(); }
     }
-    return { vertices, maxError, maxNormalError, boundsViolations, samples };
+    return { vertices, maxError, maxNormalError, maxTangentError, boundsViolations, samples };
   }
 
   dispose(): void {

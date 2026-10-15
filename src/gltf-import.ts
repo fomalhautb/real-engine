@@ -79,7 +79,7 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
   const textureViews = new Map<string, TextureAsset>();
   const material = (source: Json): MaterialBinding => {
     const pbr = object(source.pbrMetallicRoughness ?? {}, 'pbrMetallicRoughness');
-    if (source.normalTexture !== undefined || source.occlusionTexture !== undefined) throw new Error('GLTF_UNSUPPORTED_MATERIAL: normal/occlusion texture');
+    if (source.occlusionTexture !== undefined) throw new Error('GLTF_UNSUPPORTED_MATERIAL: occlusion texture');
     const extensions = object(source.extensions ?? {}, 'material.extensions');
     for (const name of Object.keys(extensions)) if (!supportedExtensions.has(name)) throw new Error('GLTF_UNSUPPORTED_MATERIAL_EXTENSION: ' + name);
     const alphaMode = source.alphaMode ?? 'OPAQUE';
@@ -120,12 +120,17 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
     const color = withTexture(m.parameter(0), pbr.baseColorTexture, 0, 'srgb');
     const mr = withTexture(m.parameter(1), pbr.metallicRoughnessTexture, 1, 'linear');
     const emission = withTexture(m.parameter(2), source.emissiveTexture, 2, 'srgb');
+    const normalInfo = source.normalTexture === undefined ? undefined : object(source.normalTexture, 'normalTexture');
+    const normal = normalInfo === undefined ? undefined : withTexture(m.constant([1, 1, 1, 1]), normalInfo, 3, 'linear');
+    const normalScale = normalInfo === undefined ? undefined : number(normalInfo.scale, 1, 'normalTexture.scale');
     return { definition: { shading: extensions.KHR_materials_unlit !== undefined ? 'unlit' : 'pbr',
       alphaMode: alphaMode === 'MASK' ? 'mask' : 'opaque', doubleSided: source.doubleSided === true,
       baseColor: color, metallic: m.component(mr, 2), roughness: m.component(mr, 1), emissive: emission,
-      alphaCutoff: m.component(m.parameter(1), 3) },
+      alphaCutoff: m.component(m.parameter(1), 3),
+      ...(normal === undefined ? {} : { normal, normalScale: m.component(m.parameter(3), 0) }) },
       parameters: new Float32Array([...baseColor, 0, number(pbr.roughnessFactor, 1, 'roughnessFactor', 0, 1),
-        number(pbr.metallicFactor, 1, 'metallicFactor', 0, 1), number(source.alphaCutoff, 0.5, 'alphaCutoff', 0), ...emissive, 0]),
+        number(pbr.metallicFactor, 1, 'metallicFactor', 0, 1), number(source.alphaCutoff, 0.5, 'alphaCutoff', 0), ...emissive, 0,
+        ...(normalScale === undefined ? [] : [normalScale, 0, 0, 0])]),
       textures: slots, samplers: samplerSlots };
   };
   const materials = materialJson.map(material), defaultMaterial = material({});
@@ -137,9 +142,8 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
     if (result.type !== type) throw new Error('GLTF_ACCESSOR_TYPE: ' + label + ' must be ' + type);
     return result;
   };
-  let warnedAboutTangents = false, warnedAboutIgnoredTangents = false;
   const meshes: GltfMesh[] = meshJson.map((source, meshIndex) => {
-    const primitives = array(source.primitives, 'primitives', 4096).map((primitiveValue): GltfPrimitive => {
+    const primitives = array(source.primitives, 'primitives', 4096).map((primitiveValue, primitiveIndex): GltfPrimitive => {
       const primitive = object(primitiveValue, 'primitive');
       if ((primitive.mode ?? 4) !== 4) throw new Error('GLTF_UNSUPPORTED_PRIMITIVE: triangles required');
       if (primitive.extensions !== undefined) throw new Error('GLTF_UNSUPPORTED_PRIMITIVE_EXTENSION');
@@ -165,13 +169,7 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
           const handedness = tangent.values[vertex * 4 + 3];
           if (handedness !== 1 && handedness !== -1) throw new Error('GLTF_TANGENT_HANDEDNESS');
         }
-        if (!normal && !warnedAboutIgnoredTangents) {
-          warnings.push('glTF tangents are ignored when source normals are absent.');
-          warnedAboutIgnoredTangents = true;
-        } else if (normal && !warnedAboutTangents) {
-          warnings.push('glTF tangent streams are retained, but the current isotropic material path does not consume them.');
-          warnedAboutTangents = true;
-        }
+        if (!normal) warnings.push(`mesh ${meshIndex} primitive ${primitiveIndex}: source TANGENT and any morph TANGENT deltas are ignored because NORMAL is absent.`);
       }
       if (joints && (![5121, 5123].includes(joints.componentType) || joints.normalized)) throw new Error('GLTF_JOINT_COMPONENT_TYPE');
       if (weights && !(weights.componentType === 5126 || ([5121, 5123].includes(weights.componentType) && weights.normalized))) throw new Error('GLTF_WEIGHT_COMPONENT_TYPE');
@@ -261,10 +259,6 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
         const normals = attribute(target.NORMAL, 'VEC3', 'target.NORMAL');
         const tangents = attribute(target.TANGENT, 'VEC3', 'target.TANGENT');
         if ([positions, normals, tangents].some(data => data && data.componentType !== 5126)) throw new Error('GLTF_MORPH_FLOAT_REQUIRED');
-        if (tangents && normal && !warnedAboutTangents) {
-          warnings.push('glTF tangent streams are retained, but the current isotropic material path does not consume them.');
-          warnedAboutTangents = true;
-        }
         const delta = positions ? remap(positions.values, 3) : new Float32Array(outputCount * 3);
         const tangentDeltas = normal && tangent
           ? tangents ? remap(tangents.values, 3) : new Float32Array(outputCount * 3)
@@ -275,7 +269,11 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
         if (!positions) return { positions: delta, normals: new Float32Array(outputCount * 3), tangents: tangentDeltas };
         return { ...buildMorphTarget(mesh, (_, i) => [delta[i * 3], delta[i * 3 + 1], delta[i * 3 + 2]]), tangents: tangentDeltas };
       });
-      return { mesh, morphTargets, hasSkin: !!joints, material: primitive.material === undefined ? defaultMaterial : materials[index(primitive.material, materials.length, 'primitive.material')] };
+      const binding = primitive.material === undefined ? defaultMaterial : materials[index(primitive.material, materials.length, 'primitive.material')];
+      if (binding.definition.normal !== undefined && !(normal && tangent)) {
+        warnings.push(`mesh ${meshIndex} primitive ${primitiveIndex}: normal texture has no effective authored TANGENT; backend uses a triangle UV-derivative frame fallback, which is not guaranteed to match MikkTSpace.`);
+      }
+      return { mesh, morphTargets, hasSkin: !!joints, material: binding };
     });
     if (!primitives.length) throw new Error('GLTF_EMPTY_MESH');
     const targetCount = primitives[0].morphTargets.length;

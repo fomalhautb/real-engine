@@ -1,4 +1,6 @@
-/** Interleaved vertex: position, normal, joints, weights, morph delta (80 bytes). */
+/** Shared GPU stream: current position/normal, previous position, tangent. */
+export const DEFORMED_VERTEX_BYTES = 64;
+/** Interleaved source vertex: position, normal, joints, weights, morph delta (80 bytes). */
 export interface MeshData {
   /** Separate packed UV0 stream; omitted assets receive zero UVs. */
   uvs?: Float32Array;

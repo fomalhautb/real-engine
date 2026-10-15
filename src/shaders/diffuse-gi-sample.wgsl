@@ -7,3 +7,6 @@
 fn diffuseGiIrradiance(position: vec3f, normal: vec3f) -> vec3f {
     return giSampleIrradiance(position, normal, gi.state.x);
 }
+fn diffuseGiSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: vec3f) -> vec3f {
+    return giSampleSurfaceIrradiance(position, normal, geometricNormal, gi.state.x);
+}

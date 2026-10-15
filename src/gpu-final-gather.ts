@@ -2,12 +2,14 @@ import commonSource from './shaders/diffuse-gi-common.wgsl?raw';
 import interpolateSource from './shaders/diffuse-gi-interpolate.wgsl?raw';
 import updateSource from './shaders/final-gather-update.wgsl?raw';
 import sampleSource from './shaders/final-gather-sample.wgsl?raw';
+import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import type { SceneBatch } from './contracts';
 import { DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import { planFinalGatherGrid, resolveFinalGatherOptions, type FinalGatherGridPlan, type ResolvedFinalGatherOptions } from './final-gather';
 import type { GpuWorldQuery } from './gpu-world-query';
 import { WORLD_HIT_BYTES, WORLD_RAY_BYTES } from './world-query';
+import { DEFORMED_VERTEX_BYTES } from './geometry';
 
 export const finalGatherSampleSource = sampleSource;
 export const FINAL_GATHER_ANCHOR_BYTES = 96;
@@ -215,7 +217,7 @@ export class GpuFinalGather {
     const common = commonSource.replace('// GI_DISTANCE_CONSTANTS',
       `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`);
     const module = this.device.createShaderModule({ label: 'surface final gather',
-      code: updateSource.replace('// GI_COMMON', common).replace('// GI_INTERPOLATE', interpolateSource) });
+      code: surfaceFrameSource + '\n' + updateSource.replace('// GI_COMMON', common).replace('// GI_INTERPOLATE', interpolateSource) });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `final gather:${error.lineNum}: ${error.message}`).join('\n'));
     const names: EntryPoint[] = ['generateCamera', 'generateHemisphere', 'generateShadows', 'integrate',
@@ -256,7 +258,7 @@ export class GpuFinalGather {
     if (!Number.isSafeInteger(scene.capacity) || scene.capacity < 1 || scene.capacity > this.queries.options.maxInstancesPerBatch
       || scene.instances.length > scene.capacity || this.batches.length >= 256) throw new Error('FINAL_GATHER_INSTANCE_BUDGET');
     for (const index of mesh.indices) if (index >= mesh.vertexCount) throw new Error('FINAL_GATHER_MESH_INDEX');
-    if (output.size < mesh.vertexCount * scene.capacity * 48 || !(output.usage & GPUBufferUsage.STORAGE)
+    if (output.size < mesh.vertexCount * scene.capacity * DEFORMED_VERTEX_BYTES || !(output.usage & GPUBufferUsage.STORAGE)
       || output.size > this.device.limits.maxStorageBufferBindingSize) throw new Error('FINAL_GATHER_DEFORMATION_BUFFER');
     this.preflight([mesh.indices.byteLength, scene.capacity * 16, AREA_PARAMETER_BYTES]);
     const start = this.buffers.length, before = this.bytes;

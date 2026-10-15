@@ -76,10 +76,51 @@ describe('glTF material import', () => {
     }).covered).toBe(false);
   });
 
-  it('rejects an unsupported normal texture instead of losing it silently', () => {
+  it('imports normalTexture as a linear slot-3 surface input with a live signed scale', () => {
     const json = texturedFixture();
-    json.materials[0].normalTexture = { index: 0 };
+    json.materials[0].normalTexture = { index: 0, scale: -0.5 };
+    const asset = importGltf(json, [binary], { images: new Map([[0, image]]) });
+    const material = asset.meshes[0].primitives[0].material;
+    const program = compileMaterial(material.definition);
+    expect(program.normalMapped).toBe(true);
+    expect(program.textureSlots).toEqual([0, 1, 2, 3]);
+    expect(program.coverageTextureSlots).toEqual([0]);
+    expect(program.parameterCount).toBe(4);
+    expect(program.coverageParameterCount).toBe(2);
+    expect(material.parameters).toHaveLength(16);
+    expect(material.parameters?.[12]).toBe(-0.5);
+    expect(material.textures?.[3]?.colorSpace).toBe('linear');
+    expect(material.textures?.[3]).toBe(material.textures?.[1]);
+    expect(material.samplers?.[3]).toMatchObject({
+      addressModeU: 'clamp-to-edge', addressModeV: 'mirror-repeat',
+      minFilter: 'nearest', magFilter: 'nearest', lodMaxClamp: 0,
+    });
+    expect(asset.warnings.some(warning => /triangle UV-derivative frame fallback/.test(warning))).toBe(false);
+    const withoutTangents = texturedFixture() as ReturnType<typeof texturedFixture> & {
+      meshes: Array<{ primitives: Array<{ attributes: Record<string, unknown>; targets?: Array<Record<string, unknown>> }> }>;
+    };
+    withoutTangents.materials[0].normalTexture = { index: 0 };
+    delete withoutTangents.meshes[0].primitives[0].attributes.TANGENT;
+    for (const target of withoutTangents.meshes[0].primitives[0].targets ?? []) delete target.TANGENT;
+    expect(importGltf(withoutTangents, [binary], { images: new Map([[0, image]]) }).warnings
+      .some(warning => /triangle UV-derivative frame fallback/.test(warning))).toBe(true);
+    const textures = (slot: number): [number, number, number, number] => slot === 3
+      ? [0.75, 0.5, 1, 1] : [1, 1, 1, 1];
+    const evaluate = () => evaluateMaterial(program, { parameters: material.parameters, textures,
+      instanceColor: [1, 1, 1, 1], instanceMetalRough: [1, 1] });
+    expect(evaluate().tangentNormal[0]).toBeLessThan(0);
+    material.parameters![12] = 0;
+    expect(evaluate().tangentNormal).toEqual([0, 0, 1]);
+  });
+
+  it('rejects unsupported occlusion and normal texture coordinates', () => {
+    const json = texturedFixture();
+    json.materials[0].occlusionTexture = { index: 0 };
     expect(() => importGltf(json, [binary], { images: new Map([[0, image]]) }))
-      .toThrow(/GLTF_UNSUPPORTED_MATERIAL: normal\/occlusion texture/);
+      .toThrow(/GLTF_UNSUPPORTED_MATERIAL: occlusion texture/);
+    delete json.materials[0].occlusionTexture;
+    json.materials[0].normalTexture = { index: 0, texCoord: 1 };
+    expect(() => importGltf(json, [binary], { images: new Map([[0, image]]) }))
+      .toThrow(/GLTF_UNSUPPORTED_TEXTURE_COORDINATES/);
   });
 });

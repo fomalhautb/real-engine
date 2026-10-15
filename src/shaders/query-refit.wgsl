@@ -1,4 +1,4 @@
-struct Deformed { position: vec4f, normal: vec4f, previous: vec4f }
+struct Deformed { position: vec4f, normal: vec4f, previous: vec4f, tangent: vec4f }
 struct Bounds { low: vec4f, high: vec4f }
 struct Params {
     shape: vec4u, // node count, vertex count, instance count, batch ID

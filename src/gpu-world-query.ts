@@ -1,5 +1,6 @@
 import refitSource from './shaders/query-refit.wgsl?raw';
 import traceSource from './shaders/query-trace.wgsl?raw';
+import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { buildBvhTopology } from './bvh-topology';
 import type { SceneBatch } from './contracts';
 import type { GpuMaterial } from './gpu-material';
@@ -19,7 +20,7 @@ type QueryBatch = {
   source: QuerySource; mesh: SceneBatch['mesh']; name: string; capacity: number; identity: string;
   topologyVersion: number; nodeCount: number; offsets: number[]; count: number; dirty: boolean;
   emissiveSampling: SceneBatch['emissiveSampling'];
-  vertexCount: number; vertices: ArrayBuffer; indices: Uint32Array; uvs?: Float32Array;
+  vertexCount: number; vertices: ArrayBuffer; indices: Uint32Array; uvs?: Float32Array; tangents?: Float32Array;
   identities: GPUBuffer; metadata: Uint32Array<ArrayBuffer>; params: GPUBuffer; trace: GPUBindGroup[];
   levels: { params: GPUBuffer; bindGroup: GPUBindGroup; count: number; offset: number }[];
 };
@@ -150,8 +151,8 @@ export class GpuWorldQuery {
   }
   async createPipeline(program: MaterialProgram): Promise<GPUComputePipeline> {
     if (this.disposed) throw new Error('WORLD_QUERY_DISPOSED');
-    const code = traceSource.replace('// MATERIAL_PROGRAM',
-      `const MATERIAL_DOUBLE_SIDED = ${program.doubleSided};\nconst MATERIAL_UNLIT = ${program.shading === 'unlit'};\n${program.wgsl}`);
+    const code = surfaceFrameSource + '\n' + traceSource.replace('// MATERIAL_PROGRAM',
+      `const MATERIAL_DOUBLE_SIDED = ${program.doubleSided};\nconst MATERIAL_UNLIT = ${program.shading === 'unlit'};\nconst MATERIAL_NORMAL_MAPPED = ${program.normalMapped};\n${program.wgsl}`);
     return this.device.createComputePipelineAsync({ label: 'shared material world hits',
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.traceLayout, this.materialLayout] }),
       compute: { module: await this.module(code, 'world material query'), entryPoint: 'main' } });
@@ -196,7 +197,7 @@ export class GpuWorldQuery {
     this.batches.push({ source, mesh, name: scene.name, capacity: scene.capacity, identity: sourceIdentity,
       emissiveSampling: scene.emissiveSampling,
       topologyVersion: scene.queryIdentity?.topologyVersion ?? 0, nodeCount: topology.nodeCount, offsets, count: 0, dirty: true,
-      vertexCount: mesh.vertexCount, vertices: mesh.vertices, indices: mesh.indices, uvs: mesh.uvs,
+      vertexCount: mesh.vertexCount, vertices: mesh.vertices, indices: mesh.indices, uvs: mesh.uvs, tangents: mesh.tangents,
       identities, metadata: new Uint32Array(scene.capacity * 4), params, trace, levels });
   }
   private validateTopology(): void {
@@ -204,7 +205,7 @@ export class GpuWorldQuery {
     for (const batch of this.batches) {
       const scene = batch.source.scene;
       if (scene.mesh !== batch.mesh || scene.mesh.vertexCount !== batch.vertexCount || scene.mesh.vertices !== batch.vertices
-        || scene.mesh.indices !== batch.indices || scene.mesh.uvs !== batch.uvs || scene.capacity !== batch.capacity
+        || scene.mesh.indices !== batch.indices || scene.mesh.uvs !== batch.uvs || scene.mesh.tangents !== batch.tangents || scene.capacity !== batch.capacity
         || scene.name !== batch.name || identity(scene) !== batch.identity || scene.emissiveSampling !== batch.emissiveSampling) {
         throw new Error('WORLD_QUERY_TOPOLOGY_CHANGED: recreate the renderer for a new immutable mesh/topology');
       }

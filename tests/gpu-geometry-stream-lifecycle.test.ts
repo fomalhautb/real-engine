@@ -1,0 +1,127 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SceneBatch } from '../src/contracts';
+import { GpuGeometryStream } from '../src/gpu-geometry-stream';
+import type { GeometryStreamSelectionFeedback } from '../src/gpu-geometry-stream-selection';
+
+const mocks = vi.hoisted(() => ({
+  cacheCreate: vi.fn(), poolCreate: vi.fn(), selectionCreate: vi.fn(),
+}));
+
+vi.mock('../src/geometry-stream-cache', () => ({ GeometryPageCache: { create: mocks.cacheCreate } }));
+vi.mock('../src/gpu-geometry-page-pool', () => ({ GpuGeometryPagePool: { create: mocks.poolCreate } }));
+vi.mock('../src/gpu-geometry-stream-selection', () => ({ GpuGeometryStreamSelection: { create: mocks.selectionCreate } }));
+
+function setup(maxRequestsPerFrame = 1) {
+  const page = { clusters: [] };
+  const directory = {
+    sourceVertexCount: 1, sourceTriangleCount: 1, vertexStride: 80,
+    rootPages: [0], pages: [{ id: 0 }, { id: 1 }, { id: 2 }, { id: 3 }], clusters: [],
+  };
+  const scene = {
+    geometryStream: { directory, provider: vi.fn(), maxRequestsPerFrame },
+    geometryLod: undefined, deformation: { jointCount: 0, nodes: [] }, morphTargets: [],
+    mesh: { vertexCount: 1, vertices: new ArrayBuffer(80), indices: new Uint32Array([0, 0, 0]) },
+    capacity: 1,
+  } as unknown as SceneBatch;
+  const cache = {
+    get: vi.fn((id: number) => id === 0 ? page : undefined),
+    request: vi.fn(), retry: vi.fn(), diagnostics: vi.fn(() => ({})),
+    dispose: vi.fn(async () => {}),
+  };
+  const pool = {
+    directory, enqueue: vi.fn(), residentPageIds: vi.fn(() => new Set([0])),
+    uploadFrame: vi.fn(() => ({ bytes: 0 })),
+    diagnostics: vi.fn(() => ({ pendingPages: [], stagingBytes: 0, limits: { maxQueuedPages: 4, maxStagingBytes: 1024 } })),
+    dispose: vi.fn(),
+  };
+  const selection = {
+    capacity: 1, update: vi.fn(() => 0),
+    feedback: vi.fn(async (): Promise<GeometryStreamSelectionFeedback> =>
+      ({ frame: 1, requestedPages: [], indices: 0, overflow: false })),
+    diagnostics: vi.fn(() => ({})), dispose: vi.fn(),
+  };
+  const device = { queue: { onSubmittedWorkDone: vi.fn(async () => {}) } } as unknown as GPUDevice;
+  mocks.cacheCreate.mockResolvedValue(cache);
+  mocks.poolCreate.mockResolvedValue(pool);
+  mocks.selectionCreate.mockResolvedValue(selection);
+  return { scene, device, cache, pool, selection };
+}
+
+async function feedbackSettled(stream: GpuGeometryStream): Promise<void> {
+  stream.afterSubmit();
+  await (stream as unknown as { feedbackTask: Promise<void> }).feedbackTask;
+}
+
+beforeEach(() => { vi.resetAllMocks(); });
+
+describe('GPU geometry stream bridge lifecycle', () => {
+  it('preserves initialization failure and cleans every owner when selection disposal throws', async () => {
+    const { scene, device, cache, pool, selection } = setup();
+    const initial = new Error('FAKE_ROOT_ENQUEUE_FAILURE');
+    pool.enqueue.mockImplementation(() => { throw initial; });
+    selection.dispose.mockImplementation(() => { throw new Error('FAKE_TRACKER_FAILURE'); });
+
+    await expect(GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {})).rejects.toBe(initial);
+    expect(selection.dispose).toHaveBeenCalledOnce();
+    expect(pool.dispose).toHaveBeenCalledOnce();
+    expect(cache.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('starts both GPU cleanups synchronously, awaits cache cleanup and shares its disposal promise', async () => {
+    const { scene, device, cache, pool, selection } = setup();
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    let completeCache!: () => void;
+    let cacheFinished = false;
+    cache.dispose.mockImplementation(() => new Promise<void>(resolve => {
+      completeCache = () => { cacheFinished = true; resolve(); };
+    }));
+    selection.dispose.mockImplementation(() => { throw new Error('FAKE_TRACKER_FAILURE'); });
+    pool.dispose.mockImplementation(() => { throw new Error('FAKE_POOL_TRACKER_FAILURE'); });
+
+    let cleanup!: Promise<void>;
+    expect(() => { cleanup = stream.dispose(); }).not.toThrow();
+    expect(cleanup).toBeInstanceOf(Promise);
+    expect(selection.dispose).toHaveBeenCalledOnce();
+    expect(pool.dispose).toHaveBeenCalledOnce();
+    expect(cache.dispose).toHaveBeenCalledOnce();
+    expect(stream.dispose()).toBe(cleanup);
+    expect(cacheFinished).toBe(false);
+    completeCache();
+    await cleanup.catch(() => {});
+    expect(cacheFinished).toBe(true);
+    expect(selection.dispose).toHaveBeenCalledOnce();
+    expect(pool.dispose).toHaveBeenCalledOnce();
+    expect(cache.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('defers a request when the CPU cache queue is saturated', async () => {
+    const { scene, device, cache, pool, selection } = setup();
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [{ pageId: 1, priority: 3 }], indices: 0, overflow: false });
+    cache.request.mockImplementation(() => { throw new Error('GEOMETRY_STREAM_REQUEST_BUDGET'); });
+
+    await feedbackSettled(stream);
+    expect(() => stream.update(1, 1, new Float32Array(16), [0, 0, 0], 1)).not.toThrow();
+    expect(cache.request).toHaveBeenCalledWith(1, 3);
+    expect(pool.uploadFrame).toHaveBeenCalledOnce();
+    expect(selection.update).toHaveBeenCalledOnce();
+    cache.request.mockClear();
+    cache.request.mockImplementation(() => {});
+    stream.update(2, 1, new Float32Array(16), [0, 0, 0], 1);
+    expect(cache.request).toHaveBeenCalledWith(1, 3);
+  });
+
+  it('advances the pending cursor across repeated feedback when one request is allowed per frame', async () => {
+    const { scene, device, cache, selection } = setup(1);
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [
+      { pageId: 1, priority: 3 }, { pageId: 2, priority: 2 }, { pageId: 3, priority: 1 },
+    ], indices: 0, overflow: false });
+
+    for (let frame = 1; frame <= 3; frame++) {
+      await feedbackSettled(stream);
+      stream.update(frame, 1, new Float32Array(16), [0, 0, 0], 1);
+    }
+    expect(cache.request.mock.calls.map(([pageId]) => pageId)).toEqual([1, 2, 3]);
+  });
+});

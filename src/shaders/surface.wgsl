@@ -55,8 +55,7 @@ struct Varyings {
     @location(8) @interpolate(flat) clusterDebug: vec3u,
     @location(9) tangent: vec4f,
 }
-fn makeVaryings(index: u32, instanceIndex: u32) -> Varyings {
-    let vertex = vertices[instanceIndex * params.vertexCount + index];
+fn geometryVaryings(vertex: Deformed, instanceIndex: u32, uv: vec2f) -> Varyings {
     let instance = instances[instanceIndex];
     var result: Varyings;
     result.position = frame.viewProjection * vertex.position;
@@ -68,9 +67,12 @@ fn makeVaryings(index: u32, instanceIndex: u32) -> Varyings {
     result.color = instance.color;
     result.material = instance.material.xy;
     result.light = frame.lightViewProjection * vertex.position;
-    result.uv = uvs[index];
+    result.uv = uv;
     result.clusterDebug = vec3u(0u);
     return result;
+}
+fn makeVaryings(index: u32, instanceIndex: u32) -> Varyings {
+    return geometryVaryings(vertices[instanceIndex * params.vertexCount + index], instanceIndex, uvs[index]);
 }
 @vertex
 fn vertexMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instanceIndex: u32) -> Varyings {
@@ -81,6 +83,17 @@ fn clusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
     let count = arrayLength(&clusterVertices);
     let identity = clusterVertices[index % count];
     var result = makeVaryings(identity.x, index / count);
+    result.clusterDebug = vec3u(identity.w, identity.z, 1u);
+    return result;
+}
+@vertex
+fn pagedClusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
+    let physical = index % params.vertexCount;
+    // The same storage binding holds the physical 128-byte records in this
+    // entry point: UV at byte 80 and identity at byte 112. No full source lookup.
+    let identity = clusterVertices[physical * 8u + 7u];
+    let uv = bitcast<vec2f>(clusterVertices[physical * 8u + 5u].xy);
+    var result = geometryVaryings(vertices[index], index / params.vertexCount, uv);
     result.clusterDebug = vec3u(identity.w, identity.z, 1u);
     return result;
 }

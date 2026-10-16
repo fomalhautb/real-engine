@@ -4,6 +4,7 @@ import type { DeformationGraph, MorphTarget } from './deformation';
 import type { MaterialDefinition } from './material';
 import type { TextureAsset } from './texture-assets';
 import type { GeometryHierarchy } from './geometry-hierarchy-types';
+import type { GeometryStreamSource } from './gpu-geometry-stream';
 
 export interface MaterialBinding {
   definition: MaterialDefinition;
@@ -39,6 +40,10 @@ export interface SceneBatch {
   /** Optional fully resident LOD for a static primitive. mesh must be hierarchy.source.
    * Opaque materials use GPU selection; Masked keeps the full-detail path. */
   geometryLod?: GeometryHierarchy;
+  /** Paged static Opaque surface geometry. mesh remains the exact full-detail
+   * shadow/query and Masked compatibility representation; not a collision LOD.
+   * Mutually exclusive with geometryLod; dynamic graphs use the full path. */
+  geometryStream?: GeometryStreamSource;
   material?: MaterialBinding;
   /** Stable asset/primitive identity for optional world queries; bump on topology replacement. */
   queryIdentity?: { assetId: string; primitiveId: number; topologyVersion: number };

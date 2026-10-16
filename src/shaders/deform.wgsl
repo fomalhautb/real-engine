@@ -4,6 +4,7 @@ struct Vertex {
     joints: vec4u,
     weights: vec4f,
     morph: vec4f,
+    // GEOMETRY_VERTEX_FIELDS
 }
 struct Instance {
     model: mat4x4f,

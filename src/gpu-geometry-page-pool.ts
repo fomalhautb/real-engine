@@ -276,18 +276,52 @@ export class GpuGeometryPagePool {
     this.live(); const frame = this.frames.get(token);
     if (!frame || frame.submitted) throw new Error('GEOMETRY_GPU_POOL_FRAME_LEASE'); this.release(token);
   }
-  /** Submit through the owning pool so even queued, unfinished GPU frames keep
-   * their physical slots pinned. Completion reports queue failure explicitly. */
+  /** Submit one command batch that references leases from pools on one device.
+   * Every lease stays pinned until the same queue completion fence settles. */
+  static submitFrames(entries: readonly { pool: GpuGeometryPagePool; lease: GeometryGpuFrameLease }[],
+    commands: readonly GPUCommandBuffer[]): Promise<{ error: string | null }> {
+    if (!Array.isArray(entries) || entries.length < 1 || entries.length > 256
+      || !Array.isArray(commands) || commands.length < 1 || commands.length > 32) {
+      throw new Error('GEOMETRY_GPU_POOL_FRAME_LEASE');
+    }
+    const seen = new Set<GpuGeometryPagePool>();
+    let device: GPUDevice | undefined;
+    const selected: { pool: GpuGeometryPagePool; lease: GeometryGpuFrameLease; frame: Frame }[] = [];
+    for (const entry of entries) {
+      const pool = entry?.pool;
+      if (!(pool instanceof GpuGeometryPagePool) || seen.has(pool) || (device && pool.device !== device)) {
+        throw new Error('GEOMETRY_GPU_POOL_FRAME_LEASE');
+      }
+      pool.live();
+      const frame = pool.frames.get(entry.lease);
+      if (!frame || frame.submitted) throw new Error('GEOMETRY_GPU_POOL_FRAME_LEASE');
+      seen.add(pool); device = pool.device;
+      selected.push({ pool, lease: entry.lease, frame });
+    }
+    // All validation is complete before the first lease or queue is changed.
+    try { device!.queue.submit(commands); }
+    catch (error) { for (const { pool, lease } of selected) pool.release(lease); throw error; }
+    for (const { frame } of selected) frame.submitted = true;
+    const failed = (cause: unknown): { error: string } => {
+      const errors: string[] = [];
+      for (const { pool, lease } of selected) {
+        pool.release(lease);
+        pool.error = 'GEOMETRY_GPU_POOL_QUEUE_FAILED: ' + String(cause);
+        try { pool.dispose(); } catch (error) { pool.error += '; tracker: ' + String(error); }
+        errors.push(pool.error);
+      }
+      return { error: [...new Set(errors)].join('; ') };
+    };
+    try {
+      return device!.queue.onSubmittedWorkDone().then(() => {
+        for (const { pool, lease } of selected) pool.release(lease);
+        return { error: selected.find(({ pool }) => pool.error)?.pool.error ?? null };
+      }, failed);
+    } catch (error) { return Promise.resolve(failed(error)); }
+  }
+  /** Submit through the owning pool so queued GPU frames keep their slots pinned. */
   submitFrame(token: GeometryGpuFrameLease, commands: readonly GPUCommandBuffer[]): Promise<{ error: string | null }> {
-    this.live(); const frame = this.frames.get(token);
-    if (!frame || frame.submitted || !Array.isArray(commands) || !commands.length || commands.length > 32) throw new Error('GEOMETRY_GPU_POOL_FRAME_LEASE');
-    try { this.device.queue.submit(commands); frame.submitted = true; }
-    catch (error) { this.release(token); throw error; }
-    return this.device.queue.onSubmittedWorkDone().then(() => { this.release(token); return { error: this.error }; }, error => {
-      this.error = 'GEOMETRY_GPU_POOL_QUEUE_FAILED: ' + String(error);
-      try { this.dispose(); } catch (error) { this.error += '; tracker: ' + String(error); }
-      return { error: this.error };
-    });
+    return GpuGeometryPagePool.submitFrames([{ pool: this, lease: token }], commands);
   }
   diagnostics() {
     return { disposed: this.disposed, error: this.error, allocatedGpuBytes: this.allocatedBytes,

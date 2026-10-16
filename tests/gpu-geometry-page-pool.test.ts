@@ -185,6 +185,106 @@ describe('GPU geometry page pool CPU lifecycle with deferred fake queue', () => 
     expect(pool.diagnostics().framesInFlight).toBe(0);
   });
 
+  it('submits two pools on one device with one fence and keeps both leases pinned', async () => {
+    const device = new FakeDevice();
+    const first = await poolWithSlots(device, roots.length + 1);
+    const second = await poolWithSlots(device, roots.length + 1);
+    enqueueRoots(first); enqueueRoots(second);
+    let firstFrame = uploadUntil(first, roots);
+    let secondFrame = uploadUntil(second, roots);
+    const a = details[0], b = details[1];
+    first.enqueue(a, pages[a]); second.enqueue(a, pages[a]);
+    firstFrame = uploadUntil(first, [a], firstFrame);
+    secondFrame = uploadUntil(second, [a], secondFrame);
+    first.enqueue(b, pages[b]); second.enqueue(b, pages[b]);
+    const firstLease = first.acquireFrame([a]);
+    const secondLease = second.acquireFrame([a]);
+    const completion = GpuGeometryPagePool.submitFrames([
+      { pool: first, lease: firstLease }, { pool: second, lease: secondLease },
+    ], [command]);
+    expect(device.submissions).toEqual([[command]]);
+    expect(device.fences).toHaveLength(1);
+    expect(first.uploadFrame(firstFrame++).blocked).toBe(true);
+    expect(second.uploadFrame(secondFrame++).blocked).toBe(true);
+    expect(() => first.cancelFrame(firstLease)).toThrow(/FRAME_LEASE/);
+    expect(() => second.cancelFrame(secondLease)).toThrow(/FRAME_LEASE/);
+    device.completeNext();
+    await expect(completion).resolves.toEqual({ error: null });
+    expect(first.diagnostics().framesInFlight).toBe(0);
+    expect(second.diagnostics().framesInFlight).toBe(0);
+    uploadUntil(first, [b], firstFrame);
+    uploadUntil(second, [b], secondFrame);
+    expect(first.residentPageIds().has(a)).toBe(false);
+    expect(second.residentPageIds().has(a)).toBe(false);
+  });
+
+  it('rejects different devices, duplicate pools and forged leases without changing valid leases', async () => {
+    const device = new FakeDevice(), otherDevice = new FakeDevice();
+    const first = await poolWithSlots(device, roots.length + 1);
+    const second = await poolWithSlots(device, roots.length + 1);
+    const other = await poolWithSlots(otherDevice, roots.length + 1);
+    for (const pool of [first, second, other]) { enqueueRoots(pool); uploadUntil(pool, roots); }
+    const firstLease = first.acquireFrame(roots), secondLease = second.acquireFrame(roots);
+    const otherLease = other.acquireFrame(roots);
+    expect(() => GpuGeometryPagePool.submitFrames([], [command])).toThrow(/FRAME_LEASE/);
+    expect(() => GpuGeometryPagePool.submitFrames(
+      Array(257).fill({ pool: first, lease: firstLease }), [command])).toThrow(/FRAME_LEASE/);
+    expect(() => GpuGeometryPagePool.submitFrames([{ pool: first, lease: firstLease }], [])).toThrow(/FRAME_LEASE/);
+    expect(() => GpuGeometryPagePool.submitFrames(
+      [{ pool: first, lease: firstLease }], Array(33).fill(command))).toThrow(/FRAME_LEASE/);
+    expect(() => GpuGeometryPagePool.submitFrames([
+      { pool: first, lease: firstLease }, { pool: other, lease: otherLease },
+    ], [command])).toThrow(/FRAME_LEASE/);
+    expect(() => GpuGeometryPagePool.submitFrames([
+      { pool: first, lease: firstLease }, { pool: first, lease: firstLease },
+    ], [command])).toThrow(/FRAME_LEASE/);
+    expect(() => GpuGeometryPagePool.submitFrames([
+      { pool: first, lease: firstLease }, { pool: second, lease: { serial: secondLease.serial } },
+    ], [command])).toThrow(/FRAME_LEASE/);
+    expect(device.submissions).toHaveLength(0);
+    expect(otherDevice.submissions).toHaveLength(0);
+    for (const pool of [first, second, other]) expect(pool.diagnostics().framesInFlight).toBe(1);
+    first.cancelFrame(firstLease); second.cancelFrame(secondLease); other.cancelFrame(otherLease);
+  });
+
+  it('releases every selected lease if queue submission throws synchronously', async () => {
+    const device = new FakeDevice();
+    const first = await poolWithSlots(device, roots.length + 1);
+    const second = await poolWithSlots(device, roots.length + 1);
+    for (const pool of [first, second]) { enqueueRoots(pool); uploadUntil(pool, roots); }
+    const firstLease = first.acquireFrame(roots), secondLease = second.acquireFrame(roots);
+    device.queue.submit = () => { throw new Error('FAKE_SUBMIT_FAILURE'); };
+    expect(() => GpuGeometryPagePool.submitFrames([
+      { pool: first, lease: firstLease }, { pool: second, lease: secondLease },
+    ], [command])).toThrow('FAKE_SUBMIT_FAILURE');
+    expect(device.fences).toHaveLength(0);
+    expect(first.diagnostics().framesInFlight).toBe(0);
+    expect(second.diagnostics().framesInFlight).toBe(0);
+    expect(first.diagnostics().disposed).toBe(false);
+    expect(second.diagnostics().disposed).toBe(false);
+  });
+
+  it('cleans all pools after a shared fence failure even when one tracker throws', async () => {
+    const device = new FakeDevice();
+    const first = await poolWithSlots(device, roots.length + 1, {}, bytes => {
+      if (bytes < 0) throw new Error('FAKE_TRACKER_FAILURE');
+    });
+    const second = await poolWithSlots(device, roots.length + 1);
+    for (const pool of [first, second]) { enqueueRoots(pool); uploadUntil(pool, roots); }
+    const completion = GpuGeometryPagePool.submitFrames([
+      { pool: first, lease: first.acquireFrame(roots) },
+      { pool: second, lease: second.acquireFrame(roots) },
+    ], [command]);
+    expect(device.fences).toHaveLength(1);
+    device.fences.shift()!.reject(new Error('FAKE_QUEUE_FAILURE'));
+    expect((await completion).error).toMatch(/QUEUE_FAILED.*FAKE_QUEUE_FAILURE.*FAKE_TRACKER_FAILURE/);
+    for (const pool of [first, second]) {
+      expect(pool.diagnostics()).toMatchObject({ disposed: true, allocatedGpuBytes: 0,
+        framesInFlight: 0, leasedPages: [] });
+    }
+    expect(device.buffers.every(buffer => buffer.destroyed)).toBe(true);
+  });
+
   it('rejects forged leases and cleans up tracked buffers and pending payload on device loss', async () => {
     const device = new FakeDevice();
     let tracked = 0;

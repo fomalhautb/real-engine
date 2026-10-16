@@ -4,6 +4,7 @@ import { buildGeometryStreamDirectory } from '../../../src/geometry-stream-direc
 import { GeometryPageCache } from '../../../src/geometry-stream-cache';
 import { GeometryStreamCut } from '../../../src/geometry-stream-cut';
 import { GpuGeometryPagePool } from '../../../src/gpu-geometry-page-pool';
+import { GpuGeometryStreamSelection } from '../../../src/gpu-geometry-stream-selection';
 import { packGeometryGpuPage } from '../../../src/geometry-gpu-page';
 import { packGeometryLod } from '../../../src/geometry-lod-data';
 import { lookAt, multiply, perspective } from '../../../src/math';
@@ -32,7 +33,7 @@ struct Varyings { @builtin(position) clip:vec4f, @location(0) normal:vec3f,
 
 /** Native GPU storage/draw diagnostic. Selection is still the CPU reference;
  * this intentionally does not claim Renderer, GI or material integration. */
-export async function runGeometryPagePoolFixture() {
+export async function runGeometryPagePoolFixture(gpuSelection = false) {
   const scene = await GeometryDemoScene.create(), hierarchy = scene.hierarchy;
   const encoded = await encodeGeometryPages(hierarchy, { maxPageBytes: 49152 });
   const directory = await buildGeometryStreamDirectory(hierarchy, encoded);
@@ -42,12 +43,14 @@ export async function runGeometryPagePoolFixture() {
   const errors: string[] = [];
   device.addEventListener('uncapturederror', event => errors.push(event.error.message));
   let owned = 0, peak = 0, pool: GpuGeometryPagePool | undefined;
+  let selection: GpuGeometryStreamSelection | undefined, selectionOwned = 0, selectionFrame = 0;
   let cache: GeometryPageCache | undefined;
   const buffers: GPUBuffer[] = [], textures: GPUTexture[] = [];
   const panel = document.createElement('section');
   panel.id = 'geometry-page-pool-visual';
   panel.style.cssText = 'position:fixed;inset:0;z-index:10000;background:#11171d;color:#eaf1f6;padding:36px;font:16px system-ui;overflow:auto';
-  panel.innerHTML = '<h1 style="font-size:28px;margin:0 0 10px">GPU 物理页池 · 分簇绘制验证</h1><p>同一资产的压缩页实际上传到有限 GPU 槽位；CPU 参考选簇。尚未接入主渲染器的材质、阴影和 GI。</p>';
+  panel.innerHTML = '<h1 style="font-size:28px;margin:0 0 10px">GPU 物理页池 · 分簇绘制验证</h1><p>同一资产的压缩页实际上传到有限 GPU 槽位；CPU 参考选簇。本图独立验证页池，主渲染器兼容性另有用例。</p>';
+  if (gpuSelection) panel.innerHTML = '<h1 style="font-size:28px;margin:0 0 10px">GPU 驻留判断 · 整组回退 · 间接绘制</h1><p>GPU 按实际页驻留选择层级、生成缺页请求并压紧索引；CPU 完整切分独立核对；主渲染器兼容性另有用例。</p>';
   const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:20px'; panel.appendChild(row); document.body.appendChild(panel);
   const allocate = (label: string, size: number, usage: GPUBufferUsageFlags, data?: ArrayBuffer): GPUBuffer => {
     const buffer = device.createBuffer({ label, size, usage, mappedAtCreation: !!data }); buffers.push(buffer);
@@ -121,6 +124,13 @@ export async function runGeometryPagePoolFixture() {
     const referenceIndexData = Uint32Array.from(referenceIndices);
     const referenceIndexBuffer = allocate('independent full hierarchy reference indices', referenceIndexData.byteLength, GPUBufferUsage.INDEX, referenceIndexData.buffer);
     const vpData = multiply(perspective(Math.PI / 3.2, 1, 0.1, 30), lookAt(eye, [0, 0, 0], [0, 1, 0]));
+    if (gpuSelection) {
+      const instanceData = new Float32Array(56);
+      for (const base of [0, 16, 32]) for (let axis = 0; axis < 4; axis++) instanceData[base + axis * 5] = 1;
+      const instances = allocate('GPU selection instance', instanceData.byteLength, GPUBufferUsage.STORAGE, instanceData.buffer);
+      selection = await GpuGeometryStreamSelection.create(device, pool, instances, 1, bytes => { selectionOwned += bytes; });
+      selection.setSettings({ maxErrorPixels: 0, frustumCulling: false });
+    }
     const vp = allocate('pool test camera', 64, GPUBufferUsage.UNIFORM, new Float32Array(vpData).buffer);
     const module = device.createShaderModule({ code: shader });
     const messages = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
@@ -136,11 +146,15 @@ export async function runGeometryPagePoolFixture() {
     textures.push(output, depth);
     const encodeDraw = (ids: number[], reference: boolean) => {
       const encoder = device.createCommandEncoder();
+      if (selection && !reference) {
+        selection.update(++selectionFrame, 1, vpData, eye, view.projectionScale); selection.encode(encoder);
+      }
       const pass = encoder.beginRenderPass({ colorAttachments: [{ view: output.createView(), clearValue: [0.025, 0.035, 0.045, 1], loadOp: 'clear', storeOp: 'store' }],
         depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
       pass.setPipeline(pipeline); pass.setBindGroup(0, reference ? referenceGroup : pagedGroup);
-      pass.setIndexBuffer(reference ? referenceIndexBuffer : currentPool.indices, 'uint32');
-      for (const id of ids) {
+      pass.setIndexBuffer(reference ? referenceIndexBuffer : selection?.indices ?? currentPool.indices, 'uint32');
+      if (selection && !reference) pass.drawIndexedIndirect(selection.arguments, 0);
+      else for (const id of ids) {
         if (reference) { const loc = referenceDraws[id]; pass.drawIndexed(loc.indexCount, 1, loc.firstIndex); }
         else { const loc = currentPool.clusterLocation(id); if (!loc) throw new Error('GPU_DRAW_PAGE_MISSING'); pass.drawIndexed(loc.indexCount, 1, loc.firstIndex, loc.baseVertex); }
       }
@@ -155,9 +169,15 @@ export async function runGeometryPagePoolFixture() {
     };
     const capture = async (label: string) => {
       const plan = planner.plan(currentPool.residentPageIds(), view);
-      const token = currentPool.acquireFrame(plan.selectedPages);
+      const token = currentPool.acquireFrame(selection ? [...currentPool.residentPageIds()] : plan.selectedPages);
       const completion = await currentPool.submitFrame(token, [encodeDraw(plan.selectedClusters, false)]);
       if (completion.error) throw new Error(completion.error);
+      const gpuPlan = selection ? await selection.feedback(true) : undefined;
+      if (gpuPlan) {
+        if (gpuPlan.overflow || gpuPlan.indices !== triangles(plan.selectedClusters) * 3
+          || JSON.stringify(gpuPlan.selectedClusters?.map(cluster => cluster.clusterId)) !== JSON.stringify(plan.selectedClusters)
+          || JSON.stringify(gpuPlan.requestedPages) !== JSON.stringify(plan.requestedPages)) throw new Error('GPU_STREAM_SELECTION_REFERENCE_MISMATCH');
+      }
       const actual = await pixels();
       device.queue.submit([encodeDraw(plan.selectedClusters, true)]); const expected = await pixels();
       let maxError = 0, differentBytes = 0, foregroundPixels = 0;
@@ -170,7 +190,7 @@ export async function runGeometryPagePoolFixture() {
       const note = document.createElement('p'); note.textContent = `${triangles(plan.selectedClusters)} 三角形 · ${plan.selectedClusters.length} 簇 · ${currentPool.residentPageIds().size}/${directory.pages.length} 页驻留`;
       section.append(title, canvas, note); row.appendChild(section);
       return { triangles: triangles(plan.selectedClusters), clusters: plan.selectedClusters.length,
-        maxError, differentBytes, foregroundPixels, selectedPages: plan.selectedPages, fallbackGroups: plan.fallbackGroups };
+        maxError, differentBytes, foregroundPixels, selectedPages: plan.selectedPages, fallbackGroups: plan.fallbackGroups, gpuPlan };
     };
     const coarse = await capture('根页：完整粗层级');
     for (const id of best) cache.request(id); await cache.idle();
@@ -203,13 +223,13 @@ export async function runGeometryPagePoolFixture() {
     const publishedIds = flags.flatMap((flag, id) => flag ? [id] : []);
     const residentIds = [...pool.residentPageIds()].sort((a, b) => a - b);
     const footer = document.createElement('p'); footer.textContent = `GPU 页池 ${slotCount} 个槽位 / ${directory.pages.length} 个资产页；每帧上传上限 8 KiB。三幅 GPU 图像均与同一选簇的完整驻留参考逐像素比对。`; panel.appendChild(footer);
-    pool.dispose(); await cache.dispose(); await device.queue.onSubmittedWorkDone();
+    selection?.dispose(); pool.dispose(); await cache.dispose(); await device.queue.onSubmittedWorkDone();
     return { adapter: { vendor: adapter.info.vendor, architecture: adapter.info.architecture, isFallbackAdapter: adapter.info.isFallbackAdapter },
       sourceTriangles: hierarchy.sourceTriangleCount, pages: directory.pages.length, roots: directory.rootPages.length, slotCount, budget,
       peak, ownedAfterDispose: owned, firstUpload, unpublished, unpublishedFlags, maxUploadBytes, maxUploadWrites,
       coarse, detailed, recovered, best, incoming, beforeEviction, heldBlocked, submittedBlocked, evicted, reused,
-      pageByteMismatches, publishedIds, residentIds, cleanup: pool.diagnostics(), errors };
+      pageByteMismatches, publishedIds, residentIds, cleanup: pool.diagnostics(), selectionOwned, selection: selection?.diagnostics(), errors };
   } finally {
-    pool?.dispose(); await cache?.dispose(); for (const buffer of buffers) buffer.destroy(); for (const texture of textures) texture.destroy(); device.destroy();
+    selection?.dispose(); pool?.dispose(); await cache?.dispose(); for (const buffer of buffers) buffer.destroy(); for (const texture of textures) texture.destroy(); device.destroy();
   }
 }

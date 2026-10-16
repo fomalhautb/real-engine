@@ -4,6 +4,8 @@ import { mkdtemp, mkdir, readFile, readdir, rm, truncate, writeFile } from 'node
 import { basename, dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { decodeGeometryPage } from '../src/geometry-pages';
+import { validateGeometryStreamDirectory } from '../src/geometry-stream-directory';
+import type { GeometryStreamDirectory } from '../src/geometry-stream-types';
 
 const script = resolve('scripts/build-geometry.mjs');
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
@@ -93,10 +95,29 @@ describe('offline geometry CLI', () => {
         expect(hierarchy.source.indices).toBeUndefined();
         expect(hierarchy.clusters).toHaveLength(primitive.clusterCount);
         expect(hierarchy.groups).toHaveLength(primitive.groupCount);
+        const directoryBytes = await readFile(join(first, primitive.streamDirectoryFile));
+        expect(primitive.streamDirectoryFile).toBe(`primitive-${primitive.index}/stream-directory.json`);
+        expect(directoryBytes.byteLength).toBe(primitive.streamDirectoryBytes);
+        expect(sha256(directoryBytes)).toBe(primitive.streamDirectorySha256);
+        expect(directoryBytes.at(-1)).toBe(10); // The manifest hashes the written newline too.
+        const directory = JSON.parse(directoryBytes.toString('utf8')) as GeometryStreamDirectory;
+        expect(() => validateGeometryStreamDirectory(directory)).not.toThrow();
+        expect(directory.primitiveKey).toBe(primitive.primitiveKey);
+        expect(directory.sourceVertexCount).toBe(primitive.vertexCount);
+        expect(directory.sourceTriangleCount).toBe(primitive.triangleCount);
+        expect(directory.clusters).toHaveLength(primitive.clusterCount);
+        expect(directory.groups).toHaveLength(primitive.groupCount);
+        expect(directory.pages).toHaveLength(primitive.pages.length);
+        expect(directory.clusterPages).toEqual(primitive.clusterPages);
+        expect(directory.rootPages).toEqual(primitive.rootPages);
+        expect((directory as unknown as Record<string, unknown>).source).toBeUndefined();
+        expect(directory.clusters.every(cluster => !('vertices' in cluster) && !('triangles' in cluster))).toBe(true);
         for (const page of primitive.pages) {
           const bytes = await readFile(join(first, page.file));
           expect(bytes.byteLength).toBe(page.compressedBytes);
           expect(sha256(bytes)).toBe(page.sha256);
+          expect(directory.pages[page.id]).toMatchObject({ id: page.id, clusterIds: page.clusterIds,
+            encodedBytes: bytes.byteLength, decodedBytes: page.decodedBytes, sha256: sha256(bytes) });
           const decoded = await decodeGeometryPage(bytes);
           expect(decoded.vertexStride).toBe(primitive.vertexStride);
           expect(decoded.clusters.map(cluster => cluster.id)).toEqual(page.clusterIds);

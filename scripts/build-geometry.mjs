@@ -113,11 +113,12 @@ async function buildInto(input, temporary, sourceBytes) {
 
   const server = await createServer({ root: REPOSITORY_ROOT, configFile: false,
     server: { middlewareMode: true }, appType: 'custom' });
-  let parseObj, buildGeometryHierarchy, encodeGeometryPages;
+  let parseObj, buildGeometryHierarchy, encodeGeometryPages, buildGeometryStreamDirectory;
   try {
     ({ parseObj } = await server.ssrLoadModule('/src/mesh-import.ts'));
     ({ buildGeometryHierarchy } = await server.ssrLoadModule('/src/geometry-hierarchy.ts'));
     ({ encodeGeometryPages } = await server.ssrLoadModule('/src/geometry-pages.ts'));
+    ({ buildGeometryStreamDirectory } = await server.ssrLoadModule('/src/geometry-stream-directory.ts'));
   } finally {
     await server.close();
   }
@@ -131,10 +132,14 @@ async function buildInto(input, temporary, sourceBytes) {
       primitiveKey: key, mesh: primitive.mesh, coverage: 'opaque',
     });
     const encoded = await encodeGeometryPages(hierarchy, PAGE_OPTIONS);
+    const streamDirectory = await buildGeometryStreamDirectory(hierarchy, encoded);
     const directory = `primitive-${index}`;
     await mkdir(join(temporary, directory));
     const hierarchyFile = `${directory}/hierarchy.json`;
     await writeFile(join(temporary, directory, 'hierarchy.json'), `${JSON.stringify(metadata(hierarchy), null, 2)}\n`);
+    const streamDirectoryFile = `${directory}/stream-directory.json`;
+    const streamDirectoryData = Buffer.from(`${JSON.stringify(streamDirectory)}\n`, 'utf8');
+    await writeFile(join(temporary, directory, 'stream-directory.json'), streamDirectoryData);
     const pages = [];
     for (const page of encoded.pages) {
       const file = `${directory}/page-${page.id}.bin`;
@@ -144,7 +149,8 @@ async function buildInto(input, temporary, sourceBytes) {
         sha256: sha256(page.bytes) });
     }
     primitives.push({ index, name: primitive.name, materialName: primitive.materialName ?? null,
-      sourceSha256: sourceHash, primitiveKey: key, hierarchyFile,
+      sourceSha256: sourceHash, primitiveKey: key, hierarchyFile, streamDirectoryFile,
+      streamDirectorySha256: sha256(streamDirectoryData), streamDirectoryBytes: streamDirectoryData.byteLength,
       buildOptions: hierarchy.options,
       vertexCount: primitive.mesh.vertexCount, triangleCount: primitive.mesh.indices.length / 3,
       clusterCount: hierarchy.clusters.length, groupCount: hierarchy.groups.length,

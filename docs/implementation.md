@@ -1,6 +1,6 @@
 # 阶段 1–2 实现状态
 
-更新日期：2026-10-15。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询及可选跨帧反馈的漫反射 GI 基础；基础法线贴图之后，本轮补全缺失 glTF 切线的资产准备路径。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何或 Lumen 类光照。
+更新日期：2026-10-16。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询及可选跨帧反馈的漫反射 GI 基础；本轮加入压缩几何页的 CPU 加载缓存、紧凑运行时目录与整组祖先回退参考选择器，尚未接入 GPU 物理页池。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何或 Lumen 类光照。
 
 ## 已实现的运行路径
 
@@ -48,9 +48,23 @@ GI 房间显式采用 2048 平方、16 MiB 阴影图，世界范围 `[-3.5,-0.25
 
 Windows 下目录发布偶发 `EPERM`：工具保留向同一父目录的私有副本发布，再仅对最后一次原子目录重命名作最多八次、总计 6.35 秒的有界重试；每次重查目标不存在，失败清理自身暂存目录。此前一次完整 `npm run check` 通过，但间歇文件锁是否彻底消除仍需后续重复运行验证；不会覆盖既有输出。
 
-CPU 回归以带属性接缝的曲面网格核对 LOD0 完整性、真实减面、组边界、DAG 单调误差/边界、多个误差阈值下的无孔洞/重复覆盖，以及页面往返、损坏输入、预算与构建可重复性。此证据只覆盖小型正确性用例，未进行本机 GPU 或大型资产压测。运行时选簇接入见下节；压缩页面尚未接入流送/祖先回退，不能把离线产物视作完整虚拟几何。
+CPU 回归以带属性接缝的曲面网格核对 LOD0 完整性、真实减面、组边界、DAG 单调误差/边界、多个误差阈值下的无孔洞/重复覆盖，以及页面往返、损坏输入、预算与构建可重复性。此证据只覆盖小型正确性用例，未进行大型资产压测。CPU 流送基础与驻留 GPU 选簇分别见下节；压缩页面尚未接入实际 GPU 流送/祖先回退绘制，不能把离线产物视作完整虚拟几何。
 
-法线贴图加入前的本地 `npm run check` 通过：250 项 CPU 单元测试（32 个文件）、TypeScript 和生产构建；基础法线贴图快照为 262 项 CPU 单元测试（34 个文件）。本轮切线资产准备版本通过 280 项 CPU 单元测试（36 个文件）、TypeScript 和生产构建，证据见下文；浏览器功能与硬件计时按各自运行范围记录。
+法线贴图加入前的本地 `npm run check` 通过：250 项 CPU 单元测试（32 个文件）、TypeScript 和生产构建；基础法线贴图快照为 262 项 CPU 单元测试（34 个文件）。此前切线资产准备版本通过 280 项 CPU 单元测试（36 个文件）；本轮 CPU 流送基础通过 304 项 CPU 单元测试（39 个文件）、TypeScript 和生产构建，证据见下文；浏览器功能与硬件计时按各自运行范围记录。
+
+## 几何流送的数据与 CPU 调度基础
+
+`geometry-stream-types.ts` 定义不依赖完整源顶点/索引数组的运行时目录。`buildGeometryStreamDirectory` 先审计现有层级，再输出簇/组边界、DAG 关系、页归属、全部根页、长度与 SHA-256；每个 primitive 的构建产物新增 `stream-directory.json`，manifest 保存该文件的精确 UTF-8 字节数和哈希。原 `hierarchy.json` 继续用于离线审计。目录输入被验证并复制为深冻结快照；最多 65,536 个簇、组和页、32 个层级，引用数量在复制前受限。构建时先检查全部页预算，再逐页复制和求哈希，避免并发保留全部摘要输入。
+
+`GeometryPageCache` 是独立的 CPU 网络/解码缓存：创建完成前加载并固定**整个根页**，同页请求合并、优先级队列、有界并发和工作字节预留、SHA-256 与页/簇身份校验、未固定页的 LRU 淘汰及显式失败重试。固定根页和保留页不会被淘汰；容量被固定页占满时保留排队请求，`idle()` 只等待可运行工作，不能被解释为所有排队页均已加载。取消和释放等待在途请求结束，拒绝晚到结果。`get()` 返回的解码数据按不可变资产使用；消费者自行长期保留的引用不属于缓存账本。
+
+默认 decoded 页预算为 16 MiB（硬上限 256 MiB），默认在途工作预算为 16 MiB（硬上限 64 MiB），每项按 `2 × encodedBytes + 2 × decodedBytes` 预留，默认同时 2 项（最多 16）、排队最多 4096 项（上限 65,536）。这些是应用管理的数据预算，不是浏览器/JS/WASM 进程内存或垃圾回收峰值的保证。根页总量或单页无法满足配置时，在请求 provider 前报错。HTTP provider 使用无凭据请求和 AbortSignal；严格限制 Fetch 返回的资产字节数，直接写入单个有界缓冲，并限制读取次数，不隐式重试。HTTP 压缩的 Content-Length 与解压后的资产长度分开处理，CORS 隐藏 Content-Encoding 时仍按实际正文长度与哈希验收；这些限额不是 HTTP 网络流量或浏览器内部解压内存账本。自定义流的取消 promise 不会阻塞错误/中止传播。页解码沿用现有独立压缩格式与损坏校验。
+
+`GeometryStreamCut` 是有界 CPU 参考选择器：从所有根簇开始，按组层级递减，只在整组父簇当前有效、投影误差需要细化且全部子页可用时，原子替换整组。缺任一子页就保留完整父组并合并请求，避免 DAG 重新分组时逐簇过滤造成孔洞；支持混合层级根簇及仿射实例变换。它的输入在未来渲染消费端必须代表**已经上传的 GPU 驻留页**；CPU 下载/解码完成不能冒充 GPU 可用。本轮测试中的 CPU 可用集合只用于选择器参考验算。
+
+这些模块尚未接入 `Renderer` 的物理 GPU 页池、上传预算、提交后页生命周期或 GPU 选择/绘制；当前 `GpuGeometryLod` 仍全部驻留，阴影和世界查询仍持有完整源几何。因此本轮不算完整运行时几何流送或“独特几何超出 GPU 驻留池”的验收，后续必须接通实际上传、祖先回退绘制、淘汰与大场景游走。现有材质、形变、物理和 GI 合约保持原有边界。
+
+2026-10-16 的完整本地验证：`npm run check` 通过 304 项 CPU 测试（39 文件）、TypeScript 和生产构建；Edge 实际非 fallback `nvidia / ampere` 的浏览器回归 57 项全部通过。证据为 `artifacts/geometry-stream-check-release-20261016.log` 和 `artifacts/geometry-stream-browser-release-native-20261016.log`。新增浏览器用例通过真实 localhost HTTP 服务加载 29 个压缩页、64 个簇，验证 gzip/CORS、先加载固定根页、SHA 损坏拒绝、整组回退与显式重试，重试后恢复全部 288 个 LOD0 三角形且 CPU 缓存释放归零；它不执行流送 GPU 绘制。该小网格有 28 个根页，根页准备后的选择已有 280 个三角形，仅用于流程正确性，不能证明根集效率或超驻留池场景。CPU 回归另验预算、LRU、取消/重入释放、稀疏元数据拒绝、混合层级根簇和几何边界覆盖；CLI 两次独立构建逐字节一致。开发服务器预打包实际使用的 meshoptimizer 子路径，避免首次按需加载触发页面刷新。本轮没有新增视觉效果或性能基准；远程 CI 按新提交单独验证。
 
 ## 驻留 GPU LOD 与可视化
 
@@ -178,15 +192,15 @@ Rapier 以独立适配器提供盒子刚体和地面碰撞、最近命中射线�
 
 Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分包和 WASM 单独加载是后续加载性能任务，不能通过提高构建警告阈值当作解决。
 
-此前镜头重投影与显式锚点诊断已通过本地 TypeScript、250 项 CPU 测试（32 文件）、生产构建及 50 项原生 NVIDIA 浏览器回归，完整输出在 `artifacts/gather-reprojection-browser-native-20261014`；这是法线贴图加入之前的快照，不是阶段 1–2 完整出口。密集接触区画质捕获及运动质量用例只在 `PLAYWRIGHT_GPU=hardware` 运行；软件 GPU CI 保留天空、发光材质、遮挡和有界历史功能测试。此前固定镜头 Final Gather 的 47 项回归在 `artifacts/final-gather-browser-native-20261014`，world-query 参数槽位和面积查询的 44 项回归在 `artifacts/query-slots-browser-native-final-20261014`。[Linux 软件 GPU CI run 38573629581](https://github.com/fomalhautb/real-engine/actions/runs/38573629581) 覆盖前一固定镜头 Final Gather 提交并已成功；后续提交 `e808c6f7` 的 [远程 CI run 38581979007](https://github.com/fomalhautb/real-engine/actions/runs/38581979007) 也已完成并成功。这两次均不覆盖基础法线贴图代码；提交 `81885d84` 的 [CI run 38687241400](https://github.com/fomalhautb/real-engine/actions/runs/38687241400) 当前仍运行浏览器步骤，不能计为通过，且不覆盖本轮切线准备改动。CI 浏览器作业超时上限从 15 分钟调至 25 分钟，因为此前耗时 13 分 33 秒且新增用例；该设置不是开发或团队工时估算。
+此前镜头重投影与显式锚点诊断已通过本地 TypeScript、250 项 CPU 测试（32 文件）、生产构建及 50 项原生 NVIDIA 浏览器回归，完整输出在 `artifacts/gather-reprojection-browser-native-20261014`；这是法线贴图加入之前的快照，不是阶段 1–2 完整出口。密集接触区画质捕获及运动质量用例只在 `PLAYWRIGHT_GPU=hardware` 运行；软件 GPU CI 保留天空、发光材质、遮挡和有界历史功能测试。此前固定镜头 Final Gather 的 47 项回归在 `artifacts/final-gather-browser-native-20261014`，world-query 参数槽位和面积查询的 44 项回归在 `artifacts/query-slots-browser-native-final-20261014`。[Linux 软件 GPU CI run 38573629581](https://github.com/fomalhautb/real-engine/actions/runs/38573629581) 覆盖前一固定镜头 Final Gather 提交并已成功；后续提交 `e808c6f7` 的 [远程 CI run 38581979007](https://github.com/fomalhautb/real-engine/actions/runs/38581979007) 也已完成并成功。这两次均不覆盖基础法线贴图代码；提交 `81885d84` 的 [CI run 38687241400](https://github.com/fomalhautb/real-engine/actions/runs/38687241400) 现已成功；切线准备提交 `20e3508c` 的 [CI run 38689221792](https://github.com/fomalhautb/real-engine/actions/runs/38689221792) 也已完成并成功。这些运行不覆盖本轮几何流送基础。CI 浏览器作业超时上限从 15 分钟调至 25 分钟，因为此前耗时 13 分 33 秒且新增用例；该设置不是开发或团队工时估算。
 
 此前 release 法线贴图回归：`npm run check` 通过 262 项 CPU 测试（34 文件）、TypeScript 与生产构建；原生 NVIDIA `npm run test:browser` 全部 55 项通过，约 2.3 分钟，GPU validation 错误为空，资源释放后应用账本为零。日志为 `artifacts/normal-map-check-release-20261015.log` 和 `artifacts/normal-map-browser-release-native-20261015.log`；原生像素截图为 `artifacts/normal-map-browser-release-native-20261015/material-normal-authored-n-e8268-eserve-geometric-visibility/normal-map-neutral.png` 与同目录的 `normal-map-tilted.png`。这些是功能与有限场景数值证据，不代表大型资产或性能验收。
 
-本轮切线资产准备的 `npm run check` 通过 280 项 CPU 测试（36 文件）、TypeScript 与生产构建；Edge 实际非 fallback `nvidia / ampere` 的完整浏览器回归全部 56 项通过，约 2.3 分钟。日志为 `artifacts/mikk-tangents-check-20261015.log` 和 `artifacts/mikk-tangents-browser-native-20261015.log`。CPU 独立平面与角度加权参考验证 `Compatible`，覆盖平滑索引保留、镜像 UV 接缝逐字节复制、仅 Morph 引入的接缝、目标切线增量、固定 handedness 拒绝、均匀极小/极大尺度、预算与高价数邻接拒绝；另有按需异步加载、取消、未初始化调用、初始化失败、并发准备和底层异常后拒绝复用回归。生产构建将切线 WASM 包装代码分为按需加载块；不改变先前 Rapier 大块仍需优化的边界。
+此前切线资产准备的 `npm run check` 通过 280 项 CPU 测试（36 文件）、TypeScript 与生产构建；Edge 实际非 fallback `nvidia / ampere` 的完整浏览器回归全部 56 项通过，约 2.3 分钟。日志为 `artifacts/mikk-tangents-check-20261015.log` 和 `artifacts/mikk-tangents-browser-native-20261015.log`。CPU 独立平面与角度加权参考验证 `Compatible`，覆盖平滑索引保留、镜像 UV 接缝逐字节复制、仅 Morph 引入的接缝、目标切线增量、固定 handedness 拒绝、均匀极小/极大尺度、预算与高价数邻接拒绝；另有按需异步加载、取消、未初始化调用、初始化失败、并发准备和底层异常后拒绝复用回归。生产构建将切线 WASM 包装代码分为按需加载块；不改变先前 Rapier 大块仍需优化的边界。
 
-新增原生 GPU 用例从缺失 `TANGENT` 的实际 glTF 数据导入：镜像 UV 的四个源顶点拆为六个，蒙皮权重与 Morph 各流跟随映射；目标切线进入 Morph → 仿射蒙皮，再供光栅和世界查询使用。独立解析法线与 PBR 对照、法线 scale 热更新、全实例形变诊断通过，位置/法线/切线最大误差各小于 `3e-4`、边界越界为零，GPU validation 错误为空且释放后账本归零。对照 PNG 在 `artifacts/mikk-tangents-browser-native-20261015/gltf-tangents-glTF-generat-ea424-skin-raster-and-world-query/gltf-tangents-neutral.png` 和同目录 `gltf-tangents-mapped.png`；斜对角亮度差来自刻意设置的两侧 UV 方向，不是几何裂缝。该用例没有证明复杂烘焙资产、负行列式 glTF 实例、任意 Morph 组合或大型场景性能；本轮未重新运行性能基准，后续三轮数字仍属于各自历史源码快照。新提交远程 CI 尚待验证。
+新增原生 GPU 用例从缺失 `TANGENT` 的实际 glTF 数据导入：镜像 UV 的四个源顶点拆为六个，蒙皮权重与 Morph 各流跟随映射；目标切线进入 Morph → 仿射蒙皮，再供光栅和世界查询使用。独立解析法线与 PBR 对照、法线 scale 热更新、全实例形变诊断通过，位置/法线/切线最大误差各小于 `3e-4`、边界越界为零，GPU validation 错误为空且释放后账本归零。对照 PNG 在 `artifacts/mikk-tangents-browser-native-20261015/gltf-tangents-glTF-generat-ea424-skin-raster-and-world-query/gltf-tangents-neutral.png` 和同目录 `gltf-tangents-mapped.png`；斜对角亮度差来自刻意设置的两侧 UV 方向，不是几何裂缝。该用例没有证明复杂烘焙资产、负行列式 glTF 实例、任意 Morph 组合或大型场景性能；本轮未重新运行性能基准，后续三轮数字仍属于各自历史源码快照。该切线提交的远程 CI 已成功，见上文；几何流送基础的 CI 需按新提交单独验证。
 
-本轮新增 GPU 用例覆盖真实像素相机 FOV、光栅与世界查询法线及解析 PBR 对照；背面、镜像、核心 Morph＋仿射蒙皮＋wave 和已变形三角形 UV 回退；`normalScale` 热更新不增 pipeline 数，深度与阴影覆盖不变；本轮法线 fixture 的 `verifyDeformation({ allInstances: true })` 各实例位置、法线、切线误差均小于 `3e-4`，包围盒越界为零；边长 `1e-14` 的微小三角形仍给出有限单位法线。几何背侧太阳不产生直接光、世界 GI 或 Final Gather 注入。60° 着色/几何法线夹角的均匀天空测试在四个原始锚点各积累 128 次、每次 8 条射线；四个原始点相对 `E = π × L × 0.75`、五个 HDR 点相对 `.96 × baseColor × L × 0.75` 的误差各小于 5%。实际 Opaque 平面 LOD 从 512 个源三角形选出 102 个三角形、5 个簇；法线参数切换不改变选簇，世界查询仍读取完整源几何，HDR PBR 数值与参考吻合。新增不可变资产检查在替换 `mesh.tangents` 引用时报 `WORLD_QUERY_TOPOLOGY_CHANGED`，恢复原引用后查询正常，无 GPU 错误且释放归零。这个联合回归只覆盖有限平面，不推广到任意复杂法线贴图资产。当前世界 SH 未精确截几何半球和 glTF 负行列式实例拒绝仍是已知边界；该法线贴图快照中的切线生成缺口由上文本轮导入路径补齐。
+此前法线贴图 GPU 用例覆盖真实像素相机 FOV、光栅与世界查询法线及解析 PBR 对照；背面、镜像、核心 Morph＋仿射蒙皮＋wave 和已变形三角形 UV 回退；`normalScale` 热更新不增 pipeline 数，深度与阴影覆盖不变；此前法线 fixture 的 `verifyDeformation({ allInstances: true })` 各实例位置、法线、切线误差均小于 `3e-4`，包围盒越界为零；边长 `1e-14` 的微小三角形仍给出有限单位法线。几何背侧太阳不产生直接光、世界 GI 或 Final Gather 注入。60° 着色/几何法线夹角的均匀天空测试在四个原始锚点各积累 128 次、每次 8 条射线；四个原始点相对 `E = π × L × 0.75`、五个 HDR 点相对 `.96 × baseColor × L × 0.75` 的误差各小于 5%。实际 Opaque 平面 LOD 从 512 个源三角形选出 102 个三角形、5 个簇；法线参数切换不改变选簇，世界查询仍读取完整源几何，HDR PBR 数值与参考吻合。新增不可变资产检查在替换 `mesh.tangents` 引用时报 `WORLD_QUERY_TOPOLOGY_CHANGED`，恢复原引用后查询正常，无 GPU 错误且释放归零。这个联合回归只覆盖有限平面，不推广到任意复杂法线贴图资产。当前世界 SH 未精确截几何半球和 glTF 负行列式实例拒绝仍是已知边界；该法线贴图快照中的切线生成缺口由上文切线导入路径补齐。
 
 最终组合为 216×128 方向采样、每探针 32 个发光面样本、2048 聚焦阴影和 FXAA。在 Edge 155、实际非 fallback `nvidia / ampere`、固定 1920×1080 和相位 0 镜头下测量三次，各预热 300 帧、测量 1800 帧。已接入 GPU pass 总和 p95 为 2.818/3.346/3.408 ms，GI 为 1.835/2.107/2.425 ms，resolve 均为 0.197 ms；每次 60 个稀疏 GPU 样本。rAF p95 均为 7.0 ms，CPU 提交 p95 均为 0.4 ms，应用 GPU 账本恒为 66,706,868 字节，释放为零且无错误。比加入发光面采样前增加 1,327,208 字节，等于本例面积元数据、索引、身份和参数；这不是驱动显存统计。证据为 `artifacts/benchmarks/local-floor-area-final-20261014`，源码指纹 `b8a594f65d56482d65d5e82d6e658759d58c98333f62f2f6be1f528110ce65c3`、构建/副本指纹 `09610f83b5262bd0f4402442426a26a338e1419d8339ad9f671ad15fbfe47580`。这是小房间短测，不含浏览器呈现、大型内容或后续反射/参与介质；不同运行的 pass 分位数不能直接相减归因。此前没有面积采样、早期 FXAA 的三次 3.277/2.949/3.149 ms 仅为历史证据（`local-shadow-aa-gi-quality-20261014`），不替代当前结果。
 

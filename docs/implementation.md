@@ -46,6 +46,8 @@ Sponza 的真实 BIN 已从官方 ZIP 精确范围 `5351–98707636` 读取，�
 
 提交 `c0a6316` 的[远程 CI run 39300084353](https://github.com/fomalhautb/real-engine/actions/runs/39300084353) 已取消，不能计为通过。CPU 检查成功，99 项浏览器用例以单 worker 执行，在正常推进到法线材质用例时达到作业 25 分钟上限；日志末尾为操作取消，没有完整浏览器结论。后续需调整远程执行组织并完成全部用例，不能用局部日志替代整套结果。
 
+远程工作流现将 CPU 检查保留为 `foundation` 作业，其成功后由四个独立 runner 执行 Playwright 原生分片。各 runner 保持一个 worker、原有单项超时与断言，关闭 matrix fail-fast，分别保留测试产物。`--list` 检查四片为 25 / 31 / 19 / 24 项，并集恰为 99 项，没有重复、遗漏或额外用例；证据 `artifacts/ci-browser-shards-20261020.txt`。这是执行组织的验证，远程实际结果仍需按对应提交确认。
+
 只读 `audit:gltf` 同步检查 `COLOR_0` 元数据格式与 POSITION 数量，明确记录 `valuesRead: false` / `valuesValidated: false`。对已保存的固定 Sponza glTF 重审，59 个 primitive 的颜色声明布局可支持；BIN 数值尚未读取，透明 decal、资产预算和完整导入障碍仍需解决，尚无 Sponza 实际画面或驻留规模成绩。
 
 ## 有界多段 Final Gather 与接触区验收

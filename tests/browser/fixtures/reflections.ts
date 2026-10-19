@@ -113,9 +113,11 @@ export async function runReflectionsCombinedFixture() {
     material: { definition: { ...DEFAULT_MATERIAL_DEFINITION,
       baseColor: m.constant([1, 1, 1, 1]) } } };
   const mesh = quad(), positions = new Float32Array(mesh.vertexCount * 3);
+  mesh.colors = new Float32Array(mesh.vertexCount * 4);
   for (let vertex = 0; vertex < mesh.vertexCount; vertex++) {
     positions[vertex * 3] = 3;
     new DataView(mesh.vertices).setUint32(vertex * 80 + 32, 0, true);
+    mesh.colors.set([1, 0.5, 0.25, 1], vertex * 4);
   }
   const emitterModel = multiply(translation(0, 0, 5), scaling(20, 20, 1));
   const emitter = (morph: number, bone: Float32Array, phase: number): InstanceState => ({
@@ -131,7 +133,7 @@ export async function runReflectionsCombinedFixture() {
     ] },
     morphTargets: [{ positions, normals: new Float32Array(mesh.vertexCount * 3) }],
     material: { definition: { ...DEFAULT_MATERIAL_DEFINITION, shading: 'unlit', doubleSided: true,
-      alphaMode: 'mask', alphaCutoff: 0.5, baseColor: m.parameter(0) },
+      alphaMode: 'mask', alphaCutoff: 0.5, baseColor: m.multiply(m.parameter(0), m.vertexColor) },
       parameters: new Float32Array([...EMITTER_COLOR, 0]) } };
   let renderer: Renderer | undefined;
   try {
@@ -182,7 +184,7 @@ export async function runReflectionsCombinedFixture() {
     samples.push(await capture('opaque-again'));
     const errors = [...active.errors];
     active.dispose();
-    return { adapter: active.info.adapterInfo, eye: EYE, emitterColor: EMITTER_COLOR, samples, errors,
+    return { adapter: active.info.adapterInfo, eye: EYE, emitterColor: [2, 0.5, 0.125] as const, samples, errors,
       ownedBytesAfterDispose: active.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }
 }

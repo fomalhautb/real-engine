@@ -249,7 +249,9 @@ export class GeometryPageCache {
       workSignal.throwIfAborted();
     } finally { lease?.release(); }
     signal.throwIfAborted();
-    if (decoded.vertexStride !== this.directory.vertexStride || decoded.sourceVertexCount !== this.directory.sourceVertexCount
+    if (decoded.vertexStride !== this.directory.vertexStride
+      || (decoded.hasColors === true) !== (this.directory.hasColors === true)
+      || decoded.sourceVertexCount !== this.directory.sourceVertexCount
       || decoded.hierarchyClusterCount !== this.directory.clusters.length || decoded.clusters.length !== page.clusterIds.length) {
       throw new Error('GEOMETRY_STREAM_PAGE_IDENTITY: ' + page.id);
     }

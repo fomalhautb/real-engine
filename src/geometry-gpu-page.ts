@@ -2,8 +2,8 @@ import type { DecodedGeometryPage } from './geometry-pages';
 import type { GeometryStreamDirectory } from './geometry-stream-types';
 
 /** Physical upload record: rest[0..79], UV[80..87], flags[88], padding[92],
- * tangent[96..111], and source/cluster/level/color identity[112..127]. */
-export const GEOMETRY_GPU_VERTEX_BYTES = 128;
+ * tangent[96..111], source/cluster/level/debug identity[112..127], linear RGBA[128..143]. */
+export const GEOMETRY_GPU_VERTEX_BYTES = 144;
 
 export interface PackedGeometryGpuPage {
   vertices: ArrayBuffer;
@@ -34,9 +34,11 @@ export function packGeometryGpuPage(
   if (!Number.isSafeInteger(pageId) || pageId < 0 || pageId >= directory.pages.length) fail('PAGE_ID');
   const page = directory.pages[pageId];
   const hasUvs = decoded?.hasUvs === true, hasTangents = decoded?.hasTangents === true;
-  const stride = REST_BYTES + (hasUvs ? 8 : 0) + (hasTangents ? 16 : 0);
+  const hasColors = decoded?.hasColors === true;
+  const stride = REST_BYTES + (hasUvs ? 8 : 0) + (hasTangents ? 16 : 0) + (hasColors ? 16 : 0);
   if (!decoded || decoded.version !== 1 || typeof decoded.hasUvs !== 'boolean'
-    || typeof decoded.hasTangents !== 'boolean' || decoded.vertexStride !== stride
+    || typeof decoded.hasTangents !== 'boolean' || (decoded.hasColors !== undefined && typeof decoded.hasColors !== 'boolean')
+    || hasColors !== (directory.hasColors === true) || decoded.vertexStride !== stride
     || stride !== directory.vertexStride || decoded.sourceVertexCount !== directory.sourceVertexCount
     || decoded.hierarchyClusterCount !== directory.clusters.length
     || !Array.isArray(decoded.clusters) || decoded.clusters.length !== page.clusterIds.length) fail('IDENTITY');
@@ -56,7 +58,9 @@ export function packGeometryGpuPage(
       || (hasUvs ? !(cluster.uvs instanceof Float32Array) || cluster.uvs.length !== metadata.vertexCount * 2
         : cluster.uvs !== undefined)
       || (hasTangents ? !(cluster.tangents instanceof Float32Array) || cluster.tangents.length !== metadata.vertexCount * 4
-        : cluster.tangents !== undefined)) fail('CLUSTER_LAYOUT');
+        : cluster.tangents !== undefined)
+      || (hasColors ? !(cluster.colors instanceof Float32Array) || cluster.colors.length !== metadata.vertexCount * 4
+        : cluster.colors !== undefined)) fail('CLUSTER_LAYOUT');
     decodedBytes += 16 + metadata.vertexCount * (4 + stride) + ((expectedIndices + 3) & ~3);
     vertexCount += metadata.vertexCount;
     indexCount += expectedIndices;
@@ -79,6 +83,10 @@ export function packGeometryGpuPage(
       if (cluster.tangents) for (let axis = 0; axis < 4; axis++) {
         if (!Number.isFinite(cluster.tangents[vertex * 4 + axis])) fail('TANGENT');
       }
+      if (cluster.colors) for (let axis = 0; axis < 4; axis++) {
+        if (!Number.isFinite(cluster.colors[vertex * 4 + axis]) || cluster.colors[vertex * 4 + axis] < 0
+          || cluster.colors[vertex * 4 + axis] > 1) fail('COLOR');
+      }
     }
     for (const localIndex of cluster.localTriangles) {
       if (localIndex >= metadata.vertexCount) fail('INDEX');
@@ -91,7 +99,7 @@ export function packGeometryGpuPage(
   const vertexBytes = new Uint8Array(vertices), vertexView = new DataView(vertices);
   const indices = new Uint32Array(indexCount);
   const clusters: PackedGeometryGpuPage['clusters'] = [];
-  const flags = (hasUvs ? 1 : 0) | (hasTangents ? 2 : 0);
+  const flags = (hasUvs ? 1 : 0) | (hasTangents ? 2 : 0) | (hasColors ? 4 : 0);
   let vertexOffset = 0, indexOffset = 0;
   for (const cluster of decoded.clusters) {
     const metadata = directory.clusters[cluster.id], seed = stableSeed(directory.primitiveKey, cluster.id);
@@ -111,6 +119,9 @@ export function packGeometryGpuPage(
       vertexView.setUint32(offset + 116, cluster.id, true);
       vertexView.setUint32(offset + 120, metadata.level, true);
       vertexView.setUint32(offset + 124, seed, true);
+      for (let axis = 0; axis < 4; axis++) {
+        vertexView.setFloat32(offset + 128 + axis * 4, cluster.colors?.[local * 4 + axis] ?? 1, true);
+      }
     }
     for (let local = 0; local < localIndices; local++) indices[indexOffset + local] = vertexOffset + cluster.localTriangles[local];
     vertexOffset += count;

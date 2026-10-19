@@ -91,6 +91,24 @@ describe('glTF material import', () => {
     }).covered).toBe(false);
   });
 
+  it('multiplies glTF baseColor factor and texture by interpolated vertex RGBA for color and coverage', () => {
+    const material = importGltf(texturedFixture(), [binary], { images: new Map([[0, image]]) })
+      .meshes[0].primitives[0].material;
+    const program = compileMaterial(material.definition);
+    const inputs = { parameters: material.parameters,
+      textures: (slot: number): [number, number, number, number] => slot === 0 ? [0.8, 0.4, 0.2, 0.5] : [1, 1, 1, 1],
+      instanceColor: [1, 1, 1, 1] as [number, number, number, number],
+      instanceMetalRough: [1, 1] as [number, number] };
+    const white = evaluateMaterial(program, inputs);
+    const tinted = evaluateMaterial(program, { ...inputs, vertexColor: [0.25, 0.5, 1, 0.5] });
+    expect(white.covered).toBe(true);
+    expect(tinted.covered).toBe(false);
+    for (const [actual, expected] of [
+      [tinted.baseColor[0], 0.1], [tinted.baseColor[1], 0.05], [tinted.baseColor[2], 0.2],
+      [tinted.opacity, 0.2],
+    ]) expect(actual).toBeCloseTo(expected);
+  });
+
   it('imports normalTexture as a linear slot-3 surface input with a live signed scale', async () => {
     await prepareGltfTangents();
     const { json, buffers: texturedBuffers } = withQuadUvs(texturedFixture() as ReturnType<typeof texturedFixture> & GltfBinaryDocument & {

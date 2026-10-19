@@ -5,6 +5,7 @@ export type Vec4Expr =
   | Readonly<{ kind: 'parameter'; slot: number }>
   | Readonly<{ kind: 'texture'; slot: number }>
   | Readonly<{ kind: 'instanceColor' }>
+  | Readonly<{ kind: 'vertexColor' }>
   | Readonly<{ kind: 'instanceMetalRough' }>
   | Readonly<{ kind: 'add' | 'multiply'; a: Vec4Expr; b: Vec4Expr }>
   | Readonly<{ kind: 'mix'; a: Vec4Expr; b: Vec4Expr; factor: ScalarExpr }>;
@@ -31,6 +32,8 @@ export const m = Object.freeze({
   parameter: (slot: number): Vec4Expr => ({ kind: 'parameter', slot }),
   texture: (slot: number): Vec4Expr => ({ kind: 'texture', slot }),
   instanceColor: Object.freeze({ kind: 'instanceColor' } as const),
+  /** Interpolated linear mesh RGBA, independent of per-instance tint. */
+  vertexColor: Object.freeze({ kind: 'vertexColor' } as const),
   instanceMetalRough: Object.freeze({ kind: 'instanceMetalRough' } as const),
   add: (a: Vec4Expr, b: Vec4Expr): Vec4Expr => ({ kind: 'add', a, b }),
   multiply: (a: Vec4Expr, b: Vec4Expr): Vec4Expr => ({ kind: 'multiply', a, b }),
@@ -57,7 +60,7 @@ type Node =
   | Readonly<{ kind: 'constant'; value: Vec4 }>
   | Readonly<{ kind: 'number'; value: number }>
   | Readonly<{ kind: 'parameter' | 'texture'; slot: number }>
-  | Readonly<{ kind: 'instanceColor' | 'instanceMetalRough' }>
+  | Readonly<{ kind: 'instanceColor' | 'instanceMetalRough' | 'vertexColor' }>
   | Readonly<{ kind: 'add' | 'multiply'; a: number; b: number }>
   | Readonly<{ kind: 'mix'; a: number; b: number; factor: number }>
   | Readonly<{ kind: 'component'; value: number; channel: number }>;
@@ -130,6 +133,7 @@ function expression(node: Node): string {
     case 'parameter': return `materialParameters.values[${node.slot}u]`;
     case 'texture': return `materialTexture${node.slot}(uv, lod)`;
     case 'instanceColor': return 'instanceColor';
+    case 'vertexColor': return 'vertexColor';
     case 'instanceMetalRough': return 'vec4f(instanceMR, 0.0, 0.0)';
     case 'add': return `v${node.a} + v${node.b}`;
     case 'multiply': return `v${node.a} * v${node.b}`;
@@ -137,7 +141,7 @@ function expression(node: Node): string {
     case 'component': return `v${node.value}[${node.channel}u]`;
   }
 }
-const argumentsWGSL = 'uv: vec2f, lod: f32, instanceColor: vec4f, instanceMR: vec2f';
+const argumentsWGSL = 'uv: vec2f, lod: f32, instanceColor: vec4f, instanceMR: vec2f, vertexColor: vec4f';
 function emitNodes(nodes: readonly Node[], selected: ReadonlySet<number>): string {
   // Node IDs are topological. Repeated object references and structurally equal nodes share one let.
   return nodes.flatMap((node, id) => selected.has(id) ? [`    let v${id} = ${expression(node)};`] : []).join('\n');
@@ -198,7 +202,7 @@ export function compileMaterial(definition: MaterialDefinition): MaterialProgram
         case 'constant': node = { kind: 'constant', value: Object.freeze(vector(source.value, 4, `${path}.value`)) as unknown as Vec4 }; break;
         case 'parameter': node = { kind: 'parameter', slot: index(source.slot, MATERIAL_LIMITS.parameters, `${path}.slot`) }; break;
         case 'texture': node = { kind: 'texture', slot: index(source.slot, MATERIAL_LIMITS.textures, `${path}.slot`) }; break;
-        case 'instanceColor': case 'instanceMetalRough': node = { kind: source.kind }; break;
+        case 'instanceColor': case 'instanceMetalRough': case 'vertexColor': node = { kind: source.kind }; break;
         case 'add': case 'multiply': node = { kind: source.kind, a: child(source.a, false, 'a'), b: child(source.b, false, 'b') }; break;
         case 'mix': node = { kind: 'mix', a: child(source.a, false, 'a'), b: child(source.b, false, 'b'), factor: child(source.factor, true, 'factor') }; break;
         default: throw new TypeError(`unknown vec4 material expression at ${path}: ${String(source.kind)}`);
@@ -237,7 +241,7 @@ export function compileMaterial(definition: MaterialDefinition): MaterialProgram
   const wgsl = `struct MaterialSurface {\n    baseColor: vec3f,\n    opacity: f32,\n    metallic: f32,\n    roughness: f32,\n    emissive: vec3f,\n    alphaCutoff: f32,\n    tangentNormal: vec3f,\n}\nfn evaluateMaterial(${argumentsWGSL}) -> MaterialSurface {\n${emitNodes(nodes, surfaceNodes)}\n${normalWgsl}\n    return MaterialSurface(\n        ${baseColorWgsl}, clamp(v${graph.baseColor}.a, 0.0, 1.0),\n        clamp(v${graph.metallic}, 0.0, 1.0), clamp(v${graph.roughness}, 0.04, 1.0),\n        max(v${graph.emissive}.rgb, vec3f(0.0)), max(v${graph.alphaCutoff}, 0.0), tangentNormal\n    );\n}\n${coverageWgsl}`;
   const surfaceResources = resources(nodes, surfaceNodes), coverageResources = resources(nodes, coverageNodes);
   const program: MaterialProgram = Object.freeze({
-    key: `material-v3:${JSON.stringify([definition.shading, definition.alphaMode, definition.doubleSided, graph])}`,
+    key: `material-v4:${JSON.stringify([definition.shading, definition.alphaMode, definition.doubleSided, graph])}`,
     wgsl, coverageWgsl, ...surfaceResources,
     coverageParameterCount: coverageResources.parameterCount,
     coverageTextureSlots: coverageResources.textureSlots,
@@ -254,6 +258,8 @@ export interface MaterialEvaluationInputs {
   readonly uv?: readonly [number, number];
   readonly lod?: number;
   readonly instanceColor: Vec4;
+  /** Interpolated linear RGBA; missing mesh colors are white. */
+  readonly vertexColor?: Vec4;
   readonly instanceMetalRough: readonly [number, number];
 }
 export interface MaterialEvaluation {
@@ -272,6 +278,7 @@ export function evaluateMaterial(program: MaterialProgram, inputs: MaterialEvalu
   const graph = graphs.get(program);
   if (!graph) throw new TypeError('program must be returned by compileMaterial');
   const instanceColor = vector(inputs.instanceColor, 4, 'instanceColor');
+  const vertexColor = vector(inputs.vertexColor ?? [1, 1, 1, 1], 4, 'vertexColor');
   const instanceMR = vector(inputs.instanceMetalRough, 2, 'instanceMetalRough');
   const uv = Object.freeze(vector(inputs.uv ?? [0, 0], 2, 'uv')) as unknown as readonly [number, number];
   const lod = finite(inputs.lod ?? 0, 'lod');
@@ -291,6 +298,7 @@ export function evaluateMaterial(program: MaterialProgram, inputs: MaterialEvalu
         if (typeof inputs.textures !== 'function') throw new TypeError(`material needs texture sampler slot ${node.slot}`);
         result = vector(inputs.textures(node.slot, uv, lod), 4, `texture[${node.slot}]`); break;
       case 'instanceColor': result = instanceColor; break;
+      case 'vertexColor': result = vertexColor; break;
       case 'instanceMetalRough': result = [instanceMR[0], instanceMR[1], 0, 0]; break;
       case 'component': result = vec(node.value)[node.channel]; break;
       case 'add': result = vec(node.a).map((v, i) => Math.fround(v + vec(node.b)[i])); break;

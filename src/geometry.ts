@@ -4,12 +4,22 @@ export const DEFORMED_VERTEX_BYTES = 64;
 export interface MeshData {
   /** Separate packed UV0 stream; omitted assets receive zero UVs. */
   uvs?: Float32Array;
+  /** Separate linear RGBA stream in [0, 1]; omitted assets receive white. */
+  colors?: Float32Array;
   /** Separate packed tangent xyzw stream, including handedness in w. */
   tangents?: Float32Array;
   vertices: ArrayBuffer;
   indices: Uint32Array;
   vertexCount: number;
   bounds: { min: [number, number, number]; max: [number, number, number] };
+}
+
+/** Validate static material attributes before copying or allocating GPU storage. */
+export function validateMeshColors(colors: Float32Array | undefined, vertexCount: number): void {
+  if (colors !== undefined && (!(colors instanceof Float32Array) || colors.length !== vertexCount * 4
+    || !colors.every(value => Number.isFinite(value) && value >= 0 && value <= 1))) {
+    throw new Error('INVALID_MESH_COLORS');
+  }
 }
 
 type Vec3 = [number, number, number];

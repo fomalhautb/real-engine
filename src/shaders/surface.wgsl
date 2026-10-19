@@ -23,7 +23,7 @@ struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, paddi
 @group(1) @binding(0) var<storage, read> vertices: array<Deformed>;
 @group(1) @binding(1) var<storage, read> instances: array<Instance>;
 @group(1) @binding(2) var<uniform> params: Parameters;
-@group(1) @binding(3) var<storage, read> uvs: array<vec2f>;
+@group(1) @binding(3) var<storage, read> attributes: array<f32>;
 @group(1) @binding(4) var<storage, read> clusterVertices: array<vec4u>;
 struct MaterialParameters { values: array<vec4f, 16> }
 @group(2) @binding(0) var<uniform> materialParameters: MaterialParameters;
@@ -56,8 +56,17 @@ struct Varyings {
     @location(8) @interpolate(flat) clusterDebug: vec3u,
     @location(9) tangent: vec4f,
     @location(10) @interpolate(flat) surfaceIdentity: vec2u,
+    @location(11) vertexColor: vec4f,
 }
-fn geometryVaryings(vertex: Deformed, instanceIndex: u32, uv: vec2f) -> Varyings {
+fn surfaceUvAt(index: u32) -> vec2f {
+    return vec2f(attributes[index * 2u], attributes[index * 2u + 1u]);
+}
+fn surfaceColorAt(index: u32) -> vec4f {
+    let start = params.vertexCount * 2u + index * 4u;
+    if (arrayLength(&attributes) <= start) { return vec4f(1.0); }
+    return vec4f(attributes[start], attributes[start + 1u], attributes[start + 2u], attributes[start + 3u]);
+}
+fn geometryVaryings(vertex: Deformed, instanceIndex: u32, uv: vec2f, color: vec4f) -> Varyings {
     let instance = instances[instanceIndex];
     var result: Varyings;
     result.position = frame.viewProjection * vertex.position;
@@ -67,6 +76,7 @@ fn geometryVaryings(vertex: Deformed, instanceIndex: u32, uv: vec2f) -> Varyings
     result.normal = vertex.normal.xyz;
     result.tangent = vertex.tangent;
     result.color = instance.color;
+    result.vertexColor = color;
     result.material = instance.material.xy;
     result.surfaceIdentity = instance.surfaceIdentity;
     result.light = frame.lightViewProjection * vertex.position;
@@ -75,7 +85,7 @@ fn geometryVaryings(vertex: Deformed, instanceIndex: u32, uv: vec2f) -> Varyings
     return result;
 }
 fn makeVaryings(index: u32, instanceIndex: u32) -> Varyings {
-    return geometryVaryings(vertices[instanceIndex * params.vertexCount + index], instanceIndex, uvs[index]);
+    return geometryVaryings(vertices[instanceIndex * params.vertexCount + index], instanceIndex, surfaceUvAt(index), surfaceColorAt(index));
 }
 @vertex
 fn vertexMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instanceIndex: u32) -> Varyings {
@@ -92,11 +102,11 @@ fn clusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
 @vertex
 fn pagedClusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
     let physical = index % params.vertexCount;
-    // The same storage binding holds the physical 128-byte records in this
-    // entry point: UV at byte 80 and identity at byte 112. No full source lookup.
-    let identity = clusterVertices[physical * 8u + 7u];
-    let uv = bitcast<vec2f>(clusterVertices[physical * 8u + 5u].xy);
-    var result = geometryVaryings(vertices[index], index / params.vertexCount, uv);
+    // Physical 144-byte record: UV at 80, identity at 112, linear RGBA at 128.
+    let identity = clusterVertices[physical * 9u + 7u];
+    let uv = bitcast<vec2f>(clusterVertices[physical * 9u + 5u].xy);
+    let color = bitcast<vec4f>(clusterVertices[physical * 9u + 8u]);
+    var result = geometryVaryings(vertices[index], index / params.vertexCount, uv, color);
     result.clusterDebug = vec3u(identity.w, identity.z, 1u);
     return result;
 }
@@ -112,19 +122,21 @@ struct ShadowVaryings {
     @location(0) uv: vec2f,
     @location(1) color: vec4f,
     @location(2) material: vec2f,
+    @location(3) vertexColor: vec4f,
 }
 @vertex
 fn shadowMain(@builtin(vertex_index) index: u32, @builtin(instance_index) instanceIndex: u32) -> ShadowVaryings {
     var result: ShadowVaryings;
     result.position = frame.lightViewProjection * vertices[instanceIndex * params.vertexCount + index].position;
-    result.uv = uvs[index];
+    result.uv = surfaceUvAt(index);
+    result.vertexColor = surfaceColorAt(index);
     result.color = instances[instanceIndex].color;
     result.material = instances[instanceIndex].material.xy;
     return result;
 }
 @fragment
 fn shadowFragment(input: ShadowVaryings) {
-    if (!evaluateCoverage(input.uv, 0.0, input.color, input.material)) { discard; }
+    if (!evaluateCoverage(input.uv, 0.0, input.color, input.material, input.vertexColor)) { discard; }
 }
 
 fn visibility(light: vec4f) -> f32 {
@@ -186,8 +198,8 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     let uv1 = dpdx(input.uv);
     let uv2 = dpdy(input.uv);
     let geometricNormal = surfaceUnit(cross(edge2, edge1), surfaceUnit(input.normal, vec3f(0.0, 1.0, 0.0)) * select(-1.0, 1.0, front));
-    let surface = evaluateMaterial(input.uv, 0.0, input.color, input.material);
-    let covered = evaluateCoverage(input.uv, 0.0, input.color, input.material);
+    let surface = evaluateMaterial(input.uv, 0.0, input.color, input.material, input.vertexColor);
+    let covered = evaluateCoverage(input.uv, 0.0, input.color, input.material, input.vertexColor);
     if (!covered) { discard; }
     var n = surfaceUnit(input.normal, geometricNormal);
     n *= select(-1.0, 1.0, dot(n, geometricNormal) >= 0.0);

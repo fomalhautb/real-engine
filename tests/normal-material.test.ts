@@ -8,7 +8,7 @@ describe('tangent-space material normal', () => {
   it('defaults to neutral and decodes an encoded neutral texel', () => {
     const plain = compile({});
     expect(plain.normalMapped).toBe(false);
-    expect(plain.key).toMatch(/^material-v3:/);
+    expect(plain.key).toMatch(/^material-v4:/);
     expect(evaluateMaterial(plain, inputs).tangentNormal).toEqual([0, 0, 1]);
     const mapped = compile({ normal: m.texture(3) });
     expect(mapped.normalMapped).toBe(true);

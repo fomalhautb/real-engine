@@ -2,6 +2,22 @@
 
 更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 线性顶点色与真实资产属性
+
+`MeshData.colors` 提供独立的线性 RGBA 浮点流，逐顶点四分量、有限且处于 `[0,1]`，缺省为白色。材质表达式新增 `m.vertexColor`，与实例颜色独立；游戏材质自行决定如何组合，既有默认材质行为不变。glTF `COLOR_0` 自动乘入 baseColor factor 与纹理，支持 VEC3/VEC4 浮点或归一化 unsigned byte/short，RGB 的 alpha 补 1；平面法线展开和 Mikk 切线接缝拆分同时重映射颜色。CPU 材质参考、主视图、Mask 阴影和世界查询共用该语义，查询在真实命中三角形上重心插值，使后续 GI/反射读取相同材质值。
+
+普通网格把可选颜色接在原 UV 存储之后，不新增 storage binding，也不按形变实例重复保存；无色网格保持原 UV 内存用量。有色网格在表面及查询表示中各增加每源顶点 16 字节。形变结果仍为 64 字节。静态 Opaque 层级简化将 RGBA 加入属性误差，保留源顶点属性；分页编码新增颜色 flag 与可选 `hasColors: true`，目录显式区分相同 stride 下的颜色/切线组合，旧无色目录和代理省略该字段并保留规范化身份。Worker 转移包含颜色缓冲。物理 GPU 页顶点由 128 增至 144 字节（增加 12.5%），RGBA 位于 128–143，页池、上传及暂存预算同步计费；固定查询代理携带相同颜色。该简化误差仍不是严格的颜色或像素误差上界。
+
+本轮 `npm run check` 通过 465 项 CPU 测试（57 文件）、类型检查及构建，日志 `artifacts/vertex-color-check-20261020.log`。覆盖导入格式、数值/范围、拆分重映射、材质 alpha、层级快照、页面及代理往返、无色旧格式、颜色传输与预算。
+
+新增 NVIDIA GPU 两项定向通过，实际适配器为非 fallback `nvidia / ampere`，证据及真实截图在 `artifacts/vertex-color-target-native-20261020-v2`。已按独立线性颜色场核对主视图 HDR、Mask 深度/阴影、世界命中与 Morph→skin→wave 组合位移；无色网格的白色回退不混入非白实例颜色。关闭太阳/天空及多次反弹后，PBR 彩色发光参与 GI，固定蓝通道发光为 0.05，命中探针读取相同值；清除发光后八个探针最大辐亮度均归零。彩色 512 三角形网格在驻留及分页路径都粗化至 70，再回到 512，HDR/查询与颜色参考一致；分页阴影/查询使用携带颜色的固定代理。错误为空、所有 Renderer 释放后账本为零。第一次定向因测试场景只预留 32 条射线、低于八探针各 32 条射线的预算而被正确拒绝；改为 256 后通过。尚无大资产颜色误差、动态虚拟几何或目标性能证明。
+
+完整 NVIDIA 浏览器回归 **99/99** 通过，日志 `artifacts/vertex-color-full-native-20261020.log`。随后将既有离屏反射联合用例升级为带顶点色的 Mask/Morph/skin/wave 发光面，主视图同时启用 GI、Final Gather 与雾；独立反射参考由材质参数 `[2,1,0.5]` 乘线性顶点色 `[1,0.5,0.25]` 得到 `[2,0.5,0.125]`。NVIDIA 中心反射锚点约为 `[1.999822,0.499956,0.124989]`，移动/恢复与覆盖热更新通过，日志 `artifacts/vertex-color-reflection-native-20261020.log` 两项通过。完整回归后未修改运行时代码；测试场景与审计 CLI 的最后修正另通过类型检查和 5 项审计测试（`artifacts/vertex-color-audit-final-20261020.log`）。
+
+新增顶点色及反射两组共四项另在 Intel 与 SwiftShader 各 **4/4** 通过：`artifacts/vertex-color-target-intel-20261020` 实际为非 fallback `intel / gen-12lp`，`artifacts/vertex-color-target-software-20261020` 为 `google / swiftshader / fallback=true`；GPU/页面错误为空，释放账本为零。这是定向功能结果，不是完整 Intel 回归或硬件性能结果；软件适配器不提供性能依据。
+
+只读 `audit:gltf` 同步检查 `COLOR_0` 元数据格式与 POSITION 数量，明确记录 `valuesRead: false` / `valuesValidated: false`。对已保存的固定 Sponza glTF 重审，59 个 primitive 的颜色声明布局可支持；BIN 数值尚未读取，透明 decal、资产预算和完整导入障碍仍需解决，尚无 Sponza 实际画面或驻留规模成绩。
+
 ## 有界多段 Final Gather 与接触区验收
 
 `FinalGatherOptions.pathSegments` 新增 1–4 段精确漫反射追踪，API 默认 1；单反弹模式始终只走一段，开启多反弹时才使用配置段数。每段使用共享世界查询、当前材质和形变，以 `.96 × baseColor × (1-metallic)` 累乘 Lambert 吞吐，只在最后一段的 PBR 命中读取世界 GI。miss 和 Unlit 结束路径，不会把后续空射线当作再次命中天空；注册面积光仅在第一段排除重复发光，后续命中的发光仍计入。它仍是有限路径与探针缓存的混合估计，不是收敛路径追踪或完整 Lumen 实现。

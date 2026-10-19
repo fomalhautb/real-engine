@@ -52,8 +52,10 @@ function readSource(mesh: MeshData, limits: Required<GeometryBuildOptions>) {
     || mesh.indices.length / 3 > limits.maxTriangles || mesh.indices.length / 3 > limits.maxOutputTriangles) throw new RangeError('GEOMETRY_TRIANGLE_BUDGET_OR_LAYOUT');
   if (mesh.uvs && (!(mesh.uvs instanceof Float32Array) || mesh.uvs.length !== mesh.vertexCount * 2 || !mesh.uvs.every(Number.isFinite))) throw new Error('GEOMETRY_UVS');
   if (mesh.tangents && (!(mesh.tangents instanceof Float32Array) || mesh.tangents.length !== mesh.vertexCount * 4 || !mesh.tangents.every(Number.isFinite))) throw new Error('GEOMETRY_TANGENTS');
+  if (mesh.colors && (!(mesh.colors instanceof Float32Array) || mesh.colors.length !== mesh.vertexCount * 4
+    || !mesh.colors.every(value => Number.isFinite(value) && value >= 0 && value <= 1))) throw new Error('GEOMETRY_COLORS');
   const positions = new Float32Array(mesh.vertexCount * 3), view = new DataView(mesh.vertices), bounds = emptyBounds();
-  const attributeStride = 3 + (mesh.uvs ? 2 : 0) + (mesh.tangents ? 4 : 0);
+  const attributeStride = 3 + (mesh.uvs ? 2 : 0) + (mesh.tangents ? 4 : 0) + (mesh.colors ? 4 : 0);
   const attributes = new Float32Array(mesh.vertexCount * attributeStride);
   for (let vertex = 0; vertex < mesh.vertexCount; vertex++) {
     for (let field = 0; field < 20; field++) {
@@ -66,6 +68,8 @@ function readSource(mesh: MeshData, limits: Required<GeometryBuildOptions>) {
     }
     if (mesh.uvs) attributes.set(mesh.uvs.subarray(vertex * 2, vertex * 2 + 2), vertex * attributeStride + 3);
     if (mesh.tangents) attributes.set(mesh.tangents.subarray(vertex * 4, vertex * 4 + 4), vertex * attributeStride + 3 + (mesh.uvs ? 2 : 0));
+    if (mesh.colors) attributes.set(mesh.colors.subarray(vertex * 4, vertex * 4 + 4),
+      vertex * attributeStride + 3 + (mesh.uvs ? 2 : 0) + (mesh.tangents ? 4 : 0));
   }
   for (const index of mesh.indices) {
     if (index >= mesh.vertexCount) throw new RangeError('GEOMETRY_INDEX');
@@ -89,7 +93,8 @@ function readSource(mesh: MeshData, limits: Required<GeometryBuildOptions>) {
   const source: MeshData = { vertices: mesh.vertices.slice(0), vertexCount: mesh.vertexCount,
     indices: new Uint32Array(mesh.indices), bounds,
     ...(mesh.uvs ? { uvs: new Float32Array(mesh.uvs) } : {}),
-    ...(mesh.tangents ? { tangents: new Float32Array(mesh.tangents) } : {}) };
+    ...(mesh.tangents ? { tangents: new Float32Array(mesh.tangents) } : {}),
+    ...(mesh.colors ? { colors: new Float32Array(mesh.colors) } : {}) };
   return { source, positions, normalized, attributes, attributeStride, extent };
 }
 

@@ -16,7 +16,7 @@ import { GpuDiffuseGi, diffuseGiSampleSource, diffuseGiFinalGatherSampleSource, 
 import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
 import { resolveSunShadowOptions, sunShadowProjection, type SunShadowOptions, type ResolvedSunShadowOptions } from './sun-shadow';
 import type { FinalGatherProbeResult } from './gpu-final-gather';
-import { DEFORMED_VERTEX_BYTES, type MeshData } from './geometry';
+import { DEFORMED_VERTEX_BYTES, validateMeshColors, type MeshData } from './geometry';
 import { snapshotMeshTangents } from './tangent-frame';
 import { GpuGeometryStream } from './gpu-geometry-stream';
 import { GpuGeometryPagePool, type GeometryGpuFrameLease } from './gpu-geometry-page-pool';
@@ -747,8 +747,13 @@ export class Renderer {
     const rest = this.buffer(scene.name + ' source', mesh.vertices.byteLength, GPUBufferUsage.STORAGE, mesh.vertices);
     const indices = this.buffer(scene.name + ' indices', mesh.indices.byteLength, GPUBufferUsage.INDEX, new Uint32Array(mesh.indices).buffer);
     if (mesh.uvs && (mesh.uvs.length !== mesh.vertexCount * 2 || !mesh.uvs.every(Number.isFinite))) throw new Error('INVALID_MESH_UVS');
-    const uvData = mesh.uvs ? new Float32Array(mesh.uvs) : new Float32Array(mesh.vertexCount * 2);
-    const uvs = this.buffer(scene.name + ' UVs', uvData.byteLength, GPUBufferUsage.STORAGE, uvData.buffer);
+    validateMeshColors(mesh.colors, mesh.vertexCount);
+    // One binding for static surface attributes. Uncolored assets retain their
+    // original UV-only allocation; color is not duplicated per deformed instance.
+    const uvData = new Float32Array(mesh.vertexCount * (mesh.colors ? 6 : 2));
+    if (mesh.uvs) uvData.set(mesh.uvs);
+    if (mesh.colors) uvData.set(mesh.colors, mesh.vertexCount * 2);
+    const uvs = this.buffer(scene.name + ' UVs and colors', uvData.byteLength, GPUBufferUsage.STORAGE, uvData.buffer);
     const params = this.buffer(scene.name + ' params', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const instances = this.buffer(scene.name + ' instances', capacity * 224, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const palettes = this.buffer(scene.name + ' palettes', Math.max(1, capacity * program.jointCount * 2) * 64, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -791,7 +796,7 @@ export class Renderer {
           const key = program.key + ':physical-pages';
           let pagedPipeline = this.deformationPipelines.get(key);
           if (!pagedPipeline) {
-            const code = deformationSource.replace('// GEOMETRY_VERTEX_FIELDS', 'uv:vec2f, flags:u32, padding:u32, tangent:vec4f, identity:vec4u,')
+            const code = deformationSource.replace('// GEOMETRY_VERTEX_FIELDS', 'uv:vec2f, flags:u32, padding:u32, tangent:vec4f, identity:vec4u, color:vec4f,')
               .replace('var t = restTangents[vertexIndex];', 'var t = vertex.tangent;').replace('// OPERATOR_BODY', program.wgslBody);
             const module = await this.shader(code, 'paged shared deformation');
             pagedPipeline = await this.device.createComputePipelineAsync({ layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] }),

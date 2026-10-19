@@ -111,6 +111,8 @@ export function packGeometryLod(hierarchy: GeometryHierarchy): PackedGeometryLod
     || !source.uvs.every(Number.isFinite))) fail('SOURCE_UVS');
   if (source.tangents !== undefined && (!(source.tangents instanceof Float32Array) || source.tangents.length !== sourceVertexCount * 4
     || !source.tangents.every(Number.isFinite))) fail('SOURCE_TANGENTS');
+  if (source.colors !== undefined && (!(source.colors instanceof Float32Array) || source.colors.length !== sourceVertexCount * 4
+    || !source.colors.every(value => Number.isFinite(value) && value >= 0 && value <= 1))) fail('SOURCE_COLORS');
   const sourceTriangleCount = integer(source.indices.length / 3, 1, MAX_TRIANGLES, 'SOURCE_TRIANGLE_BUDGET');
   if (hierarchy.sourceTriangleCount !== sourceTriangleCount) fail('SOURCE_TRIANGLE_COUNT');
 

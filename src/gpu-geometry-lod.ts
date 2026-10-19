@@ -29,7 +29,7 @@ type Entry = {
   params: GPUBuffer; paramsData: Uint32Array<ArrayBuffer>; selected: GPUBuffer; compute: GPUBindGroup;
   enabled: () => boolean; count: number; source: SceneBatch['geometryLod'];
   capacity: number;
-  vertexSource: ArrayBuffer; indexSource: Uint32Array; uvSource?: Float32Array; tangentSource?: Float32Array;
+  vertexSource: ArrayBuffer; indexSource: Uint32Array; uvSource?: Float32Array; tangentSource?: Float32Array; colorSource?: Float32Array;
 };
 const BUDGET = 128 * 1024 * 1024;
 const MAX_PAIRS = 262_144;
@@ -129,7 +129,7 @@ export class GpuGeometryLod {
       entries: [this.view, clusters, groups, input, instances, params, indices, args, selected].map((buffer, binding) => ({ binding, resource: { buffer } })) });
     const binding = { vertices, indices, arguments: args };
     this.entries.set(scene.name, { scene, source: hierarchy, packed, binding, params, paramsData, selected, compute, enabled, count: 0, capacity: scene.capacity,
-      vertexSource: scene.mesh.vertices, indexSource: scene.mesh.indices, uvSource: scene.mesh.uvs, tangentSource: scene.mesh.tangents });
+      vertexSource: scene.mesh.vertices, indexSource: scene.mesh.indices, uvSource: scene.mesh.uvs, tangentSource: scene.mesh.tangents, colorSource: scene.mesh.colors });
     return binding;
   }
   validateSources(): void {
@@ -137,6 +137,7 @@ export class GpuGeometryLod {
       const scene = entry.scene;
       if (scene.geometryLod !== entry.source || scene.mesh !== entry.source!.source || scene.mesh.vertices !== entry.vertexSource
         || scene.mesh.indices !== entry.indexSource || scene.mesh.uvs !== entry.uvSource || scene.mesh.tangents !== entry.tangentSource
+        || scene.mesh.colors !== entry.colorSource
         || scene.deformation.jointCount !== 0 || scene.deformation.nodes.length || scene.morphTargets.length
         || scene.capacity !== entry.capacity || scene.instances.length > entry.capacity) throw new Error('GEOMETRY_LOD_ASSET_CHANGED');
     }

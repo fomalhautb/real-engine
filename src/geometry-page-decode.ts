@@ -26,7 +26,7 @@ export async function decodeVerifiedGeometryPage(
 export function geometryPageTransferBuffers(decoded: DecodedGeometryPage): ArrayBuffer[] {
   const buffers = new Set<ArrayBuffer>();
   for (const cluster of decoded.clusters) {
-    for (const array of [cluster.sourceVertexIds, cluster.rest, cluster.uvs, cluster.tangents, cluster.localTriangles]) {
+    for (const array of [cluster.sourceVertexIds, cluster.rest, cluster.uvs, cluster.tangents, cluster.colors, cluster.localTriangles]) {
       if (array?.buffer instanceof ArrayBuffer) buffers.add(array.buffer);
     }
   }

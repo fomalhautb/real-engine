@@ -123,7 +123,7 @@ export class GpuGeometryPagePool {
     this.directory.rootPages.forEach((page, slot) => this.rootSlots.set(page, slot));
     try {
       const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-      this.vertices = this.buffer('paged geometry: 128-byte vertex records', sizes[0], usage);
+      this.vertices = this.buffer('paged geometry: 144-byte vertex records', sizes[0], usage);
       this.indices = this.buffer('paged geometry: page-local indices', sizes[1], usage | GPUBufferUsage.INDEX);
       this.clusterLocations = this.buffer('paged geometry: cluster locations', sizes[2], usage);
       this.pageResidency = this.buffer('paged geometry: publication flags', sizes[3], usage);

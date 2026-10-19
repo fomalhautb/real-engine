@@ -5,7 +5,7 @@ import { GeometryPageCache } from '../../../src/geometry-stream-cache';
 import { GeometryStreamCut } from '../../../src/geometry-stream-cut';
 import { GpuGeometryPagePool } from '../../../src/gpu-geometry-page-pool';
 import { GpuGeometryStreamSelection } from '../../../src/gpu-geometry-stream-selection';
-import { packGeometryGpuPage } from '../../../src/geometry-gpu-page';
+import { packGeometryGpuPage, GEOMETRY_GPU_VERTEX_BYTES } from '../../../src/geometry-gpu-page';
 import { packGeometryLod } from '../../../src/geometry-lod-data';
 import { lookAt, multiply, perspective } from '../../../src/math';
 
@@ -14,7 +14,7 @@ const eye: [number, number, number] = [3.8, 3.2, 5.0];
 const view = { eye, near: 0.1, projectionScale: size / (2 * Math.tan(Math.PI / 6.4)), maxErrorPixels: 0 };
 const shader = `
 struct Vertex { position:vec4f, normal:vec4f, joints:vec4u, weights:vec4f, morph:vec4f,
-  uv:vec2f, flags:u32, padding:u32, tangent:vec4f, identity:vec4u }
+  uv:vec2f, flags:u32, padding:u32, tangent:vec4f, identity:vec4u, color:vec4f }
 @group(0) @binding(0) var<uniform> vp:mat4x4f;
 @group(0) @binding(1) var<storage,read> vertices:array<Vertex>;
 struct Varyings { @builtin(position) clip:vec4f, @location(0) normal:vec3f,
@@ -61,7 +61,7 @@ export async function runGeometryPagePoolFixture(gpuSelection = false) {
     const verticesPerSlot = Math.max(...directory.pages.map(page => page.clusterIds.reduce((sum, id) => sum + directory.clusters[id].vertexCount, 0)));
     const indicesPerSlot = Math.max(...directory.pages.map(page => page.clusterIds.reduce((sum, id) => sum + directory.clusters[id].triangleCount * 3, 0)));
     const slotCount = directory.rootPages.length + 2;
-    const budget = slotCount * (verticesPerSlot * 128 + indicesPerSlot * 4) + directory.clusters.length * 32 + directory.pages.length * 4;
+    const budget = slotCount * (verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES + indicesPerSlot * 4) + directory.clusters.length * 32 + directory.pages.length * 4;
     pool = await GpuGeometryPagePool.create(device, directory, { maxResidentBytes: budget,
       maxUploadBytesPerFrame: 8192, maxUploadWritesPerFrame: 8, maxUploadPagesPerFrame: 1 }, bytes => { owned += bytes; peak = Math.max(peak, owned); });
     const currentPool = pool;
@@ -105,7 +105,7 @@ export async function runGeometryPagePoolFixture(gpuSelection = false) {
     // Independently assemble a fully resident reference from the original hierarchy,
     // never from the page decoder or GPU page packing/locations.
     const identities = packGeometryLod(hierarchy).vertices;
-    const referenceVertices = new ArrayBuffer(identities.length / 4 * 128);
+    const referenceVertices = new ArrayBuffer(identities.length / 4 * GEOMETRY_GPU_VERTEX_BYTES);
     const referenceBytes = new Uint8Array(referenceVertices), referenceView = new DataView(referenceVertices);
     const referenceIndices: number[] = [], referenceDraws: { firstIndex: number; indexCount: number }[] = [];
     const original = new Uint8Array(hierarchy.source.vertices);
@@ -113,9 +113,10 @@ export async function runGeometryPagePoolFixture(gpuSelection = false) {
     for (const cluster of hierarchy.clusters) {
       referenceDraws.push({ firstIndex: referenceIndices.length, indexCount: cluster.triangles.length });
       for (let local = 0; local < cluster.vertices.length; local++) {
-        const sourceId = cluster.vertices[local], at = (referenceVertex + local) * 128;
+        const sourceId = cluster.vertices[local], at = (referenceVertex + local) * GEOMETRY_GPU_VERTEX_BYTES;
         referenceBytes.set(original.subarray(sourceId * 80, sourceId * 80 + 80), at);
         for (let word = 0; word < 4; word++) referenceView.setUint32(at + 112 + word * 4, identities[(referenceVertex + local) * 4 + word], true);
+        for (let channel = 0; channel < 4; channel++) referenceView.setFloat32(at + 128 + channel * 4, 1, true);
       }
       for (const local of cluster.triangles) referenceIndices.push(referenceVertex + local);
       referenceVertex += cluster.vertices.length;
@@ -200,7 +201,7 @@ export async function runGeometryPagePoolFixture(gpuSelection = false) {
     for (const id of pool.residentPageIds()) {
       const packed = packGeometryGpuPage(directory, id, cache.get(id)!);
       const loc = pool.clusterLocation(directory.pages[id].clusterIds[0])!;
-      const actualVertices = await read(pool.vertices, loc.baseVertex * 128, packed.vertices.byteLength);
+      const actualVertices = await read(pool.vertices, loc.baseVertex * GEOMETRY_GPU_VERTEX_BYTES, packed.vertices.byteLength);
       const actualIndices = await read(pool.indices, loc.firstIndex * 4, packed.indices.byteLength);
       for (const [actual, expected] of [[actualVertices, new Uint8Array(packed.vertices)], [actualIndices, new Uint8Array(packed.indices.buffer)]]) {
         for (let byte = 0; byte < actual.length; byte++) if (actual[byte] !== expected[byte]) pageByteMismatches++;

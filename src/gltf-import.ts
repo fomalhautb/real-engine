@@ -122,7 +122,7 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       }
       return m.multiply(input, m.texture(slot));
     };
-    const color = withTexture(m.parameter(0), pbr.baseColorTexture, 0, 'srgb');
+    const color = m.multiply(withTexture(m.parameter(0), pbr.baseColorTexture, 0, 'srgb'), m.vertexColor);
     const mr = withTexture(m.parameter(1), pbr.metallicRoughnessTexture, 1, 'linear');
     const emission = withTexture(m.parameter(2), source.emissiveTexture, 2, 'srgb');
     const normalInfo = source.normalTexture === undefined ? undefined : object(source.normalTexture, 'normalTexture');
@@ -156,7 +156,7 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       if (primitive.extensions !== undefined) throw new Error('GLTF_UNSUPPORTED_PRIMITIVE_EXTENSION');
       const binding = primitive.material === undefined ? defaultMaterial : materials[index(primitive.material, materials.length, 'primitive.material')];
       const attrs = object(primitive.attributes, 'attributes');
-      for (const attribute of Object.keys(attrs)) if (!['POSITION', 'NORMAL', 'TANGENT', 'TEXCOORD_0', 'JOINTS_0', 'WEIGHTS_0'].includes(attribute)) throw new Error('GLTF_UNSUPPORTED_ATTRIBUTE: ' + attribute);
+      for (const attribute of Object.keys(attrs)) if (!['POSITION', 'NORMAL', 'TANGENT', 'TEXCOORD_0', 'COLOR_0', 'JOINTS_0', 'WEIGHTS_0'].includes(attribute)) throw new Error('GLTF_UNSUPPORTED_ATTRIBUTE: ' + attribute);
       const position = access(attrs.POSITION, 'VEC3', 'POSITION');
       if (position.componentType !== 5126) throw new Error('GLTF_POSITION_FLOAT_REQUIRED');
       const count = position.count;
@@ -168,6 +168,15 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       };
       const normal = attribute(attrs.NORMAL, 'VEC3', 'NORMAL'), tangent = attribute(attrs.TANGENT, 'VEC4', 'TANGENT');
       const uv = attribute(attrs.TEXCOORD_0, 'VEC2', 'TEXCOORD_0');
+      const color = attrs.COLOR_0 === undefined ? undefined : readAccessor(binary, buffers, index(attrs.COLOR_0, accessorCount, 'COLOR_0'));
+      if (color) {
+        if (color.count !== count || (color.type !== 'VEC3' && color.type !== 'VEC4')
+          || !(color.componentType === 5126 && !color.normalized
+            || (color.componentType === 5121 || color.componentType === 5123) && color.normalized)) {
+          throw new Error('GLTF_COLOR_LAYOUT');
+        }
+        for (const value of color.values) if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error('GLTF_COLOR_RANGE');
+      }
       const generateTangents = binding.definition.normal !== undefined && !(normal && tangent);
       if (binding.definition.normal !== undefined && !uv) throw new Error('GLTF_NORMAL_TEXTURE_REQUIRES_UV0');
       const joints = attribute(attrs.JOINTS_0, 'VEC4', 'JOINTS_0'), weights = attribute(attrs.WEIGHTS_0, 'VEC4', 'WEIGHTS_0');
@@ -259,6 +268,15 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       }
       const mesh: MeshData = { vertices, indices, vertexCount: outputCount, bounds,
         uvs: uv ? remap(uv.values, 2) : undefined,
+        colors: color ? (() => {
+          const output = new Float32Array(outputCount * 4);
+          for (let vertex = 0; vertex < outputCount; vertex++) {
+            const source = sourceVertices[vertex] * color.components, destination = vertex * 4;
+            for (let channel = 0; channel < color.components; channel++) output[destination + channel] = color.values[source + channel];
+            if (color.components === 3) output[destination + 3] = 1;
+          }
+          return output;
+        })() : undefined,
         tangents: normal && tangent ? remap(tangent.values, 4) : undefined };
       let ignoredAuthoredMorphTangents = false;
       const morphTargets = array(primitive.targets ?? [], 'targets', joints ? 31 : 32).map((targetValue): MorphTarget => {

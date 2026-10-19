@@ -18,8 +18,9 @@ export interface GeometryPage {
 
 export interface EncodedGeometryPages {
   version: 1;
-  /** 80 rest bytes plus independent optional UV (8) and tangent (16) streams. */
+  /** 80 rest bytes plus independent optional UV (8), tangent (16), and color (16) streams. */
   vertexStride: number;
+  hasColors?: true;
   pages: GeometryPage[];
   clusterPages: number[];
   rootPages: number[];
@@ -32,6 +33,7 @@ export interface DecodedGeometryCluster {
   rest: Uint8Array;
   uvs?: Float32Array;
   tangents?: Float32Array;
+  colors?: Float32Array;
   localTriangles: Uint8Array;
 }
 
@@ -40,6 +42,7 @@ export interface DecodedGeometryPage {
   vertexStride: number;
   hasUvs: boolean;
   hasTangents: boolean;
+  hasColors?: boolean;
   sourceVertexCount: number;
   hierarchyClusterCount: number;
   clusters: DecodedGeometryCluster[];
@@ -56,6 +59,7 @@ const CLUSTER_HEADER_BYTES = 16;
 const REST_BYTES = 80;
 const FLAG_UV = 1;
 const FLAG_TANGENT = 2;
+const FLAG_COLOR = 4;
 const DEFAULT_PAGE_BYTES = 65_536;
 const HARD_PAGE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_TOTAL_BYTES = 256 * 1024 * 1024;
@@ -116,8 +120,8 @@ async function requireDecoder(): Promise<void> {
 
 function flagsAndStride(hierarchy: GeometryHierarchy): { flags: number; stride: number } {
   const source = hierarchy.source;
-  const flags = (source.uvs ? FLAG_UV : 0) | (source.tangents ? FLAG_TANGENT : 0);
-  return { flags, stride: REST_BYTES + (source.uvs ? 8 : 0) + (source.tangents ? 16 : 0) };
+  const flags = (source.uvs ? FLAG_UV : 0) | (source.tangents ? FLAG_TANGENT : 0) | (source.colors ? FLAG_COLOR : 0);
+  return { flags, stride: REST_BYTES + (source.uvs ? 8 : 0) + (source.tangents ? 16 : 0) + (source.colors ? 16 : 0) };
 }
 
 function validateSource(hierarchy: GeometryHierarchy): void {
@@ -135,6 +139,10 @@ function validateSource(hierarchy: GeometryHierarchy): void {
   if (source.tangents && (!(source.tangents instanceof Float32Array) || source.tangents.length !== source.vertexCount * 4)) {
     throw new RangeError('Source tangent length does not match vertexCount');
   }
+  if (source.colors && (!(source.colors instanceof Float32Array) || source.colors.length !== source.vertexCount * 4
+    || !source.colors.every(value => Number.isFinite(value) && value >= 0 && value <= 1))) {
+    throw new RangeError('Source color length does not match vertexCount');
+  }
   const roots = new Set<number>();
   for (const id of hierarchy.roots) {
     if (!Number.isInteger(id) || id < 0 || id >= hierarchy.clusters.length || roots.has(id)) {
@@ -146,7 +154,7 @@ function validateSource(hierarchy: GeometryHierarchy): void {
 }
 
 function clusterDecodedBytes(cluster: GeometryCluster, id: number, vertexCount: number, stride: number,
-  restView: DataView, uvs?: Float32Array, tangents?: Float32Array): number {
+  restView: DataView, uvs?: Float32Array, tangents?: Float32Array, colors?: Float32Array): number {
   if (!(cluster.vertices instanceof Uint32Array) || !(cluster.triangles instanceof Uint8Array)) {
     throw new RangeError(`Cluster ${id} arrays have invalid types`);
   }
@@ -163,6 +171,10 @@ function clusterDecodedBytes(cluster: GeometryCluster, id: number, vertexCount: 
     }
     if (tangents) for (let axis = 0; axis < 4; axis++) {
       if (!Number.isFinite(tangents[sourceId * 4 + axis])) throw new RangeError(`Cluster ${id} has nonfinite tangent`);
+    }
+    if (colors) for (let axis = 0; axis < 4; axis++) {
+      if (!Number.isFinite(colors[sourceId * 4 + axis]) || colors[sourceId * 4 + axis] < 0
+        || colors[sourceId * 4 + axis] > 1) throw new RangeError(`Cluster ${id} has invalid color`);
     }
   }
   for (const localIndex of cluster.triangles) {
@@ -193,6 +205,10 @@ function appendCluster(target: Uint8Array, offset: number, cluster: GeometryClus
       for (let axis = 0; axis < 4; axis++) view.setFloat32(offset + axis * 4, source.tangents![sourceId * 4 + axis], true);
       offset += 16;
     }
+    if (flags & FLAG_COLOR) {
+      for (let axis = 0; axis < 4; axis++) view.setFloat32(offset + axis * 4, source.colors![sourceId * 4 + axis], true);
+      offset += 16;
+    }
   }
   if (offset % 4 !== 0) throw new Error(`Cluster ${id} record alignment failed (${stride})`);
   target.set(cluster.triangles, offset);
@@ -209,7 +225,7 @@ export async function encodeGeometryPages(
   const { flags, stride } = flagsAndStride(hierarchy);
   const restView = new DataView(source.vertices);
   const sizes = hierarchy.clusters.map((cluster, id) => {
-    const bytes = clusterDecodedBytes(cluster, id, source.vertexCount, stride, restView, source.uvs, source.tangents);
+    const bytes = clusterDecodedBytes(cluster, id, source.vertexCount, stride, restView, source.uvs, source.tangents, source.colors);
     if (bytes > limits.maxPageBytes) throw new RangeError(`Cluster ${id} exceeds maxPageBytes decoded residency`);
     return bytes;
   });
@@ -258,7 +274,8 @@ export async function encodeGeometryPages(
   }
   flush();
   const rootPages = [...new Set(hierarchy.roots.map((id) => clusterPages[id]))].sort((a, b) => a - b);
-  return { version: 1, vertexStride: stride, pages, clusterPages, rootPages };
+  return { version: 1, vertexStride: stride, ...(source.colors ? { hasColors: true as const } : {}),
+    pages, clusterPages, rootPages };
 }
 
 /** Decode one untrusted page after checking the declared allocation size and exact wire length. */
@@ -279,8 +296,9 @@ export async function decodeGeometryPage(
   const sourceVertexCount = header.getUint32(24, true), hierarchyClusterCount = header.getUint32(28, true);
   const expectedChecksum = header.getUint32(32, true), reserved32 = header.getUint32(36, true);
   if (magic !== PAGE_MAGIC || version !== 1 || reserved16 !== 0 || reserved32 !== 0
-    || (flags & ~(FLAG_UV | FLAG_TANGENT)) !== 0
-    || stride !== REST_BYTES + ((flags & FLAG_UV) ? 8 : 0) + ((flags & FLAG_TANGENT) ? 16 : 0)) {
+    || (flags & ~(FLAG_UV | FLAG_TANGENT | FLAG_COLOR)) !== 0
+    || stride !== REST_BYTES + ((flags & FLAG_UV) ? 8 : 0) + ((flags & FLAG_TANGENT) ? 16 : 0)
+      + ((flags & FLAG_COLOR) ? 16 : 0)) {
     throw new RangeError('Geometry page header has invalid magic, version, flags, or stride');
   }
   if (clusterCount < 1 || clusterCount > hierarchyClusterCount || clusterCount > maxPageBytes / CLUSTER_HEADER_BYTES
@@ -325,6 +343,7 @@ export async function decodeGeometryPage(
     const rest = new Uint8Array(vertexCount * REST_BYTES);
     const uvs = flags & FLAG_UV ? new Float32Array(vertexCount * 2) : undefined;
     const tangents = flags & FLAG_TANGENT ? new Float32Array(vertexCount * 4) : undefined;
+    const colors = flags & FLAG_COLOR ? new Float32Array(vertexCount * 4) : undefined;
     for (let vertex = 0; vertex < vertexCount; vertex++) {
       rest.set(raw.subarray(offset, offset + REST_BYTES), vertex * REST_BYTES);
       validateRestFloats(view, offset, 'Geometry page');
@@ -339,6 +358,11 @@ export async function decodeGeometryPage(
         if (!Number.isFinite(value)) throw new RangeError('Geometry page contains nonfinite tangent');
         tangents[vertex * 4 + axis] = value; offset += 4;
       }
+      if (colors) for (let axis = 0; axis < 4; axis++) {
+        const value = view.getFloat32(offset, true);
+        if (!Number.isFinite(value) || value < 0 || value > 1) throw new RangeError('Geometry page contains invalid color');
+        colors[vertex * 4 + axis] = value; offset += 4;
+      }
     }
     const localTriangles = raw.slice(offset, offset + indexBytes);
     for (const index of localTriangles) if (index >= vertexCount) throw new RangeError('Out-of-range local triangle index');
@@ -346,9 +370,10 @@ export async function decodeGeometryPage(
     for (let padding = indexBytes; padding < aligned4(indexBytes); padding++) {
       if (raw[offset++] !== 0) throw new RangeError('Geometry page has nonzero cluster padding');
     }
-    clusters.push({ id, sourceVertexIds, rest, uvs, tangents, localTriangles });
+    clusters.push({ id, sourceVertexIds, rest, uvs, tangents, colors, localTriangles });
   }
   if (offset !== raw.length) throw new RangeError('Geometry page has trailing decoded bytes');
   return { version: 1, vertexStride: stride, hasUvs: Boolean(flags & FLAG_UV), hasTangents: Boolean(flags & FLAG_TANGENT),
+    ...(flags & FLAG_COLOR ? { hasColors: true } : {}),
     sourceVertexCount, hierarchyClusterCount, clusters };
 }

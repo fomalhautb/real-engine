@@ -57,12 +57,14 @@ function limits(options: GeometryQueryProxyOptions = {}): Limits {
     maxBytes: integer(options.maxBytes ?? DEFAULT_BYTES, 1, HARD_BYTES, 'BYTE_BUDGET'),
   };
 }
-function rawBytes(vertexCount: number, triangleCount: number, hasUvs: boolean, hasTangents: boolean): number {
-  return vertexCount * (80 + (hasUvs ? 8 : 0) + (hasTangents ? 16 : 0)) + triangleCount * 12;
+function rawBytes(vertexCount: number, triangleCount: number, hasUvs: boolean, hasTangents: boolean,
+  hasColors: boolean): number {
+  return vertexCount * (80 + (hasUvs ? 8 : 0) + (hasTangents ? 16 : 0) + (hasColors ? 16 : 0)) + triangleCount * 12;
 }
 function flags(directory: GeometryStreamDirectory) {
-  return { hasUvs: directory.vertexStride === 88 || directory.vertexStride === 104,
-    hasTangents: directory.vertexStride === 96 || directory.vertexStride === 104 };
+  const hasColors = directory.hasColors === true, base = directory.vertexStride - (hasColors ? 16 : 0);
+  return { hasUvs: base === 88 || base === 104,
+    hasTangents: base === 96 || base === 104, hasColors };
 }
 function selectedCut(directory: GeometryStreamDirectory, maxError: number): number[] {
   const selected = new Set(directory.roots);
@@ -107,20 +109,22 @@ function freezeProxy(proxy: GeometryQueryProxy): GeometryQueryProxy {
 }
 type ProxyHeaderInput = Pick<GeometryQueryProxy, 'primitiveKey' | 'directorySha256' | 'topologyVersion'
   | 'requestedError' | 'approximateObjectSpaceError' | 'selectedClusters'> & {
-    mesh: { vertexCount: number; indices: { length: number }; uvs?: unknown; tangents?: unknown; bounds: Bounds };
+    mesh: { vertexCount: number; indices: { length: number }; uvs?: unknown; tangents?: unknown;
+      colors?: unknown; bounds: Bounds };
   };
 function metadata(proxy: ProxyHeaderInput) {
   return { primitiveKey: proxy.primitiveKey, directorySha256: proxy.directorySha256,
     topologyVersion: proxy.topologyVersion, requestedError: proxy.requestedError,
     approximateObjectSpaceError: proxy.approximateObjectSpaceError, selectedClusters: proxy.selectedClusters,
     vertexCount: proxy.mesh.vertexCount, triangleCount: proxy.mesh.indices.length / 3,
-    hasUvs: !!proxy.mesh.uvs, hasTangents: !!proxy.mesh.tangents, bounds: proxy.mesh.bounds };
+    hasUvs: !!proxy.mesh.uvs, hasTangents: !!proxy.mesh.tangents,
+    ...(proxy.mesh.colors ? { hasColors: true } : {}), bounds: proxy.mesh.bounds };
 }
 function wireBytes(proxy: GeometryQueryProxy): number {
   const header = new TextEncoder().encode(JSON.stringify(metadata(proxy)));
   if (header.byteLength > MAX_METADATA_BYTES) fail('METADATA_BUDGET');
   return HEADER_BYTES + header.byteLength + rawBytes(proxy.mesh.vertexCount,
-    proxy.mesh.indices.length / 3, !!proxy.mesh.uvs, !!proxy.mesh.tangents);
+    proxy.mesh.indices.length / 3, !!proxy.mesh.uvs, !!proxy.mesh.tangents, !!proxy.mesh.colors);
 }
 
 /** Validate asset identity, deterministic cut, geometry layout, and retained budgets. */
@@ -142,11 +146,13 @@ export async function validateGeometryQueryProxy(directoryInput: GeometryStreamD
   const vertices = integer(mesh.vertexCount, 1, budget.maxVertices, 'VERTEX_BUDGET');
   const triangles = expected.reduce((sum, id) => sum + directory.clusters[id].triangleCount, 0);
   if (triangles > budget.maxTriangles || mesh.indices.length !== triangles * 3) fail('TRIANGLE_BUDGET');
-  const { hasUvs, hasTangents } = flags(directory);
-  if (!!mesh.uvs !== hasUvs || !!mesh.tangents !== hasTangents
+  const { hasUvs, hasTangents, hasColors } = flags(directory);
+  if (!!mesh.uvs !== hasUvs || !!mesh.tangents !== hasTangents || !!mesh.colors !== hasColors
     || mesh.vertices.byteLength !== vertices * 80
     || (mesh.uvs && (!(mesh.uvs instanceof Float32Array) || mesh.uvs.length !== vertices * 2 || !mesh.uvs.every(Number.isFinite)))
-    || (mesh.tangents && (!(mesh.tangents instanceof Float32Array) || mesh.tangents.length !== vertices * 4 || !mesh.tangents.every(Number.isFinite)))) fail('MESH_LAYOUT');
+    || (mesh.tangents && (!(mesh.tangents instanceof Float32Array) || mesh.tangents.length !== vertices * 4 || !mesh.tangents.every(Number.isFinite)))
+    || (mesh.colors && (!(mesh.colors instanceof Float32Array) || mesh.colors.length !== vertices * 4
+      || !mesh.colors.every(value => Number.isFinite(value) && value >= 0 && value <= 1)))) fail('MESH_LAYOUT');
   if (mesh.indices.some(id => id >= vertices)) fail('MESH_INDEX');
   const computed = meshBounds(mesh.vertices, vertices);
   if (!mesh.bounds || !Array.isArray(mesh.bounds.min) || !Array.isArray(mesh.bounds.max)
@@ -163,40 +169,44 @@ export async function buildGeometryQueryProxy(directoryInput: GeometryStreamDire
   const selectedClusters = selectedCut(directory, budget.maxError);
   const triangles = selectedClusters.reduce((sum, id) => sum + directory.clusters[id].triangleCount, 0);
   if (triangles > budget.maxTriangles) fail('TRIANGLE_BUDGET');
-  const { hasUvs, hasTangents } = flags(directory);
-  if (rawBytes(1, triangles, hasUvs, hasTangents) + HEADER_BYTES > budget.maxBytes) fail('BYTE_BUDGET');
+  const { hasUvs, hasTangents, hasColors } = flags(directory);
+  if (rawBytes(1, triangles, hasUvs, hasTangents, hasColors) + HEADER_BYTES > budget.maxBytes) fail('BYTE_BUDGET');
   const wanted = new Set(selectedClusters), pageIds = [...new Set(selectedClusters.map(id => directory.clusterPages[id]))].sort((a, b) => a - b);
   const sourceToProxy = new Map<number, number>();
-  const records: Uint8Array[] = [], uvRecords: number[] = [], tangentRecords: number[] = [], indices: number[] = [];
-  const sourceAttributes = new Map<number, { rest: Uint8Array; uv?: number[]; tangent?: number[] }>();
+  const records: Uint8Array[] = [], uvRecords: number[] = [], tangentRecords: number[] = [], colorRecords: number[] = [], indices: number[] = [];
+  const sourceAttributes = new Map<number, { rest: Uint8Array; uv?: number[]; tangent?: number[]; color?: number[] }>();
   for (const pageId of pageIds) {
     const page = directory.pages[pageId], supplied = await provider(page, new AbortController().signal);
     if (!(supplied instanceof Uint8Array) || supplied.byteLength !== page.encodedBytes) fail('PAGE_BYTES');
     const owned = new Uint8Array(page.encodedBytes); owned.set(supplied);
     const decoded = await decodeVerifiedGeometryPage(page, owned);
-    if (decoded.vertexStride !== directory.vertexStride || decoded.sourceVertexCount !== directory.sourceVertexCount
+    if (decoded.vertexStride !== directory.vertexStride || (decoded.hasColors === true) !== hasColors
+      || decoded.sourceVertexCount !== directory.sourceVertexCount
       || decoded.hierarchyClusterCount !== directory.clusters.length || decoded.clusters.length !== page.clusterIds.length
       || decoded.clusters.some((cluster, i) => cluster.id !== page.clusterIds[i])) fail('PAGE_LAYOUT');
     for (const cluster of decoded.clusters) {
       if (!wanted.has(cluster.id)) continue;
       const expected = directory.clusters[cluster.id];
       if (cluster.sourceVertexIds.length !== expected.vertexCount || cluster.localTriangles.length !== expected.triangleCount * 3
-        || !!cluster.uvs !== hasUvs || !!cluster.tangents !== hasTangents) fail('CLUSTER_LAYOUT');
+        || !!cluster.uvs !== hasUvs || !!cluster.tangents !== hasTangents || !!cluster.colors !== hasColors) fail('CLUSTER_LAYOUT');
       const local = new Uint32Array(expected.vertexCount);
       for (let i = 0; i < expected.vertexCount; i++) {
         const id = cluster.sourceVertexIds[i], rest = cluster.rest.slice(i * 80, (i + 1) * 80);
         const uv = cluster.uvs ? Array.from(cluster.uvs.subarray(i * 2, i * 2 + 2)) : undefined;
         const tangent = cluster.tangents ? Array.from(cluster.tangents.subarray(i * 4, i * 4 + 4)) : undefined;
+        const color = cluster.colors ? Array.from(cluster.colors.subarray(i * 4, i * 4 + 4)) : undefined;
         const prior = sourceAttributes.get(id);
         if (prior) {
           if (prior.rest.some((byte, offset) => byte !== rest[offset])
             || uv?.some((value, axis) => !Object.is(value, prior.uv?.[axis]))
-            || tangent?.some((value, axis) => !Object.is(value, prior.tangent?.[axis]))) fail('SEAM_ATTRIBUTES');
+            || tangent?.some((value, axis) => !Object.is(value, prior.tangent?.[axis]))
+            || color?.some((value, axis) => !Object.is(value, prior.color?.[axis]))) fail('SEAM_ATTRIBUTES');
         } else {
           const next = sourceToProxy.size;
-          if (next >= budget.maxVertices || rawBytes(next + 1, triangles, hasUvs, hasTangents) + HEADER_BYTES > budget.maxBytes) fail('VERTEX_BUDGET');
-          sourceToProxy.set(id, next); sourceAttributes.set(id, { rest, uv, tangent });
+          if (next >= budget.maxVertices || rawBytes(next + 1, triangles, hasUvs, hasTangents, hasColors) + HEADER_BYTES > budget.maxBytes) fail('VERTEX_BUDGET');
+          sourceToProxy.set(id, next); sourceAttributes.set(id, { rest, uv, tangent, color });
           records.push(rest); if (uv) uvRecords.push(...uv); if (tangent) tangentRecords.push(...tangent);
+          if (color) colorRecords.push(...color);
         }
         local[i] = sourceToProxy.get(id)!;
       }
@@ -218,15 +228,17 @@ export async function buildGeometryQueryProxy(directoryInput: GeometryStreamDire
     topologyVersion: budget.topologyVersion, requestedError: budget.maxError,
     approximateObjectSpaceError: metric(directory, selectedClusters), selectedClusters,
     mesh: { vertexCount: records.length, indices: { length: triangles * 3 },
-      uvs: hasUvs ? true : undefined, tangents: hasTangents ? true : undefined, bounds } };
+      uvs: hasUvs ? true : undefined, tangents: hasTangents ? true : undefined,
+      colors: hasColors ? true : undefined, bounds } };
   const metadataBytes = new TextEncoder().encode(JSON.stringify(metadata(planned))).byteLength;
   if (metadataBytes > MAX_METADATA_BYTES || HEADER_BYTES + metadataBytes
-    + rawBytes(records.length, triangles, hasUvs, hasTangents) > budget.maxBytes) fail('BYTE_BUDGET');
+    + rawBytes(records.length, triangles, hasUvs, hasTangents, hasColors) > budget.maxBytes) fail('BYTE_BUDGET');
   const vertices = new ArrayBuffer(records.length * 80), raw = new Uint8Array(vertices);
   records.forEach((record, i) => raw.set(record, i * 80));
   const mesh: MeshData = { vertices, vertexCount: records.length, indices: Uint32Array.from(indices),
     ...(hasUvs ? { uvs: Float32Array.from(uvRecords) } : {}),
     ...(hasTangents ? { tangents: Float32Array.from(tangentRecords) } : {}),
+    ...(hasColors ? { colors: Float32Array.from(colorRecords) } : {}),
     bounds };
   const proxy = freezeProxy({ version: 1, primitiveKey: directory.primitiveKey,
     directorySha256, topologyVersion: budget.topologyVersion,
@@ -236,7 +248,7 @@ export async function buildGeometryQueryProxy(directoryInput: GeometryStreamDire
   return proxy;
 }
 
-/** Little-endian header, bounded JSON metadata, then rest/index/UV/tangent payloads. */
+/** Little-endian header, bounded JSON metadata, then rest/index/UV/tangent/color payloads. */
 export function encodeGeometryQueryProxy(proxy: GeometryQueryProxy): Uint8Array<ArrayBuffer> {
   if (!proxy || proxy.version !== 1 || !proxy.mesh || !(proxy.mesh.vertices instanceof ArrayBuffer)
     || !(proxy.mesh.indices instanceof Uint32Array)) fail('MESH');
@@ -252,7 +264,9 @@ export function encodeGeometryQueryProxy(proxy: GeometryQueryProxy): Uint8Array<
   const triangleCount = integer(proxy.mesh.indices.length / 3, 1, HARD_TRIANGLES, 'TRIANGLE_BUDGET');
   if (proxy.mesh.vertices.byteLength !== vertexCount * 80 || proxy.mesh.indices.some(id => id >= vertexCount)
     || (proxy.mesh.uvs && (!(proxy.mesh.uvs instanceof Float32Array) || proxy.mesh.uvs.length !== vertexCount * 2 || !proxy.mesh.uvs.every(Number.isFinite)))
-    || (proxy.mesh.tangents && (!(proxy.mesh.tangents instanceof Float32Array) || proxy.mesh.tangents.length !== vertexCount * 4 || !proxy.mesh.tangents.every(Number.isFinite)))) fail('MESH_LAYOUT');
+    || (proxy.mesh.tangents && (!(proxy.mesh.tangents instanceof Float32Array) || proxy.mesh.tangents.length !== vertexCount * 4 || !proxy.mesh.tangents.every(Number.isFinite)))
+    || (proxy.mesh.colors && (!(proxy.mesh.colors instanceof Float32Array) || proxy.mesh.colors.length !== vertexCount * 4
+      || !proxy.mesh.colors.every(value => Number.isFinite(value) && value >= 0 && value <= 1)))) fail('MESH_LAYOUT');
   const expectedBounds = meshBounds(proxy.mesh.vertices, vertexCount);
   if (!proxy.mesh.bounds || !Array.isArray(proxy.mesh.bounds.min) || !Array.isArray(proxy.mesh.bounds.max)
     || proxy.mesh.bounds.min.length !== 3 || proxy.mesh.bounds.max.length !== 3
@@ -261,7 +275,7 @@ export function encodeGeometryQueryProxy(proxy: GeometryQueryProxy): Uint8Array<
   const header = new TextEncoder().encode(JSON.stringify(metadata(proxy)));
   if (header.byteLength > MAX_METADATA_BYTES) fail('METADATA_BUDGET');
   const size = HEADER_BYTES + header.byteLength + rawBytes(proxy.mesh.vertexCount,
-    proxy.mesh.indices.length / 3, !!proxy.mesh.uvs, !!proxy.mesh.tangents);
+    proxy.mesh.indices.length / 3, !!proxy.mesh.uvs, !!proxy.mesh.tangents, !!proxy.mesh.colors);
   if (size > HARD_BYTES) fail('BYTE_BUDGET');
   const result = new Uint8Array(size), view = new DataView(result.buffer);
   view.setUint32(0, MAGIC, true); view.setUint32(4, 1, true);
@@ -271,7 +285,8 @@ export function encodeGeometryQueryProxy(proxy: GeometryQueryProxy): Uint8Array<
   for (const stream of [new Uint8Array(proxy.mesh.vertices),
     new Uint8Array(proxy.mesh.indices.buffer, proxy.mesh.indices.byteOffset, proxy.mesh.indices.byteLength),
     ...(proxy.mesh.uvs ? [new Uint8Array(proxy.mesh.uvs.buffer, proxy.mesh.uvs.byteOffset, proxy.mesh.uvs.byteLength)] : []),
-    ...(proxy.mesh.tangents ? [new Uint8Array(proxy.mesh.tangents.buffer, proxy.mesh.tangents.byteOffset, proxy.mesh.tangents.byteLength)] : [])]) {
+    ...(proxy.mesh.tangents ? [new Uint8Array(proxy.mesh.tangents.buffer, proxy.mesh.tangents.byteOffset, proxy.mesh.tangents.byteLength)] : []),
+    ...(proxy.mesh.colors ? [new Uint8Array(proxy.mesh.colors.buffer, proxy.mesh.colors.byteOffset, proxy.mesh.colors.byteLength)] : [])]) {
     result.set(stream, offset); offset += stream.byteLength;
   }
   return result;
@@ -297,9 +312,10 @@ export async function decodeGeometryQueryProxy(directoryInput: GeometryStreamDir
     || typeof meta.directorySha256 !== 'string' || meta.directorySha256 !== await directoryDigest(directory)) fail('IDENTITY');
   const vertexCount = integer(meta.vertexCount, 1, budget.maxVertices, 'VERTEX_BUDGET');
   const triangleCount = integer(meta.triangleCount, 1, budget.maxTriangles, 'TRIANGLE_BUDGET');
-  const { hasUvs, hasTangents } = flags(directory);
-  if (meta.hasUvs !== hasUvs || meta.hasTangents !== hasTangents
-    || HEADER_BYTES + length + rawBytes(vertexCount, triangleCount, hasUvs, hasTangents) !== owned.byteLength) fail('MESH_LAYOUT');
+  const { hasUvs, hasTangents, hasColors } = flags(directory);
+  if (meta.hasUvs !== hasUvs || meta.hasTangents !== hasTangents || (meta.hasColors === true) !== hasColors
+    || (meta.hasColors !== undefined && meta.hasColors !== true)
+    || HEADER_BYTES + length + rawBytes(vertexCount, triangleCount, hasUvs, hasTangents, hasColors) !== owned.byteLength) fail('MESH_LAYOUT');
   let offset = HEADER_BYTES + length;
   const copy = (size: number): ArrayBuffer => {
     const result = new ArrayBuffer(size);
@@ -308,12 +324,14 @@ export async function decodeGeometryQueryProxy(directoryInput: GeometryStreamDir
   const vertices = copy(vertexCount * 80), indices = new Uint32Array(copy(triangleCount * 12));
   const uvs = hasUvs ? new Float32Array(copy(vertexCount * 8)) : undefined;
   const tangents = hasTangents ? new Float32Array(copy(vertexCount * 16)) : undefined;
+  const colors = hasColors ? new Float32Array(copy(vertexCount * 16)) : undefined;
   const proxy: GeometryQueryProxy = { version: 1, primitiveKey: meta.primitiveKey,
     directorySha256: meta.directorySha256, topologyVersion: meta.topologyVersion as number,
     requestedError: meta.requestedError as number,
     approximateObjectSpaceError: meta.approximateObjectSpaceError as number,
     selectedClusters: meta.selectedClusters as number[],
-    mesh: { vertices, indices, vertexCount, ...(uvs ? { uvs } : {}), ...(tangents ? { tangents } : {}), bounds: meta.bounds as Bounds } };
+    mesh: { vertices, indices, vertexCount, ...(uvs ? { uvs } : {}), ...(tangents ? { tangents } : {}),
+      ...(colors ? { colors } : {}), bounds: meta.bounds as Bounds } };
   await validateGeometryQueryProxy(directory, proxy, options);
   return freezeProxy(proxy);
 }

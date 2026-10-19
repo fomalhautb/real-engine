@@ -7,7 +7,7 @@ import type { GeometryHierarchy, GeometryCluster } from '../src/geometry-hierarc
 const HEADER_BYTES = 40;
 const REST_BYTES = 80;
 
-function fixture(uvs = true, tangents = true): GeometryHierarchy {
+function fixture(uvs = true, tangents = true, colors = false): GeometryHierarchy {
   const vertexCount = 7;
   const vertices = new ArrayBuffer(vertexCount * REST_BYTES);
   const raw = new Uint8Array(vertices), view = new DataView(vertices);
@@ -20,7 +20,8 @@ function fixture(uvs = true, tangents = true): GeometryHierarchy {
   const source = { vertexCount, vertices, indices: new Uint32Array([0, 1, 2]),
     bounds: { min: [-1, 0, -6] as [number, number, number], max: [2, 7, 0] as [number, number, number] },
     uvs: uvs ? new Float32Array(Array.from({ length: vertexCount * 2 }, (_, i) => i / 7)) : undefined,
-    tangents: tangents ? new Float32Array(Array.from({ length: vertexCount * 4 }, (_, i) => i / 11)) : undefined };
+    tangents: tangents ? new Float32Array(Array.from({ length: vertexCount * 4 }, (_, i) => i / 11)) : undefined,
+    colors: colors ? new Float32Array(Array.from({ length: vertexCount * 4 }, (_, i) => i / (vertexCount * 4))) : undefined };
   const bounds = { min: [0, 0, 0] as [number, number, number], max: [1, 1, 1] as [number, number, number] };
   const cluster = (ids: number[]): GeometryCluster => ({ level: 0, vertices: new Uint32Array(ids),
     triangles: new Uint8Array([0, 1, 2]), bounds, lodBounds: bounds, error: 0, refinedGroup: null, group: 0 });
@@ -97,6 +98,27 @@ describe('lossless geometry pages', () => {
     expect(first.pages.map(page => Array.from(page.bytes))).toEqual(second.pages.map(page => Array.from(page.bytes)));
     const standalone = await decodeGeometryPage(first.pages[2].bytes, { maxPageBytes: 350 });
     expect(standalone.clusters.map(cluster => cluster.id)).toEqual([2]);
+  });
+
+  it('round-trips the optional RGBA stream and keeps legacy pages colorless', async () => {
+    const hierarchy = fixture(true, true, true);
+    const encoded = await encodeGeometryPages(hierarchy, { maxPageBytes: 512 });
+    expect(encoded.vertexStride).toBe(120);
+    expect(encoded.hasColors).toBe(true);
+    for (const page of encoded.pages) {
+      const decoded = await decodeGeometryPage(page.bytes, { maxPageBytes: 512 });
+      expect(decoded.hasColors).toBe(true);
+      for (const cluster of decoded.clusters) {
+        expect(Array.from(cluster.colors!)).toEqual(Array.from(cluster.sourceVertexIds).flatMap(id =>
+          Array.from(hierarchy.source.colors!.subarray(id * 4, id * 4 + 4))));
+      }
+    }
+    const legacy = await encodeGeometryPages(fixture(false, true), { maxPageBytes: 512 });
+    expect(legacy.hasColors).toBeUndefined();
+    expect((await decodeGeometryPage(legacy.pages[0].bytes)).hasColors).toBeUndefined();
+    const invalid = fixture(true, true, true);
+    invalid.source.colors![0] = Infinity;
+    await expect(encodeGeometryPages(invalid)).rejects.toThrow(/color/);
   });
 
   it('rejects a cluster too large for a page and caps encoded plus decoded totals', async () => {

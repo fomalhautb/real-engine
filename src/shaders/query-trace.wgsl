@@ -12,7 +12,7 @@ struct Hit {
 }
 struct Params {
     shape: vec4u, // node count, vertex count, instance count, batch ID
-    offsets: vec4u, // triangle IDs, indices, UVs, unused
+    offsets: vec4u, // triangle IDs, indices, UVs, colors (0 = white)
     limits: vec4u, // ray count, work limit, frame, topology version
     material: vec4u, // material revision, GI area-sampling source flag, scene candidates enabled
     textureLod: vec4f,
@@ -63,6 +63,12 @@ fn intersectsBox(ray: Ray, box: Bounds, closest: f32) -> bool {
 fn uvAt(vertex: u32) -> vec2f {
     let start = params.offsets.z + vertex * 2u;
     return vec2f(bitcast<f32>(source[start]), bitcast<f32>(source[start + 1u]));
+}
+fn colorAt(vertex: u32) -> vec4f {
+    if (params.offsets.w == 0u) { return vec4f(1.0); }
+    let start = params.offsets.w + vertex * 4u;
+    return vec4f(bitcast<f32>(source[start]), bitcast<f32>(source[start + 1u]),
+        bitcast<f32>(source[start + 2u]), bitcast<f32>(source[start + 3u]));
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3u) {
@@ -139,9 +145,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                         && (hit.identity.x != params.shape.w || instance >= winningInstance))) { continue; }
                 let weights = vec3f(1.0 - u - v, u, v);
                 let uv = uvAt(v0) * weights.x + uvAt(v1) * weights.y + uvAt(v2) * weights.z;
+                let color = colorAt(v0) * weights.x + colorAt(v1) * weights.y + colorAt(v2) * weights.z;
                 let inst = instances[instance];
-                if (!evaluateCoverage(uv, params.textureLod.x, inst.color, inst.material.xy)) { continue; }
-                let surface = evaluateMaterial(uv, params.textureLod.x, inst.color, inst.material.xy);
+                if (!evaluateCoverage(uv, params.textureLod.x, inst.color, inst.material.xy, color)) { continue; }
+                let surface = evaluateMaterial(uv, params.textureLod.x, inst.color, inst.material.xy, color);
                 let geometricNormal = surfaceUnit(cross(edge1, edge2), vec3f(0.0, 1.0, 0.0)) * select(-1.0, 1.0, determinant > 0.0);
                 let vertexNormal = a.normal.xyz * weights.x + b.normal.xyz * weights.y + c.normal.xyz * weights.z;
                 var normal = surfaceUnit(vertexNormal, geometricNormal);

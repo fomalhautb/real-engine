@@ -6,6 +6,7 @@ import { GeometryStreamCut, type GeometryStreamView } from '../../../src/geometr
 import { GpuGeometryPagePool } from '../../../src/gpu-geometry-page-pool';
 import { GpuGeometryStreamSelection } from '../../../src/gpu-geometry-stream-selection';
 import type { GeometryStreamDirectory } from '../../../src/geometry-stream-types';
+import { GEOMETRY_GPU_VERTEX_BYTES } from '../../../src/geometry-gpu-page';
 import { identity, lookAt, multiply, normalMatrix, perspective, scaling, translation, type Mat4 } from '../../../src/math';
 
 const eye: [number, number, number] = [0, 2, 12];
@@ -134,7 +135,7 @@ export async function runGeometryStreamSelectionCases() {
     same([...cache.residentPageIds()].sort((a, b) => a - b), allPageIds, 'CPU_CACHE_ALL_PAGES');
     const verticesPerSlot = Math.max(...directory.pages.map(page => page.clusterIds.reduce((sum, id) => sum + directory.clusters[id].vertexCount, 0)));
     const indicesPerSlot = Math.max(...directory.pages.map(page => page.clusterIds.reduce((sum, id) => sum + directory.clusters[id].triangleCount * 3, 0)));
-    const poolBudget = directory.pages.length * (verticesPerSlot * 128 + indicesPerSlot * 4)
+    const poolBudget = directory.pages.length * (verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES + indicesPerSlot * 4)
       + directory.clusters.length * 32 + directory.pages.length * 4;
     pool = await GpuGeometryPagePool.create(device, directory, {
       maxResidentBytes: poolBudget, maxStagingBytes: 64 * 1024 * 1024,

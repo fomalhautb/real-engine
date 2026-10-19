@@ -30,6 +30,47 @@ function components(mesh: MeshData, vertex: number, start: number, count: number
 }
 
 describe('glTF mesh conversion', () => {
+  it('imports normalized COLOR_0 and keeps alpha through flat-normal corner expansion', () => {
+    const fixture = new BinaryFixture();
+    const position = fixture.add(new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]), 5126, 'VEC3', 4);
+    const color = fixture.add(new Uint8Array([255, 0, 0, 128, 0, 255, 0, 255, 0, 0, 255, 64, 255, 255, 255, 0]), 5121, 'VEC4', 4, true);
+    const indices = fixture.add(new Uint16Array([0, 1, 2, 0, 2, 3]), 5123, 'SCALAR', 6);
+    const mesh = fixture.asset({ attributes: { POSITION: position, COLOR_0: color }, indices }).meshes[0].primitives[0].mesh;
+    expect(mesh.vertexCount).toBe(6);
+    const expected = [1, 0, 0, 128 / 255, 0, 1, 0, 1, 0, 0, 1, 64 / 255,
+      1, 0, 0, 128 / 255, 0, 0, 1, 64 / 255, 1, 1, 1, 0];
+    for (let i = 0; i < expected.length; i++) expect(mesh.colors![i]).toBeCloseTo(expected[i]);
+  });
+
+  it('accepts float VEC3 as opaque color and normalized unsigned-short VEC4', () => {
+    const positionData = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    for (const [data, componentType, type, normalized, expected] of [
+      [new Float32Array([0.25, 0.5, 0.75, 1, 0, 0, 0, 1, 0]), 5126, 'VEC3', false, [0.25, 0.5, 0.75, 1]],
+      [new Uint16Array([65535, 32768, 0, 16384, 0, 0, 0, 65535, 0, 0, 0, 65535]), 5123, 'VEC4', true, [1, 32768 / 65535, 0, 16384 / 65535]],
+    ] as const) {
+      const fixture = new BinaryFixture();
+      const position = fixture.add(positionData, 5126, 'VEC3', 3);
+      const color = fixture.add(data, componentType, type, 3, normalized);
+      const mesh = fixture.asset({ attributes: { POSITION: position, COLOR_0: color } }).meshes[0].primitives[0].mesh;
+      for (let i = 0; i < 4; i++) expect(mesh.colors![i]).toBeCloseTo(expected[i]);
+    }
+  });
+
+  it('rejects invalid COLOR_0 component layouts and out-of-range or nonfinite float colors', () => {
+    const positionData = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    for (const [data, componentType, type, normalized, error] of [
+      [new Uint8Array(9), 5121, 'VEC3', false, /GLTF_COLOR_LAYOUT/],
+      [new Float32Array(9).fill(1.1), 5126, 'VEC3', false, /GLTF_COLOR_RANGE/],
+      [new Float32Array([Number.NaN, ...new Array(8).fill(1)]), 5126, 'VEC3', false, /non-finite/],
+      [new Float32Array(6), 5126, 'VEC2', false, /GLTF_COLOR_LAYOUT/],
+    ] as const) {
+      const fixture = new BinaryFixture();
+      const position = fixture.add(positionData, 5126, 'VEC3', 3);
+      const color = fixture.add(data, componentType, type, 3, normalized);
+      expect(() => fixture.asset({ attributes: { POSITION: position, COLOR_0: color } })).toThrow(error);
+    }
+  });
+
   it('deindexes missing-normal faces and remaps UVs, weights, and morph deltas', () => {
     const fixture = new BinaryFixture();
     const position = fixture.add(new Float32Array([

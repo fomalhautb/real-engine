@@ -3,7 +3,7 @@ import { encodeGeometryPages } from '../src/geometry-pages';
 import type { GeometryHierarchy } from '../src/geometry-hierarchy-types';
 import { decodeVerifiedGeometryPage, geometryPageTransferBuffers } from '../src/geometry-page-decode';
 
-function fixture(withUvs: boolean, withTangents: boolean): GeometryHierarchy {
+function fixture(withUvs: boolean, withTangents: boolean, withColors = false): GeometryHierarchy {
   const vertices = new ArrayBuffer(3 * 80);
   const view = new DataView(vertices);
   for (let i = 0; i < 3; i++) view.setFloat32(i * 80, i, true);
@@ -13,7 +13,8 @@ function fixture(withUvs: boolean, withTangents: boolean): GeometryHierarchy {
     version: 1, builder: 'meshoptimizer-1.3.0', primitiveKey: 'verified-page',
     source: { vertices, vertexCount: 3, indices: new Uint32Array([0, 1, 2]), bounds,
       uvs: withUvs ? new Float32Array([0, 0, 1, 0, 0, 1]) : undefined,
-      tangents: withTangents ? new Float32Array(12).fill(1) : undefined },
+      tangents: withTangents ? new Float32Array(12).fill(1) : undefined,
+      colors: withColors ? new Float32Array(12).fill(0.5) : undefined },
     options: {} as GeometryHierarchy['options'],
     clusters: [{ level: 0, vertices: new Uint32Array([0, 1, 2]),
       triangles: new Uint8Array([0, 1, 2]), bounds, lodBounds: bounds, error: 0,
@@ -22,8 +23,8 @@ function fixture(withUvs: boolean, withTangents: boolean): GeometryHierarchy {
   };
 }
 
-async function encodedFixture(withUvs = true, withTangents = true) {
-  const page = (await encodeGeometryPages(fixture(withUvs, withTangents), { maxPageBytes: 2048 })).pages[0];
+async function encodedFixture(withUvs = true, withTangents = true, withColors = false) {
+  const page = (await encodeGeometryPages(fixture(withUvs, withTangents, withColors), { maxPageBytes: 2048 })).pages[0];
   const bytes = new Uint8Array(page.bytes);
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
   const sha256 = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
@@ -33,16 +34,18 @@ async function encodedFixture(withUvs = true, withTangents = true) {
 
 describe('verified geometry page decode', () => {
   it('checks the real encoded payload and exposes all optional transfer streams', async () => {
-    for (const [withUvs, withTangents] of [[false, false], [true, false], [false, true], [true, true]]) {
-      const { descriptor, bytes } = await encodedFixture(withUvs, withTangents);
+    for (const [withUvs, withTangents, withColors] of [[false, false, false], [true, false, false],
+      [false, true, false], [true, true, false], [false, false, true], [true, true, true]]) {
+      const { descriptor, bytes } = await encodedFixture(withUvs, withTangents, withColors);
       const decoded = await decodeVerifiedGeometryPage(descriptor, bytes);
       expect(decoded.hasUvs).toBe(withUvs);
       expect(decoded.hasTangents).toBe(withTangents);
+      expect(decoded.hasColors === true).toBe(withColors);
       const cluster = decoded.clusters[0];
-      const arrays = [cluster.sourceVertexIds, cluster.rest, cluster.uvs, cluster.tangents,
+      const arrays = [cluster.sourceVertexIds, cluster.rest, cluster.uvs, cluster.tangents, cluster.colors,
         cluster.localTriangles].filter(array => array !== undefined);
       const transfers = geometryPageTransferBuffers(decoded);
-      expect(transfers).toHaveLength(3 + Number(withUvs) + Number(withTangents));
+      expect(transfers).toHaveLength(3 + Number(withUvs) + Number(withTangents) + Number(withColors));
       expect(new Set(transfers).size).toBe(transfers.length);
       expect(transfers.reduce((sum, buffer) => sum + buffer.byteLength, 0))
         .toBe(arrays.reduce((sum, array) => sum + array.byteLength, 0));

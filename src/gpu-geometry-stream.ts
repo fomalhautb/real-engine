@@ -9,6 +9,7 @@ import { GeometryStreamWorkingSet } from './geometry-stream-working-set';
 import type { GeometryPageDecodeService } from './geometry-decode-worker-pool';
 import type { MeshData } from './geometry';
 import type { GpuOcclusion } from './gpu-occlusion';
+import { GEOMETRY_GPU_VERTEX_BYTES } from './geometry-gpu-page';
 
 export interface GeometryStreamSource {
   /** Explicit fixed representation for a source-free StreamedSceneBatch. */
@@ -34,6 +35,7 @@ export class GpuGeometryStream {
   private readonly sourceIndices: Uint32Array;
   private readonly sourceUvs?: Float32Array;
   private readonly sourceTangents?: Float32Array;
+  private readonly sourceColors?: Float32Array;
   private readonly requestsPerFrame: number;
   private pending: GeometryStreamSelectionFeedback['requestedPages'] = [];
   private pendingCursor = 0;
@@ -57,7 +59,7 @@ export class GpuGeometryStream {
     const mesh = this.sourceMesh = residentMesh(scene);
     this.sourceVertexCount = mesh.vertexCount;
     this.sourceVertices = mesh.vertices; this.sourceIndices = mesh.indices;
-    this.sourceUvs = mesh.uvs; this.sourceTangents = mesh.tangents;
+    this.sourceUvs = mesh.uvs; this.sourceTangents = mesh.tangents; this.sourceColors = mesh.colors;
     this.requestsPerFrame = this.source.maxRequestsPerFrame ?? 16;
     this.workingSet = new GeometryStreamWorkingSet(pool.directory, pool.slotCount);
     this.allocation = this.workingSet.plan([]);
@@ -74,7 +76,8 @@ export class GpuGeometryStream {
     const mesh = residentMesh(scene);
     if (source.queryProxy) await validateGeometryQueryProxy(source.directory, source.queryProxy);
     else if (source.directory.sourceVertexCount !== mesh.vertexCount || source.directory.sourceTriangleCount * 3 !== mesh.indices.length
-      || source.directory.vertexStride !== 80 + (mesh.uvs ? 8 : 0) + (mesh.tangents ? 16 : 0)) {
+      || !!source.directory.hasColors !== !!mesh.colors
+      || source.directory.vertexStride !== 80 + (mesh.uvs ? 8 : 0) + (mesh.tangents ? 16 : 0) + (mesh.colors ? 16 : 0)) {
       throw new Error('GEOMETRY_STREAM_SOURCE_MISMATCH');
     }
     let cache: GeometryPageCache | undefined, pool: GpuGeometryPagePool | undefined, selection: GpuGeometryStreamSelection | undefined;
@@ -109,6 +112,7 @@ export class GpuGeometryStream {
       || mesh !== this.sourceMesh || mesh.vertexCount !== this.sourceVertexCount
       || mesh.vertices !== this.sourceVertices || mesh.indices !== this.sourceIndices
       || mesh.uvs !== this.sourceUvs || mesh.tangents !== this.sourceTangents
+      || mesh.colors !== this.sourceColors
       || this.scene.capacity !== this.selection.capacity || this.scene.deformation.jointCount || this.scene.deformation.nodes.length || this.scene.morphTargets.length) {
       throw new Error('GEOMETRY_STREAM_ASSET_CHANGED');
     }
@@ -127,6 +131,7 @@ export class GpuGeometryStream {
       for (let byte = 0; byte < 80; byte++) if (cluster.rest[vertex * 80 + byte] !== original[source * 80 + byte]) throw new Error('GEOMETRY_STREAM_SOURCE_ATTRIBUTES');
       if (cluster.uvs) for (let axis = 0; axis < 2; axis++) if (cluster.uvs[vertex * 2 + axis] !== this.sourceUvs![source * 2 + axis]) throw new Error('GEOMETRY_STREAM_SOURCE_UVS');
       if (cluster.tangents) for (let axis = 0; axis < 4; axis++) if (cluster.tangents[vertex * 4 + axis] !== this.sourceTangents![source * 4 + axis]) throw new Error('GEOMETRY_STREAM_SOURCE_TANGENTS');
+      if (cluster.colors) for (let axis = 0; axis < 4; axis++) if (cluster.colors[vertex * 4 + axis] !== this.sourceColors![source * 4 + axis]) throw new Error('GEOMETRY_STREAM_SOURCE_COLORS');
     }
     this.checkedPages.add(id);
   }
@@ -171,7 +176,7 @@ export class GpuGeometryStream {
       const state = this.pool.diagnostics();
       if (state.pendingPages.includes(pageId)) continue;
       const bytes = this.pool.directory.pages[pageId].clusterIds.reduce((sum, id) => sum
-        + this.pool.directory.clusters[id].vertexCount * 128 + this.pool.directory.clusters[id].triangleCount * 12 + 32, 4);
+        + this.pool.directory.clusters[id].vertexCount * GEOMETRY_GPU_VERTEX_BYTES + this.pool.directory.clusters[id].triangleCount * 12 + 32, 4);
       if (state.pendingPages.length >= state.limits.maxQueuedPages || state.stagingBytes + bytes > state.limits.maxStagingBytes) break;
       this.checkPage(pageId); this.pool.enqueue(pageId, page, priority);
     }

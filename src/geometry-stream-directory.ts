@@ -51,8 +51,10 @@ export function validateGeometryStreamDirectory(input: GeometryStreamDirectory):
     || !input.primitiveKey.length || input.primitiveKey.length > 1024) fail('HEADER');
   const sourceVertexCount = integer(input.sourceVertexCount, 1, 16_000_000, 'SOURCE_VERTICES');
   const sourceTriangleCount = integer(input.sourceTriangleCount, 1, 3_000_000, 'SOURCE_TRIANGLES');
-  const vertexStride = integer(input.vertexStride, 80, 104, 'VERTEX_STRIDE');
-  if (![80, 88, 96, 104].includes(vertexStride)) fail('VERTEX_STRIDE');
+  if (input.hasColors !== undefined && input.hasColors !== true) fail('VERTEX_COLORS');
+  const hasColors = input.hasColors === true;
+  const vertexStride = integer(input.vertexStride, 80, 120, 'VERTEX_STRIDE');
+  if (![80, 88, 96, 104].includes(vertexStride - (hasColors ? 16 : 0))) fail('VERTEX_STRIDE');
   if (!Array.isArray(input.clusters) || !input.clusters.length || input.clusters.length > MAX_CLUSTERS
     || !Array.isArray(input.groups) || !input.groups.length || input.groups.length > MAX_GROUPS
     || !Array.isArray(input.pages) || !input.pages.length || input.pages.length > MAX_PAGES) fail('COUNTS');
@@ -159,7 +161,8 @@ export function validateGeometryStreamDirectory(input: GeometryStreamDirectory):
   Object.freeze(clusters); Object.freeze(groups); Object.freeze(roots); Object.freeze(pages);
   Object.freeze(clusterPages); Object.freeze(rootPages);
   return Object.freeze({ version: 1, primitiveKey: input.primitiveKey, sourceVertexCount, sourceTriangleCount,
-    vertexStride, clusters, groups, roots, pages, clusterPages, rootPages });
+    vertexStride, ...(hasColors ? { hasColors: true as const } : {}),
+    clusters, groups, roots, pages, clusterPages, rootPages });
 }
 
 /** Convert an audited offline hierarchy and encoded pages into runtime-only metadata. */
@@ -167,6 +170,8 @@ export async function buildGeometryStreamDirectory(hierarchy: GeometryHierarchy,
   packGeometryLod(hierarchy);
   if (!encoded || encoded.version !== 1 || !Array.isArray(encoded.pages)
     || !encoded.pages.length || encoded.pages.length > MAX_PAGES) fail('ENCODING');
+  if ((encoded.hasColors !== undefined && encoded.hasColors !== true)
+    || (encoded.hasColors === true) !== !!hierarchy.source.colors) fail('VERTEX_COLORS');
   let totalPageBytes = 0;
   for (const page of encoded.pages) {
     if (!page || !(page.bytes instanceof Uint8Array)) fail('PAGE_BYTES');
@@ -179,6 +184,7 @@ export async function buildGeometryStreamDirectory(hierarchy: GeometryHierarchy,
   const snapshot = validateGeometryStreamDirectory({
     version: 1, primitiveKey: hierarchy.primitiveKey, sourceVertexCount: hierarchy.source.vertexCount,
     sourceTriangleCount: hierarchy.sourceTriangleCount, vertexStride: encoded.vertexStride,
+    ...(encoded.hasColors ? { hasColors: true as const } : {}),
     clusters: hierarchy.clusters.map(cluster => ({ level: cluster.level, group: cluster.group,
       refinedGroup: cluster.refinedGroup, vertexCount: cluster.vertices.length, triangleCount: cluster.triangles.length / 3,
       bounds: cluster.bounds, lodBounds: cluster.lodBounds, error: cluster.error })),

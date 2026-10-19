@@ -4,6 +4,7 @@ import { decodeGeometryPage, encodeGeometryPages, type DecodedGeometryPage } fro
 import { buildGeometryStreamDirectory } from '../src/geometry-stream-directory';
 import type { GeometryStreamDirectory } from '../src/geometry-stream-types';
 import { GpuGeometryPagePool, type GeometryGpuPoolOptions } from '../src/gpu-geometry-page-pool';
+import { GEOMETRY_GPU_VERTEX_BYTES } from '../src/geometry-gpu-page';
 
 type FakeBuffer = { label: string; size: number; data: Uint8Array; destroyed: boolean; destroy: () => void };
 
@@ -88,7 +89,7 @@ beforeAll(async () => {
     (sum, id) => sum + directory.clusters[id].vertexCount, 0)));
   const indicesPerSlot = Math.max(...directory.pages.map(page => page.clusterIds.reduce(
     (sum, id) => sum + directory.clusters[id].triangleCount * 3, 0)));
-  bytesPerSlot = verticesPerSlot * 128 + indicesPerSlot * 4;
+  bytesPerSlot = verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES + indicesPerSlot * 4;
   metadataBytes = directory.clusters.length * 32 + directory.pages.length * 4;
 });
 

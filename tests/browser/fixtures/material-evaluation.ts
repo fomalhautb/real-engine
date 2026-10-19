@@ -29,8 +29,8 @@ struct ProbeInputs { instanceColor: vec4f, metalRoughUv: vec4f, lodAndPadding: v
 @group(1) @binding(1) var<uniform> probe: ProbeInputs;
 @compute @workgroup_size(1)
 fn main() {
-    let surface = evaluateMaterial(probe.metalRoughUv.zw, probe.lodAndPadding.x, probe.instanceColor, probe.metalRoughUv.xy);
-    let covered = evaluateCoverage(probe.metalRoughUv.zw, probe.lodAndPadding.x, probe.instanceColor, probe.metalRoughUv.xy);
+    let surface = evaluateMaterial(probe.metalRoughUv.zw, probe.lodAndPadding.x, probe.instanceColor, probe.metalRoughUv.xy, vec4f(1.0));
+    let covered = evaluateCoverage(probe.metalRoughUv.zw, probe.lodAndPadding.x, probe.instanceColor, probe.metalRoughUv.xy, vec4f(1.0));
     // Packed floats: [base RGB, opacity], [metallic, roughness, cutoff, coverage],
     // [emissive RGB, 0], [0, 0, 0, 0]. CPU checks all 16 lanes, including padding.
     result[0] = vec4f(surface.baseColor, surface.opacity);

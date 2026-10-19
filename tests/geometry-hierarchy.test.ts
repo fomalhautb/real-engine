@@ -333,6 +333,22 @@ describe('offline geometry hierarchy', () => {
     expect(first.source.bounds).toEqual(ownedBounds);
   });
 
+  it('snapshots bounded linear RGBA and retains source attributes through simplification', async () => {
+    const mesh = grid(8);
+    mesh.colors = new Float32Array(mesh.vertexCount * 4);
+    for (let i = 0; i < mesh.vertexCount; i++) mesh.colors.set([i / mesh.vertexCount, 0.25, 0.75, 1], i * 4);
+    const original = mesh.colors.slice();
+    const hierarchy = await buildGeometryHierarchy(input(mesh), BUILD_OPTIONS);
+    expect(hierarchy.source.colors).toEqual(original);
+    expect(hierarchy.groups.some(group => !group.terminal)).toBe(true);
+    expect(hierarchy.groups.every(group => Number.isFinite(group.error))).toBe(true);
+    mesh.colors[0] = 1;
+    expect(hierarchy.source.colors).toEqual(original);
+    const invalid = grid(8);
+    invalid.colors = original.slice(); invalid.colors[0] = 1.01;
+    await expect(buildGeometryHierarchy(input(invalid), BUILD_OPTIONS)).rejects.toThrow('GEOMETRY_COLORS');
+  });
+
   it('rejects unsupported coverage/deformation, malformed geometry and exceeded build budgets', async () => {
     const mesh = grid(8);
     await expect(buildGeometryHierarchy({ ...input(mesh), coverage: 'mask' }, BUILD_OPTIONS)).rejects.toThrow();

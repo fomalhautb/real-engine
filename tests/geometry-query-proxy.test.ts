@@ -7,9 +7,10 @@ import { buildGeometryQueryProxy, decodeGeometryQueryProxy, encodeGeometryQueryP
   validateGeometryQueryProxy } from '../src/geometry-query-proxy';
 
 const N = 16;
-function grid() {
+function grid(withColors = false) {
   const count = (N + 1) ** 2, vertices = new ArrayBuffer(count * 80), view = new DataView(vertices);
   const indices: number[] = [], uvs = new Float32Array(count * 2), tangents = new Float32Array(count * 4);
+  const colors = withColors ? new Float32Array(count * 4) : undefined;
   let low = Infinity, high = -Infinity;
   for (let y = 0; y <= N; y++) for (let x = 0; x <= N; x++) {
     const id = y * (N + 1) + x, z = Math.fround(0.2 * Math.sin(x * 0.47) * Math.cos(y * 0.39));
@@ -17,6 +18,7 @@ function grid() {
     view.setFloat32(id * 80 + 8, z, true); view.setFloat32(id * 80 + 12, 1, true);
     view.setFloat32(id * 80 + 24, 1, true); view.setFloat32(id * 80 + 48, 1, true);
     uvs.set([x / N, y / N], id * 2); tangents.set([1, 0, 0, 1], id * 4);
+    colors?.set([x / N, y / N, (x + y) / (2 * N), 1], id * 4);
     low = Math.min(low, z); high = Math.max(high, z);
   }
   for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
@@ -24,12 +26,13 @@ function grid() {
     indices.push(a, b, d, a, d, c);
   }
   return { vertices, vertexCount: count, indices: Uint32Array.from(indices), uvs, tangents,
+    ...(colors ? { colors } : {}),
     bounds: { min: [0, 0, low] as [number, number, number], max: [N, N, high] as [number, number, number] } };
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
-async function fixture() {
-  const source = grid();
+async function fixture(withColors = false) {
+  const source = grid(withColors);
   const hierarchy = await buildGeometryHierarchy({ primitiveKey: 'proxy/curved-grid', mesh: source, coverage: 'opaque' },
     { maxClusterTriangles: 32, groupSize: 4, simplifyRatio: 0.5, maxSimplificationError: 2, maxLevels: 8 });
   const encoded = await encodeGeometryPages(hierarchy, { maxPageBytes: 16_384 });
@@ -53,6 +56,28 @@ function assertCompleteCut(directory: GeometryStreamDirectory, ids: readonly num
 }
 
 describe('offline geometry query proxy', () => {
+  it('preserves optional RGBA through the directory, reduced cut, and proxy wire format', async () => {
+    const colored = await fixture(true);
+    expect(colored.directory.hasColors).toBe(true);
+    expect(colored.directory.vertexStride).toBe(120);
+    const proxy = await buildGeometryQueryProxy(colored.directory, colored.provider);
+    expect(proxy.mesh.colors?.length).toBe(proxy.mesh.vertexCount * 4);
+    const bytes = encodeGeometryQueryProxy(proxy);
+    const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)),
+      byte => byte.toString(16).padStart(2, '0')).join('');
+    const decoded = await decodeGeometryQueryProxy(colored.directory, bytes, sha256);
+    expect(decoded.mesh.colors).toEqual(proxy.mesh.colors);
+    const view = new DataView(proxy.mesh.vertices);
+    for (let id = 0; id < proxy.mesh.vertexCount; id++) {
+      const x = view.getFloat32(id * 80, true), y = view.getFloat32(id * 80 + 4, true);
+      const sourceId = y * (N + 1) + x;
+      expect(proxy.mesh.colors!.slice(id * 4, id * 4 + 4)).toEqual(colored.source.colors!.slice(sourceId * 4, sourceId * 4 + 4));
+    }
+    const malformed = { ...proxy, mesh: { ...proxy.mesh, colors: proxy.mesh.colors!.slice() } };
+    malformed.mesh.colors![0] = 1.1;
+    await expect(validateGeometryQueryProxy(colored.directory, malformed)).rejects.toThrow('MESH_LAYOUT');
+    expect(data.directory.hasColors).toBeUndefined();
+  });
   it('constructs a reduced source-free root cut from verified pages', async () => {
     const calls = vi.fn(data.provider);
     const proxy = await buildGeometryQueryProxy(data.directory, calls);

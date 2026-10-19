@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 const MiB = 1024 * 1024;
 const MAX_JSON_BYTES = 128 * MiB;
-const supportedAttributes = new Set(['POSITION', 'NORMAL', 'TANGENT', 'TEXCOORD_0', 'JOINTS_0', 'WEIGHTS_0']);
+const supportedAttributes = new Set(['POSITION', 'NORMAL', 'TANGENT', 'TEXCOORD_0', 'COLOR_0', 'JOINTS_0', 'WEIGHTS_0']);
 const supportedSlots = ['baseColorTexture', 'metallicRoughnessTexture', 'emissiveTexture', 'normalTexture'];
 const issue = (code, path, detail) => ({ code, path, detail });
 const items = value => Array.isArray(value) ? value : [];
@@ -85,7 +85,7 @@ async function imageInfo(image, base) {
   return result;
 }
 
-/** Metadata-only audit. Counts describe declarations, never validated decoded geometry. */
+/** Metadata-only audit. Accessor declarations are checked; vertex values are never decoded or validated. */
 export async function auditGltf(input) {
   const path = resolve(input), { json, container, containerBytes, jsonBytes } = await readJson(path);
   if (!json || typeof json !== 'object' || Array.isArray(json)) throw new Error('GLTF_ROOT_OBJECT');
@@ -98,6 +98,7 @@ export async function auditGltf(input) {
   for (const name of items(json.extensionsUsed)) if (name !== 'KHR_materials_unlit' && !items(json.extensionsRequired).includes(name)) add('OPTIONAL_EXTENSION_NOT_INTERPRETED', 'extensionsUsed', name);
   const primitiveReports = [], positionAccessors = new Set(), indexAccessors = new Set();
   let primitiveVertices = 0, primitiveIndices = 0, primitiveTriangles = 0, missingNormalsExtraVertices = 0;
+  let color0Primitives = 0, color0DeclaredVertices = 0;
   for (const [mi, mesh] of meshes.entries()) for (const [pi, primitive] of items(mesh.primitives).entries()) {
     const where = `meshes[${mi}].primitives[${pi}]`, attrs = record(primitive.attributes);
     const pos = accessors[attrs.POSITION], idx = accessors[primitive.indices];
@@ -108,13 +109,28 @@ export async function auditGltf(input) {
     if (primitive.extensions !== undefined) add('GLTF_UNSUPPORTED_PRIMITIVE_EXTENSION', where, Object.keys(record(primitive.extensions)));
     if (pos?.componentType !== 5126) add('GLTF_POSITION_FLOAT_REQUIRED', where, pos?.componentType ?? null);
     for (const key of Object.keys(attrs)) if (!supportedAttributes.has(key)) add('GLTF_UNSUPPORTED_ATTRIBUTE', where, key);
+    let color0 = null;
+    if (attrs.COLOR_0 !== undefined) {
+      color0Primitives++;
+      const color = Number.isSafeInteger(attrs.COLOR_0) && attrs.COLOR_0 >= 0 ? accessors[attrs.COLOR_0] : undefined;
+      const count = integer(color?.count), componentType = color?.componentType ?? null;
+      color0DeclaredVertices += count ?? 0;
+      color0 = { accessor: attrs.COLOR_0, count, type: color?.type ?? null, componentType,
+        normalized: color?.normalized ?? false, valuesRead: false, valuesValidated: false };
+      if (count !== vertices || !['VEC3', 'VEC4'].includes(color?.type)
+        || (color.normalized !== undefined && typeof color.normalized !== 'boolean')
+        || !(componentType === 5126 && color.normalized !== true
+          || (componentType === 5121 || componentType === 5123) && color.normalized === true)) {
+        add('GLTF_COLOR_LAYOUT', `${where}.attributes.COLOR_0`, color0);
+      }
+    }
     if (Number.isSafeInteger(attrs.POSITION)) positionAccessors.add(attrs.POSITION);
     if (Number.isSafeInteger(primitive.indices)) indexAccessors.add(primitive.indices);
     if (attrs.NORMAL === undefined && indices !== null) missingNormalsExtraVertices += Math.max(0, indices - (vertices ?? 0));
     if (vertices !== null) primitiveVertices += vertices;
     if (indices !== null) primitiveIndices += indices;
     if (triangles !== null) primitiveTriangles += triangles;
-    primitiveReports.push({ mesh: mi, primitive: pi, material: primitive.material ?? null, vertices, indices, triangles, attributes: Object.keys(attrs), mode: primitive.mode ?? 4 });
+    primitiveReports.push({ mesh: mi, primitive: pi, material: primitive.material ?? null, vertices, indices, triangles, attributes: Object.keys(attrs), color0, mode: primitive.mode ?? 4 });
   }
   const uniqueAccessorVertices = [...positionAccessors].reduce((sum, i) => sum + (integer(accessors[i]?.count) ?? 0), 0);
   const uniqueAccessorIndices = [...indexAccessors].reduce((sum, i) => sum + (integer(accessors[i]?.count) ?? 0), 0);
@@ -172,7 +188,7 @@ export async function auditGltf(input) {
   if (primitiveIndices > 3_000_000) add('GLTF_INDICES_OR_BUDGET', 'meshes', primitiveIndices);
   const declaredBufferBytes = items(json.buffers).reduce((sum, buffer) => sum + (integer(buffer.byteLength) ?? 0), 0);
   if (containerBytes + declaredBufferBytes + imageReports.reduce((sum, image) => sum + (image.fileBytes ?? 0), 0) > 128 * MiB) warnings.push(issue('DEFAULT_DOWNLOAD_BUDGET_LIKELY', 'resources', 'Uses file bytes as a conservative proxy; embedded and duplicate resources may be double counted.'));
-  return { schemaVersion: 1, input: path, container, containerBytes, jsonBytes, counts: { meshes: meshes.length, primitives: primitiveReports.length, nodes: nodes.length, scenes: sceneReports.length, materials: materials.length, textures: textures.length, images: images.length, uniquePositionAccessors: positionAccessors.size, uniqueAccessorVertices, uniqueIndexAccessors: indexAccessors.size, uniqueAccessorIndices, primitiveVertices, primitiveIndices, primitiveTriangles, declaredBufferBytes }, scenes: sceneReports, primitives: primitiveReports, materials: materials.map((m, i) => ({ index: i, name: m.name ?? null, alphaMode: m.alphaMode ?? 'OPAQUE', alphaCutoff: m.alphaCutoff ?? 0.5, doubleSided: m.doubleSided === true, extensions: Object.keys(record(m.extensions)) })), textureUsages, images: imageReports, extensionsUsed: items(json.extensionsUsed), extensionsRequired: items(json.extensionsRequired), blockers, warnings, assessment: blockers.length ? 'blocked' : 'metadata-compatible-unverified' };
+  return { schemaVersion: 1, input: path, container, containerBytes, jsonBytes, counts: { meshes: meshes.length, primitives: primitiveReports.length, nodes: nodes.length, scenes: sceneReports.length, materials: materials.length, textures: textures.length, images: images.length, uniquePositionAccessors: positionAccessors.size, uniqueAccessorVertices, uniqueIndexAccessors: indexAccessors.size, uniqueAccessorIndices, primitiveVertices, primitiveIndices, primitiveTriangles, color0Primitives, color0DeclaredVertices, declaredBufferBytes }, scenes: sceneReports, primitives: primitiveReports, materials: materials.map((m, i) => ({ index: i, name: m.name ?? null, alphaMode: m.alphaMode ?? 'OPAQUE', alphaCutoff: m.alphaCutoff ?? 0.5, doubleSided: m.doubleSided === true, extensions: Object.keys(record(m.extensions)) })), textureUsages, images: imageReports, extensionsUsed: items(json.extensionsUsed), extensionsRequired: items(json.extensionsRequired), blockers, warnings, limitations: ['Accessor values, including COLOR_0 channel ranges and finiteness, were not read or validated.'], assessment: blockers.length ? 'blocked' : 'metadata-compatible-unverified' };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

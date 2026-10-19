@@ -113,13 +113,17 @@ export function generateGltfTangents(mesh: MeshData, morphTargets: readonly Morp
   if (!(mesh.uvs instanceof Float32Array) || mesh.uvs.length !== vertices * 2) {
     throw new Error('GLTF_NORMAL_TEXTURE_REQUIRES_UV0');
   }
+  if (mesh.colors && (!(mesh.colors instanceof Float32Array) || mesh.colors.length !== vertices * 4
+    || !mesh.colors.every(value => Number.isFinite(value) && value >= 0 && value <= 1))) {
+    throw new Error('GLTF_COLOR_LAYOUT');
+  }
   // Includes retained corner frames, packed inputs, typed hash/remap scratch, worst-case
   // output streams and conservative library workspace. It is not a process-memory ceiling:
   // the shared WASM module retains its high-water heap and exposes no shrinking API.
   const vertexTableSize = tableSize(vertices), cornerTableSize = tableSize(corners);
-  const workBytes = 256 * 1024 + vertices * (96 + (targets ? 24 : 0)) + vertexTableSize * 8
+  const workBytes = 256 * 1024 + vertices * (96 + (targets ? 24 : 0) + (mesh.colors ? 16 : 0)) + vertexTableSize * 8
     + corners * (72 + 16 * (targets + 1)) + cornerTableSize * 4
-    + Math.min(corners, options.maxVertices) * (104 + 36 * targets);
+    + Math.min(corners, options.maxVertices) * (104 + 36 * targets + (mesh.colors ? 16 : 0));
   if (workBytes > options.maxTangentBytes) throw new Error('GLTF_TANGENT_WORK_BUDGET');
   if (!generator) throw generatorFailure ?? new Error('GLTF_TANGENT_GENERATOR_NOT_READY: await prepareGltfTangents()');
   for (const index of mesh.indices) if (index >= vertices) throw new Error('GLTF_TANGENT_INDEX');
@@ -201,6 +205,7 @@ export function generateGltfTangents(mesh: MeshData, morphTargets: readonly Morp
 
   const output = new Uint8Array(outputCount * 80), input = new Uint8Array(mesh.vertices);
   const outputUvs = new Float32Array(outputCount * 2), tangents = new Float32Array(outputCount * 4);
+  const outputColors = mesh.colors ? new Float32Array(outputCount * 4) : undefined;
   const outputMorphs: MorphTarget[] = morphTargets.map(() => ({ positions: new Float32Array(outputCount * 3),
     normals: new Float32Array(outputCount * 3), tangents: new Float32Array(outputCount * 3) }));
   const bounds: MeshData['bounds'] = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
@@ -208,6 +213,7 @@ export function generateGltfTangents(mesh: MeshData, morphTargets: readonly Morp
     const corner = representatives[vertex], sourceVertex = mesh.indices[corner];
     output.set(input.subarray(sourceVertex * 80, (sourceVertex + 1) * 80), vertex * 80);
     for (let axis = 0; axis < 2; axis++) outputUvs[vertex * 2 + axis] = mesh.uvs[sourceVertex * 2 + axis];
+    if (outputColors) for (let channel = 0; channel < 4; channel++) outputColors[vertex * 4 + channel] = mesh.colors![sourceVertex * 4 + channel];
     for (let axis = 0; axis < 4; axis++) tangents[vertex * 4 + axis] = frames[0][corner * 4 + axis];
     for (let axis = 0; axis < 3; axis++) {
       const value = source.getFloat32(sourceVertex * 80 + axis * 4, true);
@@ -219,6 +225,6 @@ export function generateGltfTangents(mesh: MeshData, morphTargets: readonly Morp
       }
     }
   }
-  return { mesh: { vertices: output.buffer, vertexCount: outputCount, indices, bounds, uvs: outputUvs, tangents },
+  return { mesh: { vertices: output.buffer, vertexCount: outputCount, indices, bounds, uvs: outputUvs, colors: outputColors, tangents },
     morphTargets: outputMorphs };
 }

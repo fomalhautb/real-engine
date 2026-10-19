@@ -4,6 +4,8 @@
 
 `RendererOptions.occlusion` 默认不启用，配置后默认使用 2 像素采样、`depthBias: 0.00002` 和 64 MiB 上限；两份 `r32float` 最大深度金字塔与 208 字节参数按实际 mip 计入预算，resize 在销毁旧附件前预检。`gpuMs.occlusion` 只计金字塔与恢复选簇，恢复表面绘制计入 `gpuMs.surface`。本轮完整 NVIDIA 功能回归已通过，性能及大场景验收仍待完成，不能把此切片计为阶段 2 可见性工作包完成。
 
+本轮补齐线性 RGBA 顶点色：glTF `COLOR_0`、材质 IR、主视图/Mask 阴影、世界查询、共享形变、静态层级与分页、固定查询代理均保留同一属性。NVIDIA 定向测试按独立颜色场验证 HDR/深度/查询与彩色发光 GI；驻留及分页模型均从 512 三角形粗化至 70 并恢复到 512。完整检查通过 465 项 CPU 测试，GPU 回归范围与资源成本详见 [implementation.md](implementation.md#线性顶点色与真实资产属性)。Sponza 的颜色声明布局现可支持，BIN 值、透明 decal、完整资产导入与大场景验收仍未完成。
+
 ## 阶段 1
 
 下述 250 项 CPU、50 项浏览器及早期性能数值来自法线贴图加入前的历史快照。法线贴图、glTF 切线生成、CPU 流送、物理页池及主 Renderer 接入的证据分别记录于 implementation.md；此前提交 `20e3508c`、`0267cbe1`、`8fdf9b61`、`e7214d3`、`c5f6cfb` 的远程 CI 均已成功。此前 Worker 页解码通过 365 项 CPU（47 文件）和 65 项完整原生 NVIDIA 浏览器回归；提交 `86358ff` 的[远程 CI run 39227014810](https://github.com/fomalhautb/real-engine/actions/runs/39227014810) 已成功。本轮固定代理版本通过 371 项 CPU（48 文件）及 67 项完整原生 NVIDIA 浏览器回归，固定代理提交 `789279c` 的[远程 CI run 39230781801](https://github.com/fomalhautb/real-engine/actions/runs/39230781801) 已成功。尚未测量目标规模的流送性能或大资产导入成本。

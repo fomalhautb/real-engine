@@ -90,6 +90,7 @@ describe('Mikk-compatible glTF tangent generation', () => {
     // Both triangles share source vertices 0 and 2, which cannot carry both w signs.
     const source = meshOf([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
       [[0, 0], [1, 0], [0, 1], [1, 0]], [0, 1, 2, 0, 2, 3]);
+    source.colors = new Float32Array([1, 0, 0, 0.25, 0, 1, 0, 0.5, 0, 0, 1, 0.75, 1, 1, 1, 1]);
     const original = source.vertices.slice(0), originalUvs = new Float32Array(source.uvs!);
     const morph: MorphTarget = { positions: new Float32Array(12), normals: new Float32Array(12) };
     for (let i = 0; i < 4; i++) {
@@ -103,6 +104,7 @@ describe('Mikk-compatible glTF tangent generation', () => {
       const output = mesh.indices[corner], input = cornerSource[corner];
       expect(new Uint8Array(mesh.vertices, output * 80, 80)).toEqual(new Uint8Array(original, input * 80, 80));
       close(mesh.uvs!.subarray(output * 2, output * 2 + 2), originalUvs.subarray(input * 2, input * 2 + 2));
+      close(mesh.colors!.subarray(output * 4, output * 4 + 4), source.colors.subarray(input * 4, input * 4 + 4));
       close(morphTargets[0].positions.subarray(output * 3, output * 3 + 3),
         morph.positions.subarray(input * 3, input * 3 + 3));
       close(morphTargets[0].normals.subarray(output * 3, output * 3 + 3),

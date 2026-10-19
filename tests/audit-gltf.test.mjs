@@ -83,3 +83,42 @@ test('flags default vertex and index budgets without decoding buffers', async ()
     assert(result.blockers.some(x => x.code === 'GLTF_INDICES_OR_BUDGET'));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('checks COLOR_0 accessor declarations while explicitly leaving channel values unverified', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'audit-gltf-color-'));
+  try {
+    const path = join(dir, 'color.gltf');
+    const make = color => ({ ...fixture,
+      accessors: [...fixture.accessors, color],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 0, COLOR_0: 2 }, indices: 1 }] }],
+      materials: [], textures: [], images: [], nodes: [{ mesh: 0 }], scenes: [{ nodes: [0] }] });
+    for (const color of [
+      { count: 4, type: 'VEC3', componentType: 5126 },
+      { count: 4, type: 'VEC4', componentType: 5121, normalized: true },
+      { count: 4, type: 'VEC3', componentType: 5123, normalized: true },
+    ]) {
+      await writeFile(path, JSON.stringify(make(color)));
+      const result = await auditGltf(path);
+      assert.equal(result.counts.color0Primitives, 1);
+      assert.equal(result.counts.color0DeclaredVertices, 4);
+      assert.equal(result.primitives[0].color0.valuesRead, false);
+      assert.equal(result.primitives[0].color0.valuesValidated, false);
+      assert(result.limitations[0].includes('COLOR_0'));
+      assert(!result.blockers.some(x => x.code === 'GLTF_COLOR_LAYOUT'));
+    }
+    for (const color of [
+      { count: 3, type: 'VEC4', componentType: 5126 },
+      { count: 4, type: 'VEC2', componentType: 5126 },
+      { count: 4, type: 'VEC4', componentType: 5121, normalized: false },
+      { count: 4, type: 'VEC3', componentType: 5126, normalized: true },
+      { count: 4, type: 'VEC3', componentType: 5126, normalized: 'false' },
+      { count: 4, type: 'VEC3', componentType: 5126, normalized: null },
+      { count: 4, type: 'VEC3', componentType: 5122, normalized: true },
+    ]) {
+      await writeFile(path, JSON.stringify(make(color)));
+      const result = await auditGltf(path);
+      assert.equal(result.assessment, 'blocked');
+      assert(result.blockers.some(x => x.code === 'GLTF_COLOR_LAYOUT'));
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

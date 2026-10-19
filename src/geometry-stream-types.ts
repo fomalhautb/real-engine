@@ -32,6 +32,8 @@ export interface GeometryStreamDirectory {
   readonly sourceVertexCount: number;
   readonly sourceTriangleCount: number;
   readonly vertexStride: number;
+  /** Present only when pages carry linear RGBA. Omitted in legacy directories. */
+  readonly hasColors?: true;
   readonly clusters: readonly GeometryStreamCluster[];
   readonly groups: readonly GeometryStreamGroup[];
   readonly roots: readonly number[];

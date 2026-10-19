@@ -13,6 +13,26 @@ function close(actual: readonly number[], expected: readonly number[], digits = 
 }
 
 describe('shared material expression compiler', () => {
+  it('keeps vertex color separate from instance tint and shares alpha coverage', () => {
+    const plain = compile({ baseColor: m.vertexColor });
+    expect(evaluateMaterial(plain, inputs).baseColor).toEqual([1, 1, 1]);
+    const vertexColor = [0.5, 0.25, 0.75, 0.5] as const;
+    close(evaluateMaterial(plain, { ...inputs, vertexColor }).baseColor, [0.5, 0.25, 0.75]);
+    const tinted = compile({ alphaMode: 'mask', baseColor: m.multiply(m.vertexColor, m.instanceColor),
+      emissive: m.vertexColor, alphaCutoff: 0.3 });
+    const result = evaluateMaterial(tinted, { ...inputs, vertexColor });
+    close(result.baseColor, [0.1, 0.1, 0.6]);
+    close(result.emissive, [0.5, 0.25, 0.75]);
+    expect(result.opacity).toBeCloseTo(0.3);
+    expect(result.covered).toBe(true);
+    expect(evaluateMaterial(tinted, { ...inputs, vertexColor: [0.5, 0.25, 0.75, 0.49] }).covered).toBe(false);
+    expect(tinted.coverageWgsl).toContain('= vertexColor;');
+    expect(tinted.textureSlots).toEqual([]);
+    expect(tinted.parameterCount).toBe(0);
+    expect(() => evaluateMaterial(plain, { ...inputs, vertexColor: [NaN, 1, 1, 1] })).toThrow(/vertexColor/);
+    expect(evaluateMaterial(DEFAULT_MATERIAL_PROGRAM, { ...inputs, vertexColor }).baseColor)
+      .toEqual(evaluateMaterial(DEFAULT_MATERIAL_PROGRAM, inputs).baseColor);
+  });
   it('evaluates the default per-instance PBR material without texture or parameter dependencies', () => {
     const result = evaluateMaterial(DEFAULT_MATERIAL_PROGRAM, inputs);
     close(result.baseColor, [0.2, 0.4, 0.8]);

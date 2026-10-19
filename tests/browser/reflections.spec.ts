@@ -101,7 +101,7 @@ test('bounded world-space reflections show an offscreen emitter and update after
   expect(pageErrors).toEqual([]);
 });
 
-test('combined GI, final gather and fog preserve reflected offscreen Mask, Morph, skin and wave edits', async ({ page }, testInfo) => {
+test('combined GI, final gather and fog preserve reflected offscreen vertex color, Mask, Morph, skin and wave edits', async ({ page }, testInfo) => {
   test.setTimeout(180_000);
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));

@@ -7,6 +7,7 @@ import { Renderer } from '../../../src/renderer';
 import type { RenderBatch } from '../../../src/contracts';
 import type { WorldRay } from '../../../src/world-query';
 import { identity } from '../../../src/math';
+import { GEOMETRY_GPU_VERTEX_BYTES } from '../../../src/geometry-gpu-page';
 
 function proxyRays(proxy: GeometryQueryProxy): WorldRay[] {
   const view = new DataView(proxy.mesh.vertices), indices = proxy.mesh.indices;
@@ -46,7 +47,7 @@ export async function runGeometryStreamBudget(sourceFree = false) {
   // Six slots can only hold the common coarse ancestry. Eight slots permit
   // competing finer branches: view A needs page 8, view B needs page 7.
   const slots = roots.size + 4;
-  const poolBytes = slots * (verticesPerSlot * 128 + indicesPerSlot * 4) + directory.clusters.length * 32 + directory.pages.length * 4;
+  const poolBytes = slots * (verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES + indicesPerSlot * 4) + directory.clusters.length * 32 + directory.pages.length * 4;
   const cpuBytes = directory.rootPages.reduce((sum, id) => sum + directory.pages[id].decodedBytes, 0)
     + Math.max(...directory.pages.filter(page => !roots.has(page.id)).map(page => page.decodedBytes));
   const canvas = document.createElement('canvas'); canvas.style.cssText = 'width:512px;height:512px;display:block';

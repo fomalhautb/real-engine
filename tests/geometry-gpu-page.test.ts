@@ -4,12 +4,13 @@ import type { DecodedGeometryPage } from '../src/geometry-pages';
 import { validateGeometryStreamDirectory } from '../src/geometry-stream-directory';
 import type { GeometryStreamDirectory } from '../src/geometry-stream-types';
 
-function fixture(hasUvs = true, hasTangents = true): { directory: GeometryStreamDirectory; decoded: DecodedGeometryPage } {
-  const stride = 80 + (hasUvs ? 8 : 0) + (hasTangents ? 16 : 0);
+function fixture(hasUvs = true, hasTangents = true, hasColors = false): { directory: GeometryStreamDirectory; decoded: DecodedGeometryPage } {
+  const stride = 80 + (hasUvs ? 8 : 0) + (hasTangents ? 16 : 0) + (hasColors ? 16 : 0);
   const bounds = { min: [0, 0, -3] as [number, number, number], max: [3, 6, 0] as [number, number, number] };
   const clusterBytes = 16 + 3 * (4 + stride) + 4;
   const directory = validateGeometryStreamDirectory({
     version: 1, primitiveKey: 'gpu/fixture', sourceVertexCount: 4, sourceTriangleCount: 2, vertexStride: stride,
+    ...(hasColors ? { hasColors: true as const } : {}),
     clusters: [0, 1].map(() => ({ level: 0, group: 0, refinedGroup: null, vertexCount: 3,
       triangleCount: 1, bounds, lodBounds: bounds, error: 0 })),
     groups: [{ level: 0, children: [0, 1], parents: [], bounds, error: 0, terminal: true }],
@@ -30,23 +31,25 @@ function fixture(hasUvs = true, hasTangents = true): { directory: GeometryStream
     return { id, sourceVertexIds: new Uint32Array(ids), rest,
       uvs: hasUvs ? new Float32Array(ids.flatMap(source => [source / 8, source / 4])) : undefined,
       tangents: hasTangents ? new Float32Array(ids.flatMap(source => [source / 3, 0.25, -0.5, 1])) : undefined,
+      colors: hasColors ? new Float32Array(ids.flatMap(source => [source / 4, 0.25, 0.5, 1])) : undefined,
       localTriangles: new Uint8Array(id === 0 ? [2, 0, 1] : [1, 2, 0]) };
   });
   return { directory, decoded: { version: 1, vertexStride: stride, hasUvs, hasTangents,
+    ...(hasColors ? { hasColors: true } : {}),
     sourceVertexCount: 4, hierarchyClusterCount: 2, clusters } };
 }
 
 describe('physical geometry page packing', () => {
   it('preserves exact rest bytes and packs optional streams, flags and identity at fixed offsets', () => {
-    expect(GEOMETRY_GPU_VERTEX_BYTES).toBe(128);
+    expect(GEOMETRY_GPU_VERTEX_BYTES).toBe(144);
     for (const [uv, tangent, flags] of [[false, false, 0], [true, false, 1],
       [false, true, 2], [true, true, 3]] as const) {
       const { directory, decoded } = fixture(uv, tangent);
       const packed = packGeometryGpuPage(directory, 0, decoded);
-      expect(packed.vertices.byteLength).toBe(6 * 128);
+      expect(packed.vertices.byteLength).toBe(6 * GEOMETRY_GPU_VERTEX_BYTES);
       const bytes = new Uint8Array(packed.vertices), view = new DataView(packed.vertices);
       for (let ordinal = 0; ordinal < 2; ordinal++) for (let local = 0; local < 3; local++) {
-        const cluster = decoded.clusters[ordinal], offset = (ordinal * 3 + local) * 128;
+        const cluster = decoded.clusters[ordinal], offset = (ordinal * 3 + local) * GEOMETRY_GPU_VERTEX_BYTES;
         expect(bytes.slice(offset, offset + 80)).toEqual(cluster.rest.slice(local * 80, (local + 1) * 80));
         expect(view.getUint32(offset + 32, true)).toBe(0xff00_0100 + cluster.sourceVertexIds[local] * 4);
         expect(view.getFloat32(offset + 80, true)).toBe(uv ? cluster.uvs![local * 2] : 0);
@@ -59,6 +62,7 @@ describe('physical geometry page packing', () => {
         expect([112, 116, 120].map(at => view.getUint32(offset + at, true)))
           .toEqual([cluster.sourceVertexIds[local], ordinal, 0]);
         expect(view.getUint32(offset + 124, true)).toBe(ordinal === 0 ? 182926153 : 3132816440);
+        expect([0, 1, 2, 3].map(axis => view.getFloat32(offset + 128 + axis * 4, true))).toEqual([1, 1, 1, 1]);
       }
       expect(Array.from(packed.indices)).toEqual([2, 0, 1, 4, 5, 3]);
       expect(packed.clusters).toEqual([
@@ -69,6 +73,26 @@ describe('physical geometry page packing', () => {
       expect(new Uint8Array(again.vertices)).toEqual(bytes);
       expect(again.indices).toEqual(packed.indices);
     }
+  });
+
+  it('packs optional linear RGBA at the appended offset and rejects spoofed color layout', () => {
+    for (const [uv, tangent, stride] of [[false, false, 96], [true, false, 104],
+      [false, true, 112], [true, true, 120]] as const) {
+      const colored = fixture(uv, tangent, true);
+      expect(colored.directory.vertexStride).toBe(stride);
+      expect(packGeometryGpuPage(colored.directory, 0, colored.decoded).vertices.byteLength)
+        .toBe(6 * GEOMETRY_GPU_VERTEX_BYTES);
+    }
+    const { directory, decoded } = fixture(true, true, true);
+    const packed = packGeometryGpuPage(directory, 0, decoded);
+    const view = new DataView(packed.vertices);
+    expect(view.getUint32(88, true)).toBe(7);
+    expect([0, 1, 2, 3].map(axis => view.getFloat32(128 + axis * 4, true)))
+      .toEqual([0, 0.25, 0.5, 1]);
+    decoded.clusters[0].colors![0] = Number.NaN;
+    expect(() => packGeometryGpuPage(directory, 0, decoded)).toThrow('GEOMETRY_GPU_PAGE_COLOR');
+    decoded.clusters[0].colors = undefined;
+    expect(() => packGeometryGpuPage(directory, 0, decoded)).toThrow('GEOMETRY_GPU_PAGE_CLUSTER_LAYOUT');
   });
 
   it('rejects spoofed identity, counts, malformed arrays, nonfinite values and out-of-bounds positions', () => {

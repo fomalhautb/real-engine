@@ -6,7 +6,7 @@ import { buildInstanceBvhTopology, orderInstanceBounds } from './instance-bvh';
 import { GpuQuerySceneBvh } from './gpu-query-scene-bvh';
 import type { Bounds3 } from './deformation';
 import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
-import type { MeshData } from './geometry';
+import { validateMeshColors, type MeshData } from './geometry';
 import type { GpuMaterial } from './gpu-material';
 import type { MaterialProgram } from './material';
 import { decodeWorldHits, packWorldRays, resolveWorldQueryOptions, WORLD_HIT_BYTES, WORLD_RAY_BYTES,
@@ -31,6 +31,7 @@ type QueryBatch = {
   topologyVersion: number; nodeCount: number; offsets: number[]; count: number; dirty: boolean;
   emissiveSampling: RenderBatch['emissiveSampling'];
   vertexCount: number; vertices: ArrayBuffer; indices: Uint32Array; uvs?: Float32Array; tangents?: Float32Array;
+  colors?: Float32Array; colorOffset: number;
   identities: GPUBuffer; metadata: Uint32Array<ArrayBuffer>; params: GPUBuffer; trace: GPUBindGroup[];
   levels: RefitLevel[];
   data: GPUBuffer; instanceTree: readonly [number, number, number, number]; instanceLevels: RefitLevel[];
@@ -206,10 +207,13 @@ export class GpuWorldQuery {
     if (this.batches.length >= 256) throw new Error('WORLD_QUERY_BATCH_BUDGET');
     if (!Number.isSafeInteger(scene.capacity) || scene.capacity < 1 || scene.capacity > this.options.maxInstancesPerBatch) throw new Error('WORLD_QUERY_INSTANCE_BUDGET');
     const sourceIdentity = identity(scene);
+    validateMeshColors(mesh.colors, mesh.vertexCount);
     const topology = buildBvhTopology(mesh, { maxTriangles: this.options.maxTrianglesPerMesh });
     const offsets = [topology.nodes.length, topology.nodes.length + topology.triangles.length];
     offsets.push(offsets[1] + mesh.indices.length);
     let length = offsets[2] + mesh.vertexCount * 2;
+    const colorOffset = mesh.colors ? length : 0;
+    if (mesh.colors) length += mesh.vertexCount * 4;
     const levelOffsets = topology.levels.map(level => { const start = length; length += level.length; return start; });
     const instanceTopology = this.options.instanceAcceleration === 'bvh' && scene.capacity >= 8
       ? buildInstanceBvhTopology(scene.capacity) : undefined;
@@ -232,13 +236,14 @@ export class GpuWorldQuery {
     const packed = new Uint32Array(length);
     packed.set(topology.nodes); packed.set(topology.triangles, offsets[0]); packed.set(mesh.indices, offsets[1]);
     if (mesh.uvs) new Float32Array(packed.buffer).set(mesh.uvs, offsets[2]);
+    if (mesh.colors) new Float32Array(packed.buffer).set(mesh.colors, colorOffset);
     topology.levels.forEach((level, i) => packed.set(level, levelOffsets[i]));
     if (instanceTopology) {
       packed.set(instanceTopology.nodes, instanceNodesOffset);
       packed.fill(0xffff_ffff, instanceOrderOffset, instanceOrderOffset + scene.capacity);
       instanceTopology.levels.forEach((level, i) => packed.set(level, instanceLevelOffsets[i]));
     }
-    const data = this.buffer('world BVH topology and UVs', packed.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, packed.buffer);
+    const data = this.buffer('world BVH topology and material attributes', packed.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, packed.buffer);
     const bounds = this.buffer('world BVH instance bounds', boundsSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     const identities = this.buffer('world entity identities', scene.capacity * 16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const params = this.buffer('world batch parameter slots', parameterBytes, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -261,6 +266,7 @@ export class GpuWorldQuery {
       emissiveSampling: scene.emissiveSampling,
       topologyVersion: scene.queryIdentity?.topologyVersion ?? 0, nodeCount: topology.nodeCount, offsets, count: 0, dirty: true,
       vertexCount: mesh.vertexCount, vertices: mesh.vertices, indices: mesh.indices, uvs: mesh.uvs, tangents: mesh.tangents,
+      colors: mesh.colors, colorOffset,
       identities, metadata: new Uint32Array(scene.capacity * 4), params, trace, levels, data, instanceTree, instanceLevels,
       bounds, root, sortBounds: null });
   }
@@ -270,7 +276,7 @@ export class GpuWorldQuery {
       const scene = batch.source.scene;
       const mesh = residentMesh(scene), proxy = queryProxy(scene);
       if (mesh !== batch.mesh || mesh.vertexCount !== batch.vertexCount || mesh.vertices !== batch.vertices
-        || mesh.indices !== batch.indices || mesh.uvs !== batch.uvs || mesh.tangents !== batch.tangents || scene.capacity !== batch.capacity
+        || mesh.indices !== batch.indices || mesh.uvs !== batch.uvs || mesh.tangents !== batch.tangents || mesh.colors !== batch.colors || scene.capacity !== batch.capacity
         || proxy !== batch.proxy || proxyIdentity(proxy) !== batch.proxyIdentity
         || scene.name !== batch.name || identity(scene) !== batch.identity || scene.emissiveSampling !== batch.emissiveSampling) {
         throw new Error('WORLD_QUERY_TOPOLOGY_CHANGED: recreate the renderer for a new immutable mesh/topology');
@@ -449,7 +455,7 @@ export class GpuWorldQuery {
       if (upload) {
         const params = new ArrayBuffer(96);
         new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
-          ...batch.offsets, 0, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
+          ...batch.offsets, batch.colorOffset, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
           batch.emissiveSampling === 'triangle-area' ? 1 : 0, this.sceneEnabled ? 1 : 0]);
         new Float32Array(params)[16] = textureLod;
         new Uint32Array(params).set(batch.instanceTree, 20);

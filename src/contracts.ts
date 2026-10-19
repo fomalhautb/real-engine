@@ -46,6 +46,10 @@ export interface SceneBatch {
    * Mutually exclusive with geometryLod; dynamic graphs use the full path. */
   geometryStream?: GeometryStreamSource;
   material?: MaterialBinding;
+  /** Optional conservative local units per unit UV after deformation. Static
+   * full meshes derive this once from triangles. Without a proven bound,
+   * dynamic or proxy-only meshes conservatively request finest visible mips. */
+  textureUvSpan?: number;
   /** Stable asset/primitive identity for optional world queries; bump on topology replacement. */
   queryIdentity?: { assetId: string; primitiveId: number; topologyVersion: number };
   /** Committed inputs replace instance objects on every change; mutable inputs

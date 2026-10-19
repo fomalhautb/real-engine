@@ -35,6 +35,8 @@
 
 ## 本地运行
 
+`RendererOptions.textureStreaming` 可按相机与 UV 密度，在统一图像预算内自动加载、上传和淘汰原生 mip。材质引用来源的低清 `fallback` 身份，之后的新材质也自动使用当前驻留；未完成的图像不会发布，离屏查询保持有效材质。输入、HTTP provider、逐帧/CPU 预算、重试及已验证范围见[自动纹理流送](docs/implementation.md#按视图需求的自动纹理流送)。当前提供整图 mip 尾链调度，尚未完成大型资产打包、细分纹理页或最终性能验收。
+
 需要 Node.js 24 与支持 WebGPU 的浏览器。使用 localhost 或 HTTPS。
 
 ```sh

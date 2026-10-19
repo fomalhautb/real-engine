@@ -566,4 +566,99 @@ describe('material texture residency and ownership', () => {
     expect(device.buffers.every(buffer => buffer.destroyed)).toBe(true);
     expect(tracked.bytes).toBe(0);
   });
+
+  it('pins more distinct root images than the upload-handle limit permits', () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const resources = new MaterialResources(device as unknown as GPUDevice, tracked.account);
+    const pins = Array.from({ length: 72 }, () => resources.pinTexture(prepared(8, 8, 'rgba8', 2)));
+    expect(resources.diagnostics()).toEqual({ materials: 0, images: 72, imageBytes: 72 * 20 });
+    expect(resources.uploadDiagnostics()).toEqual({ active: 0, pending: 0, pendingImageBytes: 0 });
+    expect(device.textures).toHaveLength(73); // Manager fallback plus distinct roots.
+    expect(tracked.bytes).toBe(4 + 72 * 20);
+    pins.forEach(pin => pin.dispose());
+    pins.forEach(pin => pin.dispose());
+    expect(resources.diagnostics()).toEqual({ materials: 0, images: 0, imageBytes: 0 });
+    expect(device.textures.slice(1).every(texture => texture.destroyed)).toBe(true);
+    resources.dispose();
+    expect(tracked.bytes).toBe(0);
+  });
+
+  it('shares an existing material image with pins without another allocation or upload', () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const resources = new MaterialResources(device as unknown as GPUDevice, tracked.account);
+    const asset = prepared(8, 8, 'rgba8', 2), material = resources.create(binding(asset));
+    const image = device.textures[1];
+    const textureCount = device.textures.length, writeCount = device.writes.length;
+    const first = resources.pinTexture(asset), second = resources.pinTexture(asset);
+    expect(device.textures).toHaveLength(textureCount);
+    expect(device.writes).toHaveLength(writeCount);
+    expect(resources.diagnostics()).toEqual({ materials: 1, images: 1, imageBytes: 20 });
+    resources.release(material);
+    expect(image.destroyed).toBe(false);
+    first.dispose();
+    expect(image.destroyed).toBe(false);
+    second.dispose(); second.dispose();
+    expect(image.destroyed).toBe(true);
+    expect(resources.diagnostics()).toEqual({ materials: 0, images: 0, imageBytes: 0 });
+    resources.dispose();
+    expect(tracked.bytes).toBe(0);
+  });
+
+  it('transfers a completed stage to a pin and material without rewriting pixels', () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const resources = new MaterialResources(device as unknown as GPUDevice, tracked.account);
+    const asset = prepared(8, 8, 'rgba8'), stage = resources.stageTexture(asset);
+    const image = device.textures[1];
+    expect(stage.upload(340)).toBe(340);
+    expect(stage.complete).toBe(true);
+    const writes = device.writes.length;
+    const pin = resources.pinTexture(asset);
+    stage.dispose();
+    expect(image.destroyed).toBe(false);
+    const material = resources.create(binding(asset));
+    expect(material.images[0].texture).toBe(image);
+    expect(device.textures).toHaveLength(2);
+    expect(device.writes).toHaveLength(writes);
+    pin.dispose();
+    expect(image.destroyed).toBe(false);
+    resources.release(material);
+    expect(image.destroyed).toBe(true);
+    expect(resources.diagnostics()).toEqual({ materials: 0, images: 0, imageBytes: 0 });
+    resources.dispose();
+    expect(tracked.bytes).toBe(0);
+  });
+
+  it('rejects a pin for an incomplete staged image and cancels it without a leak', () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const resources = new MaterialResources(device as unknown as GPUDevice, tracked.account);
+    const asset = prepared(8, 8, 'rgba8'), stage = resources.stageTexture(asset);
+    stage.upload(32);
+    const image = device.textures[1], textureCount = device.textures.length;
+    expect(() => resources.pinTexture(asset)).toThrow('MATERIAL_TEXTURE_PENDING_UPLOAD');
+    expect(device.textures).toHaveLength(textureCount);
+    expect(resources.diagnostics()).toEqual({ materials: 0, images: 0, imageBytes: 340 });
+    stage.dispose(); stage.dispose();
+    expect(image.destroyed).toBe(true);
+    expect(resources.uploadDiagnostics()).toEqual({ active: 0, pending: 0, pendingImageBytes: 0 });
+    expect(resources.diagnostics()).toEqual({ materials: 0, images: 0, imageBytes: 0 });
+    expect(tracked.bytes).toBe(4);
+    resources.dispose();
+    expect(tracked.bytes).toBe(0);
+  });
+
+  it('releases live pins on manager disposal and makes later pin disposal harmless', () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const resources = new MaterialResources(device as unknown as GPUDevice, tracked.account);
+    const asset = prepared(8, 8, 'rgba8', 2);
+    const first = resources.pinTexture(asset), second = resources.pinTexture(asset);
+    const image = device.textures[1];
+    expect(resources.diagnostics()).toEqual({ materials: 0, images: 1, imageBytes: 20 });
+    resources.dispose(); resources.dispose();
+    expect(image.destroyed).toBe(true);
+    expect(resources.diagnostics()).toEqual({ materials: 0, images: 0, imageBytes: 0 });
+    expect(tracked.bytes).toBe(0);
+    first.dispose(); second.dispose();
+    expect(tracked.bytes).toBe(0);
+    expect(() => resources.pinTexture(asset)).toThrow('MATERIAL_RESOURCES_DISPOSED');
+  });
 });

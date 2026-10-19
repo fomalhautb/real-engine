@@ -28,6 +28,9 @@ import { GpuReflections, reflectionSurfaceSource, type ReflectionProbeResult } f
 import { resolveReflectionsOptions, type ReflectionsOptions } from './reflections';
 import { GpuOcclusion } from './gpu-occlusion';
 import { resolveOcclusionOptions, type OcclusionOptions } from './occlusion';
+import { TextureStreaming } from './texture-streaming';
+import { meshWorldUnitsPerUv, modelStretch, textureViewDemand } from './texture-stream-demand';
+import type { TextureStreamDemand, TextureStreamingOptions } from './texture-stream-types';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 0, length = values.length): boolean {
@@ -50,6 +53,8 @@ type Batch = {
   /** Reused [start, end) slot ranges, bounded to 16 writes per input stream. */
   uploadRanges: number[];
   material: GpuMaterial; materialPipelines: MaterialPipelines; materialRequest: number;
+  textureInputs: readonly (MaterialTextureAsset | undefined)[];
+  textureUvSpan: number; textureBounds?: Bounds3;
 };
 export interface FrameStats {
   /** triangles is source instance-expanded geometry; use probeGeometryLod for actual selected triangles. */
@@ -76,6 +81,9 @@ export interface RendererOptions {
   materialVariantLimit?: number;
   /** Shared material images, all mips. Atomic replacements require overlap with their old images. */
   textureBudgetBytes?: number;
+  /** Native mip sources with bounded CPU IO and per-frame uploads. Materials
+   * bind each source's fallback identity; current residency resolves internally. */
+  textureStreaming?: TextureStreamingOptions;
   /** Optional GPU world-space ray queries; disabled unless explicitly configured. */
   worldQueries?: WorldQueryOptions;
   /** Fixed world-space probe grid; requires worldQueries with sufficient ray capacity. */
@@ -133,6 +141,9 @@ export class Renderer {
   private readonly deformationPipelines = new Map<string, GPUComputePipeline>();
   private graph!: ReturnType<typeof compileRenderGraph<GPUCommandEncoder>>;
   private readonly materialResources: MaterialResources;
+  private readonly textureStreamingOptions?: TextureStreamingOptions;
+  private readonly textureBudgetBytes: number;
+  private textureStreaming?: TextureStreaming;
   private readonly materialPipelines = new Map<string, Promise<MaterialPipelines>>();
   private readonly compilingMaterials = new Set<string>();
   private readonly materialVariantLimit: number;
@@ -236,6 +247,7 @@ export class Renderer {
         this.errors.push('DEVICE_LOST: ' + loss.reason + ' ' + loss.message);
         for (const batch of this.batches) if (batch.stream) void batch.stream.runtime.dispose().catch(error => this.errors.push(String(error)));
         this.geometryDecoder?.dispose();
+        void this.textureStreaming?.dispose().catch(error => this.errors.push(String(error)));
       }
     });
     this.materialVariantLimit = options.materialVariantLimit ?? 128;
@@ -249,6 +261,8 @@ export class Renderer {
       + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.reflections ? 2 : 0) + (options.occlusion ? 6 : 0)
       + (options.volumetricFog ? (options.volumetricFog.temporal ? 8 : 6) : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes, adapter.info);
+    this.textureStreamingOptions = options.textureStreaming;
+    this.textureBudgetBytes = options.textureBudgetBytes ?? 256 * 1024 * 1024;
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.antiAliasing = options.antiAliasing ?? 'none';
@@ -307,6 +321,20 @@ export class Renderer {
   }
 
   private async initialize(format: GPUTextureFormat, scene: RenderBatch[]): Promise<void> {
+    if (this.textureStreamingOptions) {
+      this.textureStreaming = await TextureStreaming.create(this.textureStreamingOptions, {
+        budgetBytes: this.textureBudgetBytes,
+        imageBytes: () => this.materialResources.diagnostics().imageBytes,
+        pin: asset => this.materialResources.pinTexture(asset),
+        stage: asset => this.materialResources.stageTexture(asset),
+        replace: (source, next) => {
+          const result = this.materialResources.replaceTexture(source, next);
+          if (result.materials) this.materialRevision++;
+          return result;
+        },
+      });
+      if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    }
     if (this.hasGeometryStream) this.geometryDecoder = new GeometryDecodeWorkerPool(this.geometryDecodeOptions);
     this.format = format;
     this.resolveLayout = this.device.createBindGroupLayout({ entries: [
@@ -470,7 +498,7 @@ export class Renderer {
   }
 
   private async prepareMaterial(binding?: MaterialBinding): Promise<{ material: GpuMaterial; materialPipelines: MaterialPipelines }> {
-    const material = this.materialResources.create(binding);
+    const material = this.materialResources.create(this.textureStreaming ? this.textureStreaming.resolve(binding) : binding);
     const program = material.program;
     try {
       let pending = this.materialPipelines.get(program.key);
@@ -554,11 +582,13 @@ export class Renderer {
       throw new Error('GEOMETRY_PROXY_MASK_REQUIRES_FULL_SOURCE');
     }
     const request = ++batch.materialRequest;
+    const textureInputs = binding.textures?.slice() ?? [];
     const replacement = await this.prepareMaterial(binding);
     if (this.disposed) { this.materialResources.release(replacement.material); throw new Error('RENDERER_DISPOSED'); }
     if (request !== batch.materialRequest) { this.materialResources.release(replacement.material); return; }
     const previous = batch.material;
     Object.assign(batch, replacement);
+    batch.textureInputs = textureInputs;
     this.materialResources.release(previous);
     this.materialRevision++;
   }
@@ -577,6 +607,7 @@ export class Renderer {
    * texture budget until publication. No pipeline compilation is needed. */
   replaceTexture(source: MaterialTextureAsset, replacement: MaterialTextureAsset) {
     if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    if (this.textureStreaming?.owns(source) || this.textureStreaming?.owns(replacement)) throw new Error('TEXTURE_STREAM_MANAGED_IDENTITY');
     const result = this.materialResources.replaceTexture(source, replacement);
     if (result.materials) this.materialRevision++;
     return result;
@@ -588,6 +619,15 @@ export class Renderer {
     if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
     return this.materialResources.stageTexture(asset);
   }
+
+  retryTexture(sourceId: string): void {
+    if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    if (!this.textureStreaming) throw new Error('TEXTURE_STREAM_DISABLED');
+    this.textureStreaming.retry(sourceId);
+  }
+
+  /** Wait for current native mip IO only; rendering advances staged uploads. */
+  async waitForTextureIo(): Promise<void> { await this.textureStreaming?.idle(); }
 
   setGeometryLod(settings: GeometryLodSettings): void {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
@@ -748,6 +788,20 @@ export class Renderer {
       throw new Error('GEOMETRY_PROXY_MASK_REQUIRES_FULL_SOURCE');
     }
     const mesh = residentMesh(scene);
+    if (scene.textureUvSpan !== undefined && (!Number.isFinite(scene.textureUvSpan) || scene.textureUvSpan <= 0)) throw new Error('TEXTURE_UV_SPAN');
+    const textureUvSpan = scene.textureUvSpan ?? (this.textureStreaming && scene.mesh && !scene.deformation.nodes.length &&
+      mesh.vertexCount <= 1_048_576 && mesh.indices.length <= 3_145_728 ? meshWorldUnitsPerUv(mesh) : Infinity);
+    let textureBounds: Bounds3 | undefined;
+    if (!scene.mesh && this.textureStreaming) {
+      textureBounds = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+      for (const id of scene.geometryStream.directory.roots) {
+        const bounds = scene.geometryStream.directory.clusters[id].lodBounds;
+        for (let axis = 0; axis < 3; axis++) {
+          textureBounds.min[axis] = Math.min(textureBounds.min[axis], bounds.min[axis]);
+          textureBounds.max[axis] = Math.max(textureBounds.max[axis], bounds.max[axis]);
+        }
+      }
+    }
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('INVALID_BATCH_CAPACITY');
     if (!Number.isSafeInteger(mesh.vertexCount) || mesh.vertexCount < 1
       || Math.ceil(capacity * mesh.vertexCount / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('DEFORMATION_DISPATCH_BUDGET');
@@ -795,6 +849,7 @@ export class Renderer {
     const instanceData = new Float32Array(capacity * 56);
     const batch: Batch = {
       ...material, materialRequest: 0, sourceId: this.batches.length + 1,
+      textureInputs: scene.material?.textures?.slice() ?? [], textureUvSpan, textureBounds,
       scene, mesh, rest, indices, params, instances, palettes, output, scalars, program, pipeline, morphBounds, bounds: new Map(), tangentData,
       compute: this.device.createBindGroup({ layout: this.computeLayout,
         entries: [params, rest, instances, palettes, output, morphs, scalars, tangents].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
@@ -966,6 +1021,34 @@ export class Renderer {
     for (const batch of this.batches) batch.history.clear();
   }
 
+  private updateTextureStreaming(eye: [number, number, number], target: [number, number, number], vp: Mat4): number {
+    const streaming = this.textureStreaming;
+    if (!streaming) return 0;
+    const length = Math.hypot(...target.map((value, axis) => value - eye[axis]));
+    const forward = target.map((value, axis) => (value - eye[axis]) / length);
+    const demands = new Map<PreparedTextureAsset, { source: PreparedTextureAsset; mip: number; priority: number }>();
+    const focalPixels = this.stats.height / (2 * Math.tan(Math.PI / 6.4));
+    for (const batch of this.batches) {
+      const sources = new Set(batch.material.program.textureSlots.map(slot => streaming.source(batch.textureInputs[slot])).filter(source => source !== undefined));
+      if (!sources.size) continue;
+      for (const instance of batch.scene.instances) {
+        const bounds = batch.textureBounds ? conservativeDeformationBounds(batch.program, batch.textureBounds,
+          batch.morphBounds, instance.bones, instance.deformScalars, instance.model) : batch.bounds.get(instance.entityId)!;
+        const span = Number.isFinite(batch.textureUvSpan) ? batch.textureUvSpan * modelStretch(instance.model) : Infinity;
+        for (const source of sources) {
+          const demand = textureViewDemand({ bounds, viewProjection: vp, eye, forward, focalPixels,
+            worldUnitsPerUv: span, width: source.width, height: source.height, maxMip: source.fallback.baseMipLevel });
+          if (!demand.visible) continue;
+          const existing = demands.get(source.fallback);
+          if (existing) {
+            existing.mip = Math.min(existing.mip, demand.mip); existing.priority = Math.max(existing.priority, demand.priority);
+          } else demands.set(source.fallback, { source: source.fallback, mip: demand.mip, priority: demand.priority });
+        }
+      }
+    }
+    return streaming.tick([...demands.values()] satisfies TextureStreamDemand[]);
+  }
+
   render(eye: [number, number, number], target: [number, number, number]): void {
     if (this.disposed || this.errors.length) return;
     for (const batch of this.batches) if (batch.stream) {
@@ -979,8 +1062,9 @@ export class Renderer {
     this.worldQueries?.validateSources();
     this.geometryLod?.validateSources();
     for (const batch of this.batches) this.upload(batch);
-    this.stats.uploadedBytes += this.worldQueries?.updateSnapshot(this.stats.frames + 1, this.materialRevision) ?? 0;
     const vp = multiply(perspective(Math.PI / 3.2, this.stats.width / this.stats.height, 0.1, 150), lookAt(eye, target, [0, 1, 0]));
+    this.stats.uploadedBytes += this.updateTextureStreaming(eye, target, vp);
+    this.stats.uploadedBytes += this.worldQueries?.updateSnapshot(this.stats.frames + 1, this.materialRevision) ?? 0;
     this.stats.uploadedBytes += this.occlusion?.update(this.stats.frames + 1, this.stats.width, this.stats.height, vp, this.depth!,
       !this.geometryLod!.settings.frozen) ?? 0;
     this.frameData.set(vp); this.frameData.set(this.lastViewProjection ?? vp, 16); this.frameData.set(this.lightMatrix, 32);
@@ -1128,6 +1212,8 @@ export class Renderer {
         transfer: 'sRGB', toneMap: 'filmic-fit', maxSceneRadiance: 65504 },
       materials: this.materialResources.diagnostics(), materialTexturePreparation: this.materialResources.preparationDiagnostics(),
       materialTextureUploads: this.materialResources.uploadDiagnostics(),
+      textureStreaming: this.textureStreaming?.diagnostics() ?? null,
+      textureStreamingConservativeBatches: this.textureStreaming ? this.batches.filter(batch => !Number.isFinite(batch.textureUvSpan)).map(batch => batch.scene.name) : [],
       materialRevision: this.materialRevision, passes: this.graph.order,
       lifetimes: Object.fromEntries(this.graph.lifetimes),
       bounds: this.batches.flatMap(batch => Array.from(batch.bounds, ([entityId, bounds]) => ({ entityId, ...bounds }))) };
@@ -1358,6 +1444,7 @@ export class Renderer {
     this.occlusion?.dispose();
     for (const batch of this.batches) if (batch.stream) void batch.stream.runtime.dispose().catch(error => this.errors.push(String(error)));
     this.geometryDecoder?.dispose();
+    void this.textureStreaming?.dispose().catch(error => this.errors.push(String(error)));
     this.materialResources.dispose(); this.materialPipelines.clear();
     for (const buffer of this.buffers) buffer.destroy();
     this.shadow.destroy(); this.depth?.destroy(); this.velocity?.destroy(); this.hdr?.destroy(); this.querySet?.destroy();

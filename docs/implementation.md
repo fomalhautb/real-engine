@@ -2,6 +2,34 @@
 
 更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 按视图需求的自动纹理流送
+
+`RendererOptions.textureStreaming` 接受最多 1024 份 `TextureStreamSource`：稳定 ID、源尺寸/格式/色彩空间、完整 mip 元数据与 SHA-256、已提供的低清 `fallback` 尾链，以及可取消的原生 mip provider。游戏材质始终引用 `source.fallback` 对象身份，Renderer 创建材质时解析为当前驻留图像；后来执行的 `setMaterial` 也使用最新驻留，异步等待中的材质仍包含在整组发布中。手动 `replaceTexture` 拒绝触碰受管身份，避免调度器与外部替换互相覆盖。几何、形变、覆盖、查询和光照不按资产类别分管线。
+
+静态完整网格在初始化时按三角形计算 `dP/dUV0` 范数上界；每帧用当前实例边界、模型伸缩、相机投影和视口高度估算需求。计算包含离轴透视导数的保守放大，近裁剪面相交请求最高细节；同一来源的多材质/多实例合并为最精细需求与最大投影优先级。动态形变、缺失/退化 UV 或只有查询代理而无可信源 UV 密度时，可见实例保守请求 mip 0；可显式提供形变后局部空间的 `SceneBatch.textureUvSpan` 上界，诊断列出未证明上界的批次。源网格可省略批次的视图边界取几何目录根簇范围，不用简化查询代理的边界代替完整表面。预算不足仍保留有效低 mip，需求估算不构成最终画质证明。
+
+所有注册来源持有一份完整当前图像的独立引用；离开相机视野后降低需求，而不是移除世界查询材质。初始低清数据在 `Renderer.create` 完成前校验并上传，初始化工作不计入逐帧上传额度。单个调度器当前串行处理一项跨帧传输，按优先级选择可容纳的完整 mip 尾链，低需求默认持续 15 帧后降级。默认每帧最多 256 KiB 原生纹理数据，CPU 驻留加预留 128 MiB，provider/哈希工作窗口 64 MiB；均有显式配置及硬上限。图像预算还包含普通材质和上传预留，并为最大的低清图像留下替换空间；中等清晰度无法直接与更高清图像共存时，先完整换回低清图像，再加载目标，不破坏旧绑定。普通材质后续占用挤压该空间时公开 `budgetBlocked`，不超额分配。
+
+CPU 预算包含各来源低清数据、当前细节和新请求的完整预留。升级复用已有尾层，只请求缺失的较精细层；降级后释放不再引用的细节数据，当前没有额外的闲置 CPU LRU 缓存。取消会中止请求并释放暂存 GPU 图像；如果自定义 provider 忽略 abort，工作与预留一直保留到其实际结束，不立即重复启动另一份请求。失败保持旧图像并在来源诊断中记录，不逐帧重试；调用 `retryTexture(id)` 显式重试。`waitForTextureIo()` 只等待当前 IO/哈希，后续 render 帧仍负责上传和发布。资源销毁等待异步载荷退出并释放管理器自身的引用。
+
+`createHttpTextureMipProvider` 通过 `fetch` 和有长度上限的流式读取获取每级原生块，不使用无界 `response.arrayBuffer()`；短包、超长包、HTTP 失败、取消及内容哈希不匹配被拒绝。每级必须为独立、精确长度的 ArrayBuffer，不能用很小的 view 掩盖被保留的大缓冲。初始化尾链与后续加载使用同一份哈希清单；WebCrypto 完成验证后才进入 GPU 上传。RGBA8、BC7、ETC2 RGBA8、ASTC 4×4 沿用已有设备能力与块对齐规则，不提供编码器或转码器。
+
+`diagnostics().textureStreaming` 报告各来源当前/请求/预算选定 mip、失败、CPU/在途字节、请求/取消/发布/淘汰数及逐帧原生上传字节。原生图像数据额度不包含材质绑定的 uniform 写入；CPU 数字不是整个 JS 进程或浏览器网络缓冲的 RSS，GPU 数字不是驱动显存。`MaterialResources.pinTexture` 独立于最多 64 个暂存上传句柄，支持大型资产的多个当前图像，最多 4096 个 owner pin；72 个低清图像的持有、共享和释放已纳入 CPU 测试。
+
+本轮 `npm run check` 通过 **561 项 CPU 测试（68 文件）**、类型检查和构建，日志 `artifacts/texture-streaming-check-20261020.log`。新增覆盖原生清单/哈希/HTTP 中止、UV 与离轴投影需求、预算竞争、部分上传、共享绑定、退回低清的替换峰值、忽略取消的 provider、显式重试、资源释放及低需求延迟。
+
+新增 NVIDIA 定向浏览器用例 **1/1** 通过，日志 `artifacts/texture-streaming-target-native-20261020.log`，实际为非 fallback `nvidia / ampere`。两个独立 8×8 图像各为全链 340 字节/低清尾链 20 字节，总图像预算 400 字节、原生上传每帧 32 字节。真实浏览器 fetch 通过受控 HTTP 响应按 `a/0 → a/1 → b/0 → b/1 → a/0 → a/1` 取得数据，哈希通过后才上传；48 个 render 帧中，相机 A→B→A 自动产生 `[0,2] → [2,0] → [0,2]` 驻留，完成 5 次发布、2 次淘汰。GPU 图像峰值 380 字节，CPU 驻留加预留峰值 360 字节，累计原生上传 1060 字节，逐帧最大 32 字节；工作窗口的即时峰值由 CPU 延迟 provider 用例验证，不把帧末诊断的零读数说成没有在途工作。
+
+完整发布前旧 HDR/深度/世界查询保持有效；两个 A 材质保留各自参数与 sampler、共同换入细节，离屏 B 及离屏 A 的查询颜色按其实际驻留层核对。换入后新建材质仍绑定当前图像，管线数不变；稳定后额外 8 帧没有新增请求、上传或淘汰，GPU/页面错误为空，释放归零。真实 PNG/JSON 在对应输出目录 `texture-streaming-automati-b873b-shared-material-publication`。这些诊断纹理使用 mip 哨兵色，不是大型场景观感或真实网络性能的证明。
+
+该运行时代码的完整原生 NVIDIA 浏览器回归 **105/105** 通过，日志 `artifacts/texture-streaming-full-native-20261020.log`；包含原有共享形变、GI、反射、介质、遮挡和几何流送用例。后续自动流送与光照的新增联合用例及跨适配器定向结果另记，不将不同运行合并成一次完整通过数。
+
+随后新增自动流送与离屏光照联合用例：同一 Mask/Morph 发光面从低清 mip 1 自动升级到 mip 0，再因离屏需求降低而降回 mip 1，GI 探针和镜面锚点均与各层独立已知颜色一致；Morph 移走时贡献归零，恢复后返回。78 个渲染帧内材质版本为 `0 → 1 → 2`，形变变化不额外修改材质版本，管线变体数始终为 2；回看镜面后第 25 帧完成降级。逐帧原生上传不超过 32 字节，图像预算 500 字节、CPU 驻留加预留及在途窗口各 512 字节，查询失败和 GPU/页面错误为空，释放后账本归零。该场景使用已知颜色的诊断纹理，不是最终 GI 质量或大场景性能证明。
+
+包含该新增用例、自动 HTTP 流送、共享发布和预制纹理/材质计算的 7 项定向回归，在非 fallback `nvidia / ampere`、非 fallback `intel / gen-12lp` 与 `google / swiftshader / fallback=true` 上分别 **7/7** 通过。日志依次为 `artifacts/texture-streaming-final-target-native-20261020.log`、`artifacts/texture-streaming-target-intel-20261020.log`、`artifacts/texture-streaming-target-software-20261020.log`；各目录保存 `automatic-texture-lighting.json` 及原有数值/图像证据。完整 105 项运行后只增加测试，没有改变运行时代码；不能将它改记为一次完整 106 项通过，也不能将软件后端结果用于硬件性能判断。
+
+这是已接入主 Renderer 的自动原生 mip 调度，尚未完成 Sponza 的实际纹理编码/打包、整场景材质组织、真实网络压力、流送性能或最终大场景画质验收；当前没有细分纹理页、反馈纹理采样或并发多源 IO，不能等同完整 Virtual Texturing。
+
 ## 共享纹理原子发布与分片上传
 
 `Renderer.replaceTexture(source, replacement)` 按不可变图像对象身份，一次替换所有当前保留的材质引用，返回受影响的材质数与纹理槽数；也包含已分配、正在等待异步 pipeline 完成的材质。先为所有受影响者准备新 uniform 和 bind group，再同步发布；参数热更新的最新值、各槽 sampler、源 mip 坐标及同一材质句柄保留，不编译新 pipeline。任一步准备失败时销毁本次临时资源，所有旧绑定和材质版本不变。成功的整组替换仅增加一次 `materialRevision`，从而使共享世界查询、GI、反射及历史读取同一更新。后来提交的独立 `setMaterial` 仍按自己的请求顺序生效；该接口不永久重定向旧资产身份。资源管理器最多保留 4096 个活材质，包含等待编译者，整组遍历与临时 uniform 数量有界。
@@ -10,13 +38,15 @@
 
 上传未完整排队前，图像不能被 `create` / `replaceTexture` 引用；原材质仍绘制完整旧 mip。`complete` 表示同队列之后可使用，不要求 CPU 等待 GPU。SwiftShader 的压缩图像只在全部片段完成后执行既有一次准备。完成句柄继续固定该图像，可随后调用 `replaceTexture` 原子发布，再 `dispose` 释放这份固定引用；材质自己的引用继续有效。取消未完成句柄销毁其 GPU 分配，不影响旧图像；资源管理器销毁会取消所有剩余句柄。最多同时 64 个句柄，同一资产的未完成上传禁止重复启动；完整/未完整分配和旧图像同时计入原有纹理预算。`materialTextureUploads` 公开 active、pending、pendingImageBytes；`materials.imageBytes` 包含预留，`materials.images` 只计可绑定图像。这些字节仍不代表驱动显存。
 
-本轮 `npm run check` 通过 **531 项 CPU 测试（65 文件）**、类型检查和构建，日志 `artifacts/texture-residency-check-20261020.log`。新增检查覆盖块行边界、NPOT、预算不超额、源 byteOffset/无复制、失败重试、同图多材质/多槽、不同 sampler、热更新参数保留、第二个绑定创建失败的整组回滚、共享图像只上传一次、分片上传句柄、取消/释放及并发预留。自动视图需求、网络请求/缓存、CPU 数据淘汰和全局上传调度尚未接入，不能把这些接口计为完整自动纹理流送。
+该接口提交的 `npm run check` 通过 **531 项 CPU 测试（65 文件）**、类型检查和构建，日志 `artifacts/texture-residency-check-20261020.log`。新增检查覆盖块行边界、NPOT、预算不超额、源 byteOffset/无复制、失败重试、同图多材质/多槽、不同 sampler、热更新参数保留、第二个绑定创建失败的整组回滚、共享图像只上传一次、分片上传句柄、取消/释放及并发预留。当时尚未接入自动视图需求、网络请求或全局上传调度；之后的自动调度与剩余边界见上文。
 
 新增 NVIDIA 定向两项通过（`artifacts/texture-residency-target-native-20261020.log`），随后同源码完整原生 NVIDIA 浏览器回归 **104/104** 通过（`artifacts/texture-residency-full-native-20261020.log`）。双材质场景以 20 字节粗 mip 保持旧画面，将 340 字节完整 RGBA8 图像分为每次最多 32 字节上传，预留峰值恰为 360 字节；中途取消释放回 20，重试中各次不完整发布均被拒绝且 HDR/阴影/查询保持旧值。最终整组发布同时更新两个现有材质与一个等待异步 `setMaterial` 的材质，原子替换报告 3 材质 / 3 槽；后者完成后未重新引入旧图像。每材质的参数及固定源 mip sampler 保留，材质变体数不变；换为 20 字节 Mask 尾链时两者的主视图/阴影/世界查询同时变为孔洞，再恢复原粗链。实际 PNG 和 JSON 位于定向输出的 `texture-residency-bounded--b99ba-eserve-pending-replacements` 目录，最终资源账本归零。
 
 另一新增用例以每次最多 16 个原生字节逐片上传离屏发光材质，保持原有 GI、反射、Mask 和 Morph 的数值断言；BC7 尾链为 48 字节，RGBA8 尾链为 84 字节。上传期间材质版本不变，每次完整发布只增加一次版本且材质变体不增；GPU/页面错误为空、释放归零。这些是有界小场景的正确性与应用字节验证，不代表帧时间、完整自动流送或最终场景观感通过。
 
 同源码在 Intel 与 SwiftShader 各通过 **5/5 定向浏览器用例**，日志为 `artifacts/texture-residency-intel-20261020.log` 与 `artifacts/texture-residency-software-20261020.log`；范围包括两个新增上传/发布用例及三个原有预制纹理/独立计算用例。Intel 实际为非 fallback `intel / gen-12lp`，验证 RGBA8 与 BC7；SwiftShader 实际为 `google / swiftshader`，另外覆盖 ETC2 RGBA8 和 ASTC 4×4。两者均验证取消、完整发布、共享引用、异步材质、离屏 GI/反射与释放归零；GPU 错误为空。软件独立计算的 35 个样本最大误差为 `6.56e-6`，原生 Intel 不启用压缩准备附件。此为跨适配器定向功能验证，不是完整 Intel 回归或软件适配器性能证据。
+
+共享纹理发布/分片上传提交 `e4db942` 的[远程 CI run 39317256433](https://github.com/fomalhautb/real-engine/actions/runs/39317256433) 已完整成功，含 foundation 与四个软件 GPU 分片；它不覆盖随后新增的自动流送调度。
 
 ## 预制 mip 与 GPU 压缩纹理输入
 

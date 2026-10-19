@@ -22,6 +22,7 @@ export interface PreparedTextureUpload {
   /** Cancel or release the upload's pin. Published material references remain valid. */
   dispose(): void;
 }
+export interface MaterialTexturePin { dispose(): void }
 function materialSampler(source: GPUSamplerDescriptor): GPUSamplerDescriptor {
   if (!source || typeof source !== 'object' || source.compare !== undefined) throw new Error('MATERIAL_SAMPLER_DESCRIPTOR');
   const descriptor: GPUSamplerDescriptor = { addressModeU: 'repeat', addressModeV: 'repeat',
@@ -55,6 +56,7 @@ export class MaterialResources {
   private readonly materials = new Set<GpuMaterial>();
   private readonly inputs = new Map<GpuMaterial, MaterialInputs>();
   private readonly uploads = new Set<PreparedTextureUpload>();
+  private readonly pins = new Set<MaterialTexturePin>();
   private readonly pendingUploads = new Map<MaterialTextureAsset, PreparedTextureUpload>();
   private readonly fallback: GPUTexture;
   private disposed = false;
@@ -236,6 +238,21 @@ export class MaterialResources {
     return handle;
   }
 
+  /** A bounded owner reference independent of pending upload handles. Streaming
+   * retains the complete current image even when no material currently uses it. */
+  pinTexture(asset: MaterialTextureAsset): MaterialTexturePin {
+    if (this.disposed) throw new Error('MATERIAL_RESOURCES_DISPOSED');
+    if (this.pins.size >= 4096) throw new Error('MATERIAL_TEXTURE_PIN_LIMIT');
+    const image = this.retainImage(asset);
+    let disposed = false;
+    const pin = { dispose: () => {
+      if (disposed) return;
+      disposed = true; this.pins.delete(pin); this.releaseImage(image);
+    } };
+    this.pins.add(pin);
+    return pin;
+  }
+
   private parameters(program: MaterialProgram, values?: Float32Array): Float32Array<ArrayBuffer> {
     if ((values?.length ?? 0) < program.parameterCount * 4 || (values?.length ?? 0) > 64) throw new Error('MATERIAL_PARAMETER_COUNT');
     const data = new Float32Array(64);
@@ -316,6 +333,7 @@ export class MaterialResources {
     this.disposed = true;
     for (const material of Array.from(this.materials)) this.release(material);
     for (const upload of Array.from(this.uploads)) upload.dispose();
+    for (const pin of Array.from(this.pins)) pin.dispose();
     this.texturePreparation.dispose();
     this.fallback.destroy(); this.account(-4);
   }

@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 import { writeFile } from 'node:fs/promises';
-import type { runPreparedTextureSurfaceFixture, runPreparedTextureLightingFixture } from './fixtures/prepared-textures';
+import type { runPreparedTextureSurfaceFixture, runPreparedTextureLightingFixture,
+  runAutomaticTextureLightingFixture } from './fixtures/prepared-textures';
 
 test.use({ deviceScaleFactor: 1 });
 function adapterCheck(adapter: { isFallbackAdapter: boolean | null; vendor: string }) {
@@ -144,4 +145,52 @@ test('bounded staged texture uploads publish once while GI and reflections retai
     near(sample.giMax, sample.expected, 0.015, sample.name + ' GI');
   }
   expect(result.errors).toEqual([]); expect(result.afterDispose).toBe(0); expect(errors).toEqual([]);
+});
+
+test('automatic texture residency updates offscreen GI and reflections without changing the emitter path', async ({ page }, info) => {
+  test.setTimeout(180_000);
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/?trees=1');
+  await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
+  await expect(page.locator('#error')).toBeHidden();
+  const result = await page.evaluate(async () => {
+    window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose();
+    const module = await import('/tests/browser/fixtures/' + 'prepared-textures.ts') as {
+      runAutomaticTextureLightingFixture: typeof runAutomaticTextureLightingFixture };
+    return module.runAutomaticTextureLightingFixture();
+  });
+  const report = JSON.stringify(result, null, 2);
+  await writeFile(info.outputPath('automatic-texture-lighting.json'), report);
+  await info.attach('automatic-texture-lighting.json', { body: report, contentType: 'application/json' });
+  adapterCheck(result.adapter);
+  const coarse = [32, 192, 16].map(value => value / 255);
+  const fine = [192, 32, 16].map(value => value / 255);
+  for (const [sample, mip, color] of [
+    [result.coarse, 1, coarse], [result.fine, 0, fine], [result.coarseAgain, 1, coarse],
+    [result.morphAway, 1, [0, 0, 0]], [result.morphRestored, 1, coarse],
+  ] as const) {
+    expect(sample.mip, sample.name).toBe(mip);
+    expect(sample.anchor.valid, sample.name).toBe(true);
+    expect(sample.anchor.failedQueries, sample.name).toBe(0);
+    near(sample.anchor.radiance, color, 0.015, sample.name + ' reflection');
+    near(sample.giMax, color, 0.015, sample.name + ' GI');
+    expect(sample.variants).toBe(result.coarse.variants);
+  }
+  expect(result.fine.revision).toBeGreaterThan(result.coarse.revision);
+  expect(result.coarseAgain.revision).toBeGreaterThan(result.fine.revision);
+  expect(result.morphAway.revision).toBe(result.coarseAgain.revision);
+  expect(result.morphRestored.revision).toBe(result.coarseAgain.revision);
+  expect(result.downgradeFrames).toBeGreaterThan(15);
+  for (const frame of result.frames) {
+    const streaming = frame.streaming;
+    expect(streaming.frameUploadedBytes).toBeLessThanOrEqual(32);
+    expect(streaming.cpuBytes + streaming.reservedCpuBytes).toBeLessThanOrEqual(512);
+    expect(streaming.inFlightBytes).toBeLessThanOrEqual(512);
+    expect(frame.imageBytes).toBeLessThanOrEqual(500);
+    expect(streaming.sources.every(source => source.failure === null)).toBe(true);
+  }
+  expect(result.errors).toEqual([]);
+  expect(errors).toEqual([]);
+  expect(result.afterDispose).toBe(0);
 });

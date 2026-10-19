@@ -4,6 +4,7 @@ import { identity, multiply, normalMatrix, scaling, translation } from '../../..
 import { DEFAULT_MATERIAL_DEFINITION, m } from '../../../src/material';
 import { Renderer } from '../../../src/renderer';
 import { textureStorageLayout, type PreparedTextureAsset } from '../../../src/texture-storage';
+import type { TextureStreamSource } from '../../../src/texture-stream-types';
 import { compressedSolidBlockCases, type Rgba8 } from './compressed-texture-blocks';
 
 type V3 = [number, number, number];
@@ -235,5 +236,96 @@ export async function runPreparedTextureLightingFixture(staged = false) {
     const errors = [...active.errors], adapter = active.info.adapterInfo, features = active.info.features;
     active.dispose();
     return { samples, stagedUploads, errors, adapter, features, afterDispose: active.stats.ownedGpuBytes };
+  } finally { renderer?.dispose(); canvas.remove(); }
+}
+
+/** The offscreen emitter remains available to GI and reflections as its managed mip changes. */
+export async function runAutomaticTextureLightingFixture() {
+  const canvas = canvasOf(32);
+  const mirror = batch('automatic-mirror', quad(), { definition: { ...DEFAULT_MATERIAL_DEFINITION,
+    baseColor: m.constant([1, 1, 1, 1]), metallic: 1, roughness: 0.045 } });
+  mirror.instances = [instance(11, scaling(3, 3, 1))];
+  const full = rgbaTexture(8, 8, 0), fallback = rgbaTexture(8, 8, 1);
+  const mips = await Promise.all(full.levels.map(async (level, index) => {
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', level.data.buffer as ArrayBuffer));
+    return { level: index, width: level.width, height: level.height, byteLength: level.data.byteLength,
+      sha256: Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('') };
+  }));
+  const source: TextureStreamSource = { id: 'automatic-emitter', width: 8, height: 8,
+    format: 'rgba8', colorSpace: 'linear', mips, fallback,
+    provider: async (mip, signal) => {
+      if (signal.aborted) throw signal.reason;
+      return full.levels[mip.level].data.slice();
+    } };
+  const emitter = batch('automatic-emitter', quad(), { definition: {
+    ...DEFAULT_MATERIAL_DEFINITION, doubleSided: true, alphaMode: 'mask', alphaCutoff: 0.5,
+    baseColor: m.multiply(m.texture(0), m.constant([0, 0, 0, 1])), emissive: m.texture(0),
+  }, textures: [fallback] });
+  const model = multiply(translation(0, 0, 5), scaling(20, 20, 1));
+  emitter.instances = [instance(12, model)];
+  const morph = new Float32Array(12);
+  for (let i = 0; i < 4; i++) morph[i * 3] = 3;
+  emitter.deformation = { jointCount: 0, nodes: [{ kind: 'morph', target: 0, weight: 0 }] };
+  emitter.morphTargets = [{ positions: morph, normals: new Float32Array(12) }];
+  emitter.instances[0].deformScalars = [0];
+  let renderer: Renderer | undefined;
+  try {
+    renderer = await Renderer.create(canvas, [mirror, emitter], { antiAliasing: 'none',
+      textureBudgetBytes: 500, textureStreaming: { sources: [source], maxCpuBytes: 512,
+        maxInFlightBytes: 512, maxUploadBytesPerFrame: 32, downgradeDelayFrames: 32 },
+      worldQueries: { maxRays: 4096 },
+      diffuseGi: { origin: [-1, -1, -1], spacing: [2, 2, 2], counts: [2, 2, 2],
+        raysPerProbe: 16, maxDistance: 10, skyRadiance: [0, 0, 0],
+        finalGather: { pixelSpacing: 4, maxAnchors: 64, raysPerAnchor: 4 } },
+      reflections: { pixelSpacing: 1, maxAnchors: 1024, samplesPerAnchor: 4,
+        maxDistance: 20, maxBytes: 16 * 1024 * 1024, skyRadiance: [0, 0, 0] },
+      volumetricFog: { pixelSize: 4, slices: 16, maxViewDepth: 10,
+        maxFroxels: 8 * 8 * 16, maxBytes: 1024 * 1024 } });
+    const active = renderer;
+    active.setSun({ direction: [0, 0, 1], color: [0, 0, 0] });
+    active.setDiffuseGiMultiBounce(false);
+    const frameDiagnostics: { streaming: NonNullable<ReturnType<Renderer['diagnostics']>['textureStreaming']>; imageBytes: number }[] = [];
+    const render = (eye: V3, target: V3) => {
+      active.render(eye, target);
+      const diagnostic = active.diagnostics();
+      frameDiagnostics.push({ streaming: diagnostic.textureStreaming!, imageBytes: diagnostic.materials.imageBytes });
+      if (frameDiagnostics.length > 200) throw new Error('AUTOMATIC_LIGHTING_FRAME_LIMIT');
+      return diagnostic;
+    };
+    const mirrorEye: V3 = [0, 0, 3], mirrorTarget: V3 = [0, 0, 0];
+    const emitterTarget: V3 = [0, 0, 5];
+    const capture = async (name: string) => {
+      for (let frame = 0; frame < 8; frame++) render(mirrorEye, mirrorTarget);
+      const [gi, reflections] = await Promise.all([active.probeDiffuseGi(), active.probeReflections([16 * 32 + 16])]);
+      const diagnostics = active.diagnostics();
+      return { name, giMax: [0, 1, 2].map(channel => Math.max(...gi.probes.map(probe => probe.maxRadiance[channel]))),
+        anchor: reflections.anchors[0], mip: diagnostics.textureStreaming!.sources[0].currentMip,
+        revision: diagnostics.materialRevision, variants: diagnostics.materialVariants };
+    };
+    const coarse = await capture('coarse-offscreen');
+    let visibleFrames = 0;
+    for (; visibleFrames < 100; visibleFrames++) {
+      const diagnostics = render(mirrorEye, emitterTarget);
+      await active.waitForTextureIo();
+      if (diagnostics.textureStreaming!.sources[0].currentMip === 0 && !diagnostics.textureStreaming!.active) break;
+    }
+    if (visibleFrames === 100) throw new Error('AUTOMATIC_LIGHTING_DID_NOT_REFINE');
+    const fine = await capture('fine-offscreen');
+    let downgradeFrames = 0;
+    for (; downgradeFrames < 100; downgradeFrames++) {
+      const diagnostics = render(mirrorEye, mirrorTarget);
+      await active.waitForTextureIo();
+      if (diagnostics.textureStreaming!.sources[0].currentMip === 1 && !diagnostics.textureStreaming!.active) break;
+    }
+    if (downgradeFrames === 100) throw new Error('AUTOMATIC_LIGHTING_DID_NOT_DOWNGRADE');
+    const coarseAgain = await capture('coarse-again');
+    emitter.instances = [{ ...emitter.instances[0], deformScalars: [1] }];
+    const morphAway = await capture('morph-away');
+    emitter.instances = [{ ...emitter.instances[0], deformScalars: [0] }];
+    const morphRestored = await capture('morph-restored');
+    const adapter = active.info.adapterInfo, errors = [...active.errors];
+    active.dispose();
+    return { coarse, fine, coarseAgain, morphAway, morphRestored, visibleFrames, downgradeFrames,
+      frames: frameDiagnostics, adapter, errors, afterDispose: active.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }
 }

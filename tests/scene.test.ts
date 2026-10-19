@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { DemoScene } from '../src/scene';
 import { transformPoint } from '../src/math';
 import { compileMaterial, evaluateMaterial } from '../src/material';
-import type { TextureAsset } from '../src/texture-assets';
 
 describe('DemoScene', () => {
   it('creates bounded batches with four compatible bone transforms', async () => {
@@ -47,6 +46,7 @@ describe('DemoScene', () => {
       expect([program.shading, program.alphaMode, program.doubleSided]).toEqual(['unlit', 'mask', true]);
       expect(program.textureSlots).toEqual([0]);
       const texture = binding.textures![0]!;
+      if (!('pixels' in texture)) throw new Error('Expected decoded demo card texture');
       const sample = (x: number, y: number) => Array.from(texture.pixels.slice((y * texture.width + x) * 4, (y * texture.width + x) * 4 + 4), v => v / 255) as [number, number, number, number];
       const input = { parameters: binding.parameters, instanceColor: [1, 1, 1, 1] as const, instanceMetalRough: [0, 1] as const };
       expect(evaluateMaterial(program, { ...input, textures: () => sample(32, 32) }).covered).toBe(false);
@@ -54,7 +54,8 @@ describe('DemoScene', () => {
 
       const ground = scene.batches[2].material!;
       expect(ground.definition.alphaMode).toBe('opaque');
-      const groundTexture: TextureAsset = ground.textures![0]!;
+      const groundTexture = ground.textures![0]!;
+      if (!('pixels' in groundTexture)) throw new Error('Expected decoded demo ground texture');
       expect(groundTexture.pixels[3]).toBe(255);
       expect(groundTexture.pixels[(40 * groundTexture.width + 40) * 4 + 3]).toBe(255);
     } finally {

@@ -1,8 +1,12 @@
 import { compileMaterial, DEFAULT_MATERIAL_DEFINITION, type MaterialProgram } from './material';
-import { buildMipChain, textureByteSize, type TextureAsset } from './texture-assets';
+import { buildMipChain } from './texture-assets';
+import { textureStorageLayout, type MaterialTextureAsset, type TextureStorageLayout } from './texture-storage';
 import type { MaterialBinding } from './contracts';
+import { CompressedTexturePreparation } from './gpu-texture-preparation';
 
-type ImageResource = { texture: GPUTexture; bytes: number; refs: number; asset: TextureAsset };
+type ImageResource = { texture: GPUTexture; bytes: number; refs: number;
+  asset: MaterialTextureAsset; layout: TextureStorageLayout };
+const MATERIAL_UNIFORM_BYTES = 320;
 function materialSampler(source: GPUSamplerDescriptor): GPUSamplerDescriptor {
   if (!source || typeof source !== 'object' || source.compare !== undefined) throw new Error('MATERIAL_SAMPLER_DESCRIPTOR');
   const descriptor: GPUSamplerDescriptor = { addressModeU: 'repeat', addressModeV: 'repeat',
@@ -32,17 +36,20 @@ export interface GpuMaterial {
 export class MaterialResources {
   readonly layout: GPUBindGroupLayout;
   private readonly sampler: GPUSampler;
-  private readonly images = new Map<TextureAsset, ImageResource>();
+  private readonly images = new Map<MaterialTextureAsset, ImageResource>();
   private readonly materials = new Set<GpuMaterial>();
   private readonly fallback: GPUTexture;
   private disposed = false;
   private imageBytes = 0;
+  private readonly texturePreparation: CompressedTexturePreparation;
 
   constructor(private readonly device: GPUDevice, private readonly account: (bytes: number) => void,
-    private readonly imageBudgetBytes = 256 * 1024 * 1024) {
+    private readonly imageBudgetBytes = 256 * 1024 * 1024,
+    adapterInfo: Pick<GPUAdapterInfo, 'architecture' | 'description'> | undefined = device.adapterInfo) {
     if (!Number.isSafeInteger(imageBudgetBytes) || imageBudgetBytes < 0) throw new Error('INVALID_TEXTURE_BUDGET');
+    this.texturePreparation = new CompressedTexturePreparation(device, account, adapterInfo);
     this.layout = device.createBindGroupLayout({ label: 'shared material inputs', entries: [
-      { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 256 } },
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: MATERIAL_UNIFORM_BYTES } },
       ...[1, 2, 3, 4].map(binding => ({ binding, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, texture: { sampleType: 'float' as const } })),
       ...[5, 6, 7, 8].map(binding => ({ binding, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, sampler: { type: 'filtering' as const } })),
     ] });
@@ -65,24 +72,40 @@ export class MaterialResources {
     let uniform: GPUBuffer | undefined;
     try {
       const views = Array.from({ length: 4 }, () => this.fallback.createView());
+      const textureInfo = new Float32Array(16);
+      for (let slot = 0; slot < 4; slot++) {
+        textureInfo[slot * 4 + 1] = 1; textureInfo[slot * 4 + 2] = 1;
+      }
       for (const slot of program.textureSlots) {
         const asset = binding?.textures?.[slot];
         if (!asset) throw new Error('MATERIAL_TEXTURE_MISSING: slot ' + slot);
         const image = this.retainImage(asset); retained.push(image); views[slot] = image.texture.createView();
+        const layout = image.layout;
+        textureInfo[slot * 4] = layout.baseMipLevel;
+        // Preserve source-space LOD even when odd dimensions round down in a tail.
+        textureInfo[slot * 4 + 1] = layout.sourceWidth * 2 ** -layout.baseMipLevel / layout.width;
+        textureInfo[slot * 4 + 2] = layout.sourceHeight * 2 ** -layout.baseMipLevel / layout.height;
       }
-      uniform = this.device.createBuffer({ label: 'material vec4 parameters', size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      this.account(256); this.device.queue.writeBuffer(uniform, 0, parameters);
+      const data = new Float32Array(MATERIAL_UNIFORM_BYTES / 4);
+      data.set(parameters); data.set(textureInfo, 64);
+      uniform = this.device.createBuffer({ label: 'material parameters and texture residency', size: MATERIAL_UNIFORM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.account(MATERIAL_UNIFORM_BYTES); this.device.queue.writeBuffer(uniform, 0, data);
       const bindGroup = this.device.createBindGroup({ layout: this.layout, entries: [
         { binding: 0, resource: { buffer: uniform } },
         ...views.map((resource, index) => ({ binding: index + 1, resource })),
-        ...[0, 1, 2, 3].map(slot => ({ binding: slot + 5,
-          resource: samplers[slot] ? this.device.createSampler(samplers[slot]) : this.sampler })),
+        ...[0, 1, 2, 3].map(slot => {
+          const descriptor = samplers[slot], baseMip = textureInfo[slot * 4];
+          return { binding: slot + 5, resource: descriptor ? this.device.createSampler({ ...descriptor,
+            lodMinClamp: Math.max(0, (descriptor.lodMinClamp ?? 0) - baseMip),
+            lodMaxClamp: Math.max(0, (descriptor.lodMaxClamp ?? 32) - baseMip),
+          }) : this.sampler };
+        }),
       ] });
       const result: GpuMaterial = { program, bindGroup, uniform, images: retained, disposed: false };
       this.materials.add(result);
       return result;
     } catch (error) {
-      if (uniform) { uniform.destroy(); this.account(-256); }
+      if (uniform) { uniform.destroy(); this.account(-MATERIAL_UNIFORM_BYTES); }
       for (const image of retained) this.releaseImage(image);
       throw error;
     }
@@ -103,24 +126,31 @@ export class MaterialResources {
     return data;
   }
 
-  private retainImage(asset: TextureAsset): ImageResource {
+  private retainImage(asset: MaterialTextureAsset): ImageResource {
     const cached = this.images.get(asset);
     if (cached) { cached.refs++; return cached; }
-    if (asset.width > this.device.limits.maxTextureDimension2D || asset.height > this.device.limits.maxTextureDimension2D) throw new Error('MATERIAL_TEXTURE_DEVICE_LIMIT');
-    const bytes = textureByteSize(asset);
+    const layout = textureStorageLayout(asset);
+    if (layout.width > this.device.limits.maxTextureDimension2D || layout.height > this.device.limits.maxTextureDimension2D) throw new Error('MATERIAL_TEXTURE_DEVICE_LIMIT');
+    if (layout.requiredFeature && !this.device.features.has(layout.requiredFeature)) {
+      throw new Error('MATERIAL_TEXTURE_FEATURE: ' + layout.requiredFeature);
+    }
+    const bytes = layout.byteLength;
     if (this.imageBytes + bytes > this.imageBudgetBytes) throw new Error('MATERIAL_TEXTURE_BUDGET: replacement must fit alongside currently referenced images');
-    const levels = buildMipChain(asset);
+    const levels = 'kind' in asset ? asset.levels.map(level => level.data)
+      : buildMipChain(asset).map(level => level.pixels);
     const texture = this.device.createTexture({ label: 'material image (' + asset.colorSpace + ')',
-      size: [asset.width, asset.height], mipLevelCount: levels.length,
-      format: asset.colorSpace === 'srgb' ? 'rgba8unorm-srgb' : 'rgba8unorm',
+      size: [layout.width, layout.height], mipLevelCount: levels.length,
+      format: layout.gpuFormat,
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     try {
       for (let mipLevel = 0; mipLevel < levels.length; mipLevel++) {
-        const level = levels[mipLevel];
-        this.device.queue.writeTexture({ texture, mipLevel }, new Uint8Array(level.pixels), { bytesPerRow: level.width * 4 }, [level.width, level.height]);
+        const level = layout.levels[mipLevel];
+        this.device.queue.writeTexture({ texture, mipLevel }, levels[mipLevel],
+          { bytesPerRow: level.bytesPerRow, rowsPerImage: level.rowsPerImage }, [level.copyWidth, level.copyHeight]);
       }
+      if (layout.requiredFeature) this.texturePreparation.prepare(texture);
     } catch (error) { texture.destroy(); throw error; }
-    const image = { texture, bytes, refs: 1, asset };
+    const image = { texture, bytes, refs: 1, asset, layout };
     this.images.set(asset, image); this.imageBytes += bytes; this.account(bytes);
     return image;
   }
@@ -132,7 +162,7 @@ export class MaterialResources {
 
   release(material: GpuMaterial): void {
     if (material.disposed) return;
-    material.disposed = true; material.uniform.destroy(); this.account(-256);
+    material.disposed = true; material.uniform.destroy(); this.account(-MATERIAL_UNIFORM_BYTES);
     for (const image of material.images) this.releaseImage(image);
     this.materials.delete(material);
   }
@@ -141,10 +171,13 @@ export class MaterialResources {
 
   diagnostics() { return { materials: this.materials.size, images: this.images.size, imageBytes: this.imageBytes }; }
 
+  preparationDiagnostics() { return this.texturePreparation.diagnostics(); }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     for (const material of Array.from(this.materials)) this.release(material);
+    this.texturePreparation.dispose();
     this.fallback.destroy(); this.account(-4);
   }
 }

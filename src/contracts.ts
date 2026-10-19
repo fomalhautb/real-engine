@@ -2,7 +2,7 @@ import type { Mat4 } from './math';
 import type { MeshData } from './geometry';
 import type { DeformationGraph, MorphTarget } from './deformation';
 import type { MaterialDefinition } from './material';
-import type { TextureAsset } from './texture-assets';
+import type { MaterialTextureAsset } from './texture-storage';
 import type { GeometryHierarchy } from './geometry-hierarchy-types';
 import type { GeometryStreamSource } from './gpu-geometry-stream';
 import type { GeometryQueryProxy } from './geometry-query-proxy';
@@ -12,7 +12,7 @@ export interface MaterialBinding {
   /** Runtime vec4 parameters, packed in slot order. Updating them never compiles a pipeline. */
   parameters?: Float32Array;
   /** Immutable image assets; slots referenced by the definition must be present. */
-  textures?: readonly (TextureAsset | undefined)[];
+  textures?: readonly (MaterialTextureAsset | undefined)[];
   /** Per-texture sampling, independent of immutable image identity. */
   samplers?: readonly (Omit<GPUSamplerDescriptor, 'compare'> | undefined)[];
 }

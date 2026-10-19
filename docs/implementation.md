@@ -2,6 +2,36 @@
 
 更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 预制 mip 与 GPU 压缩纹理输入
+
+`MaterialBinding.textures` 现在接受原有解码 RGBA8 `TextureAsset`，以及 `texture-storage.ts` 的 `PreparedTextureAsset`。后者给出完整源图尺寸、色彩空间、`rgba8` / `bc7` / `etc2-rgba8` / `astc-4x4` 格式、第一层驻留的源 `baseMipLevel`，以及从该层连续到 1×1 的全部载荷。源尺寸上限仍为 8192；布局预检验证每级尺寸和精确字节数，只生成元数据。预制载荷直接上传，不重新生成 mip、不在 CPU 解压压缩块；旧 RGBA8 输入继续使用原有线性光 mip 构建器。
+
+Renderer 请求适配器已声明支持的 BC、ETC2 和 ASTC 压缩特性，并在 `info.features` 中公开实际启用项。没有对应特性的设备在图像分配前明确报 `MATERIAL_TEXTURE_FEATURE`；调用方选择 RGBA8 或另一份资产，不静默改格式。三种压缩输入均为每个 4×4 块 16 字节；当前要求驻留首层宽高可被 4 整除，2×2 / 1×1 尾层按实际物理块范围上传，不依赖额外的非对齐纹理扩展。规则依据 [WebGPU 压缩纹理格式](https://www.w3.org/TR/webgpu/#compressed-texture-formats) 与 [writeTexture](https://www.w3.org/TR/webgpu/#dom-gpuqueue-writetexture)。这不是对任意 BC/ETC/ASTC 编码格式的支持。
+
+显式世界查询 LOD 与 sampler 的 min/max clamp 均使用完整源 mip 坐标，上传尾链后转换为驻留纹理坐标；主视图及 Mask 阴影按源尺寸修正 UV 导数，包含奇数尺寸逐级向下取整的情况。GI、反射继续共用生产世界查询材质函数。材质 uniform 从 256 增为 320 字节，新增每槽的 base mip 与两个导数比例，16 个 vec4 参数容量不变；参数热更新只写前 256 字节。图像身份仍按不可变 asset 对象引用共享，替换使用新对象和原子 `setMaterial`，保留材质版本及历史失效语义。图像预算按驻留的原生块字节计费，包括最小尾块，替换峰值须容纳新旧图像；此账本不等于驱动实际显存分配。
+
+完整 `npm run check` 通过 499 项 CPU 测试（63 文件）、类型检查和构建，记录 `artifacts/prepared-texture-check-release-20261020.log`。新增 CPU 检查覆盖完整/尾 mip、NPOT、非法载荷、格式/特性、块尺寸、共享引用、预算、分配/上传中途失败清理、sampler clamp 和参数更新保留纹理元数据。
+
+首轮 NVIDIA 定向 2/3 通过；新的动画 fixture 原地修改已提交的帧对象，违反 `inputMode: committed` 的不可变快照约定，改为提交新实例后 GI/反射随 Morph 移动和恢复，生产动画路径未变。第二轮 5/6 通过，覆盖主视图、阴影、查询、GI/反射及驻留/分页 LOD；唯一失败为 BC7 的测试期望已换成中间色而块数据仍为红色，已同步为 `[128,64,32,254]`，使 sRGB 解码检查能识别遗漏色彩转换。两次原始日志分别保留为 `artifacts/prepared-texture-target-native-20261020.log` 与 `artifacts/prepared-texture-target-native-20261020-v2.log`；最终完整 GPU 回归另记，不把局部通过或修正意图作为最终结果。
+
+兼容处理加入前的完整 NVIDIA 浏览器回归 **102/102** 通过，记录 `artifacts/prepared-texture-full-native-20261020.log`，实际 adapter 为非 fallback `nvidia / ampere`。Compute 材质参考包含原 11 项和新增 16 项，BC7 4×4 / 2×2 / 1×1 块解码与 Mask 判定通过；中间色 `[128,64,32]` 的 sRGB 采样最大绝对误差约 `4.02e-5`。该设备只提供 BC，ETC2 / ASTC 明确记录 unavailable，验证拒绝时账本不变，不计为格式解码通过。同版新增四项在非 fallback `intel / gen-12lp` 通过，日志 `artifacts/prepared-texture-target-intel-20261020.log`；同样只验证 BC 解码。
+
+SwiftShader 首轮新增四项为 **3/4**，日志 `artifacts/prepared-texture-target-software-20261020.log`。主 Renderer 的三种压缩格式通过，但独立 Compute 的全部 12 个压缩样本读出零或旧值，原 23 个非压缩样本通过；不能将软件路径计为全部成功。隔离实验排除了更换 sampler、重建计算管线、改变 base mip、工作组大小及等待队列完成；先执行一次真实图形采样后，三种格式的 12 个压缩样本全部符合原参考且无 GPU 错误，记录 `artifacts/texture-debug-draw-results/diagnostic-draw/result.json` 与 `artifacts/texture-debug-draw.log`。这些诊断不是性能测试。
+
+该行为与当前 [SwiftShader 图形路径](https://github.com/google/swiftshader/blob/master/src/Device/Renderer.cpp)调用 `DescriptorSet::PrepareForSampling`、[Compute 路径](https://github.com/google/swiftshader/blob/master/src/Pipeline/ComputeProgram.cpp)未作同样准备，以及 [VkImage 延迟解压](https://github.com/google/swiftshader/blob/master/src/Vulkan/VkImage.cpp)的实现一致；未据此断言所测浏览器与当前上游源码完全同版。`CompressedTexturePreparation` 在明确识别 `architecture` 或 `description` 含 SwiftShader 时，仅在新压缩图像全部 mip 上传后执行一次 1×1 图形采样，再发布图像。完整 mip view 一次准备，队列顺序保证之后 Compute 可读，无 CPU 读回/等待，不依赖物体先进入主视图或阴影。共享图像不重复准备，RGBA8 与其他适配器不创建此管线或附件。惰性缓存的 4 字节目标纳入资源账本并随材质资源管理器释放；图形准备次数、模式与额外字节通过 `diagnostics().materialTexturePreparation` 公开。后台软件解码的实际内存不属于应用 GPU 账本。
+
+兼容处理后的 `npm run check` 通过 **516 项 CPU 测试（64 文件）**、类型检查和构建，日志 `artifacts/prepared-texture-compat-check-release-20261020.log`。新增准备资源的惰性分配、原生设备零分配、共享图像只准备一次、上传/提交顺序、创建/提交/记账拒绝及幂等释放验证；首次准备中途失败时已创建的 4 字节共享目标可保留到资源管理器销毁，失败图像不发布、不加入图像账本。最终 Shader 以 `storeOp: store` 保存 1×1 结果，避免声明结果可丢弃。
+
+同版 SwiftShader 新增四项 **4/4** 通过，日志 `artifacts/prepared-texture-compat-software-20261020.log`。独立计算的 35 个样本全部通过原数值、覆盖和色彩空间断言，最大误差 `6.56e-6`；三种压缩格式的 12 次图像准备被显式核对，共享附件为 4 字节，释放后总账本为零。其他三项涵盖 Renderer 的完整/尾链、Mask、阴影/查询、离屏 GI/反射、共享形变和驻留/分页几何。此为新增路径的定向功能验证，不是完整软件回归或硬件性能结果。
+
+兼容处理后的完整原生 NVIDIA 浏览器回归再次 **102/102** 通过，日志 `artifacts/prepared-texture-compat-native-20261020.log`，实际适配器为 `nvidia / ampere`。计算材质的 27 个样本通过，明确核对 `texturePreparation` 为 `mode: none`、准备次数 0、额外字节 0；原有阴影、GI、形变、几何流送、反射和雾用例没有被跳过。本轮为功能回归，没有重新测量或宣称目标大场景帧率。
+
+兼容处理后的 Intel 定向四项也 **4/4** 通过，日志 `artifacts/prepared-texture-compat-intel-20261020.log`，实际为非 fallback `intel / gen-12lp`。27 个计算样本通过，明确核对准备模式、次数和字节均未启用；GPU/页面错误为空，释放账本归零。Intel / NVIDIA 均不支持本轮 ETC2 / ASTC 特性，这两种格式的实际解码证据来自 SwiftShader，仍缺对应原生硬件验证。
+
+生产 Renderer 验证完整与尾 mip、显式源 LOD、sampler clamp、参数更新、Mask 主视图/阴影/世界查询，以及预算或缺失特性导致的原子替换失败。9×5 非整数尺寸纹理在解析源 LOD 1.5 下，完整链和从 4×2 开始的尾链读回同一 HDR `[0.0941162,0.4392090,0.4077148]`，对照两层哨兵颜色的等权混合；图像账本分别为 224 / 44 字节。8×8 RGBA8 全链 / 从 4×4 开始的尾链 / BC7 同尺寸尾链分别计 340 / 84 / 48 字节。离屏 PBR 发光通过同一纹理参与 GI 与反射，Morph 移走及 Mask 透明时贡献归零，恢复后返回；测试同时启用 Final Gather 和雾的基础绑定，不代表 GI 已照亮空气。静态普通网格、驻留 GPU LOD 和源网格可省略的分页路径，在 512→70→512 三角形切换中均保留 prepared 尾链乘顶点色的 HDR 与命中材质。新增用例的错误为空，释放后应用 GPU 账本归零；JSON 与 PNG 在同名结果目录内。上述小样本字节量和功能检查不是大场景性能或驱动显存成绩。
+
+这些输入和一致性检查是纹理流送的基础：当前仍由调用方明确提供完整驻留尾链并替换材质，没有自动请求/淘汰 mip、共享图像多材质批量更新、逐帧上传调度、KTX2/Basis 转码或通用压缩编码器。合成测试块只用于已知数值的诊断，不是生产资产编码方案。Sponza 的图片尚未完整下载、编码或渲染，大场景纹理保真、性能和整体阶段验收继续按原目标推进。
+
 ## 根簇与细节页分离
 
 离线页编码器先按稳定 cluster ID 打包根簇，结束根页后再打包非根簇，避免必驻根页夹带细节。簇 ID、层级、顶点属性、误差和页面线格式不变；重新构建的页 ID、页面哈希与目录摘要会改变，相应查询代理必须随新目录一起发布，不能混用旧目录。旧混合页面仍由同一解码器读取。两个分区各自按原字节上限贪心打包，不跨分区填满末页；总页数可能略增。
@@ -69,6 +99,8 @@ Sponza 的真实 BIN 已从官方 ZIP 精确范围 `5351–98707636` 读取，�
 提交 `c0a6316` 的[远程 CI run 39300084353](https://github.com/fomalhautb/real-engine/actions/runs/39300084353) 已取消，不能计为通过。CPU 检查成功，99 项浏览器用例以单 worker 执行，在正常推进到法线材质用例时达到作业 25 分钟上限；日志末尾为操作取消，没有完整浏览器结论。后续需调整远程执行组织并完成全部用例，不能用局部日志替代整套结果。
 
 远程工作流现将 CPU 检查保留为 `foundation` 作业，其成功后由四个独立 runner 执行 Playwright 原生分片。各 runner 保持一个 worker、原有单项超时与断言，关闭 matrix fail-fast，分别保留测试产物。`--list` 检查四片为 25 / 31 / 19 / 24 项，并集恰为 99 项，没有重复、遗漏或额外用例；证据 `artifacts/ci-browser-shards-20261020.txt`。这是执行组织的验证，远程实际结果仍需按对应提交确认。
+
+后续确认：分片工作流提交 `a439405` 的 [CI run 39305386655](https://github.com/fomalhautb/real-engine/actions/runs/39305386655)，以及根页分离提交 `9000613` 的 [CI run 39307328386](https://github.com/fomalhautb/real-engine/actions/runs/39307328386) 均已完整成功，含 foundation 与四个软件 GPU 分片。这些结果对应各自提交，不覆盖本轮新增的 prepared texture 代码。
 
 只读 `audit:gltf` 同步检查 `COLOR_0` 元数据格式与 POSITION 数量，明确记录 `valuesRead: false` / `valuesValidated: false`。对已保存的固定 Sponza glTF 重审，59 个 primitive 的颜色声明布局可支持；BIN 数值尚未读取，透明 decal、资产预算和完整导入障碍仍需解决，尚无 Sponza 实际画面或驻留规模成绩。
 

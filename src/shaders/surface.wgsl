@@ -25,7 +25,7 @@ struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, paddi
 @group(1) @binding(2) var<uniform> params: Parameters;
 @group(1) @binding(3) var<storage, read> attributes: array<f32>;
 @group(1) @binding(4) var<storage, read> clusterVertices: array<vec4u>;
-struct MaterialParameters { values: array<vec4f, 16> }
+struct MaterialParameters { values: array<vec4f, 16>, textureInfo: array<vec4f, 4> }
 @group(2) @binding(0) var<uniform> materialParameters: MaterialParameters;
 @group(2) @binding(1) var materialImage0: texture_2d<f32>;
 @group(2) @binding(2) var materialImage1: texture_2d<f32>;
@@ -35,11 +35,23 @@ struct MaterialParameters { values: array<vec4f, 16> }
 @group(2) @binding(6) var materialSampler1: sampler;
 @group(2) @binding(7) var materialSampler2: sampler;
 @group(2) @binding(8) var materialSampler3: sampler;
-// Raster uses implicit derivatives; world-space backends supply explicit-LOD helpers.
-fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage0, materialSampler0, uv); }
-fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage1, materialSampler1, uv); }
-fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage2, materialSampler2, uv); }
-fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSample(materialImage3, materialSampler3, uv); }
+// A resident mip tail keeps source-space gradients, including odd dimensions.
+fn materialTexture0(uv: vec2f, lod: f32) -> vec4f {
+  let scale = materialParameters.textureInfo[0].yz;
+  return textureSampleGrad(materialImage0, materialSampler0, uv, dpdx(uv) * scale, dpdy(uv) * scale);
+}
+fn materialTexture1(uv: vec2f, lod: f32) -> vec4f {
+  let scale = materialParameters.textureInfo[1].yz;
+  return textureSampleGrad(materialImage1, materialSampler1, uv, dpdx(uv) * scale, dpdy(uv) * scale);
+}
+fn materialTexture2(uv: vec2f, lod: f32) -> vec4f {
+  let scale = materialParameters.textureInfo[2].yz;
+  return textureSampleGrad(materialImage2, materialSampler2, uv, dpdx(uv) * scale, dpdy(uv) * scale);
+}
+fn materialTexture3(uv: vec2f, lod: f32) -> vec4f {
+  let scale = materialParameters.textureInfo[3].yz;
+  return textureSampleGrad(materialImage3, materialSampler3, uv, dpdx(uv) * scale, dpdy(uv) * scale);
+}
 // MATERIAL_PROGRAM
 // DIFFUSE_GI_PROGRAM
 

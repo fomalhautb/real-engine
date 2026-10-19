@@ -7,6 +7,7 @@ import { buildGeometryQueryProxy } from '../../../src/geometry-query-proxy';
 import { identity, normalMatrix, translation } from '../../../src/math';
 import { DEFAULT_MATERIAL_DEFINITION, m } from '../../../src/material';
 import { Renderer } from '../../../src/renderer';
+import type { PreparedTextureAsset } from '../../../src/texture-storage';
 
 type V3 = [number, number, number];
 const SIZE = 256;
@@ -45,9 +46,11 @@ function colouredGrid(cells: number): MeshData {
     bounds: { min: [-1, -1, 0], max: [1, 1, 0] } };
 }
 
-function batch(name: string, mesh: MeshData, mode: 'opaque' | 'mask', deform = false): SceneBatch {
+function batch(name: string, mesh: MeshData, mode: 'opaque' | 'mask', deform = false,
+  texture?: PreparedTextureAsset): SceneBatch {
   const morph = new Float32Array(mesh.vertexCount * 3);
   for (let i = 0; i < mesh.vertexCount; i++) morph[i * 3] = 0.1;
+  const color = texture ? m.multiply(m.vertexColor, m.texture(0)) : m.vertexColor;
   return { name, mesh, capacity: 1, inputMode: 'committed', instances: [pose(101)],
     deformation: deform ? { jointCount: 1, nodes: [
       { kind: 'morph', target: 0, weight: 0 }, { kind: 'skin' },
@@ -56,7 +59,19 @@ function batch(name: string, mesh: MeshData, mode: 'opaque' | 'mask', deform = f
     morphTargets: deform ? [{ positions: morph, normals: new Float32Array(morph.length) }] : [],
     material: { definition: { ...DEFAULT_MATERIAL_DEFINITION, shading: 'unlit',
       alphaMode: mode, alphaCutoff: 0.5, doubleSided: true,
-      baseColor: m.vertexColor, emissive: m.multiply(m.vertexColor, m.constant([0.2, 0.2, 0.2, 1])) } } };
+      baseColor: color, emissive: m.multiply(color, m.constant([0.2, 0.2, 0.2, 1])) },
+    textures: texture ? [texture] : undefined } };
+}
+
+function mipTailTexture(): PreparedTextureAsset {
+  const solid = (width: number, height: number, rgba: readonly [number, number, number, number]) => {
+    const data = new Uint8Array(width * height * 4);
+    for (let offset = 0; offset < data.length; offset += 4) data.set(rgba, offset);
+    return { width, height, data };
+  };
+  return { kind: 'prepared', width: 8, height: 8, colorSpace: 'linear', format: 'rgba8', baseMipLevel: 1,
+    levels: [solid(4, 4, [192, 128, 64, 255]), solid(2, 2, [32, 224, 48, 255]),
+      solid(1, 1, [224, 32, 192, 255])] };
 }
 
 const rays = (shift = 0) => POINTS.map(([x, y]) => ({ origin: [x + shift, y, 4] as V3,
@@ -127,7 +142,7 @@ export async function runVertexColorSurfaceFixture() {
   } finally { renderer?.dispose(); whiteRenderer?.dispose(); canvas.remove(); whiteCanvas?.remove(); }
 }
 
-export async function runVertexColorHierarchyFixture() {
+export async function runVertexColorHierarchyFixture(preparedMipTail = false) {
   const source = colouredGrid(16);
   const hierarchy = await buildGeometryHierarchy({ primitiveKey: 'vertex-colour-grid', mesh: source,
     coverage: 'opaque' }, { maxClusterTriangles: 32, groupSize: 4, simplifyRatio: 0.5, maxLevels: 6 });
@@ -137,11 +152,12 @@ export async function runVertexColorHierarchyFixture() {
     signal.throwIfAborted(); return encoded.pages[page.id].bytes;
   };
   const proxy = await buildGeometryQueryProxy(directory, provider, { topologyVersion: 1 });
-  const full = batch('vertex-colour-full', hierarchy.source, 'opaque');
-  const resident = { ...batch('vertex-colour-resident', hierarchy.source, 'opaque'),
+  const texture = preparedMipTail ? mipTailTexture() : undefined;
+  const full = batch('vertex-colour-full', hierarchy.source, 'opaque', false, texture);
+  const resident = { ...batch('vertex-colour-resident', hierarchy.source, 'opaque', false, texture),
     geometryLod: hierarchy };
   const { mesh: _omittedMesh, geometryLod: _omittedLod, geometryStream: _omittedStream,
-    ...pagedCommon } = batch('vertex-colour-paged', hierarchy.source, 'opaque');
+    ...pagedCommon } = batch('vertex-colour-paged', hierarchy.source, 'opaque', false, texture);
   const paged: StreamedSceneBatch = { ...pagedCommon,
     geometryStream: { directory, provider, queryProxy: proxy } };
   const scenes = [full, resident, paged], canvases: HTMLCanvasElement[] = [], renderers: Renderer[] = [];
@@ -181,6 +197,7 @@ export async function runVertexColorHierarchyFixture() {
     const errors = renderers.flatMap(renderer => renderer.errors);
     for (const renderer of renderers) renderer.dispose();
     return { coarse, samples: fine, points: POINTS, sourceTriangles: hierarchy.sourceTriangleCount,
+      preparedBaseMipLevel: texture?.baseMipLevel ?? null,
       sourceColors: Array.from(hierarchy.source.colors ?? []),
       proxyColors: Array.from(proxy.mesh.colors ?? []), pages: directory.pages.length,
       adapter, errors, afterDispose: renderers.map(renderer => renderer.stats.ownedGpuBytes) };

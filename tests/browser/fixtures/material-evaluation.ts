@@ -5,10 +5,14 @@ import {
   type MaterialEvaluationInputs, type Vec4,
 } from '../../../src/material';
 import type { TextureAsset } from '../../../src/texture-assets';
+import { TEXTURE_COMPRESSION_FEATURES, type PreparedTextureAsset,
+  type PreparedTextureFormat } from '../../../src/texture-storage';
+import { astc4x4LdrSolidBlock, bc7Mode6SolidBlock, compressedSolidBlockCases,
+  etc2Rgba8SolidBlock, type Rgba8 } from './compressed-texture-blocks';
 
 /** This fixture evaluates material parameters in compute. It does not implement GI or ray tracing. */
 const materialBindingsWGSL = `
-struct MaterialParameters { values: array<vec4f, 16> }
+struct MaterialParameters { values: array<vec4f, 16>, textureInfo: array<vec4f, 4> }
 @group(0) @binding(0) var<uniform> materialParameters: MaterialParameters;
 @group(0) @binding(1) var materialImage0: texture_2d<f32>;
 @group(0) @binding(2) var materialImage1: texture_2d<f32>;
@@ -18,10 +22,10 @@ struct MaterialParameters { values: array<vec4f, 16> }
 @group(0) @binding(6) var materialSampler1: sampler;
 @group(0) @binding(7) var materialSampler2: sampler;
 @group(0) @binding(8) var materialSampler3: sampler;
-fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage0, materialSampler0, uv, lod); }
-fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage1, materialSampler1, uv, lod); }
-fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage2, materialSampler2, uv, lod); }
-fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage3, materialSampler3, uv, lod); }
+fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage0, materialSampler0, uv, max(0.0, lod - materialParameters.textureInfo[0].x)); }
+fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage1, materialSampler1, uv, max(0.0, lod - materialParameters.textureInfo[1].x)); }
+fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage2, materialSampler2, uv, max(0.0, lod - materialParameters.textureInfo[2].x)); }
+fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage3, materialSampler3, uv, max(0.0, lod - materialParameters.textureInfo[3].x)); }
 `;
 const probeWGSL = `
 struct ProbeInputs { instanceColor: vec4f, metalRoughUv: vec4f, lodAndPadding: vec4f }
@@ -48,12 +52,47 @@ function linearFromSrgbByte(value: number): number {
   const encoded = value / 255;
   return encoded <= 0.04045 ? encoded / 12.92 : ((encoded + 0.055) / 1.055) ** 2.4;
 }
+function sampled(rgba: Rgba8, colorSpace: 'linear' | 'srgb'): Vec4 {
+  return [colorSpace === 'srgb' ? linearFromSrgbByte(rgba[0]) : rgba[0] / 255,
+    colorSpace === 'srgb' ? linearFromSrgbByte(rgba[1]) : rgba[1] / 255,
+    colorSpace === 'srgb' ? linearFromSrgbByte(rgba[2]) : rgba[2] / 255, rgba[3] / 255];
+}
+function solidRgbaLevel(size: number, rgba: Rgba8) {
+  const data = new Uint8Array(size * size * 4);
+  for (let pixel = 0; pixel < size * size; pixel++) data.set(rgba, pixel * 4);
+  return { width: size, height: size, data };
+}
+function preparedRgba(baseMipLevel: 0 | 1, colors: readonly Rgba8[]): PreparedTextureAsset {
+  return { kind: 'prepared', format: 'rgba8', colorSpace: 'linear', width: 8, height: 8,
+    baseMipLevel, levels: colors.slice(baseMipLevel).map((rgba, index) => solidRgbaLevel(8 >> (index + baseMipLevel), rgba)) };
+}
+function compressedBlock(format: PreparedTextureFormat, rgba: Rgba8): Uint8Array<ArrayBuffer> {
+  switch (format) {
+    case 'bc7': return bc7Mode6SolidBlock(rgba);
+    case 'etc2-rgba8':
+      if (rgba[0] !== 138 || rgba[1] !== 70 || rgba[2] !== 36) throw new Error('ETC2 fixture RGB is fixed');
+      return etc2Rgba8SolidBlock(rgba[3]);
+    case 'astc-4x4': return astc4x4LdrSolidBlock(rgba);
+    default: throw new Error('not a compressed diagnostic format');
+  }
+}
+function preparedCompressed(format: 'bc7' | 'etc2-rgba8' | 'astc-4x4',
+  colorSpace: 'linear' | 'srgb', colors: readonly Rgba8[]): PreparedTextureAsset {
+  return { kind: 'prepared', format, colorSpace, width: 16, height: 16, baseMipLevel: 2,
+    levels: colors.map((rgba, index) => ({ width: 4 >> index, height: 4 >> index,
+      data: compressedBlock(format, rgba) })) };
+}
 
 export async function runMaterialEvaluationFixture() {
   if (!navigator.gpu) throw new Error('MATERIAL_COMPUTE_WEBGPU_UNAVAILABLE');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('MATERIAL_COMPUTE_ADAPTER_UNAVAILABLE');
-  const device = await adapter.requestDevice();
+  const compressionFeatures = TEXTURE_COMPRESSION_FEATURES.filter(feature => adapter.features.has(feature));
+  const device = await adapter.requestDevice({ requiredFeatures: compressionFeatures });
+  const adapterInfo = { vendor: adapter.info.vendor, architecture: adapter.info.architecture,
+    device: adapter.info.device, description: adapter.info.description };
+  const adapterFeatures = Array.from(adapter.features).sort();
+  const deviceFeatures = Array.from(device.features).sort();
   const errors: string[] = [];
   device.addEventListener('uncapturederror', event => errors.push(event.error.message));
   let disposed = false;
@@ -63,10 +102,14 @@ export async function runMaterialEvaluationFixture() {
   let ownedGpuBytes = 0;
   let pipelineCompilations = 0;
   const rows: { name: string; gpu: number[]; cpu: number[]; maxError: number; tolerance: number }[] = [];
+  let baselinePipelineCompilations = 0;
+  const unavailable: { format: PreparedTextureFormat; feature: GPUFeatureName; error: string;
+    unchanged: boolean }[] = [];
   let parameterUpdate = { sameProgram: false, compilationsBefore: 0, compilationsAfter: 0, bytesBefore: 0, bytesAfter: 0 };
   let released = { materials: -1, images: -1, imageBytes: -1 };
+  let texturePreparation: ReturnType<MaterialResources['preparationDiagnostics']> | undefined;
   try {
-    resources = new MaterialResources(device, bytes => { ownedGpuBytes += bytes; }, 1024);
+    resources = new MaterialResources(device, bytes => { ownedGpuBytes += bytes; }, 1024, adapter.info);
     const manager = resources;
     const buffer = (size: number, usage: GPUBufferUsageFlags, label: string) => {
       const created = device.createBuffer({ size, usage, label });
@@ -193,6 +236,79 @@ export async function runMaterialEvaluationFixture() {
           instanceMetalRough: [0, 0.5], uv: [u, 0.5], lod: 1, textures: slot => expected[slot] });
       }
     } finally { manager.release(distinctSamplers); }
+    baselinePipelineCompilations = pipelineCompilations;
+
+    const nearest = { magFilter: 'nearest', minFilter: 'nearest', mipmapFilter: 'nearest' } as const;
+    const plainTextureDefinition = { ...DEFAULT_MATERIAL_DEFINITION, shading: 'unlit' as const,
+      alphaMode: 'mask' as const, baseColor: m.texture(0) };
+    const whiteInstance: MaterialEvaluationInputs = { instanceColor: [1, 1, 1, 1],
+      instanceMetalRough: [0, 0.5], uv: [0.5, 0.5] };
+    const preparedRun = async (name: string, asset: PreparedTextureAsset, lod: number,
+      rgba: Rgba8, sampler: GPUSamplerDescriptor = nearest, tolerance = 0.008) => {
+      const material = manager.create({ definition: plainTextureDefinition, textures: [asset], samplers: [sampler] });
+      try { await run(name, material, { ...whiteInstance, lod,
+        textures: () => sampled(rgba, asset.colorSpace) }, tolerance); }
+      finally { manager.release(material); }
+    };
+    const mipColors: readonly Rgba8[] = [
+      [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 64],
+    ];
+    const full = preparedRgba(0, mipColors), tail = preparedRgba(1, mipColors);
+    for (let lod = 0; lod < 4; lod++) {
+      await preparedRun(`prepared-rgba-full-${lod}`, full, lod, mipColors[lod]);
+      await preparedRun(`prepared-rgba-tail-${lod}`, tail, lod, mipColors[Math.max(1, lod)]);
+    }
+    await preparedRun('prepared-rgba-tail-min-clamp', tail, 0, mipColors[2],
+      { ...nearest, lodMinClamp: 2, lodMaxClamp: 2 });
+    await preparedRun('prepared-rgba-tail-max-clamp', tail, 3, mipColors[1],
+      { ...nearest, lodMaxClamp: 1 });
+
+    const factors = new Float32Array([1, 1, 1, 1]);
+    const updated = manager.create({ definition: { ...plainTextureDefinition,
+      baseColor: m.multiply(m.texture(0), m.parameter(0)) }, parameters: factors,
+      textures: [tail], samplers: [nearest] });
+    try {
+      await run('prepared-rgba-before-parameter-update', updated,
+        { ...whiteInstance, lod: 3, parameters: factors, textures: () => sampled(mipColors[3], 'linear') }, 0.008);
+      factors.set([0.5, 0.25, 1, 1]);
+      manager.updateParameters(updated, factors);
+      await run('prepared-rgba-after-parameter-update', updated,
+        { ...whiteInstance, lod: 3, parameters: factors, textures: () => sampled(mipColors[3], 'linear') }, 0.008);
+    } finally { manager.release(updated); }
+
+    const featureByFormat = {
+      bc7: 'texture-compression-bc',
+      'etc2-rgba8': 'texture-compression-etc2',
+      'astc-4x4': 'texture-compression-astc',
+    } as const satisfies Record<'bc7' | 'etc2-rgba8' | 'astc-4x4', GPUFeatureName>;
+    for (const format of ['bc7', 'etc2-rgba8', 'astc-4x4'] as const) {
+      const [opaqueCase, maskCase] = compressedSolidBlockCases.filter(value => value.format === format);
+      const opaque = opaqueCase.expected.map(value => Math.round(value * 255)) as unknown as Rgba8;
+      const mask = maskCase.expected.map(value => Math.round(value * 255)) as unknown as Rgba8;
+      const last: Rgba8 = format === 'etc2-rgba8' ? [138, 70, 36, 192]
+        : format === 'bc7' ? [0, 128, 0, 254] : [192, 64, 32, 255];
+      const colors = [opaque, mask, last] as const;
+      const asset = preparedCompressed(format, 'linear', colors);
+      if (!device.features.has(featureByFormat[format])) {
+        const before = { ...manager.diagnostics(), bytes: ownedGpuBytes };
+        let error = '';
+        try { manager.create({ definition: plainTextureDefinition, textures: [asset] }); }
+        catch (failure) { error = String(failure); }
+        const after = { ...manager.diagnostics(), bytes: ownedGpuBytes };
+        unavailable.push({ format, feature: featureByFormat[format], error,
+          unchanged: JSON.stringify(before) === JSON.stringify(after) });
+        if (!error.includes('MATERIAL_TEXTURE_FEATURE') || !unavailable.at(-1)!.unchanged) {
+          throw new Error('MATERIAL_COMPRESSED_FEATURE_REJECTION_NOT_ATOMIC: ' + format);
+        }
+        continue;
+      }
+      for (let level = 0; level < 3; level++) {
+        await preparedRun(`prepared-${format}-${4 >> level}x${4 >> level}`, asset,
+          level + 2, colors[level]);
+      }
+      const srgb = preparedCompressed(format, 'srgb', colors);
+      await preparedRun(`prepared-${format}-srgb`, srgb, 2, opaque, nearest, 0.012);
+    }
     // Invalid sampler descriptors must fail before retaining images or allocating uniforms.
     for (const invalid of [{ compare: 'less' }, { lodMaxClamp: -1 }, { maxAnisotropy: 2, minFilter: 'nearest' }]) {
       const bytes = ownedGpuBytes;
@@ -205,11 +321,13 @@ export async function runMaterialEvaluationFixture() {
     // Give uncaptured GPU validation events a task boundary before returning diagnostics.
     await new Promise<void>(resolve => setTimeout(resolve, 0));
     released = manager.diagnostics();
+    texturePreparation = manager.preparationDiagnostics();
   } finally {
     resources?.dispose();
     for (const buffer of buffers) buffer.destroy();
     disposed = true;
     device.destroy();
   }
-  return { rows, pipelineCompilations, parameterUpdate, released, ownedGpuBytesAfterDispose: ownedGpuBytes, errors };
+  return { rows, pipelineCompilations, baselinePipelineCompilations, parameterUpdate, released,
+    ownedGpuBytesAfterDispose: ownedGpuBytes, errors, adapterInfo, adapterFeatures, deviceFeatures, unavailable, texturePreparation };
 }

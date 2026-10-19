@@ -27,7 +27,7 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> hits: array<Hit>;
 @group(0) @binding(7) var<storage, read> identities: array<vec4u>;
 @group(0) @binding(8) var<storage, read> batchCandidates: array<u32>;
-struct MaterialParameters { values: array<vec4f, 16> }
+struct MaterialParameters { values: array<vec4f, 16>, textureInfo: array<vec4f, 4> }
 @group(1) @binding(0) var<uniform> materialParameters: MaterialParameters;
 @group(1) @binding(1) var materialImage0: texture_2d<f32>;
 @group(1) @binding(2) var materialImage1: texture_2d<f32>;
@@ -37,10 +37,10 @@ struct MaterialParameters { values: array<vec4f, 16> }
 @group(1) @binding(6) var materialSampler1: sampler;
 @group(1) @binding(7) var materialSampler2: sampler;
 @group(1) @binding(8) var materialSampler3: sampler;
-fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage0, materialSampler0, uv, lod); }
-fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage1, materialSampler1, uv, lod); }
-fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage2, materialSampler2, uv, lod); }
-fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage3, materialSampler3, uv, lod); }
+fn materialTexture0(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage0, materialSampler0, uv, max(0.0, lod - materialParameters.textureInfo[0].x)); }
+fn materialTexture1(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage1, materialSampler1, uv, max(0.0, lod - materialParameters.textureInfo[1].x)); }
+fn materialTexture2(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage2, materialSampler2, uv, max(0.0, lod - materialParameters.textureInfo[2].x)); }
+fn materialTexture3(uv: vec2f, lod: f32) -> vec4f { return textureSampleLevel(materialImage3, materialSampler3, uv, max(0.0, lod - materialParameters.textureInfo[3].x)); }
 // MATERIAL_PROGRAM
 
 fn intersectsBox(ray: Ray, box: Bounds, closest: f32) -> bool {

@@ -6,6 +6,7 @@ import resolveSource from './shaders/resolve.wgsl?raw';
 import { identity, lookAt, multiply, perspective, transformPoint, type Mat4 } from './math';
 import { residentMesh, type InstanceState, type RenderBatch, type MaterialBinding } from './contracts';
 import { MaterialResources, type GpuMaterial } from './gpu-material';
+import { TEXTURE_COMPRESSION_FEATURES } from './texture-storage';
 import { compileDeformation, conservativeDeformationBounds, evaluateDeformation,
   validateDeformationVertex, validateMorphTargets, type Bounds3 } from './deformation';
 import { compileRenderGraph } from './render-graph';
@@ -186,7 +187,9 @@ export class Renderer {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('ADAPTER_UNAVAILABLE: no compatible WebGPU adapter.');
     const timing = adapter.features.has('timestamp-query');
-    const device = await adapter.requestDevice({ requiredFeatures: timing ? ['timestamp-query'] : [] });
+    const requiredFeatures: GPUFeatureName[] = timing ? ['timestamp-query'] : [];
+    for (const feature of TEXTURE_COMPRESSION_FEATURES) if (adapter.features.has(feature)) requiredFeatures.push(feature);
+    const device = await adapter.requestDevice({ requiredFeatures });
     let context: GPUCanvasContext | null = null;
     let renderer: Renderer | undefined;
     try {
@@ -245,7 +248,7 @@ export class Renderer {
     this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0)
       + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.reflections ? 2 : 0) + (options.occlusion ? 6 : 0)
       + (options.volumetricFog ? (options.volumetricFog.temporal ? 8 : 6) : 0);
-    this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
+    this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes, adapter.info);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.antiAliasing = options.antiAliasing ?? 'none';
@@ -1105,7 +1108,8 @@ export class Renderer {
         projection: this.sunShadowOptions.focusBounds ? 'world-bounds-snapped' : 'legacy-fixed', cascades: 1 },
       output: { sceneFormat: 'rgba16float', exposureEV: this.exposureEV, antiAliasing: this.antiAliasing,
         transfer: 'sRGB', toneMap: 'filmic-fit', maxSceneRadiance: 65504 },
-      materials: this.materialResources.diagnostics(), materialRevision: this.materialRevision, passes: this.graph.order,
+      materials: this.materialResources.diagnostics(), materialTexturePreparation: this.materialResources.preparationDiagnostics(),
+      materialRevision: this.materialRevision, passes: this.graph.order,
       lifetimes: Object.fromEntries(this.graph.lifetimes),
       bounds: this.batches.flatMap(batch => Array.from(batch.bounds, ([entityId, bounds]) => ({ entityId, ...bounds }))) };
   }

@@ -144,3 +144,65 @@ test('resident and source-free paged geometry retain authored vertex colours', a
   expect(result.afterDispose).toEqual([0, 0, 0]);
   expect(pageErrors).toEqual([]);
 });
+
+test('prepared RGBA8 mip tail multiplies vertex colour in full, resident and source-free paths',
+  async ({ page }, testInfo) => {
+    test.setTimeout(180_000);
+    const pageErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
+    await page.goto('/?trees=1');
+    await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
+    await expect(page.locator('#error')).toBeHidden();
+    const result = await page.evaluate(async () => {
+      window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose();
+      const fixture = await import('/tests/browser/fixtures/' + 'vertex-color.ts') as {
+        runVertexColorHierarchyFixture: typeof runVertexColorHierarchyFixture;
+      };
+      return fixture.runVertexColorHierarchyFixture(true);
+    }) as Hierarchy;
+    await testInfo.attach('vertex-color-prepared-tail.json', {
+      body: JSON.stringify({ ...result, samples: result.samples.map(({ png: _png, ...sample }) => sample),
+        coarse: result.coarse.map(({ png: _png, ...sample }) => sample),
+        sourceColors: `${result.sourceColors.length} values`, proxyColors: `${result.proxyColors.length} values` }, null, 2),
+      contentType: 'application/json',
+    });
+    await savePng(testInfo, 'vertex-color-tail-paged-coarse.png', result.coarse[2].png);
+    await savePng(testInfo, 'vertex-color-tail-paged-fine.png', result.samples[2].png);
+    expectAdapter(result.adapter);
+    expect(result.preparedBaseMipLevel).toBe(1);
+    expect(result.pages).toBeGreaterThan(0);
+    expect(result.sourceColors.length).toBeGreaterThan(0);
+    expect(result.proxyColors.length).toBeGreaterThan(0);
+    // The full-resolution mip is absent. Resident mip 0 corresponds to authored
+    // mip 1; the two later mips have deliberately different sentinel colours.
+    const tailColor = [192 / 255, 128 / 255, 64 / 255];
+    for (const [state, samples] of [['coarse', result.coarse], ['fine', result.samples]] as const) {
+      for (let representation = 0; representation < 3; representation++) {
+        for (let point = 0; point < result.points.length; point++) {
+          const x = result.points[point][0];
+          const vertex = [0.5 + 0.3 * x, 0.4, 0.25];
+          const hit = samples[representation].hits[point];
+          expect(hit, `${state} representation ${representation} point ${point}`).not.toBeNull();
+          for (let channel = 0; channel < 3; channel++) {
+            const base = vertex[channel] * tailColor[channel];
+            expect(Math.abs(hit!.baseColor[channel] - base),
+              `${state} representation ${representation} query base ${point}/${channel}`).toBeLessThan(0.025);
+            expect(Math.abs(hit!.emissive[channel] - base * 0.2),
+              `${state} representation ${representation} query emission ${point}/${channel}`).toBeLessThan(0.025);
+            expect(Math.abs(samples[representation].hdr[point][channel] - base * 1.2),
+              `${state} representation ${representation} HDR ${point}/${channel}`).toBeLessThan(state === 'coarse' ? 0.06 : 0.035);
+          }
+          expect(Math.abs(hit!.opacity - (0.5 + 0.3 * x)),
+            `${state} representation ${representation} query opacity ${point}`).toBeLessThan(0.025);
+        }
+      }
+    }
+    for (const representation of [1, 2]) {
+      expect(result.coarse[representation].lod!.triangles).toBeGreaterThan(0);
+      expect(result.coarse[representation].lod!.triangles).toBeLessThan(result.sourceTriangles);
+      expect(result.samples[representation].lod!.triangles).toBe(result.sourceTriangles);
+    }
+    expect(result.errors).toEqual([]);
+    expect(result.afterDispose).toEqual([0, 0, 0]);
+    expect(pageErrors).toEqual([]);
+  });

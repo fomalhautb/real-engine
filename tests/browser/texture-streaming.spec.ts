@@ -1,10 +1,14 @@
 import { expect, test } from '@playwright/test';
 import { writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import type { runTextureStreamingFixture } from './fixtures/texture-streaming';
 
 test.use({ deviceScaleFactor: 1 });
 
-test('automatic texture streaming preserves coarse images, budgets, and shared material publication', async ({ page }, info) => {
+for (const useManifest of [false, true]) {
+test(useManifest
+  ? 'manifest texture streaming preserves coarse images, budgets, and shared material publication'
+  : 'automatic texture streaming preserves coarse images, budgets, and shared material publication', async ({ page }, info) => {
   test.setTimeout(180_000);
   const pageErrors: string[] = [];
   const colors = {
@@ -12,25 +16,42 @@ test('automatic texture streaming preserves coarse images, budgets, and shared m
     b: [[16, 192, 96], [192, 16, 96], [96, 16, 192], [32, 128, 64]],
   };
   const httpRequests: string[] = [];
-  await page.route('**/__texture-stream/**', async route => {
-    const match = new URL(route.request().url()).pathname.match(/^\/__texture-stream\/(a|b)\/([0-3])\.bin$/);
-    if (!match) throw new Error('Unexpected texture mip URL');
-    const source = match[1] as 'a' | 'b', level = Number(match[2]);
-    httpRequests.push(`${source}/${level}`);
+  const mipBytes = (source: 'a' | 'b', level: number) => {
     const bytes = Buffer.alloc((8 >> level) ** 2 * 4), rgb = colors[source][level];
     for (let offset = 0; offset < bytes.length; offset += 4) bytes.set([...rgb, 255], offset);
-    await route.fulfill({ status: 200, contentType: 'application/octet-stream', body: bytes });
+    return bytes;
+  };
+  await page.route('**/__texture-stream/**', async route => {
+    const match = new URL(route.request().url()).pathname.match(/^\/__texture-stream\/(a|b)\/(manifest\.json|[0-3]\.bin)$/);
+    if (!match) throw new Error('Unexpected texture mip URL');
+    const source = match[1] as 'a' | 'b';
+    if (match[2] === 'manifest.json') {
+      httpRequests.push(`${source}/manifest`);
+      const mips = Array.from({ length: 4 }, (_, level) => {
+        const bytes = mipBytes(source, level);
+        return { level, width: 8 >> level, height: 8 >> level, byteLength: bytes.byteLength,
+          sha256: createHash('sha256').update(bytes).digest('hex'), file: `${level}.bin` };
+      });
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        version: 1, id: source, width: 8, height: 8, colorSpace: 'linear', format: 'rgba8',
+        fallbackMip: 2, mips,
+      }) });
+      return;
+    }
+    const level = Number(match[2][0]);
+    httpRequests.push(`${source}/${level}`);
+    await route.fulfill({ status: 200, contentType: 'application/octet-stream', body: mipBytes(source, level) });
   });
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto('/?trees=1');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async (manifest) => {
     window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose();
     const module = await import('/tests/browser/fixtures/' + 'texture-streaming.ts') as {
       runTextureStreamingFixture: typeof runTextureStreamingFixture };
-    return module.runTextureStreamingFixture();
-  });
+    return module.runTextureStreamingFixture(manifest);
+  }, useManifest);
   const samples = [result.coarse, result.partial, result.aFine, result.aLateMaterial,
     result.bFine, result.bLateMaterial, result.aReturn];
   await writeFile(info.outputPath('texture-streaming.json'), JSON.stringify({ ...result, httpRequests,
@@ -88,8 +109,18 @@ test('automatic texture streaming preserves coarse images, budgets, and shared m
     expect(result.settledEnd[key], key).toBe(result.settledStart[key]);
   }
   expect(result.settledEnd.active).toBe(0);
-  expect(httpRequests).toEqual(['a/0', 'a/1', 'b/0', 'b/1', 'a/0', 'a/1']);
+  const detailRequests = httpRequests.filter(request => /^[ab]\/[01]$/.test(request));
+  expect(detailRequests).toEqual(['a/0', 'a/1', 'b/0', 'b/1', 'a/0', 'a/1']);
+  if (useManifest) {
+    for (const source of ['a', 'b']) {
+      expect(httpRequests.filter(request => request.startsWith(`${source}/`)).slice(0, 3))
+        .toEqual([`${source}/manifest`, `${source}/2`, `${source}/3`]);
+    }
+  } else {
+    expect(httpRequests).toEqual(detailRequests);
+  }
   expect(result.errors).toEqual([]);
   expect(pageErrors).toEqual([]);
   expect(result.afterDispose).toBe(0);
 });
+}

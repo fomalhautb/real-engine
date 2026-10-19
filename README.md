@@ -35,7 +35,9 @@
 
 ## 本地运行
 
-`RendererOptions.textureStreaming` 可按相机与 UV 密度，在统一图像预算内自动加载、上传和淘汰原生 mip。材质引用来源的低清 `fallback` 身份，之后的新材质也自动使用当前驻留；未完成的图像不会发布，离屏查询保持有效材质。输入、HTTP provider、逐帧/CPU 预算、重试及已验证范围见[自动纹理流送](docs/implementation.md#按视图需求的自动纹理流送)。当前提供整图 mip 尾链调度，尚未完成大型资产打包、细分纹理页或最终性能验收。
+`RendererOptions.textureStreaming` 可按相机与 UV 密度，在统一图像预算内自动加载、上传和淘汰原生 mip。材质引用来源的低清 `fallback` 身份，之后的新材质也自动使用当前驻留；未完成的图像不会发布，离屏查询保持有效材质。输入、HTTP provider、逐帧/CPU 预算、重试及已验证范围见[自动纹理流送](docs/implementation.md#按视图需求的自动纹理流送)。当前提供整图 mip 尾链调度，尚未完成细分纹理页或最终性能验收。
+
+`npm run build:texture -- --input image.dds --output new-package` 将完整 DX10 RGBA8/BC7 mip 链打包为独立层文件与哈希清单；PNG 可显式配置外部 texconv、格式和色彩空间。浏览器调用 `loadTextureStreamSource('/new-package/manifest.json')` 取得已校验的低清来源，再将它交给自动流送。真实 Sponza 72 张贴图的候选包已构建，石墙材质已有实际浏览器预览；法线压缩质量与整个场景仍需验收。命令、约束和证据见[纹理包构建](docs/implementation.md#纹理包构建清单加载与真实-sponza-贴图)。
 
 需要 Node.js 24 与支持 WebGPU 的浏览器。使用 localhost 或 HTTPS。
 

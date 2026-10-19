@@ -6,6 +6,7 @@ import { Renderer } from '../../../src/renderer';
 import type { PreparedTextureAsset } from '../../../src/texture-storage';
 import type { TextureStreamSource } from '../../../src/texture-stream-types';
 import { createHttpTextureMipProvider } from '../../../src/texture-stream-source';
+import { loadTextureStreamSource } from '../../../src/texture-stream-manifest';
 
 const COLORS = {
   a: [[192, 32, 16], [32, 192, 16], [16, 32, 192], [128, 64, 32]],
@@ -34,7 +35,16 @@ function payload(name: SourceName, level: number): Uint8Array {
   return data;
 }
 
-async function source(name: SourceName, gate?: Promise<void>): Promise<TextureStreamSource> {
+async function source(name: SourceName, gate?: Promise<void>, useManifest = false): Promise<TextureStreamSource> {
+  if (useManifest) {
+    const loaded = await loadTextureStreamSource(`/__texture-stream/${name}/manifest.json`);
+    let first = true;
+    return { ...loaded, provider: async (mip, signal) => {
+      if (gate && first) { first = false; await gate; }
+      if (signal.aborted) throw signal.reason;
+      return loaded.provider(mip, signal);
+    } };
+  }
   const payloads = Array.from({ length: 4 }, (_, level) => payload(name, level));
   const mips = await Promise.all(payloads.map(async (data, level) => {
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data.buffer as ArrayBuffer));
@@ -70,14 +80,14 @@ function batch(name: string, x: number, material: MaterialBinding, entityId: num
       color: [1, 1, 1, 1], metalness: 0, roughness: 1, historyVersion: 0 }] };
 }
 
-export async function runTextureStreamingFixture() {
+export async function runTextureStreamingFixture(useManifest = false) {
   const canvas = document.createElement('canvas');
   canvas.width = 128; canvas.height = 128;
   canvas.style.cssText = 'position:fixed;left:0;top:0;width:128px;height:128px;z-index:10000';
   document.body.append(canvas);
   let releaseFirstA!: () => void;
   const gate = new Promise<void>(resolve => { releaseFirstA = resolve; });
-  const [a, b] = await Promise.all([source('a', gate), source('b')]);
+  const [a, b] = await Promise.all([source('a', gate, useManifest), source('b', undefined, useManifest)]);
   const scene = [batch('a-left', -4.5, binding(a.fallback, [1, 1, 1, 1]), 1),
     batch('a-right', -3.5, binding(a.fallback, [1, 0.5, 1, 1], true), 2),
     batch('b', 4, binding(b.fallback, [1, 1, 1, 1]), 3)];

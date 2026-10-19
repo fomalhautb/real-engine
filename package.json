@@ -8,6 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "build:geometry": "node scripts/build-geometry.mjs",
     "build:gltf-geometry": "node scripts/build-gltf-geometry.mjs",
+    "build:texture": "node scripts/build-texture.mjs",
     "audit:gltf": "node scripts/audit-gltf.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

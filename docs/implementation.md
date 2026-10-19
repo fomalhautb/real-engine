@@ -2,6 +2,30 @@
 
 更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 纹理包构建、清单加载与真实 Sponza 贴图
+
+`npm run build:texture -- --input image.dds --output new-directory [--id asset-id] [--fallback-size 64]` 新增可重复的离线纹理打包入口。DDS 路径不启动编码器，接受 DX10 头的单张 2D RGBA8 / BC7、线性 / sRGB 及完整 mip 链；检查尺寸、行/块字节、数组/体积/立方体、截断和多余载荷，拒绝 premultiplied alpha 与当前 WebGPU 不可用的 BC7 顶级未对齐尺寸。每级数据复制为独立精确长度缓冲；此解析不解码或验证 BC7 块内位流。格式依据 [Microsoft DDS 文档](https://learn.microsoft.com/en-us/windows/win32/direct3ddds/dx-graphics-dds-pguide)。
+
+PNG 路径需显式给出 `--format rgba8|bc7 --color-space srgb|linear --texconv path`，可选 `--gpu-adapter 0..15` 仅用于 PNG→BC7。使用外部 [Microsoft DirectXTex texconv](https://github.com/microsoft/DirectXTex/wiki/Texconv) 解码、生成完整 BOX mip 并编码；没有运行时转码或隐式下载工具。先检查 PNG 尺寸和输出预算，不缩放、不翻转 Y、不重建法线。忽略图片内色彩空间声明，以调用方指定的 sRGB/线性语义为准；RGB 按线性光过滤，alpha 独立过滤，对应 DDS CUSTOM alpha 标记。此策略与当前 `buildMipChain` 一致，不提供透明边缘的 alpha 加权过滤或 Mask 覆盖保持；这些策略应由专门资产处理或已经处理好的 DDS 提供。原始 PNG/DDS 完整保留，PNG 解码成 RGBA8 时可能量化更高位深数据，不能把这种输入转换说成原文件无损解码。
+
+构建输出 `manifest.json`、`build.json`、原始来源、PNG 编码的完整 `source.dds`，以及 `mips/<level>.bin`。清单包含稳定 ID、尺寸、格式、色彩空间、低清起始层和每级字节数/SHA-256；构建记录包含来源/编码哈希、工具版本/可执行文件哈希、实际参数与输出，区分请求的 GPU 适配器和工具报告的实际设备。默认选择最大维度不超过 64 的首个可用层；压缩尾链起始层必须两维 4 对齐，不满足尺寸目标时保留最粗的合法起始层。输入 DDS 上限 384 MiB、PNG 128 MiB、尺寸 8192，发布文件总量上限 768 MiB；外部编码进程有执行时间与日志上限，CPU 编码请求 4 个 OpenMP 线程，这些不是整个进程 RSS 或驱动显存硬限额。目标目录必须不存在，私有暂存构建完毕后按 manifest-last 发布，失败不覆盖已有产物。
+
+`loadTextureStreamSource(manifestUrl, options)` 通过有界 HTTP 读取和冻结后的清单，顺序下载并校验完整低清尾链，再返回可直接传给 `RendererOptions.textureStreaming.sources` 的稳定来源；材质引用其 `fallback`。默认清单最多 64 KiB、低清尾链最多 4 MiB，硬上限分别为 1 / 64 MiB。所有 mip 路径须为安全相对路径，初始 mip URL 与最终清单 URL 同源；清单拒绝跨源重定向。mip provider 沿用浏览器 fetch/CORS 的重定向行为和内容哈希校验，不把初始 URL 检查宣称为最终网络来源隔离。取消覆盖清单、低清下载及校验；之后的细节 provider 使用每次调用自己的 signal。
+
+本轮 `npm run check` 通过 **585 项 CPU 测试（71 文件）**、类型检查与构建，日志 `artifacts/texture-package-check-20261020.log`。新增 DDS 独立头/载荷例、完整命令行打包与不可覆盖、确定性/哈希、清单路径/预算/取消/后续 signal 等验证。真实 Windows 编码器另用独立构造的 8×8 PNG 检查所有原始像素及四级 mip：线性黑白平均为 128、sRGB 为 188，透明像素 RGB 和独立 alpha 均符合解析预期，最大字节误差为零；记录 `artifacts/texture-codec-reference-20261020/report.json`。平台无关 CPU 测试不依赖 Windows 编码器，此本地真实编码结果单独记录。
+
+完整原生 NVIDIA 浏览器回归 **107/107** 通过，日志 `artifacts/texture-package-full-native-20261020.log`。新增清单路径实际通过 HTTP 请求 JSON、低清尾链及随后细节，仍逐项核对原有主视图/阴影/世界查询、A→B→A 竞争、共享发布、后建材质和上传/驻留预算；每来源清单→mip 2→mip 3 的初始化顺序与六次后续细节请求均独立断言。两项流送定向在非 fallback `intel / gen-12lp` 与 `google / swiftshader / fallback=true` 各 **2/2** 通过，日志 `artifacts/texture-package-target-intel-20261020.log`、`artifacts/texture-package-target-software-20261020.log`；错误为空、释放归零。软件结果仅证明功能，完整场景与硬件性能门槛不由这些用例替代。
+
+Sponza 的全部 **72 张实际引用 4K PNG 已下载**，从已审计的 Intel 官方 ZIP 精确读取每个条目，核对本地头、长度及 ZIP CRC32，并记录 SHA-256；源 PNG 合计 **2,031,165,435 字节**。报告 `artifacts/sponza-range-audit/image-downloads.json`，日志 `artifacts/sponza-image-downloads-20261020.log`；原先只读 294,912 字节 PNG 头的记录属于较早快照。许可和来源保持不变，图片及编码产物在忽略目录内，不进入源码提交。
+
+72 份 BC7 候选包已全部构建，并独立按每级尺寸/块字节、哈希及完整 DDS 切片回查 **936 个 mip 文件**。总原生载荷 **1,610,614,656 字节**（约 1.50 GiB），全部 64×64 起始尾链合计 **395,136 字节**；这些是文件/原生图像载荷，不是完整场景实际显存或性能成绩。每张全链为 22,369,648 字节，低清尾链为 5,488 字节。工具为官方 may2026 / `2026.5.8.1`，可执行文件 SHA-256 `dcfdec10244e02cf5037fba089c55fb7e1326b1c8181742d77d15fa5cb5eef06`，Authenticode 有效；实际编码输出确认 `NVIDIA GeForce RTX 3070 Laptop GPU`。汇总 `artifacts/sponza-textures-gpu-20261020/manifest.json`，逐张构建/回查日志 `artifacts/sponza-texture-all-build-20261020.log`。首张 CPU BC7 尝试达到编码进程执行上限后失败，保留 `artifacts/sponza-texture-first-build-20261020.log`；未发布该目标，也不将后续 GPU 成功改记为 CPU 成功。
+
+初步保真检查对石墙基础色、法线、金属粗糙度三张图的每个 texel、全部 mip，比较 PNG→RGBA8 参考与 BC7→RGBA8 独立解码结果。顶级存储 RGB 的 RMSE 分别为 **0.005118 / 0.042119 / 0.008723**（通道归一化至 0–1），这是编码通道误差，不是最终线性 HDR 误差。法线顶级平均方向误差 **5.363°**、最差 **97.767°**，约 9.61% texel 超过 10°；原图还有 4,371 个负 Z texel，因此不能默认丢弃 Z 并重建正半球。该法线压缩质量尚未验收，BC7 包只是候选，未决定整场景最终格式。报告 `artifacts/sponza-texture-quality-20261020/report.json` 与同名日志保留全部层数据；基础色/金属粗糙度也仍需图像及材质级目标验收。
+
+真实浏览器预览通过上述清单加载同一石墙的 BC7 基础色/金属粗糙度和精确 RGBA8 法线，共享现有 PBR、切线与太阳阴影路径。在非 fallback `nvidia / ampere` 的 1024×768 画布，三张图从 mip 6 自动升至当前视角需求 mip 1，133 个主动推进的 render 帧完成 3 次发布；单帧原生上传峰值 262,144 字节，图像账本峰值 33,576,328 字节、CPU 驻留加预留峰值 33,554,484 字节，GPU/页面错误为空且释放归零。主动等待 IO 的推进帧不是实时帧率测试。实际截图 `artifacts/sponza-texture-preview-20261020/coarse.png` / `fine.png`，报告同目录 `report.json`。这验证真实材质与加载链，不代表整个 Sponza 已渲染。
+
+剩余工作仍包括所有真实材质的最终编码保真、完整场景批次与代理组织、透明路径、网络压力、目标规模游走、整帧性能和联合稳定性；不能把全部离线纹理打包完成当成阶段 2 大场景验收完成。
+
 ## 按视图需求的自动纹理流送
 
 `RendererOptions.textureStreaming` 接受最多 1024 份 `TextureStreamSource`：稳定 ID、源尺寸/格式/色彩空间、完整 mip 元数据与 SHA-256、已提供的低清 `fallback` 尾链，以及可取消的原生 mip provider。游戏材质始终引用 `source.fallback` 对象身份，Renderer 创建材质时解析为当前驻留图像；后来执行的 `setMaterial` 也使用最新驻留，异步等待中的材质仍包含在整组发布中。手动 `replaceTexture` 拒绝触碰受管身份，避免调度器与外部替换互相覆盖。几何、形变、覆盖、查询和光照不按资产类别分管线。
@@ -29,6 +53,8 @@ CPU 预算包含各来源低清数据、当前细节和新请求的完整预留�
 包含该新增用例、自动 HTTP 流送、共享发布和预制纹理/材质计算的 7 项定向回归，在非 fallback `nvidia / ampere`、非 fallback `intel / gen-12lp` 与 `google / swiftshader / fallback=true` 上分别 **7/7** 通过。日志依次为 `artifacts/texture-streaming-final-target-native-20261020.log`、`artifacts/texture-streaming-target-intel-20261020.log`、`artifacts/texture-streaming-target-software-20261020.log`；各目录保存 `automatic-texture-lighting.json` 及原有数值/图像证据。完整 105 项运行后只增加测试，没有改变运行时代码；不能将它改记为一次完整 106 项通过，也不能将软件后端结果用于硬件性能判断。
 
 这是已接入主 Renderer 的自动原生 mip 调度，尚未完成 Sponza 的实际纹理编码/打包、整场景材质组织、真实网络压力、流送性能或最终大场景画质验收；当前没有细分纹理页、反馈纹理采样或并发多源 IO，不能等同完整 Virtual Texturing。
+
+该自动调度提交 `bc76ccb` 的[远程 CI run 39321473519](https://github.com/fomalhautb/real-engine/actions/runs/39321473519) 已完成成功，包含 foundation 与四个软件 GPU 分片。此结果不覆盖后续新增的 DDS/PNG 打包和清单加载；真实 Sponza 贴图构建进展见本文较新章节，上述“尚未编码/打包”保留为该提交的历史边界。
 
 ## 共享纹理原子发布与分片上传
 

@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GpuVolumetricFog } from '../src/gpu-volumetric-fog';
+import { identity } from '../src/math';
 
 type FakeBuffer = { label: string; destroyed: boolean; destroy(): void };
 type FakeTexture = { label: string; destroyed: boolean; createView(): object; destroy(): void };
 
 class FakeDevice {
-  readonly limits = { maxStorageBuffersPerShaderStage: 3, maxTextureDimension2D: 4096,
+  readonly limits = { maxStorageBuffersPerShaderStage: 5, maxTextureDimension2D: 4096,
     maxBufferSize: 128 * 1024 * 1024, maxStorageBufferBindingSize: 128 * 1024 * 1024,
     maxComputeWorkgroupsPerDimension: 65_535 };
   readonly buffers: FakeBuffer[] = [];
@@ -70,7 +71,7 @@ function resize(fog: GpuVolumetricFog, width: number, height: number): void {
 }
 
 beforeEach(() => {
-  vi.stubGlobal('GPUBufferUsage', { UNIFORM: 1, COPY_DST: 2, STORAGE: 4 });
+  vi.stubGlobal('GPUBufferUsage', { UNIFORM: 1, COPY_DST: 2, STORAGE: 4, COPY_SRC: 8 });
   vi.stubGlobal('GPUTextureUsage', { RENDER_ATTACHMENT: 1, TEXTURE_BINDING: 2, COPY_SRC: 4 });
   vi.stubGlobal('GPUShaderStage', { COMPUTE: 1, FRAGMENT: 2 });
 });
@@ -87,6 +88,20 @@ describe('GPU volumetric fog ownership', () => {
     const device = new FakeDevice(), tracked = ledger();
     await expect(GpuVolumetricFog.create(device as unknown as GPUDevice, { maxBytes: 1 }, tracked.account)).rejects.toThrow('fog grid cannot fit');
     expect(device.buffers).toHaveLength(0); expect(tracked.bytes).toBe(0);
+  });
+  it('preflights the extra temporal storage bindings before allocating resources', async () => {
+    const device = new FakeDevice(), tracked = ledger();
+    device.limits.maxStorageBuffersPerShaderStage = 4;
+    await expect(GpuVolumetricFog.create(device as unknown as GPUDevice,
+      { temporal: {} }, tracked.account)).rejects.toThrow('FOG_STORAGE_BINDING_LIMIT');
+    expect(device.buffers).toHaveLength(0);
+    expect(tracked.bytes).toBe(0);
+    // The non-temporal path continues to fit the three-binding baseline.
+    device.limits.maxStorageBuffersPerShaderStage = 3;
+    const fog = await GpuVolumetricFog.create(device as unknown as GPUDevice, {}, tracked.account);
+    fog.dispose();
+    expect(tracked.bytes).toBe(0);
+    expect(allDestroyed(device)).toBe(true);
   });
   it('releases the first allocation when construction fails and both persistent buffers when pipeline creation fails', async () => {
     const secondBuffer = new FakeDevice(), firstLedger = ledger();
@@ -121,7 +136,7 @@ describe('GPU volumetric fog ownership', () => {
         expect(oldOutput.destroyed).toBe(true); // Old view is retired before the new allocation.
         expect(fog.colorTexture).toBeUndefined();
         expect(fog.diagnostics().grid).toBeNull();
-        expect(tracked.bytes).toBe(5376);
+        expect(tracked.bytes).toBe(5504);
         expect(tracked.balances.every(bytes => bytes >= 0)).toBe(true);
         expect(device.buffers.filter(buffer => buffer.label.startsWith('fog ') && buffer.label !== 'fog frame'
           && buffer.label !== 'fog local media').every(buffer => buffer.destroyed)).toBe(true);
@@ -156,5 +171,86 @@ describe('GPU volumetric fog ownership', () => {
       expect(tracked.bytes).toBe(0);
       expect(allDestroyed(device)).toBe(true);
     }
+  });
+
+  it.each([5, 6, 7, 8])('releases every partially allocated temporal history buffer when allocation %i fails',
+    async failedCall => {
+      const device = new FakeDevice(), tracked = ledger();
+      const fog = await GpuVolumetricFog.create(device as unknown as GPUDevice,
+        { slices: 8, temporal: { maxHistoryFrames: 6 } }, tracked.account);
+      try {
+        device.failBufferCall = failedCall;
+        expect(() => resize(fog, 32, 32)).toThrow('FAKE_BUFFER_FAILURE');
+        expect(fog.diagnostics().grid).toBeNull();
+        expect(fog.colorTexture).toBeUndefined();
+        expect(tracked.bytes).toBe(5504);
+        expect(device.buffers.filter(buffer => buffer.label.startsWith('fog history'))
+          .every(buffer => buffer.destroyed)).toBe(true);
+        expect(device.buffers.filter(buffer => buffer.label === 'fog source and extinction'
+          || buffer.label === 'fog cumulative radiance and transmission')
+          .every(buffer => buffer.destroyed)).toBe(true);
+        expect(device.textures.every(texture => texture.destroyed)).toBe(true);
+        expect(tracked.balances.every(bytes => bytes >= 0)).toBe(true);
+
+        resize(fog, 32, 32);
+        expect(fog.diagnostics().grid?.bytes).toBe(tracked.bytes);
+        expect(device.buffers.filter(buffer => buffer.label.startsWith('fog history') && !buffer.destroyed)).toHaveLength(4);
+      } finally { fog.dispose(); }
+      expect(tracked.bytes).toBe(0);
+      expect(allDestroyed(device)).toBe(true);
+    });
+
+  it('cleans temporal history after bind-group initialization fails, then retries', async () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const fog = await GpuVolumetricFog.create(device as unknown as GPUDevice, { temporal: {} }, tracked.account);
+    try {
+      device.failBindGroupCall = device.bindGroupCalls + 3;
+      expect(() => resize(fog, 32, 32)).toThrow('FAKE_BIND_GROUP_FAILURE');
+      expect(fog.diagnostics().grid).toBeNull();
+      expect(tracked.bytes).toBe(5504);
+      expect(device.buffers.filter(buffer => buffer.label.startsWith('fog history')).every(buffer => buffer.destroyed)).toBe(true);
+      expect(device.textures.every(texture => texture.destroyed)).toBe(true);
+      resize(fog, 32, 32);
+      expect(fog.diagnostics().grid?.bytes).toBe(tracked.bytes);
+    } finally { fog.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    expect(allDestroyed(device)).toBe(true);
+  });
+
+  it('accounts for temporal history bytes and records history only after submission', async () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const fog = await GpuVolumetricFog.create(device as unknown as GPUDevice,
+      { pixelSize: 8, slices: 8, temporal: { maxHistoryFrames: 4 }, maxBytes: 7680 }, tracked.account);
+    try {
+      expect(fog.planResize(16, 8)).toEqual({ columns: 2, rows: 1, slices: 8,
+        pixelSize: 8, froxels: 16, bytes: 7680 });
+      resize(fog, 16, 8);
+      expect(tracked.bytes).toBe(7680);
+      const camera = identity();
+      const update = () => fog.update([0, 1, 5], [0, 1, 0], Math.PI / 3, 0.1, 100,
+        [0, 1, -1], [2, 2, 2], camera, camera,
+        { cameraCut: false, sceneChanged: false, materialRevision: 1 });
+      expect(update()).toBe(384 + 64 * 80);
+      expect(fog.diagnostics().history).toMatchObject({ configured: true, valid: false, framesSinceReset: 0, maxFrames: 4 });
+      fog.afterSubmit();
+      expect(fog.diagnostics().history).toMatchObject({ configured: true, valid: true, framesSinceReset: 1 });
+      expect(update()).toBe(384);
+      fog.afterSubmit();
+      expect(fog.diagnostics().history.framesSinceReset).toBe(2);
+      fog.invalidateHistory('test-cut');
+      expect(fog.diagnostics().history).toMatchObject({ valid: false, framesSinceReset: 0, lastResetReason: 'test-cut' });
+    } finally { fog.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    expect(allDestroyed(device)).toBe(true);
+
+    const constrained = new FakeDevice(), constrainedLedger = ledger();
+    const tight = await GpuVolumetricFog.create(constrained as unknown as GPUDevice,
+      { pixelSize: 8, slices: 8, temporal: {}, maxBytes: 7679 }, constrainedLedger.account);
+    try {
+      expect(tight.planResize(16, 8)).toEqual({ columns: 1, rows: 1, slices: 8,
+        pixelSize: 16, froxels: 8, bytes: 7104 });
+    } finally { tight.dispose(); }
+    expect(constrainedLedger.bytes).toBe(0);
+    expect(allDestroyed(constrained)).toBe(true);
   });
 });

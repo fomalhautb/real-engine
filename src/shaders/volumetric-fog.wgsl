@@ -10,6 +10,7 @@ struct FogVolume {
 @group(0) @binding(3) var<storage, read_write> integrated: array<vec4f>;
 @group(0) @binding(4) var shadowMap: texture_depth_2d;
 @group(0) @binding(5) var shadowSampler: sampler_comparison;
+// FOG_RESOLVED_SOURCE
 
 fn phase(cosTheta: f32, g: f32) -> f32 {
   let denominator = max(1.0 + g * g - 2.0 * g * cosTheta, 0.000001);
@@ -30,7 +31,9 @@ fn mediumSource(optics: vec2f, albedo: vec3f, emission: vec3f, incident: vec3f, 
 fn inject(@builtin(global_invocation_id) id: vec3u) {
   if (any(id >= frame.grid.xyz)) { return; }
   let ray = fogRay((vec2f(id.xy) + 0.5) / vec2f(frame.grid.xy));
-  let world = frame.eye.xyz + ray * ((sliceDepth(id.z) + sliceDepth(id.z + 1u)) * 0.5);
+  let sampleRay = fogRay((vec2f(id.xy) + 0.5 + frame.reserved.xy) / vec2f(frame.grid.xy));
+  let sampleDepth = mix(sliceDepth(id.z), sliceDepth(id.z + 1u), 0.5 + frame.reserved.z);
+  let world = frame.eye.xyz + sampleRay * sampleDepth;
   let incident = frame.sunColor.xyz * visibility(world);
   // Incoming propagation is -sunDirection; outgoing to camera is -ray.
   let cosine = clamp(dot(normalize(ray), frame.sunDirection.xyz), -1.0, 1.0);
@@ -55,7 +58,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
   var cumulative = vec4f(0.0, 0.0, 0.0, 1.0);
   for (var z = 0u; z < frame.grid.z; z++) {
     let index = cellIndex(id.xy, z);
-    cumulative = fogOver(cumulative, fogSegment(sources[index], (sliceDepth(z + 1u) - sliceDepth(z)) * rayLength));
+    cumulative = fogOver(cumulative, fogSegment(resolvedSource(index), (sliceDepth(z + 1u) - sliceDepth(z)) * rayLength));
     integrated[index] = cumulative;
   }
 }

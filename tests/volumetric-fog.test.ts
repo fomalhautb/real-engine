@@ -9,11 +9,11 @@ describe('volumetric fog configuration', () => {
   it('sets bounded defaults and chooses the smallest valid 1080p grid', () => {
     const options = resolveVolumetricFogOptions();
     expect(options).toEqual({ pixelSize: 8, slices: 64, maxViewDepth: 80,
-      maxFroxels: 1_048_576, maxBytes: 64 * 1024 * 1024, volumes: [] });
+      maxFroxels: 1_048_576, maxBytes: 64 * 1024 * 1024, temporal: false, volumes: [] });
     expect(Object.isFrozen(options)).toBe(true);
     expect(Object.isFrozen(options.volumes)).toBe(true);
     expect(selectFogGrid(1920, 1080, options)).toEqual({ columns: 160, rows: 90,
-      slices: 64, pixelSize: 12, froxels: 921_600, bytes: 46_085_376 });
+      slices: 64, pixelSize: 12, froxels: 921_600, bytes: 46_085_504 });
     expect(selectFogGrid(1280, 720, options).pixelSize).toBe(8);
   });
 
@@ -51,12 +51,37 @@ describe('volumetric fog configuration', () => {
   it('grows the pixel size minimally for froxel and byte limits', () => {
     const froxelLimited = resolveVolumetricFogOptions({ pixelSize: 1, slices: 8, maxFroxels: 96 });
     expect(selectFogGrid(33, 17, froxelLimited)).toEqual({ columns: 4, rows: 2,
-      slices: 8, pixelSize: 9, froxels: 64, bytes: 256 + 64 * 80 + 33 * 17 * 8 + 64 * 32 });
+      slices: 8, pixelSize: 9, froxels: 64, bytes: 384 + 64 * 80 + 33 * 17 * 8 + 64 * 32 });
     const byteLimited = resolveVolumetricFogOptions({ pixelSize: 1, slices: 8, maxBytes: 7000 });
     expect(selectFogGrid(10, 10, byteLimited)).toEqual({ columns: 1, rows: 1,
-      slices: 8, pixelSize: 10, froxels: 8, bytes: 6432 });
-    expect(() => selectFogGrid(10, 10, resolveVolumetricFogOptions({ slices: 8, maxBytes: 6431 })))
+      slices: 8, pixelSize: 10, froxels: 8, bytes: 6560 });
+    expect(() => selectFogGrid(10, 10, resolveVolumetricFogOptions({ slices: 8, maxBytes: 6559 })))
       .toThrow(/cannot fit/);
+  });
+
+  it('snapshots bounded temporal options and accounts for both history source and count buffers', () => {
+    const author = { maxHistoryFrames: 12 };
+    const temporal = resolveVolumetricFogOptions({ pixelSize: 8, slices: 8, temporal: author });
+    author.maxHistoryFrames = 20;
+    expect(temporal.temporal).toEqual({ maxHistoryFrames: 12 });
+    expect(Object.isFrozen(temporal.temporal)).toBe(true);
+    expect(resolveVolumetricFogOptions({ temporal: {} }).temporal).toEqual({ maxHistoryFrames: 8 });
+    expect(resolveVolumetricFogOptions({ temporal: { maxHistoryFrames: 2 } }).temporal).toEqual({ maxHistoryFrames: 2 });
+    expect(resolveVolumetricFogOptions({ temporal: { maxHistoryFrames: 32 } }).temporal).toEqual({ maxHistoryFrames: 32 });
+
+    // 16x8 HDR: 1024 B; uniform + volume: 384 + 5120 B. A 2x1x8 grid
+    // carries 16 * (32 base + 40 temporal) B, then drops to 1x1x8.
+    expect(selectFogGrid(16, 8, resolveVolumetricFogOptions({ pixelSize: 8, slices: 8,
+      temporal: {}, maxBytes: 7680 }))).toEqual({ columns: 2, rows: 1,
+      slices: 8, pixelSize: 8, froxels: 16, bytes: 7680 });
+    expect(selectFogGrid(16, 8, resolveVolumetricFogOptions({ pixelSize: 8, slices: 8,
+      temporal: {}, maxBytes: 7679 }))).toEqual({ columns: 1, rows: 1,
+      slices: 8, pixelSize: 16, froxels: 8, bytes: 7104 });
+    expect(() => selectFogGrid(16, 8, resolveVolumetricFogOptions({ slices: 8,
+      temporal: {}, maxBytes: 7103 }))).toThrow(/cannot fit/);
+    expect(selectFogGrid(16, 8, resolveVolumetricFogOptions({ pixelSize: 8, slices: 8,
+      maxBytes: 7103 }))).toEqual({ columns: 2, rows: 1,
+      slices: 8, pixelSize: 8, froxels: 16, bytes: 7040 });
   });
 
   it('rejects invalid option, medium, and local-shape budgets', () => {
@@ -64,6 +89,9 @@ describe('volumetric fog configuration', () => {
       { pixelSize: 0 }, { pixelSize: 129 }, { pixelSize: 1.5 },
       { slices: 7 }, { slices: 129 }, { maxViewDepth: 0.09 }, { maxViewDepth: 1001 },
       { maxFroxels: 63 }, { maxFroxels: 4_194_305 }, { maxBytes: 0 }, { maxBytes: 1.5 },
+      { temporal: { maxHistoryFrames: 1 } }, { temporal: { maxHistoryFrames: 33 } },
+      { temporal: { maxHistoryFrames: 2.5 } }, { temporal: { maxHistoryFrames: NaN } },
+      ...[true, null, 1, 'on', []].map(temporal => ({ temporal } as unknown as VolumetricFogOptions)),
       { global: { coefficients: { ...medium, extinction: 10_001 } } },
       { global: { coefficients: { ...medium, emission: [0, 10_001, 0] } } },
       { global: { coefficients: medium, baseHeight: 1_000_001 } },

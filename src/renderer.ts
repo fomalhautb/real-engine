@@ -20,10 +20,14 @@ import { snapshotMeshTangents } from './tangent-frame';
 import { GpuGeometryStream } from './gpu-geometry-stream';
 import { GpuGeometryPagePool, type GeometryGpuFrameLease } from './gpu-geometry-page-pool';
 import { GeometryDecodeWorkerPool, type GeometryDecodeWorkerOptions } from './geometry-decode-worker-pool';
-import { GpuVolumetricFog } from './gpu-volumetric-fog';
+import { GpuVolumetricFog, type FogHistoryCell } from './gpu-volumetric-fog';
 import { resolveVolumetricFogOptions, type VolumetricFogOptions } from './volumetric-fog';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
+function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 0, length = values.length): boolean {
+  for (let c = 0; c < length; c++) if (Math.fround(values[c]) !== old[offset + c]) return true;
+  return false;
+}
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; surfaceStream?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
 type Batch = {
   scene: RenderBatch; mesh: MeshData; rest: GPUBuffer; indices: GPUBuffer; params: GPUBuffer;
@@ -36,7 +40,7 @@ type Batch = {
   tangentData: Float32Array<ArrayBuffer>;
   morphBounds: Bounds3[]; bounds: Map<number, Bounds3>;
   history: Map<number, Previous>;
-  dirty: boolean; lastInstances: InstanceState[]; lastInputMode?: RenderBatch['inputMode'];
+  dirty: boolean; fogSceneChanged: boolean; lastInstances: InstanceState[]; lastInputMode?: RenderBatch['inputMode'];
   /** Reused [start, end) slot ranges, bounded to 16 writes per input stream. */
   uploadRanges: number[];
   material: GpuMaterial; materialPipelines: MaterialPipelines; materialRequest: number;
@@ -214,7 +218,7 @@ export class Renderer {
     this.diffuseGiOptions = options.diffuseGi && resolveDiffuseGiOptions(options.diffuseGi);
     this.volumetricFogOptions = options.volumetricFog && resolveVolumetricFogOptions(options.volumetricFog);
     this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0)
-      + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.volumetricFog ? 6 : 0);
+      + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.volumetricFog ? (options.volumetricFog.temporal ? 8 : 6) : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -330,6 +334,7 @@ export class Renderer {
       ...(this.volumetricFog ? [
         { name: 'fog-media', kind: 'buffer' as const, source: 'imported' as const },
         { name: 'fog-source', kind: 'buffer' as const, source: 'transient' as const },
+        ...(this.volumetricFog.temporalConfigured ? [{ name: 'fog-history', kind: 'buffer' as const, source: 'imported' as const }] : []),
         { name: 'fog-integrated', kind: 'buffer' as const, source: 'transient' as const },
         { name: 'fog-hdr', kind: 'texture' as const, source: 'transient' as const },
       ] : []),
@@ -373,10 +378,16 @@ export class Renderer {
         { resource: 'scene-hdr', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
       ...(this.volumetricFog ? [
         { name: 'fog-inject', uses: [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const }, { resource: 'fog-source', access: 'write' as const }],
-          execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeInject(encoder, this.timestamp(this.timestampCount - 6)) },
-        { name: 'fog-integrate', uses: [{ resource: 'fog-source', access: 'read' as const }, { resource: 'fog-integrated', access: 'write' as const }],
+          execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeInject(encoder, this.timestamp(this.timestampCount - (this.volumetricFog!.temporalConfigured ? 8 : 6))) },
+        ...(this.volumetricFog.temporalConfigured ? [{ name: 'fog-temporal', uses: [
+          { resource: 'fog-source', access: 'read' as const }, { resource: 'fog-history', access: 'readWrite' as const }],
+          execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeTemporal(encoder, this.timestamp(this.timestampCount - 6)) }] : []),
+        { name: 'fog-integrate', uses: [{ resource: 'fog-source', access: 'read' as const },
+          ...(this.volumetricFog.temporalConfigured ? [{ resource: 'fog-history', access: 'read' as const }] : []),
+          { resource: 'fog-integrated', access: 'write' as const }],
           execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeIntegrate(encoder, this.timestamp(this.timestampCount - 4)) },
         { name: 'fog-compose', uses: [{ resource: 'fog-source', access: 'read' as const }, { resource: 'fog-integrated', access: 'read' as const },
+          ...(this.volumetricFog.temporalConfigured ? [{ resource: 'fog-history', access: 'read' as const }] : []),
           { resource: 'scene-hdr', access: 'read' as const }, { resource: 'depth', access: 'read' as const }, { resource: 'fog-hdr', access: 'write' as const }],
           execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeCompose(encoder, this.timestamp(this.timestampCount - 2)) },
       ] : []),
@@ -522,6 +533,19 @@ export class Renderer {
     this.volumetricFog.setMedia(media);
   }
 
+  /** Toggle configured history without reallocating the view grid. */
+  setVolumetricFogTemporalEnabled(enabled: boolean): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.volumetricFog) throw new Error('VOLUMETRIC_FOG_DISABLED');
+    this.volumetricFog.setTemporalEnabled(enabled);
+  }
+
+  async probeVolumetricFogHistory(cells: readonly FogHistoryCell[]) {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.volumetricFog || !this.lastViewProjection) throw new Error('FOG_HISTORY_UNAVAILABLE');
+    return this.volumetricFog.probeHistory(cells);
+  }
+
   /** Disabling GI removes indirect lighting; it does not restore the legacy ambient fill. */
   setDiffuseGiEnabled(enabled: boolean): void {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
@@ -655,7 +679,7 @@ export class Renderer {
         entries: [params, rest, instances, palettes, output, morphs, scalars, tangents].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
       render: undefined as unknown as GPUBindGroup,
       instanceData: new Float32Array(capacity * 56), paletteData: new Float32Array(capacity * program.jointCount * 32),
-      scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, lastInstances: [], uploadRanges: [],
+      scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, fogSceneChanged: true, lastInstances: [], uploadRanges: [],
     };
     try {
       if (scene.geometryLod) batch.geometryLod = this.geometryLod!.addBatch(scene, instances, () => batch.material.program.alphaMode === 'opaque');
@@ -691,6 +715,7 @@ export class Renderer {
 
   private upload(batch: Batch): void {
     const states = batch.scene.instances;
+    batch.fogSceneChanged = states.length !== batch.lastInstances.length;
     if (states.length > batch.scene.capacity) throw new Error('INSTANCE_CAPACITY: ' + batch.scene.name);
     const committed = batch.scene.inputMode === 'committed' && batch.lastInputMode === 'committed';
     const reusable = (state: InstanceState, i: number, previous: Previous | undefined): boolean =>
@@ -723,6 +748,20 @@ export class Renderer {
       const generation = state.entityGeneration ?? 0;
       let previous = batch.history.get(state.entityId);
       if (reusable(state, i, previous)) continue;
+      // Upload dirtiness also includes mutable inputs and settling previous pose.
+      // Fog history depends on actual rendered changes, not a CPU upload request.
+      // Compare bounded inputs before overwriting the existing render snapshot;
+      // no second geometry copy or per-frame GPU readback is needed.
+      if (this.volumetricFog?.temporalConfigured && !batch.fogSceneChanged) {
+        batch.fogSceneChanged = !previous || previous.version !== state.historyVersion || previous.generation !== generation
+          || differsF32(state.model, batch.instanceData, i * 56)
+          || differsF32(state.normalMatrix, batch.instanceData, i * 56 + 32)
+          || differsF32(state.color, batch.instanceData, i * 56 + 48)
+          || Math.fround(state.metalness) !== batch.instanceData[i * 56 + 52]
+          || Math.fround(state.roughness) !== batch.instanceData[i * 56 + 53]
+          || state.bones.some((bone, j) => differsF32(bone, previous!.bones[j]))
+          || differsF32(state.deformScalars, batch.scalarData, i * scalarCount * 2, batch.program.scalarCount);
+      }
       // Adjacent changes share a write. Highly fragmented updates use one
       // envelope instead of issuing an unbounded number of tiny queue writes.
       if (coalesced) ranges[1] = i + 1;
@@ -799,6 +838,7 @@ export class Renderer {
   invalidateHistory(): void {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     this.lastViewProjection = undefined;
+    this.volumetricFog?.invalidateHistory();
     for (const batch of this.batches) batch.history.clear();
   }
 
@@ -823,7 +863,8 @@ export class Renderer {
     new Uint32Array(this.frameData.buffer)[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : 0;
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
     this.stats.uploadedBytes += this.volumetricFog?.update(eye, target, Math.PI / 3.2, 0.1, 150,
-      this.sunDirection, this.sunColor, this.lightMatrix) ?? 0;
+      this.sunDirection, this.sunColor, this.lightMatrix, vp,
+      { cameraCut: !this.lastViewProjection, sceneChanged: this.batches.some(batch => batch.fogSceneChanged), materialRevision: this.materialRevision }) ?? 0;
     this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
     for (const batch of this.batches) if (batch.stream) {
       const count = batch.material.program.alphaMode === 'opaque' ? batch.scene.instances.length : 0;
@@ -858,6 +899,7 @@ export class Renderer {
       throw error;
     }
     for (const batch of this.batches) batch.stream?.runtime.afterSubmit();
+    this.volumetricFog?.afterSubmit();
     if (readTiming) void this.readTiming(this.stats.frames + 1);
     this.stats.frames++;
     this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2 + 1 + (this.volumetricFog ? 1 : 0);
@@ -978,7 +1020,7 @@ export class Renderer {
         geometryLod: this.geometryLod ? Number(values[this.worldQueries ? 11 : 9] - values[this.worldQueries ? 10 : 8]) / 1e6 : 0,
         diffuseGi: this.diffuseGi ? Number(values[this.geometryLod ? 13 : 11] - values[this.geometryLod ? 12 : 10]) / 1e6 : 0,
         finalGather: this.diffuseGiOptions?.finalGather ? Number(values[this.geometryLod ? 15 : 13] - values[this.geometryLod ? 14 : 12]) / 1e6 : 0,
-        volumetricFog: this.volumetricFog ? [6, 4, 2].reduce((sum, offset) => sum
+        volumetricFog: this.volumetricFog ? (this.volumetricFog.temporalConfigured ? [8, 6, 4, 2] : [6, 4, 2]).reduce((sum, offset) => sum
           + Number(values[this.timestampCount - offset + 1] - values[this.timestampCount - offset]) / 1e6, 0) : 0 };
       this.stats.gpuSampleFrame = frame;
       this.queryRead!.unmap();

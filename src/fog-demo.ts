@@ -12,6 +12,7 @@ type Color = [number, number, number, number];
 interface FogDemoHarness {
   pause(value: boolean): void;
   render(): void;
+  resetHistory(): void;
   step(dt?: number): void;
   snapshot(): ReturnType<typeof snapshot>;
   dispose(): void;
@@ -87,6 +88,7 @@ let failed = false;
 let paused = benchmarkMode;
 let trajectory = true;
 let fogEnabled = true;
+let temporalEnabled = true;
 let density = 0.14;
 let sunAzimuth = 150;
 let sunElevation = 50;
@@ -117,7 +119,8 @@ const options: RendererOptions = {
   sunShadow: { resolution: 2048,
     focusBounds: { min: [-6.2, -0.7, -6.2], max: [6.2, 4.8, 6.2] },
     maxBytes: 16 * 1024 * 1024 },
-  volumetricFog: { pixelSize: 8, slices: 64, maxViewDepth: 30, volumes: localMedium() },
+  volumetricFog: { pixelSize: 8, slices: 64, maxViewDepth: 30, volumes: localMedium(),
+    maxBytes: 128 * 1024 * 1024, temporal: { maxHistoryFrames: 16 } },
 };
 
 function applySun(): void {
@@ -157,7 +160,7 @@ function updateUi(): void {
 function snapshot() {
   return { page: 'volumetric-fog-demo', scene: { ...scene, batches: [batch.name] },
     camera: { eye: cameraEye(), target: [...target], phase },
-    controls: { paused, trajectory, fogEnabled, density, sunAzimuth, sunElevation, sunIntensity },
+    controls: { paused, trajectory, fogEnabled, temporalEnabled, density, sunAzimuth, sunElevation, sunIntensity },
     fog: renderer?.diagnostics().volumetricFog ?? null,
     stats: renderer ? structuredClone(renderer.stats) : null,
     adapter: renderer?.info ?? null,
@@ -221,7 +224,7 @@ function dispose(): void {
   $('status').textContent = '已释放';
 }
 
-window.__FOG_DEMO__ = { pause, render, step, snapshot, dispose };
+window.__FOG_DEMO__ = { pause, render, step, snapshot, dispose, resetHistory: () => renderer?.invalidateHistory() };
 
 async function main(): Promise<void> {
   try {
@@ -232,6 +235,10 @@ async function main(): Promise<void> {
     updateMedium();
     renderer.setVolumetricFogEnabled(fogEnabled);
     const signal = events.signal;
+    $<HTMLInputElement>('temporal-enabled').addEventListener('change', event => {
+      try { temporalEnabled = (event.target as HTMLInputElement).checked;
+        renderer?.setVolumetricFogTemporalEnabled(temporalEnabled); render(); } catch (error) { fail(error); }
+    }, { signal });
     $<HTMLInputElement>('fog-enabled').addEventListener('change', event => {
       try { fogEnabled = (event.target as HTMLInputElement).checked;
         renderer?.setVolumetricFogEnabled(fogEnabled); render(); } catch (error) { fail(error); }

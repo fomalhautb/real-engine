@@ -21,6 +21,7 @@ export interface VolumetricFogOptions {
   readonly maxViewDepth?: number;
   readonly maxFroxels?: number;
   readonly maxBytes?: number;
+  readonly temporal?: false | { readonly maxHistoryFrames?: number };
   readonly global?: FogHeightMedium;
   readonly volumes?: readonly FogVolume[];
 }
@@ -43,6 +44,7 @@ export interface ResolvedVolumetricFogOptions {
   readonly maxViewDepth: number;
   readonly maxFroxels: number;
   readonly maxBytes: number;
+  readonly temporal: false | Readonly<{ maxHistoryFrames: number }>;
   readonly global?: ResolvedFogHeightMedium;
   readonly volumes: readonly ResolvedFogVolume[];
 }
@@ -63,7 +65,9 @@ const DEFAULTS = {
 const MAX_COORDINATE = 1_000_000;
 const MAX_VOLUMES = 64;
 const VOLUME_BYTES = MAX_VOLUMES * 80;
-const UNIFORM_BYTES = 256;
+const UNIFORM_BYTES = 384;
+const BASE_FROXEL_BYTES = 32;
+const TEMPORAL_FROXEL_BYTES = 2 * 16 + 2 * 4;
 const MAX_UINT32 = 0xffff_ffff;
 
 function integer(value: number, min: number, max: number, label: string): number {
@@ -105,6 +109,14 @@ export function resolveVolumetricFogOptions(options: VolumetricFogOptions = {}):
   const maxViewDepth = finite(options.maxViewDepth ?? DEFAULTS.maxViewDepth, 0.1, 1000, 'maxViewDepth');
   const maxFroxels = integer(options.maxFroxels ?? DEFAULTS.maxFroxels, slices, 4_194_304, 'maxFroxels');
   const maxBytes = integer(options.maxBytes ?? DEFAULTS.maxBytes, 1, Number.MAX_SAFE_INTEGER, 'maxBytes');
+  let temporal: ResolvedVolumetricFogOptions['temporal'] = false;
+  if (options.temporal !== undefined && options.temporal !== false) {
+    if (!options.temporal || typeof options.temporal !== 'object' || Array.isArray(options.temporal)) {
+      throw new TypeError('temporal fog must be false or an options object');
+    }
+    temporal = Object.freeze({ maxHistoryFrames: integer(options.temporal.maxHistoryFrames ?? 8,
+      2, 32, 'maxHistoryFrames') });
+  }
 
   let global: ResolvedFogHeightMedium | undefined;
   if (options.global !== undefined) {
@@ -138,7 +150,7 @@ export function resolveVolumetricFogOptions(options: VolumetricFogOptions = {}):
     } else throw new RangeError(`volumes[${index}].shape kind`);
     return Object.freeze({ id, shape, coefficients: coefficients(volume.coefficients) });
   });
-  return Object.freeze({ pixelSize, slices, maxViewDepth, maxFroxels, maxBytes,
+  return Object.freeze({ pixelSize, slices, maxViewDepth, maxFroxels, maxBytes, temporal,
     ...(global ? { global } : {}), volumes: Object.freeze(volumes) });
 }
 
@@ -155,12 +167,13 @@ export function selectFogGrid(width: number, height: number, options: ResolvedVo
   const hdrBytes = width * height * 8;
   if (!Number.isSafeInteger(hdrBytes)) throw new RangeError('HDR dimensions exceed safe byte accounting');
   const fixedBytes = UNIFORM_BYTES + VOLUME_BYTES + hdrBytes;
-  if (fixedBytes + options.slices * 32 > options.maxBytes) throw new RangeError('fog grid cannot fit 1x1 slices');
+  const froxelBytes = BASE_FROXEL_BYTES + (options.temporal ? TEMPORAL_FROXEL_BYTES : 0);
+  if (fixedBytes + options.slices * froxelBytes > options.maxBytes) throw new RangeError('fog grid cannot fit 1x1 slices');
 
   const fits = (pixelSize: number): boolean => {
     const columns = Math.ceil(width / pixelSize), rows = Math.ceil(height / pixelSize);
     const froxels = columns * rows * options.slices;
-    return froxels <= options.maxFroxels && fixedBytes + froxels * 32 <= options.maxBytes;
+    return froxels <= options.maxFroxels && fixedBytes + froxels * froxelBytes <= options.maxBytes;
   };
   let low = options.pixelSize, high = Math.max(options.pixelSize, width, height);
   while (low < high) {
@@ -170,7 +183,7 @@ export function selectFogGrid(width: number, height: number, options: ResolvedVo
   }
   const columns = Math.ceil(width / low), rows = Math.ceil(height / low);
   const froxels = columns * rows * options.slices;
-  const bytes = fixedBytes + froxels * 32;
+  const bytes = fixedBytes + froxels * froxelBytes;
   if (!fits(low) || !Number.isSafeInteger(bytes)) throw new RangeError('fog grid exceeds budget');
   return { columns, rows, slices: options.slices, pixelSize: low, froxels, bytes };
 }

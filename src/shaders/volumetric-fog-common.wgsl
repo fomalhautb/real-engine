@@ -12,6 +12,11 @@ struct FogFrame {
   viewport: vec4f,
   reserved: vec4f,
   lightMatrix: mat4x4f,
+  previousEye: vec4f,
+  previousForward: vec4f,
+  previousViewProjection: mat4x4f,
+  temporal: vec4f,
+  padding: vec4f,
 }
 @group(0) @binding(0) var<uniform> frame: FogFrame;
 

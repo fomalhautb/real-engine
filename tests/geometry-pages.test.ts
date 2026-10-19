@@ -60,7 +60,7 @@ describe('lossless geometry pages', () => {
       const hierarchy = fixture(withUv, withTangent);
       const result = await encodeGeometryPages(hierarchy, { maxPageBytes: 350 });
       expect(result.vertexStride).toBe(stride);
-      expect(result.clusterPages).toEqual(stride === 104 ? [0, 1, 2] : expect.any(Array));
+      expect(result.clusterPages).toEqual([0, 2, 1]);
       expect(result.rootPages).toEqual([...new Set([result.clusterPages[0], result.clusterPages[2]])].sort());
       for (const page of result.pages) {
         expect(page.decodedBytes).toBeLessThanOrEqual(350);
@@ -93,11 +93,28 @@ describe('lossless geometry pages', () => {
     const first = await encodeGeometryPages(hierarchy, { maxPageBytes: 350 });
     const second = await encodeGeometryPages(hierarchy, { maxPageBytes: 350 });
     expect(first.pages).toHaveLength(3);
-    expect(first.clusterPages).toEqual([0, 1, 2]);
-    expect(first.rootPages).toEqual([0, 2]);
+    expect(first.clusterPages).toEqual([0, 2, 1]);
+    expect(first.rootPages).toEqual([0, 1]);
     expect(first.pages.map(page => Array.from(page.bytes))).toEqual(second.pages.map(page => Array.from(page.bytes)));
     const standalone = await decodeGeometryPage(first.pages[2].bytes, { maxPageBytes: 350 });
-    expect(standalone.clusters.map(cluster => cluster.id)).toEqual([2]);
+    expect(standalone.clusters.map(cluster => cluster.id)).toEqual([1]);
+  });
+
+  it('packs roots ahead of details without mixing them or omitting any cluster', async () => {
+    const hierarchy = fixture();
+    const result = await encodeGeometryPages(hierarchy, { maxPageBytes: 700 });
+    expect(result.pages.map(page => page.clusterIds)).toEqual([[0, 2], [1]]);
+    expect(result.rootPages).toEqual([0]);
+    expect(result.clusterPages).toEqual([0, 1, 0]);
+    const roots = new Set(hierarchy.roots);
+    for (const page of result.pages) {
+      expect(page.clusterIds.every(id => roots.has(id))).toBe(result.rootPages.includes(page.id));
+      expect(page.decodedBytes).toBeLessThanOrEqual(700);
+      expect((await decodeGeometryPage(page.bytes, { maxPageBytes: 700 })).clusters.map(cluster => cluster.id))
+        .toEqual(page.clusterIds);
+    }
+    expect(result.pages.flatMap(page => page.clusterIds).sort((a, b) => a - b))
+      .toEqual(hierarchy.clusters.map((_, id) => id));
   });
 
   it('round-trips the optional RGBA stream and keeps legacy pages colorless', async () => {

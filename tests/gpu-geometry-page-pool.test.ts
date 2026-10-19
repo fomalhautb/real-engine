@@ -83,7 +83,9 @@ beforeAll(async () => {
   pages = await Promise.all(encoded.pages.map(page => decodeGeometryPage(page.bytes, { maxPageBytes: 49152 })));
   roots = [...directory.rootPages];
   details = directory.pages.map(page => page.id).filter(id => !roots.includes(id));
-  expect(roots).toHaveLength(4);
+  expect(roots).toHaveLength(2);
+  expect(roots.every(pageId => directory.pages[pageId].clusterIds.every(id => hierarchy.roots.includes(id))))
+    .toBe(true);
   expect(details.length).toBeGreaterThan(3);
   const verticesPerSlot = Math.max(...directory.pages.map(page => page.clusterIds.reduce(
     (sum, id) => sum + directory.clusters[id].vertexCount, 0)));

@@ -44,9 +44,9 @@ export async function runGeometryStreamBudget(sourceFree = false) {
   const roots = new Set(directory.rootPages);
   const verticesPerSlot = Math.max(...directory.pages.map(page => page.clusterIds.reduce((sum, id) => sum + directory.clusters[id].vertexCount, 0)));
   const indicesPerSlot = Math.max(...directory.pages.map(page => page.clusterIds.reduce((sum, id) => sum + directory.clusters[id].triangleCount * 3, 0)));
-  // Six slots can only hold the common coarse ancestry. Eight slots permit
-  // competing finer branches: view A needs page 8, view B needs page 7.
-  const slots = roots.size + 4;
+  // Root-only packing leaves two root pages. With seven slots both views settle
+  // on the same pages; eight slots admit one competing detail page per view.
+  const slots = 8;
   const poolBytes = slots * (verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES + indicesPerSlot * 4) + directory.clusters.length * 32 + directory.pages.length * 4;
   const cpuBytes = directory.rootPages.reduce((sum, id) => sum + directory.pages[id].decodedBytes, 0)
     + Math.max(...directory.pages.filter(page => !roots.has(page.id)).map(page => page.decodedBytes));

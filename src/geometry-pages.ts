@@ -215,7 +215,8 @@ function appendCluster(target: Uint8Array, offset: number, cluster: GeometryClus
   return offset + aligned4(indexCount);
 }
 
-/** Greedy stable packing; each page is independently decodable, with no runtime streaming implied. */
+/** Greedy stable packing; root clusters precede and never share pages with details.
+ * Each page is independently decodable, with no runtime streaming implied. */
 export async function encodeGeometryPages(
   hierarchy: GeometryHierarchy, options: GeometryPageOptions = {},
 ): Promise<EncodedGeometryPages> {
@@ -267,11 +268,15 @@ export async function encodeGeometryPages(
     pages.push({ id: pageId, clusterIds: [...ids], decodedBytes: raw.length, bytes: page });
     ids = []; rawBytes = 0;
   };
-  for (let id = 0; id < sizes.length; id++) {
+  const append = (id: number): void => {
     if (ids.length > 0 && rawBytes + sizes[id] > limits.maxPageBytes) flush();
     ids.push(id);
     rawBytes += sizes[id];
-  }
+  };
+  const rootIds = [...hierarchy.roots].sort((a, b) => a - b), roots = new Set(rootIds);
+  for (const id of rootIds) append(id);
+  flush(); // The last root page cannot acquire detail clusters.
+  for (let id = 0; id < sizes.length; id++) if (!roots.has(id)) append(id);
   flush();
   const rootPages = [...new Set(hierarchy.roots.map((id) => clusterPages[id]))].sort((a, b) => a - b);
   return { version: 1, vertexStride: stride, ...(source.colors ? { hasColors: true as const } : {}),

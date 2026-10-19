@@ -121,6 +121,8 @@ export class FoundationBenchmark {
           this.recorder.recordGpu({ frame: gpuSampleFrame, deformation: gpuMs.deformation,
             shadow: gpuMs.shadow, surface: gpuMs.surface, resolve: gpuMs.resolve,
             worldQueryRefit: gpuMs.worldQueryRefit, geometryLod: gpuMs.geometryLod,
+            occlusion: 'occlusion' in gpuMs && typeof gpuMs.occlusion === 'number'
+              ? gpuMs.occlusion : 0,
             diffuseGi: gpuMs.diffuseGi, finalGather: gpuMs.finalGather,
             reflections: 'reflections' in gpuMs && typeof gpuMs.reflections === 'number'
               ? gpuMs.reflections : 0,

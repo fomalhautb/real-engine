@@ -2,6 +2,7 @@ import source from './shaders/geometry-lod.wgsl?raw';
 import { packGeometryLod, type PackedGeometryLod } from './geometry-lod-data';
 import type { SceneBatch } from './contracts';
 import type { Mat4 } from './math';
+import { occlusionTestSource, type GpuOcclusion } from './gpu-occlusion';
 
 export interface GeometryLodSettings {
   maxErrorPixels?: number;
@@ -16,6 +17,7 @@ export interface GeometryLodProbe {
   triangles: number;
   selectedClusters: { clusterId: number; instanceIndex: number; level: number }[];
   overflow: boolean;
+  occlusion: { deferredClusters: number; culledClusters: number; recoveredClusters: number };
 }
 export interface GeometryLodBinding {
   vertices: GPUBuffer;
@@ -32,7 +34,7 @@ type Entry = {
 const BUDGET = 128 * 1024 * 1024;
 const MAX_PAIRS = 262_144;
 
-/** Fully resident GPU cut selection and index compaction. No page streaming or occlusion yet. */
+/** Fully resident GPU cut selection and compaction, with optional two-phase Hi-Z. */
 export class GpuGeometryLod {
   readonly settings: Required<GeometryLodSettings> = { maxErrorPixels: 1, frustumCulling: true, frozen: false, debug: 'material' };
   private readonly entries = new Map<string, Entry>();
@@ -48,23 +50,32 @@ export class GpuGeometryLod {
   private readonly layout: GPUBindGroupLayout;
   private select!: GPUComputePipeline;
   private finalize!: GPUComputePipeline;
+  private recover!: GPUComputePipeline;
+  private finalizeRecovery!: GPUComputePipeline;
 
-  static async create(device: GPUDevice, track: (bytes: number) => void): Promise<GpuGeometryLod> {
-    const result = new GpuGeometryLod(device, track);
+  static async create(device: GPUDevice, track: (bytes: number) => void, occlusion?: GpuOcclusion): Promise<GpuGeometryLod> {
+    const result = new GpuGeometryLod(device, track, occlusion);
     try {
-      const module = device.createShaderModule({ label: 'resident geometry LOD', code: source });
+      const module = device.createShaderModule({ label: 'resident geometry LOD', code: source + '\n' + (occlusion
+        ? occlusionTestSource : 'fn geometryOccluded(center:vec3f,extent:vec3f)->bool{return false;}') });
       const info = await module.getCompilationInfo();
       const errors = info.messages.filter(message => message.type === 'error');
       if (errors.length) throw new Error(errors.map(e => `GEOMETRY_LOD_SHADER:${e.lineNum}: ${e.message}`).join('\n'));
-      const layout = device.createPipelineLayout({ bindGroupLayouts: [result.layout] });
+      const layout = device.createPipelineLayout({ bindGroupLayouts: [result.layout, ...(occlusion ? [occlusion.testLayout] : [])] });
       result.select = await device.createComputePipelineAsync({ label: 'select LOD and compact indices', layout,
         compute: { module, entryPoint: 'selectClusters' } });
       result.finalize = await device.createComputePipelineAsync({ label: 'validate indirect LOD arguments', layout,
         compute: { module, entryPoint: 'finalize' } });
+      if (occlusion) {
+        result.recover = await device.createComputePipelineAsync({ label: 'recover current-frame visible LOD', layout,
+          compute: { module, entryPoint: 'recoverClusters' } });
+        result.finalizeRecovery = await device.createComputePipelineAsync({ label: 'guard recovered LOD arguments', layout,
+          compute: { module, entryPoint: 'finalizeRecovery' } });
+      }
       return result;
     } catch (error) { result.dispose(); throw error; }
   }
-  private constructor(private device: GPUDevice, private track: (bytes: number) => void) {
+  private constructor(private device: GPUDevice, private track: (bytes: number) => void, private occlusion?: GpuOcclusion) {
     this.view = this.buffer('LOD selection camera', 96, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.layout = device.createBindGroupLayout({ entries: Array.from({ length: 9 }, (_, binding) => ({
       binding, visibility: GPUShaderStage.COMPUTE,
@@ -102,7 +113,7 @@ export class GpuGeometryLod {
     const maxIndices = packed.sourceTriangleCount * 3 * scene.capacity;
     if (pairs > MAX_PAIRS || Math.ceil(pairs / 64) > this.device.limits.maxComputeWorkgroupsPerDimension
       || packed.clusterVertexCount * scene.capacity > 0xffffffff || maxIndices > 0xffffffff) throw new Error('GEOMETRY_LOD_WORK_BUDGET');
-    const sizes = [packed.clusters.byteLength, packed.groups.byteLength, packed.vertices.byteLength, packed.indices.byteLength, maxIndices * 4, pairs * 4, 32, 32];
+    const sizes = [packed.clusters.byteLength, packed.groups.byteLength, packed.vertices.byteLength, packed.indices.byteLength, maxIndices * 4, pairs * 4, 64, 32];
     if (sizes.some(size => size > this.device.limits.maxStorageBufferBindingSize || size > this.device.limits.maxBufferSize)
       || sizes.reduce((a, b) => a + b, this.bytes) > BUDGET) throw new Error('GEOMETRY_LOD_RESOURCE_BUDGET');
     const clusters = this.buffer('LOD clusters', packed.clusters.byteLength, GPUBufferUsage.STORAGE, packed.clusters);
@@ -110,7 +121,7 @@ export class GpuGeometryLod {
     const vertices = this.buffer('LOD vertex identities', packed.vertices.byteLength, GPUBufferUsage.STORAGE, new Uint32Array(packed.vertices).buffer);
     const input = this.buffer('LOD source indices', packed.indices.byteLength, GPUBufferUsage.STORAGE, new Uint32Array(packed.indices).buffer);
     const indices = this.buffer('GPU selected indices', maxIndices * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.INDEX);
-    const args = this.buffer('LOD indirect arguments and counters', 32, GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+    const args = this.buffer('LOD two-phase indirect arguments and counters', 64, GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
     const selected = this.buffer('LOD selected cluster flags', pairs * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     const paramsData = new Uint32Array([packed.clusterCount, packed.clusterVertexCount, packed.sourceVertexCount, maxIndices, 0, 0, 0, 0]);
     const params = this.buffer('LOD batch parameters', 32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, paramsData.buffer);
@@ -157,6 +168,7 @@ export class GpuGeometryLod {
       querySet: timestamp.querySet, beginningOfPassWriteIndex: timestamp.beginningOfPassWriteIndex,
     } : undefined });
     select.setPipeline(this.select);
+    if (this.occlusion) select.setBindGroup(1, this.occlusion.previousGroup);
     for (const entry of this.entries.values()) {
       if (!entry.count) continue;
       select.setBindGroup(0, entry.compute); select.dispatchWorkgroups(Math.ceil(entry.packed.clusterCount * entry.count / 64));
@@ -166,11 +178,25 @@ export class GpuGeometryLod {
       querySet: timestamp.querySet, endOfPassWriteIndex: timestamp.endOfPassWriteIndex,
     } : undefined });
     finalize.setPipeline(this.finalize);
+    if (this.occlusion) finalize.setBindGroup(1, this.occlusion.previousGroup);
     for (const entry of this.entries.values()) {
       if (!entry.count) continue;
       finalize.setBindGroup(0, entry.compute); finalize.dispatchWorkgroups(1);
     }
     finalize.end();
+  }
+  encodeRecovery(encoder: GPUCommandEncoder): void {
+    if (!this.occlusion) return;
+    for (const [pipeline, name] of [[this.recover, 'recoverClusters'], [this.finalizeRecovery, 'finalizeRecovery']] as const) {
+      const pass = encoder.beginComputePass({ label: 'LOD ' + name }); pass.setPipeline(pipeline);
+      pass.setBindGroup(1, this.occlusion.currentGroup);
+      for (const entry of this.entries.values()) {
+        if (!entry.count) continue;
+        pass.setBindGroup(0, entry.compute);
+        pass.dispatchWorkgroups(name === 'finalizeRecovery' ? 1 : Math.ceil(entry.packed.clusterCount * entry.count / 64));
+      }
+      pass.end();
+    }
   }
   async probe(name: string): Promise<GeometryLodProbe> {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
@@ -179,23 +205,25 @@ export class GpuGeometryLod {
     const entry = this.entries.get(name);
     if (!entry) throw new Error('GEOMETRY_LOD_BATCH_NOT_FOUND');
     const frame = this.frame, count = entry.count, flags = entry.packed.clusterCount * count;
-    const size = 32 + flags * 4;
+    const size = 64 + flags * 4;
     const read = this.device.createBuffer({ label: 'explicit LOD diagnostic readback', size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     this.probing = true; this.readback = read; this.track(size);
     try {
       const encoder = this.device.createCommandEncoder({ label: 'explicit LOD diagnostic' });
-      encoder.copyBufferToBuffer(entry.binding.arguments, 0, read, 0, 32);
-      if (flags) encoder.copyBufferToBuffer(entry.selected, 0, read, 32, flags * 4);
+      encoder.copyBufferToBuffer(entry.binding.arguments, 0, read, 0, 64);
+      if (flags) encoder.copyBufferToBuffer(entry.selected, 0, read, 64, flags * 4);
       this.device.queue.submit([encoder.finish()]);
       await read.mapAsync(GPUMapMode.READ);
       const data = new Uint32Array(read.getMappedRange()), selectedClusters: GeometryLodProbe['selectedClusters'] = [];
       const clusterView = new DataView(entry.packed.clusters);
-      for (let index = 0; index < flags; index++) if (data[8 + index]) {
+      for (let index = 0; index < flags; index++) if (data[16 + index] === 1) {
         const clusterId = index % entry.packed.clusterCount;
         selectedClusters.push({ clusterId, instanceIndex: Math.floor(index / entry.packed.clusterCount), level: clusterView.getUint32(clusterId * 64 + 56, true) });
       }
-      const result = { frame, indices: data[0], triangles: data[0] / 3, selectedClusters, overflow: data[6] !== 0 };
-      if (!result.overflow && selectedClusters.length !== data[5]) throw new Error('GEOMETRY_LOD_COUNTER_MISMATCH');
+      const indices = data[0] + data[8];
+      const result = { frame, indices, triangles: indices / 3, selectedClusters, overflow: data[6] !== 0 || data[14] !== 0,
+        occlusion: { deferredClusters: data[7], culledClusters: data[15], recoveredClusters: data[13] } };
+      if (!result.overflow && selectedClusters.length !== data[5] + data[13]) throw new Error('GEOMETRY_LOD_COUNTER_MISMATCH');
       return result;
     } finally {
       read.destroy();
@@ -205,7 +233,7 @@ export class GpuGeometryLod {
   }
   diagnostics() {
     return { settings: { ...this.settings }, frame: this.frame, residentBytes: this.bytes, budgetBytes: BUDGET,
-      fullyResident: true, streaming: false, occlusionCulling: false, maxClusterInstances: MAX_PAIRS,
+      fullyResident: true, streaming: false, occlusionCulling: !!this.occlusion, maxClusterInstances: MAX_PAIRS,
       batches: Array.from(this.entries, ([name, entry]) => ({ name, active: entry.enabled(), sourceTriangles: entry.packed.sourceTriangleCount,
         clusters: entry.packed.clusterCount, instances: entry.count, primitiveKey: entry.source!.primitiveKey })) };
   }

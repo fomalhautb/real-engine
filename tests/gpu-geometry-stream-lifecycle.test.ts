@@ -6,6 +6,7 @@ import type { GeometryStreamSelectionFeedback } from '../src/gpu-geometry-stream
 const mocks = vi.hoisted(() => ({
   cacheCreate: vi.fn(), poolCreate: vi.fn(), selectionCreate: vi.fn(),
 }));
+const zeroOcclusion = { deferredClusters: 0, culledClusters: 0, recoveredClusters: 0 };
 
 vi.mock('../src/geometry-stream-cache', () => ({ GeometryPageCache: { create: mocks.cacheCreate } }));
 vi.mock('../src/gpu-geometry-page-pool', () => ({ GpuGeometryPagePool: { create: mocks.poolCreate } }));
@@ -45,7 +46,7 @@ function setup(maxRequestsPerFrame = 1) {
   const selection = {
     capacity: 1, update: vi.fn(() => 0),
     feedback: vi.fn(async (): Promise<GeometryStreamSelectionFeedback> =>
-      ({ frame: 1, requestedPages: [], desiredGroups: [], indices: 0, overflow: false })),
+      ({ frame: 1, requestedPages: [], desiredGroups: [], indices: 0, overflow: false, occlusion: zeroOcclusion })),
     diagnostics: vi.fn(() => ({})), dispose: vi.fn(),
   };
   const device = { queue: { onSubmittedWorkDone: vi.fn(async () => {}) } } as unknown as GPUDevice;
@@ -106,7 +107,7 @@ describe('GPU geometry stream bridge lifecycle', () => {
     const { scene, device, cache, pool, selection } = setup();
     const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
     selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [{ pageId: 1, priority: 3 }],
-      desiredGroups: [{ groupId: 1, projectedError: 3 }], indices: 0, overflow: false });
+      desiredGroups: [{ groupId: 1, projectedError: 3 }], indices: 0, overflow: false, occlusion: zeroOcclusion });
     cache.request.mockImplementation(() => { throw new Error('GEOMETRY_STREAM_REQUEST_BUDGET'); });
 
     await feedbackSettled(stream);
@@ -125,7 +126,8 @@ describe('GPU geometry stream bridge lifecycle', () => {
     const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
     selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [
       { pageId: 1, priority: 3 }, { pageId: 2, priority: 2 }, { pageId: 3, priority: 1 },
-    ], desiredGroups: [1, 2, 3].map(id => ({ groupId: id, projectedError: 4 - id })), indices: 0, overflow: false });
+    ], desiredGroups: [1, 2, 3].map(id => ({ groupId: id, projectedError: 4 - id })),
+      indices: 0, overflow: false, occlusion: zeroOcclusion });
 
     for (let frame = 1; frame <= 3; frame++) {
       await feedbackSettled(stream);
@@ -140,7 +142,8 @@ describe('GPU geometry stream bridge lifecycle', () => {
     cache.diagnostics.mockReturnValue({ failedPages: [], limits: { maxResidentBytes: 200 } });
     const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
     selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [],
-      desiredGroups: [1, 2].map(groupId => ({ groupId, projectedError: 1 })), indices: 0, overflow: false });
+      desiredGroups: [1, 2].map(groupId => ({ groupId, projectedError: 1 })),
+      indices: 0, overflow: false, occlusion: zeroOcclusion });
     for (let frame = 1; frame <= 4; frame++) {
       await feedbackSettled(stream);
       stream.update(frame, 1, new Float32Array(16), [0, 0, 0], 1);
@@ -162,13 +165,13 @@ describe('GPU geometry stream bridge lifecycle', () => {
     const { scene, device, cache, pool, selection } = setup(1);
     const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
     selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [],
-      desiredGroups: [{ groupId: 1, projectedError: 2 }], indices: 0, overflow: false });
+      desiredGroups: [{ groupId: 1, projectedError: 2 }], indices: 0, overflow: false, occlusion: zeroOcclusion });
     await feedbackSettled(stream);
     stream.update(1, 1, new Float32Array(16), [0, 0, 0], 1);
     expect(cache.setRequestWindow).toHaveBeenLastCalledWith([1]);
     pool.residentPageIds.mockReturnValue(new Set([0, 3]));
     selection.feedback.mockResolvedValue({ frame: 2, requestedPages: [],
-      desiredGroups: [{ groupId: 2, projectedError: 2 }], indices: 0, overflow: false });
+      desiredGroups: [{ groupId: 2, projectedError: 2 }], indices: 0, overflow: false, occlusion: zeroOcclusion });
     await feedbackSettled(stream);
     stream.update(2, 1, new Float32Array(16), [0, 0, 0], 1);
     expect(cache.setRequestWindow).toHaveBeenLastCalledWith([2]);

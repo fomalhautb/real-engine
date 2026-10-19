@@ -25,6 +25,8 @@ import { GpuVolumetricFog, type FogHistoryCell } from './gpu-volumetric-fog';
 import { resolveVolumetricFogOptions, type VolumetricFogOptions } from './volumetric-fog';
 import { GpuReflections, reflectionSurfaceSource, type ReflectionProbeResult } from './gpu-reflections';
 import { resolveReflectionsOptions, type ReflectionsOptions } from './reflections';
+import { GpuOcclusion } from './gpu-occlusion';
+import { resolveOcclusionOptions, type OcclusionOptions } from './occlusion';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 0, length = values.length): boolean {
@@ -52,7 +54,7 @@ export interface FrameStats {
   /** triangles is source instance-expanded geometry; use probeGeometryLod for actual selected triangles. */
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
-  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number; reflections: number; volumetricFog: number } | null;
+  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number; reflections: number; occlusion: number; volumetricFog: number } | null;
   /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
   gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
@@ -81,6 +83,8 @@ export interface RendererOptions {
   volumetricFog?: VolumetricFogOptions;
   /** World-query specular reflection; requires worldQueries. */
   reflections?: ReflectionsOptions;
+  /** Conservative two-phase Hi-Z for resident/paged virtual geometry. */
+  occlusion?: OcclusionOptions;
 }
 
 export interface RendererAdapterInfo {
@@ -142,6 +146,8 @@ export class Renderer {
   private volumetricFog?: GpuVolumetricFog;
   private readonly reflectionsOptions?: ReflectionsOptions;
   private reflections?: GpuReflections;
+  private readonly occlusionOptions?: OcclusionOptions;
+  private occlusion?: GpuOcclusion;
   private lightingLayout?: GPUBindGroupLayout;
   private lightingGroups: GPUBindGroup[] = [];
   private defaultClusterVertices!: GPUBuffer;
@@ -158,6 +164,10 @@ export class Renderer {
     if (options.reflections) {
       resolveReflectionsOptions(options.reflections);
       if (!options.worldQueries) throw new Error('REFLECTIONS_WORLD_QUERIES_REQUIRED');
+    }
+    if (options.occlusion) {
+      resolveOcclusionOptions(options.occlusion);
+      if (!scene.some(batch => batch.geometryLod || batch.geometryStream)) throw new Error('OCCLUSION_REQUIRES_VIRTUAL_GEOMETRY');
     }
     const limit = options.materialVariantLimit ?? 128;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 4096) throw new Error('INVALID_MATERIAL_VARIANT_LIMIT');
@@ -231,8 +241,10 @@ export class Renderer {
     this.diffuseGiOptions = options.diffuseGi && resolveDiffuseGiOptions(options.diffuseGi);
     this.volumetricFogOptions = options.volumetricFog && resolveVolumetricFogOptions(options.volumetricFog);
     this.reflectionsOptions = options.reflections && resolveReflectionsOptions(options.reflections);
+    this.occlusionOptions = options.occlusion && resolveOcclusionOptions(options.occlusion);
     this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0)
-      + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.reflections ? 2 : 0) + (options.volumetricFog ? (options.volumetricFog.temporal ? 8 : 6) : 0);
+      + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.reflections ? 2 : 0) + (options.occlusion ? 6 : 0)
+      + (options.volumetricFog ? (options.volumetricFog.temporal ? 8 : 6) : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -314,7 +326,8 @@ export class Renderer {
     })) });
     this.defaultClusterVertices = this.buffer('unused cluster identity', 16, GPUBufferUsage.STORAGE);
     if (new Set(scene.map(batch => batch.name)).size !== scene.length) throw new Error('DUPLICATE_BATCH_NAME');
-    if (this.hasGeometryLod) this.geometryLod = await GpuGeometryLod.create(this.device, bytes => { this.stats.ownedGpuBytes += bytes; });
+    if (this.occlusionOptions) this.occlusion = await GpuOcclusion.create(this.device, this.occlusionOptions, bytes => { this.stats.ownedGpuBytes += bytes; });
+    if (this.hasGeometryLod) this.geometryLod = await GpuGeometryLod.create(this.device, bytes => { this.stats.ownedGpuBytes += bytes; }, this.occlusion);
     if (this.worldQueryOptions) {
       this.worldQueries = await GpuWorldQuery.create(this.device, this.materialResources.layout,
         bytes => { this.stats.ownedGpuBytes += bytes; }, this.worldQueryOptions);
@@ -363,6 +376,10 @@ export class Renderer {
       { name: 'scene-hdr', kind: 'texture', source: 'transient' },
       { name: 'depth', kind: 'texture', source: 'transient' },
       { name: 'velocity', kind: 'texture', source: 'transient' },
+      ...(this.occlusion ? [
+        { name: 'occlusion-previous', kind: 'texture' as const, source: 'imported' as const },
+        { name: 'occlusion-current', kind: 'texture' as const, source: 'transient' as const },
+      ] : []),
       ...(this.volumetricFog ? [
         { name: 'fog-media', kind: 'buffer' as const, source: 'imported' as const },
         { name: 'fog-source', kind: 'buffer' as const, source: 'transient' as const },
@@ -380,6 +397,7 @@ export class Renderer {
       ], after: ['deformation'], execute: (encoder: GPUCommandEncoder) => this.worldQueries!.encodeRefit(encoder, this.timestamp(8)) }] : []),
       ...(this.geometryLod ? [{ name: 'geometry-lod', uses: [
         { resource: 'scene-input' as const, access: 'read' as const },
+        ...(this.occlusion ? [{ resource: 'occlusion-previous', access: 'read' as const }] : []),
         ...(this.hasGeometryStream ? [{ resource: 'stream-pages', access: 'read' as const }] : []),
         { resource: 'selected-geometry' as const, access: 'write' as const },
       ], execute: (encoder: GPUCommandEncoder) => this.encodeGeometrySelection(encoder) }] : []),
@@ -415,6 +433,20 @@ export class Renderer {
         ...(this.diffuseGiOptions?.finalGather ? [{ resource: 'final-gather-anchors', access: 'read' as const }] : []),
         ...(this.reflections ? [{ resource: 'reflection-anchors', access: 'read' as const }] : []),
         { resource: 'scene-hdr', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
+      ...(this.occlusion ? [
+        { name: 'occlusion-pyramid', uses: [{ resource: 'depth', access: 'read' as const }, { resource: 'occlusion-current', access: 'write' as const }],
+          execute: (encoder: GPUCommandEncoder) => this.occlusion!.encodePyramid(encoder, this.timestamp(this.occlusionTimestampIndex)) },
+        { name: 'occlusion-recover', uses: [{ resource: 'occlusion-current', access: 'read' as const }, { resource: 'scene-input', access: 'read' as const },
+          ...(this.hasGeometryStream ? [{ resource: 'stream-pages', access: 'read' as const }] : []),
+          { resource: 'selected-geometry', access: 'readWrite' as const }], execute: (encoder: GPUCommandEncoder) => this.encodeGeometryRecovery(encoder) },
+        { name: 'surface-recover', uses: [{ resource: 'shared-geometry', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const },
+          { resource: 'selected-geometry', access: 'read' as const },
+          ...(this.diffuseGi ? [{ resource: 'diffuse-gi-probes', access: 'read' as const }] : []),
+          ...(this.diffuseGiOptions?.finalGather ? [{ resource: 'final-gather-anchors', access: 'read' as const }] : []),
+          ...(this.reflections ? [{ resource: 'reflection-anchors', access: 'read' as const }] : []),
+          { resource: 'scene-hdr', access: 'attachmentLoad' as const }, { resource: 'depth', access: 'attachmentLoad' as const },
+          { resource: 'velocity', access: 'attachmentLoad' as const }], execute: (encoder: GPUCommandEncoder) => this.encodeSurface(encoder, true) },
+      ] : []),
       ...(this.volumetricFog ? [
         { name: 'fog-inject', uses: [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const }, { resource: 'fog-source', access: 'write' as const }],
           execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeInject(encoder, this.timestamp(this.timestampCount - (this.volumetricFog!.temporalConfigured ? 8 : 6))) },
@@ -542,6 +574,11 @@ export class Renderer {
     this.geometryLod.setSettings(settings);
     for (const batch of this.batches) batch.stream?.runtime.selection.setSettings(settings);
   }
+  setOcclusionEnabled(enabled: boolean): void {
+    if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    if (!this.occlusion) throw new Error('OCCLUSION_DISABLED');
+    this.occlusion.setEnabled(enabled);
+  }
 
   /** Explicit asynchronous diagnostic, never required to choose or draw geometry. */
   async probeGeometryLod(batchName: string): Promise<GeometryLodProbe> {
@@ -552,6 +589,7 @@ export class Renderer {
     if (stream) {
       const result = await stream.runtime.probe();
       return { frame: result.frame, indices: result.indices, triangles: result.indices / 3, overflow: result.overflow,
+        occlusion: result.occlusion,
         selectedClusters: (result.selectedClusters ?? []).filter(cluster => cluster.visible).map(({ clusterId, instanceIndex, level }) => ({ clusterId, instanceIndex, level })) };
     }
     return this.geometryLod.probe(batchName);
@@ -744,7 +782,7 @@ export class Renderer {
         entries: [output, instances, params, uvs, batch.geometryLod?.vertices ?? this.defaultClusterVertices].map((buffer, binding) => ({ binding, resource: { buffer } })) });
       if (scene.geometryStream) {
         const runtime = await GpuGeometryStream.create(this.device, scene, instances,
-          bytes => { this.stats.ownedGpuBytes += bytes; }, this.geometryDecoder);
+          bytes => { this.stats.ownedGpuBytes += bytes; }, this.geometryDecoder, this.occlusion);
         try {
           const vertexCount = runtime.selection.physicalVertexCount;
           if (Math.ceil(vertexCount * capacity / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('GEOMETRY_STREAM_DEFORMATION_BUDGET');
@@ -874,6 +912,7 @@ export class Renderer {
     const height = Math.max(1, Math.min(this.device.limits.maxTextureDimension2D, Math.round(this.canvas.clientHeight * ratio)));
     if (width === this.stats.width && height === this.stats.height) return;
     this.volumetricFog?.planResize(width, height);
+    this.occlusion?.planResize(width, height);
     if (this.depth) {
       this.stats.ownedGpuBytes -= this.stats.width * this.stats.height * 16;
       this.depth.destroy(); this.velocity!.destroy(); this.hdr!.destroy();
@@ -916,6 +955,8 @@ export class Renderer {
     for (const batch of this.batches) this.upload(batch);
     this.stats.uploadedBytes += this.worldQueries?.updateSnapshot(this.stats.frames + 1, this.materialRevision) ?? 0;
     const vp = multiply(perspective(Math.PI / 3.2, this.stats.width / this.stats.height, 0.1, 150), lookAt(eye, target, [0, 1, 0]));
+    this.stats.uploadedBytes += this.occlusion?.update(this.stats.frames + 1, this.stats.width, this.stats.height, vp, this.depth!,
+      !this.geometryLod!.settings.frozen) ?? 0;
     this.frameData.set(vp); this.frameData.set(this.lastViewProjection ?? vp, 16); this.frameData.set(this.lightMatrix, 32);
     this.frameData.set([...eye, 1], 48); this.frameData.set([...this.sunDirection, 0], 52); this.frameData.set([...this.sunColor, 1], 56);
     const debug = this.geometryLod?.settings.debug;
@@ -964,7 +1005,9 @@ export class Renderer {
     this.volumetricFog?.afterSubmit();
     if (readTiming) void this.readTiming(this.stats.frames + 1);
     this.stats.frames++;
-    this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2 + 1 + (this.volumetricFog ? 1 : 0);
+    this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2 + 1 + (this.volumetricFog ? 1 : 0)
+      + (this.occlusion ? this.batches.filter(batch => batch.scene.instances.length && batch.material.program.alphaMode === 'opaque'
+        && (batch.geometryLod || batch.stream)).length : 0);
     this.stats.triangles = this.batches.reduce((sum, batch) => sum + (batch.scene.geometryStream?.directory.sourceTriangleCount ?? batch.mesh.indices.length / 3) * batch.scene.instances.length, 0);
     this.stats.deformedVertices = this.batches.reduce((sum, batch) => sum + (batch.dirty ? batch.mesh.vertexCount * batch.scene.instances.length : 0)
       + (batch.stream && batch.material.program.alphaMode === 'opaque' ? batch.stream.runtime.selection.physicalVertexCount * batch.scene.instances.length : 0), 0);
@@ -981,6 +1024,7 @@ export class Renderer {
   private get reflectionTimestampIndex(): number {
     return 8 + (this.worldQueries ? 2 : 0) + (this.geometryLod ? 2 : 0) + (this.diffuseGi ? 2 : 0) + (this.diffuseGiOptions?.finalGather ? 2 : 0);
   }
+  private get occlusionTimestampIndex(): number { return this.reflectionTimestampIndex + (this.reflections ? 2 : 0); }
   private timestamp(index: number): GPUComputePassTimestampWrites | undefined {
     return this.querySet ? { querySet: this.querySet, beginningOfPassWriteIndex: index, endOfPassWriteIndex: index + 1 } : undefined;
   }
@@ -1015,14 +1059,24 @@ export class Renderer {
     pass.setBindGroup(0, this.shadowFrameBindGroup);
     this.draw(pass, 'shadow'); pass.end();
   }
-  private encodeSurface(encoder: GPUCommandEncoder): void {
-    const pass = encoder.beginRenderPass({ label: 'PBR and velocity', timestampWrites: this.timestamp(4), colorAttachments: [
-      { view: this.hdr!.createView(), clearValue: [0.0035, 0.0055, 0.0065, 1], loadOp: 'clear', storeOp: 'store' },
-      { view: this.velocity!.createView(), clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store' },
-    ], depthStencilAttachment: { view: this.depth!.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
+  private encodeGeometryRecovery(encoder: GPUCommandEncoder): void {
+    const timestamp = this.timestamp(this.occlusionTimestampIndex + 2);
+    const begin = encoder.beginComputePass({ label: 'geometry visibility recovery begin', timestampWrites: timestamp
+      ? { querySet: timestamp.querySet, beginningOfPassWriteIndex: timestamp.beginningOfPassWriteIndex } : undefined }); begin.end();
+    this.geometryLod!.encodeRecovery(encoder);
+    for (const batch of this.batches) batch.stream?.runtime.selection.encodeRecovery(encoder);
+    const end = encoder.beginComputePass({ label: 'geometry visibility recovery end', timestampWrites: timestamp
+      ? { querySet: timestamp.querySet, endOfPassWriteIndex: timestamp.endOfPassWriteIndex } : undefined }); end.end();
+  }
+  private encodeSurface(encoder: GPUCommandEncoder, recovery = false): void {
+    const pass = encoder.beginRenderPass({ label: recovery ? 'recovered PBR and velocity' : 'PBR and velocity',
+      timestampWrites: this.timestamp(recovery ? this.occlusionTimestampIndex + 4 : 4), colorAttachments: [
+      { view: this.hdr!.createView(), clearValue: [0.0035, 0.0055, 0.0065, 1], loadOp: recovery ? 'load' : 'clear', storeOp: 'store' },
+      { view: this.velocity!.createView(), clearValue: [0, 0, 0, 0], loadOp: recovery ? 'load' : 'clear', storeOp: 'store' },
+    ], depthStencilAttachment: { view: this.depth!.createView(), depthClearValue: 1, depthLoadOp: recovery ? 'load' : 'clear', depthStoreOp: 'store' } });
     pass.setBindGroup(0, this.frameBindGroup);
     if (this.lightingLayout) pass.setBindGroup(3, this.lightingGroups[this.diffuseGi?.surfaceBindingIndex ?? 0]);
-    this.draw(pass, 'surface'); pass.end();
+    this.draw(pass, 'surface', recovery); pass.end();
   }
   private encodeResolve(encoder: GPUCommandEncoder): void {
     const pass = encoder.beginRenderPass({ label: 'HDR exposure and display transfer', timestampWrites: this.timestamp(6), colorAttachments: [
@@ -1039,6 +1093,7 @@ export class Renderer {
       diffuseGi: this.diffuseGi?.diagnostics() ?? null,
       volumetricFog: this.volumetricFog?.diagnostics() ?? null,
       reflections: this.reflections?.diagnostics() ?? null,
+      occlusion: this.occlusion?.diagnostics() ?? null,
       sunShadow: { resolution: this.sunShadowOptions.resolution, bytes: this.sunShadowOptions.bytes,
         focusBounds: this.sunShadowOptions.focusBounds ?? null, width: this.sunShadowProjection.width,
         depth: this.sunShadowProjection.depth, texelWorldSize: this.sunShadowProjection.texelWorldSize,
@@ -1056,19 +1111,20 @@ export class Renderer {
       weights: floats(48, 4) as [number, number, number, number],
       ...(tangents?.[vertex * 4 + 3] ? { tangent: Array.from(tangents.subarray(vertex * 4, vertex * 4 + 4)) as [number, number, number, number] } : {}) };
   }
-  private draw(pass: GPURenderPassEncoder, kind: 'surface' | 'shadow'): void {
+  private draw(pass: GPURenderPassEncoder, kind: 'surface' | 'shadow', recovery = false): void {
     for (const batch of this.batches) {
       if (!batch.scene.instances.length) continue;
       if (kind === 'surface' && batch.stream && batch.material.program.alphaMode === 'opaque') {
         pass.setPipeline(batch.materialPipelines.surfaceStream!); pass.setBindGroup(2, batch.material.bindGroup);
         pass.setBindGroup(1, batch.stream.render); pass.setIndexBuffer(batch.stream.runtime.selection.indices, 'uint32');
-        pass.drawIndexedIndirect(batch.stream.runtime.selection.arguments, 0); continue;
+        pass.drawIndexedIndirect(batch.stream.runtime.selection.arguments, recovery ? 32 : 0); continue;
       }
       const lod = kind === 'surface' && batch.material.program.alphaMode === 'opaque' ? batch.geometryLod : undefined;
+      if (recovery && !lod) continue;
       pass.setPipeline(lod ? batch.materialPipelines.surfaceLod! : batch.materialPipelines[kind]); pass.setBindGroup(2, batch.material.bindGroup);
       if (lod) {
         pass.setBindGroup(1, batch.render); pass.setIndexBuffer(lod.indices, 'uint32');
-        pass.drawIndexedIndirect(lod.arguments, 0);
+        pass.drawIndexedIndirect(lod.arguments, recovery ? 32 : 0);
         continue;
       }
       pass.setBindGroup(1, batch.render); pass.setIndexBuffer(batch.indices, 'uint32');
@@ -1080,13 +1136,16 @@ export class Renderer {
       await this.queryRead!.mapAsync(GPUMapMode.READ);
       const values = new BigUint64Array(this.queryRead!.getMappedRange());
       this.stats.gpuMs = { deformation: Number(values[1] - values[0]) / 1e6,
-        shadow: Number(values[3] - values[2]) / 1e6, surface: Number(values[5] - values[4]) / 1e6,
+        shadow: Number(values[3] - values[2]) / 1e6, surface: Number(values[5] - values[4]) / 1e6
+          + (this.occlusion ? Number(values[this.occlusionTimestampIndex + 5] - values[this.occlusionTimestampIndex + 4]) / 1e6 : 0),
         resolve: Number(values[7] - values[6]) / 1e6,
         worldQueryRefit: this.worldQueries ? Number(values[9] - values[8]) / 1e6 : 0,
         geometryLod: this.geometryLod ? Number(values[this.worldQueries ? 11 : 9] - values[this.worldQueries ? 10 : 8]) / 1e6 : 0,
         diffuseGi: this.diffuseGi ? Number(values[this.geometryLod ? 13 : 11] - values[this.geometryLod ? 12 : 10]) / 1e6 : 0,
         finalGather: this.diffuseGiOptions?.finalGather ? Number(values[this.geometryLod ? 15 : 13] - values[this.geometryLod ? 14 : 12]) / 1e6 : 0,
         reflections: this.reflections ? Number(values[this.reflectionTimestampIndex + 1] - values[this.reflectionTimestampIndex]) / 1e6 : 0,
+        occlusion: this.occlusion ? Number(values[this.occlusionTimestampIndex + 1] - values[this.occlusionTimestampIndex]
+          + values[this.occlusionTimestampIndex + 3] - values[this.occlusionTimestampIndex + 2]) / 1e6 : 0,
         volumetricFog: this.volumetricFog ? (this.volumetricFog.temporalConfigured ? [8, 6, 4, 2] : [6, 4, 2]).reduce((sum, offset) => sum
           + Number(values[this.timestampCount - offset + 1] - values[this.timestampCount - offset]) / 1e6, 0) : 0 };
       this.stats.gpuSampleFrame = frame;
@@ -1268,6 +1327,7 @@ export class Renderer {
     this.diffuseGi?.dispose();
     this.worldQueries?.dispose();
     this.geometryLod?.dispose();
+    this.occlusion?.dispose();
     for (const batch of this.batches) if (batch.stream) void batch.stream.runtime.dispose().catch(error => this.errors.push(String(error)));
     this.geometryDecoder?.dispose();
     this.materialResources.dispose(); this.materialPipelines.clear();

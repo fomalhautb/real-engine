@@ -7,20 +7,21 @@ struct Parameters {
 }
 struct Arguments {
     indexCount:atomic<u32>, instanceCount:u32, firstIndex:u32, baseVertex:i32, firstInstance:u32,
-    selectedCount:atomic<u32>, overflow:atomic<u32>, padding:u32,
+    selectedCount:atomic<u32>, overflow:atomic<u32>, padding:atomic<u32>,
 }
+struct DrawArguments { first:Arguments, recovery:Arguments }
 @group(0) @binding(0) var<uniform> view:View;
 @group(0) @binding(1) var<uniform> params:Parameters;
 @group(0) @binding(2) var<storage,read> metadata:array<u32>;
 @group(0) @binding(3) var<storage,read> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read> residency:array<u32>;
-// 0 = outside cut, 1 = complete cut but culled, 2 = actually drawn.
+// 0 = outside cut, 1 = complete cut but culled, 2 = drawn, 3 = occlusion pending.
 @group(0) @binding(5) var<storage,read_write> selected:array<atomic<u32>>;
 @group(0) @binding(6) var<storage,read_write> requests:array<atomic<u32>>;
 @group(0) @binding(7) var<storage,read> locations:array<vec4u>;
 @group(0) @binding(8) var<storage,read> pageIndices:array<u32>;
 @group(0) @binding(9) var<storage,read_write> outputIndices:array<u32>;
-@group(0) @binding(10) var<storage,read_write> args:Arguments;
+@group(0) @binding(10) var<storage,read_write> args:DrawArguments;
 
 fn vector(at:u32)->vec3f { return bitcast<vec3f>(vec3u(metadata[at],metadata[at+1u],metadata[at+2u])); }
 struct WorldBounds { center:vec3f, extent:vec3f }
@@ -103,24 +104,59 @@ fn refine(@builtin(global_invocation_id) invocation:vec3u) {
 fn compact(@builtin(global_invocation_id) invocation:vec3u) {
     let index=invocation.x;
     if(index>=params.clusterCount*params.instanceCount){return;}
-    if(index==0u){args.instanceCount=1u;}
+    if(index==0u){args.first.instanceCount=1u;}
     if(atomicLoad(&selected[index])==0u){return;}
     let cluster=index%params.clusterCount; let instanceIndex=index/params.clusterCount;
     let at=params.clusterOffset+cluster*16u;
-    if(!visible(at,instances[instanceIndex].model)){return;}
+    let model=instances[instanceIndex].model;
+    if(!visible(at,model)){return;}
+    let bounds=worldBounds(vector(at),vector(at+4u),model);
+    if(geometryOccluded(bounds.center,bounds.extent)){
+        atomicStore(&selected[index],3u); atomicAdd(&args.first.padding,1u); return;
+    }
     let page=metadata[at+7u];
     // Even on a broken caller contract, do not draw a partially reused slot.
     let location0=locations[cluster*2u]; let location1=locations[cluster*2u+1u];
-    if(residency[page]==0u || location1.y!=page){atomicStore(&args.overflow,1u);return;}
-    let count=location1.x; let offset=atomicAdd(&args.indexCount,count);
+    if(residency[page]==0u || location1.y!=page){atomicStore(&args.first.overflow,1u);return;}
+    let count=location1.x; let offset=atomicAdd(&args.first.indexCount,count);
     if(offset>params.outputCapacity || count>params.outputCapacity-min(offset,params.outputCapacity)){
-        atomicStore(&args.overflow,1u);return;
+        atomicStore(&args.first.overflow,1u);return;
     }
     let vertexBase=instanceIndex*params.physicalVertexCount+location0.x;
     for(var i=0u;i<count;i++){outputIndices[offset+i]=pageIndices[location0.w+i]+vertexBase;}
-    atomicStore(&selected[index],2u); atomicAdd(&args.selectedCount,1u);
+    atomicStore(&selected[index],2u); atomicAdd(&args.first.selectedCount,1u);
 }
 @compute @workgroup_size(1)
 fn finalize(){
-    if(atomicLoad(&args.overflow)!=0u){atomicStore(&args.indexCount,0u);args.instanceCount=0u;}
+    if(atomicLoad(&args.first.overflow)!=0u){atomicStore(&args.first.indexCount,0u);args.first.instanceCount=0u;}
+    args.recovery.firstIndex=atomicLoad(&args.first.indexCount);
+    args.recovery.instanceCount=1u;
+}
+@compute @workgroup_size(64)
+fn recover(@builtin(global_invocation_id) invocation:vec3u) {
+    let index=invocation.x;
+    if(index>=params.clusterCount*params.instanceCount || atomicLoad(&args.first.overflow)!=0u){return;}
+    if(atomicLoad(&selected[index])!=3u){return;}
+    let cluster=index%params.clusterCount; let instanceIndex=index/params.clusterCount;
+    let at=params.clusterOffset+cluster*16u;
+    let bounds=worldBounds(vector(at),vector(at+4u),instances[instanceIndex].model);
+    if(geometryOccluded(bounds.center,bounds.extent)){
+        atomicStore(&selected[index],1u); atomicAdd(&args.recovery.padding,1u); return;
+    }
+    let page=metadata[at+7u];
+    let location0=locations[cluster*2u]; let location1=locations[cluster*2u+1u];
+    if(residency[page]==0u || location1.y!=page){atomicStore(&args.recovery.overflow,1u);return;}
+    let count=location1.x; let offset=atomicAdd(&args.recovery.indexCount,count);
+    let base=args.recovery.firstIndex;
+    if(base>params.outputCapacity || offset>params.outputCapacity-base
+        || count>params.outputCapacity-base-offset){atomicStore(&args.recovery.overflow,1u);return;}
+    let vertexBase=instanceIndex*params.physicalVertexCount+location0.x;
+    for(var i=0u;i<count;i++){outputIndices[base+offset+i]=pageIndices[location0.w+i]+vertexBase;}
+    atomicStore(&selected[index],2u); atomicAdd(&args.recovery.selectedCount,1u);
+}
+@compute @workgroup_size(1)
+fn finalizeRecovery(){
+    if(atomicLoad(&args.recovery.overflow)!=0u || atomicLoad(&args.first.overflow)!=0u){
+        atomicStore(&args.recovery.indexCount,0u); args.recovery.instanceCount=0u;
+    }
 }

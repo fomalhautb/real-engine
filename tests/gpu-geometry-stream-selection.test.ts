@@ -6,6 +6,8 @@ import type { GeometryStreamDirectory } from '../src/geometry-stream-types';
 import type { GpuGeometryPagePool } from '../src/gpu-geometry-page-pool';
 import { GpuGeometryStreamSelection } from '../src/gpu-geometry-stream-selection';
 import { identity } from '../src/math';
+import type { GpuOcclusion } from '../src/gpu-occlusion';
+import { packGeometryStreamSelection } from '../src/geometry-stream-selection-data';
 
 type FakeBuffer = { label: string; size: number; bytes: ArrayBuffer; destroyed: boolean;
   getMappedRange: () => ArrayBuffer; unmap: () => void; mapAsync: () => Promise<void>; destroy: () => void };
@@ -27,6 +29,7 @@ class FakeDevice {
   failBufferAt = -1;
   failPipelineAt = -1;
   pipelines = 0;
+  readonly boundGroups: { index: number; group: unknown }[] = [];
 
   constructor() { this.lost = new Promise(resolve => { this.lose = resolve; }); }
   loseDevice() { this.lose({ message: 'fake loss' }); }
@@ -45,8 +48,12 @@ class FakeDevice {
     return {};
   };
   createCommandEncoder = () => ({
-    clearBuffer() {}, copyBufferToBuffer() {}, finish: () => ({}),
-    beginComputePass: () => ({ setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {}, end() {} }),
+    clearBuffer() {}, copyBufferToBuffer(source: FakeBuffer, sourceOffset: number, target: FakeBuffer, targetOffset: number, size: number) {
+      new Uint8Array(target.bytes, targetOffset, size).set(new Uint8Array(source.bytes, sourceOffset, size));
+    }, finish: () => ({}),
+    beginComputePass: () => ({ setPipeline() {}, setBindGroup: (index: number, group: unknown) => {
+      this.boundGroups.push({ index, group });
+    }, dispatchWorkgroups() {}, end() {} }),
   });
   queue = { writeBuffer() {}, submit() {} };
 }
@@ -62,9 +69,10 @@ function fakePool(): GpuGeometryPagePool {
   } as unknown as GpuGeometryPagePool;
 }
 
-async function selection(device: FakeDevice, track: (bytes: number) => void = () => {}, maxGpuBytes?: number) {
+async function selection(device: FakeDevice, track: (bytes: number) => void = () => {}, maxGpuBytes?: number,
+  occlusion?: GpuOcclusion) {
   const result = await GpuGeometryStreamSelection.create(device as unknown as GPUDevice, fakePool(),
-    buffer('instances', 224) as unknown as GPUBuffer, 1, track, { maxGpuBytes });
+    buffer('instances', 224) as unknown as GPUBuffer, 1, track, { maxGpuBytes }, occlusion);
   selections.push(result);
   return result;
 }
@@ -146,12 +154,58 @@ describe('GPU streamed selection ownership and failure lifecycle', () => {
     const device = new FakeDevice();
     const current = await selection(device);
     const { gpuBytes, maxFeedbackBytes } = current.diagnostics();
-    expect(maxFeedbackBytes).toBe(32 + (directory.pages.length + directory.groups.length + directory.clusters.length) * 4);
+    expect(maxFeedbackBytes).toBe(64 + (directory.pages.length + directory.groups.length + directory.clusters.length) * 4);
     const allocations = device.buffers.length;
     await expect(selection(device, () => {}, gpuBytes + maxFeedbackBytes - 1))
       .rejects.toThrow('GEOMETRY_STREAM_RESOURCE_BUDGET');
     expect(device.buffers).toHaveLength(allocations);
     const exact = await selection(device, () => {}, gpuBytes + maxFeedbackBytes);
     expect(exact.diagnostics().maxGpuBytes).toBe(gpuBytes + maxFeedbackBytes);
+  });
+
+  it('keeps the legacy one-pass path and exposes zero occlusion counters', async () => {
+    const device = new FakeDevice();
+    const current = await selection(device);
+    current.update(1, 1, identity(), [0, 0, 4], 400);
+    current.encode(device.createCommandEncoder() as unknown as GPUCommandEncoder);
+    current.encodeRecovery(device.createCommandEncoder() as unknown as GPUCommandEncoder);
+    expect(device.pipelines).toBe(5);
+    expect(device.boundGroups.every(binding => binding.index === 0)).toBe(true);
+    expect(await current.feedback()).toMatchObject({ indices: 0, overflow: false,
+      occlusion: { deferredClusters: 0, culledClusters: 0, recoveredClusters: 0 } });
+  });
+
+  it('requires recovery before feedback and combines both draw records with bounded offsets', async () => {
+    const device = new FakeDevice();
+    const previousGroup = { name: 'previous' }, currentGroup = { name: 'current' };
+    const occlusion = { testLayout: {}, previousGroup, currentGroup } as unknown as GpuOcclusion;
+    const current = await selection(device, () => {}, undefined, occlusion);
+    current.update(1, 1, identity(), [0, 0, 4], 400);
+    current.encode(device.createCommandEncoder() as unknown as GPUCommandEncoder);
+    expect(device.pipelines).toBe(7);
+    expect(device.boundGroups.some(binding => binding.index === 1 && binding.group === previousGroup)).toBe(true);
+    await expect(current.feedback()).rejects.toThrow('GEOMETRY_STREAM_RECOVERY_PENDING');
+    current.encodeRecovery(device.createCommandEncoder() as unknown as GPUCommandEncoder);
+    expect(device.boundGroups.some(binding => binding.index === 1 && binding.group === currentGroup)).toBe(true);
+    expect(() => current.encodeRecovery(device.createCommandEncoder() as unknown as GPUCommandEncoder))
+      .toThrow('GEOMETRY_STREAM_RECOVERY_FRAME');
+
+    const args = new Uint32Array(device.buffers.find(entry => entry.label === 'stream indirect draw arguments')!.bytes);
+    args[0] = 6; args[7] = 2; args[8] = 3; args[13] = 1; args[15] = 1;
+    const requests = new Uint32Array(device.buffers.find(entry => entry.label === 'stream page requests and group demand')!.bytes);
+    requests[0] = 6;
+    new Float32Array(requests.buffer)[directory.pages.length] = 4.5;
+    const selected = new Uint32Array(device.buffers.find(entry => entry.label === 'stream cut and visible flags')!.bytes);
+    selected[0] = 2; selected[1] = 1;
+    const feedback = await current.feedback(true);
+    expect(feedback).toMatchObject({ frame: 1, indices: 9, overflow: false,
+      requestedPages: [{ pageId: 0, priority: 5 }],
+      desiredGroups: [{ groupId: packGeometryStreamSelection(directory).groupIds[0], projectedError: 4.5 }],
+      occlusion: { deferredClusters: 2, culledClusters: 1, recoveredClusters: 1 } });
+    expect(feedback.selectedClusters?.slice(0, 2)).toMatchObject([
+      { clusterId: 0, visible: true }, { clusterId: 1, visible: false },
+    ]);
+    args[14] = 1;
+    expect(await current.feedback()).toMatchObject({ overflow: true });
   });
 });

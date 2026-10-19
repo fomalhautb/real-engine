@@ -4,6 +4,7 @@ import type { GpuGeometryPagePool } from './gpu-geometry-page-pool';
 import type { GeometryLodSettings } from './gpu-geometry-lod';
 import type { Mat4 } from './math';
 import type { GeometryGroupDemand } from './geometry-stream-working-set';
+import { occlusionTestSource, type GpuOcclusion } from './gpu-occlusion';
 
 /** Includes persistent buffers and the maximum one-at-a-time feedback buffer. */
 export interface GeometryStreamSelectionOptions { maxGpuBytes?: number }
@@ -14,6 +15,8 @@ export interface GeometryStreamSelectionFeedback {
   desiredGroups: GeometryGroupDemand[];
   indices: number;
   overflow: boolean;
+  /** Previous-frame candidates, current-frame rejects, and recovered draws. */
+  occlusion: { deferredClusters: number; culledClusters: number; recoveredClusters: number };
   /** Present only for explicit diagnostics, never required for page scheduling. */
   selectedClusters?: { clusterId: number; instanceIndex: number; level: number; visible: boolean }[];
 }
@@ -39,11 +42,13 @@ export class GpuGeometryStreamSelection {
   private readonly parameterData: Uint32Array<ArrayBuffer>;
   private readonly parameterStride: number;
   private readonly viewData = new Float32Array(24);
-  private pipelines!: Record<'demand' | 'initialize' | 'refine' | 'compact' | 'finalize', GPUComputePipeline>;
+  private pipelines!: Record<'demand' | 'initialize' | 'refine' | 'compact' | 'finalize', GPUComputePipeline>
+    & Partial<Record<'recover' | 'finalizeRecovery', GPUComputePipeline>>;
   private hasView = false;
   private count = 0;
   private frame = 0;
   private encodedFrame = 0;
+  private recoveredFrame = 0;
   private bytes = 0;
   private disposed = false;
   private reading?: GPUBuffer;
@@ -52,19 +57,25 @@ export class GpuGeometryStreamSelection {
   private readonly maxGpuBytes: number;
 
   static async create(device: GPUDevice, pool: GpuGeometryPagePool, instances: GPUBuffer, capacity: number,
-    track: (bytes: number) => void = () => {}, options: GeometryStreamSelectionOptions = {}) {
+    track: (bytes: number) => void = () => {}, options: GeometryStreamSelectionOptions = {}, occlusion?: GpuOcclusion) {
     let result: GpuGeometryStreamSelection | undefined;
     device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
     try {
-      result = new GpuGeometryStreamSelection(device, pool, instances, capacity, track, options);
-      const module = device.createShaderModule({ label: 'resident-page GPU selection', code: source });
+      result = new GpuGeometryStreamSelection(device, pool, instances, capacity, track, options, occlusion);
+      const stub = 'fn geometryOccluded(center:vec3f,extent:vec3f)->bool { return false; }';
+      const module = device.createShaderModule({ label: 'resident-page GPU selection',
+        code: (occlusion ? occlusionTestSource : stub) + '\n' + source });
       const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
       if (errors.length) throw new Error(errors.map(e => `GEOMETRY_STREAM_SHADER:${e.lineNum}: ${e.message}`).join('\n'));
       const pipelines = {} as GpuGeometryStreamSelection['pipelines'];
-      for (const entryPoint of ['demand', 'initialize', 'refine', 'compact', 'finalize'] as const) {
+      const entries = ['demand', 'initialize', 'refine', 'compact', 'finalize',
+        ...(occlusion ? ['recover', 'finalizeRecovery'] as const : [])] as const;
+      for (const entryPoint of entries) {
         const layout = ['demand', 'initialize', 'refine'].includes(entryPoint) ? result.selectLayout : result.compactLayout;
+        const occlusionPass = !!occlusion && (entryPoint === 'compact' || entryPoint === 'recover');
         pipelines[entryPoint] = await device.createComputePipelineAsync({ label: 'stream geometry ' + entryPoint,
-          layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module, entryPoint } });
+          layout: device.createPipelineLayout({ bindGroupLayouts: occlusionPass ? [layout, occlusion.testLayout] : [layout] }),
+          compute: { module, entryPoint } });
       }
       result.pipelines = pipelines;
     } catch (error) {
@@ -79,7 +90,8 @@ export class GpuGeometryStreamSelection {
   }
 
   private constructor(private readonly device: GPUDevice, readonly pool: GpuGeometryPagePool, instances: GPUBuffer,
-    readonly capacity: number, private readonly track: (bytes: number) => void, options: GeometryStreamSelectionOptions) {
+    readonly capacity: number, private readonly track: (bytes: number) => void,
+    options: GeometryStreamSelectionOptions, private readonly occlusion?: GpuOcclusion) {
     if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 256) throw new Error('GEOMETRY_STREAM_INSTANCE_BUDGET');
     this.packed = packGeometryStreamSelection(pool.directory);
     const directory = this.packed.directory, pairs = directory.clusters.length * capacity;
@@ -97,9 +109,9 @@ export class GpuGeometryStreamSelection {
         this.packed.edgeOffset, directory.pages.length, level?.level ?? 0, 0], slot * this.parameterStride / 4);
     }
     const sizes = [96, this.parameterData.byteLength, this.packed.words.byteLength, pairs * 4,
-      (directory.pages.length + directory.groups.length) * 4, maxIndices * 4, 32];
+      (directory.pages.length + directory.groups.length) * 4, maxIndices * 4, 64];
     const budget = options.maxGpuBytes ?? 128 * 1024 * 1024;
-    this.feedbackBudget = 32 + sizes[4] + pairs * 4;
+    this.feedbackBudget = 64 + sizes[4] + pairs * 4;
     this.maxGpuBytes = budget;
     if (!Number.isSafeInteger(budget) || budget < 1 || budget > 256 * 1024 * 1024
       || sizes.some(size => size > device.limits.maxBufferSize || size > device.limits.maxStorageBufferBindingSize)
@@ -164,50 +176,75 @@ export class GpuGeometryStreamSelection {
     encoder.clearBuffer(this.arguments); encoder.clearBuffer(this.requests);
     const dispatch = (entry: keyof GpuGeometryStreamSelection['pipelines'], work: number, offset = 0) => {
       if (!work) return;
-      const pass = encoder.beginComputePass({ label: 'stream geometry ' + entry }); pass.setPipeline(this.pipelines[entry]);
+      const pass = encoder.beginComputePass({ label: 'stream geometry ' + entry }); pass.setPipeline(this.pipelines[entry]!);
       pass.setBindGroup(0, ['demand', 'initialize', 'refine'].includes(entry) ? this.selectGroup : this.compactGroup, [offset]);
+      if (entry === 'compact' && this.occlusion) pass.setBindGroup(1, this.occlusion.previousGroup);
       pass.dispatchWorkgroups(entry === 'finalize' ? 1 : Math.ceil(work / 64)); pass.end();
     };
     dispatch('demand', this.packed.directory.groups.length * this.count);
     dispatch('initialize', this.packed.directory.clusters.length * this.count);
     this.packed.levels.forEach((level, index) => dispatch('refine', level.groupCount * this.count, (index + 1) * this.parameterStride));
     dispatch('compact', this.packed.directory.clusters.length * this.count); dispatch('finalize', this.count);
-    this.encodedFrame = this.frame;
+    this.encodedFrame = this.frame; this.recoveredFrame = this.occlusion ? 0 : this.frame;
+  }
+  /** Recheck deferred candidates against the current frame's completed Hi-Z. */
+  encodeRecovery(encoder: GPUCommandEncoder): void {
+    this.live();
+    if (!this.occlusion) return;
+    if (!this.frame || this.encodedFrame !== this.frame || this.recoveredFrame === this.frame)
+      throw new Error('GEOMETRY_STREAM_RECOVERY_FRAME');
+    const work = this.packed.directory.clusters.length * this.count;
+    if (work) {
+      const pass = encoder.beginComputePass({ label: 'stream geometry recover' });
+      pass.setPipeline(this.pipelines.recover!); pass.setBindGroup(0, this.compactGroup, [0]);
+      pass.setBindGroup(1, this.occlusion.currentGroup);
+      pass.dispatchWorkgroups(Math.ceil(work / 64)); pass.end();
+      const finalize = encoder.beginComputePass({ label: 'stream geometry finalizeRecovery' });
+      finalize.setPipeline(this.pipelines.finalizeRecovery!); finalize.setBindGroup(0, this.compactGroup, [0]);
+      finalize.dispatchWorkgroups(1); finalize.end();
+    }
+    this.recoveredFrame = this.frame;
   }
   /** Bounded async page IDs/counters. Include cut flags only for explicit diagnostics. */
   async feedback(includeSelected = false): Promise<GeometryStreamSelectionFeedback> {
     this.live(); if (!this.encodedFrame) throw new Error('GEOMETRY_STREAM_NO_FRAME');
+    if (this.occlusion && this.recoveredFrame !== this.encodedFrame) throw new Error('GEOMETRY_STREAM_RECOVERY_PENDING');
     if (this.reading) throw new Error('GEOMETRY_STREAM_FEEDBACK_BUSY');
     const frame = this.encodedFrame, directory = this.packed.directory, pairs = directory.clusters.length * this.count;
     const requestBytes = (directory.pages.length + directory.groups.length) * 4;
-    const bytes = 32 + requestBytes + (includeSelected ? pairs * 4 : 0);
+    const bytes = 64 + requestBytes + (includeSelected ? pairs * 4 : 0);
     const read = this.device.createBuffer({ label: 'bounded stream requests and counters', size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     this.reading = read;
     try {
       this.track(bytes);
-      const encoder = this.device.createCommandEncoder(); encoder.copyBufferToBuffer(this.arguments, 0, read, 0, 32);
-      encoder.copyBufferToBuffer(this.requests, 0, read, 32, requestBytes);
-      if (includeSelected && pairs) encoder.copyBufferToBuffer(this.selected, 0, read, 32 + requestBytes, pairs * 4);
+      const encoder = this.device.createCommandEncoder(); encoder.copyBufferToBuffer(this.arguments, 0, read, 0, 64);
+      encoder.copyBufferToBuffer(this.requests, 0, read, 64, requestBytes);
+      if (includeSelected && pairs) encoder.copyBufferToBuffer(this.selected, 0, read, 64 + requestBytes, pairs * 4);
       this.device.queue.submit([encoder.finish()]); await read.mapAsync(GPUMapMode.READ);
       const values = new Uint32Array(read.getMappedRange()), requestedPages: GeometryStreamSelectionFeedback['requestedPages'] = [];
-      for (let id = 0; id < directory.pages.length; id++) if (values[8 + id]) requestedPages.push({ pageId: id, priority: values[8 + id] - 1 });
+      for (let id = 0; id < directory.pages.length; id++) if (values[16 + id]) requestedPages.push({ pageId: id, priority: values[16 + id] - 1 });
       requestedPages.sort((a, b) => b.priority - a.priority || a.pageId - b.pageId);
       const floats = new Float32Array(values.buffer), desiredGroups: GeometryGroupDemand[] = [];
       for (let ordinal = 0; ordinal < directory.groups.length; ordinal++) {
-        const projectedError = floats[8 + directory.pages.length + ordinal];
+        const projectedError = floats[16 + directory.pages.length + ordinal];
         if (projectedError > 0) desiredGroups.push({ groupId: this.packed.groupIds[ordinal], projectedError });
       }
       const selectedClusters = includeSelected ? [] as NonNullable<GeometryStreamSelectionFeedback['selectedClusters']> : undefined;
       if (selectedClusters) for (let i = 0; i < pairs; i++) {
-        const flag = values[8 + requestBytes / 4 + i], clusterId = i % directory.clusters.length;
+        const flag = values[16 + requestBytes / 4 + i], clusterId = i % directory.clusters.length;
         if (flag) selectedClusters.push({ clusterId, instanceIndex: Math.floor(i / directory.clusters.length), level: directory.clusters[clusterId].level, visible: flag === 2 });
       }
-      return { frame, requestedPages, desiredGroups, indices: values[0], overflow: values[6] !== 0, selectedClusters };
+      return { frame, requestedPages, desiredGroups, indices: values[0] + values[8],
+        overflow: values[6] !== 0 || values[14] !== 0,
+        occlusion: { deferredClusters: values[7], culledClusters: values[15], recoveredClusters: values[13] },
+        selectedClusters };
     } finally { read.destroy(); if (this.reading === read) { this.reading = undefined; this.track(-bytes); } }
   }
   diagnostics() { return { frame: this.encodedFrame, instances: this.count, gpuBytes: this.bytes + (this.reading?.size ?? 0), disposed: this.disposed,
     error: this.error, maxGpuBytes: this.maxGpuBytes, maxFeedbackBytes: this.feedbackBudget,
-    physicalVertexCount: this.physicalVertexCount, levels: this.packed.levels.length, feedbackPending: !!this.reading, settings: { ...this.settings } }; }
+    physicalVertexCount: this.physicalVertexCount, levels: this.packed.levels.length, feedbackPending: !!this.reading,
+    occlusion: { enabled: !!this.occlusion, stages: this.occlusion ? 2 : 1,
+      recoveredFrame: this.recoveredFrame }, settings: { ...this.settings } }; }
   dispose() {
     if (this.disposed) return; this.disposed = true;
     for (const buffer of this.buffers) buffer.destroy(); this.buffers.length = 0;

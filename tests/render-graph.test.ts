@@ -90,6 +90,36 @@ describe('render graph', () => {
     ])).toThrow(/before its first write/);
   });
 
+  it('treats attachment load/store as a texture read followed by a write', () => {
+    const graph = compileRenderGraph([texture('color')], [
+      pass('clear', [{ resource: 'color', access: 'write' }]),
+      pass('overlay', [{ resource: 'color', access: 'attachmentLoad' }]),
+      pass('sample', [{ resource: 'color', access: 'read' }]),
+    ]);
+    expect(graph.order).toEqual(['clear', 'overlay', 'sample']);
+    expect(graph.lifetimes.get('color')).toEqual({ first: 0, last: 2 });
+    expect(() => compileRenderGraph([texture('color')], [
+      pass('clear', [{ resource: 'color', access: 'write' }]),
+      pass('sample', [{ resource: 'color', access: 'read' }], ['overlay']),
+      pass('overlay', [{ resource: 'color', access: 'attachmentLoad' }]),
+    ])).toThrow(/cycle/); // Loading must wait for prior sampling to finish.
+  });
+
+  it('rejects attachment load on buffers, uninitialized textures, and same-pass sampling', () => {
+    expect(() => compileRenderGraph([buffer('data', 'imported')], [
+      pass('overlay', [{ resource: 'data', access: 'attachmentLoad' }]),
+    ])).toThrow(/cannot attachmentLoad buffer/);
+    expect(() => compileRenderGraph([texture('color')], [
+      pass('overlay', [{ resource: 'color', access: 'attachmentLoad' }]),
+    ])).toThrow(/before its first write/);
+    expect(() => compileRenderGraph([texture('color')], [
+      pass('clear', [{ resource: 'color', access: 'write' }]),
+      pass('invalid', [
+        { resource: 'color', access: 'read' }, { resource: 'color', access: 'attachmentLoad' },
+      ]),
+    ])).toThrow(/more than once/);
+  });
+
   it('rejects missing names, self dependencies, and cycles', () => {
     expect(() => compileRenderGraph([], [pass('a', [], ['missing'])])).toThrow(/missing pass/);
     expect(() => compileRenderGraph([], [pass('a', [], ['a'])])).toThrow(/depends on itself/);

@@ -22,8 +22,9 @@ struct Parameters {
 }
 struct Arguments {
     indexCount: atomic<u32>, instanceCount: u32, firstIndex: u32, baseVertex: i32, firstInstance: u32,
-    selectedCount: atomic<u32>, overflow: atomic<u32>, padding: u32,
+    selectedCount: atomic<u32>, overflow: atomic<u32>, padding: atomic<u32>,
 }
+struct DrawArguments { first:Arguments, recovery:Arguments }
 @group(0) @binding(0) var<uniform> view: View;
 @group(0) @binding(1) var<storage, read> clusters: array<Cluster>;
 @group(0) @binding(2) var<storage, read> groups: array<Group>;
@@ -31,7 +32,7 @@ struct Arguments {
 @group(0) @binding(4) var<storage, read> instances: array<Instance>;
 @group(0) @binding(5) var<uniform> params: Parameters;
 @group(0) @binding(6) var<storage, read_write> outputIndices: array<u32>;
-@group(0) @binding(7) var<storage, read_write> args: Arguments;
+@group(0) @binding(7) var<storage, read_write> args: DrawArguments;
 @group(0) @binding(8) var<storage, read_write> selected: array<u32>;
 
 struct WorldBounds { center: vec3f, extent: vec3f }
@@ -73,37 +74,65 @@ fn visible(cluster: Cluster, model: mat4x4f) -> bool {
         || center.z + radius.z < 0.0
         || center.w - center.z + radius.w + radius.z < 0.0);
 }
-@compute @workgroup_size(64)
-fn selectClusters(@builtin(global_invocation_id) invocation: vec3u) {
-    let index = invocation.x;
-    if (index >= params.clusterCount * params.instanceCount) { return; }
-    if (index == 0u) { args.instanceCount = 1u; }
-    selected[index] = 0u;
-    let instanceIndex = index / params.clusterCount;
-    let cluster = clusters[index % params.clusterCount];
-    let model = instances[instanceIndex].model;
-    let scale = scaleBound(model);
-    if (coarsen(cluster.data.z, model, scale)) { return; }
-    if (cluster.data.w != 0xffffffffu && !coarsen(cluster.data.w, model, scale)) { return; }
-    if (!visible(cluster, model)) { return; }
+fn appendCluster(index:u32,instanceIndex:u32,cluster:Cluster,recovery:bool){
     let count = cluster.data.y;
-    let offset = atomicAdd(&args.indexCount, count);
+    var offset=0u;
+    if(recovery){offset=atomicLoad(&args.first.indexCount)+atomicAdd(&args.recovery.indexCount,count);}
+    else{offset=atomicAdd(&args.first.indexCount,count);}
     if (offset > params.outputCapacity || count > params.outputCapacity - min(offset, params.outputCapacity)) {
-        atomicStore(&args.overflow, 1u);
+        if(recovery){atomicStore(&args.recovery.overflow,1u);}else{atomicStore(&args.first.overflow,1u);}
         return;
     }
     selected[index] = 1u;
-    atomicAdd(&args.selectedCount, 1u);
+    if(recovery){atomicAdd(&args.recovery.selectedCount,1u);}else{atomicAdd(&args.first.selectedCount,1u);}
     let instanceBase = instanceIndex * params.clusterVertexCount;
     for (var i = 0u; i < count; i++) {
         outputIndices[offset + i] = sourceIndices[cluster.data.x + i] + instanceBase;
     }
 }
+@compute @workgroup_size(64)
+fn selectClusters(@builtin(global_invocation_id) invocation: vec3u) {
+    let index=invocation.x;
+    if(index>=params.clusterCount*params.instanceCount){return;}
+    if(index==0u){args.first.instanceCount=1u;}
+    selected[index]=0u;
+    let instanceIndex=index/params.clusterCount;
+    let cluster=clusters[index%params.clusterCount]; let model=instances[instanceIndex].model;
+    let scale=scaleBound(model);
+    if(coarsen(cluster.data.z,model,scale)){return;}
+    if(cluster.data.w!=0xffffffffu && !coarsen(cluster.data.w,model,scale)){return;}
+    if(!visible(cluster,model)){return;}
+    let bounds=worldBounds(cluster.minimum.xyz,cluster.maximum.xyz,model);
+    if(geometryOccluded(bounds.center,bounds.extent)){
+        selected[index]=2u; atomicAdd(&args.first.padding,1u); return;
+    }
+    appendCluster(index,instanceIndex,cluster,false);
+}
+@compute @workgroup_size(64)
+fn recoverClusters(@builtin(global_invocation_id) invocation:vec3u){
+    let index=invocation.x;
+    if(index>=params.clusterCount*params.instanceCount){return;}
+    if(index==0u){args.recovery.instanceCount=1u;args.recovery.firstIndex=atomicLoad(&args.first.indexCount);}
+    if(selected[index]!=2u){return;}
+    let instanceIndex=index/params.clusterCount;
+    let cluster=clusters[index%params.clusterCount];
+    let bounds=worldBounds(cluster.minimum.xyz,cluster.maximum.xyz,instances[instanceIndex].model);
+    if(geometryOccluded(bounds.center,bounds.extent)){
+        selected[index]=0u; atomicAdd(&args.recovery.padding,1u); return;
+    }
+    appendCluster(index,instanceIndex,cluster,true);
+}
 // Separate dispatch/pass: no reliance on cross-workgroup synchronization.
 @compute @workgroup_size(1)
 fn finalize() {
-    if (atomicLoad(&args.overflow) != 0u) {
-        atomicStore(&args.indexCount, 0u);
-        args.instanceCount = 0u;
+    if (atomicLoad(&args.first.overflow) != 0u) {
+        atomicStore(&args.first.indexCount, 0u);
+        args.first.instanceCount = 0u;
+    }
+}
+@compute @workgroup_size(1)
+fn finalizeRecovery(){
+    if(atomicLoad(&args.recovery.overflow)!=0u || atomicLoad(&args.first.overflow)!=0u){
+        atomicStore(&args.recovery.indexCount,0u);args.recovery.instanceCount=0u;
     }
 }

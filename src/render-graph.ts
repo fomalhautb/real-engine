@@ -7,7 +7,8 @@ export interface RenderResource {
 
 export interface RenderResourceUse {
   resource: string;
-  access: 'read' | 'write' | 'readWrite';
+  /** attachmentLoad reads an existing texture attachment and stores its replacement. */
+  access: 'read' | 'write' | 'readWrite' | 'attachmentLoad';
 }
 
 export interface RenderPass<Context> {
@@ -95,6 +96,9 @@ export function compileRenderGraph<Context>(
       used.add(use.resource);
       if (use.access === 'readWrite' && resource.kind !== 'buffer') {
         throw new Error(`Render graph pass "${pass.name}" cannot readWrite texture "${use.resource}" in one pass.`);
+      }
+      if (use.access === 'attachmentLoad' && resource.kind !== 'texture') {
+        throw new Error(`Render graph pass "${pass.name}" cannot attachmentLoad buffer "${use.resource}".`);
       }
       const state = history.get(use.resource)!;
       if (use.access !== 'write' && !state.initialized) {

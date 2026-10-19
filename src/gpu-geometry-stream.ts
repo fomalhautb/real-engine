@@ -8,6 +8,7 @@ import type { Mat4 } from './math';
 import { GeometryStreamWorkingSet } from './geometry-stream-working-set';
 import type { GeometryPageDecodeService } from './geometry-decode-worker-pool';
 import type { MeshData } from './geometry';
+import type { GpuOcclusion } from './gpu-occlusion';
 
 export interface GeometryStreamSource {
   /** Explicit fixed representation for a source-free StreamedSceneBatch. */
@@ -62,7 +63,7 @@ export class GpuGeometryStream {
     this.allocation = this.workingSet.plan([]);
   }
   static async create(device: GPUDevice, scene: RenderBatch, instances: GPUBuffer, track: (bytes: number) => void,
-    decoder?: GeometryPageDecodeService) {
+    decoder?: GeometryPageDecodeService, occlusion?: GpuOcclusion) {
     const source = scene.geometryStream;
     if (!source || scene.geometryLod || scene.deformation.jointCount || scene.deformation.nodes.length || scene.morphTargets.length) {
       throw new Error('GEOMETRY_STREAM_REQUIRES_STATIC_SOURCE');
@@ -80,7 +81,7 @@ export class GpuGeometryStream {
     try {
       pool = await GpuGeometryPagePool.create(device, source.directory, source.gpuPool, track);
       cache = await GeometryPageCache.create(source.directory, source.provider, source.cpuCache, decoder);
-      selection = await GpuGeometryStreamSelection.create(device, pool, instances, scene.capacity, track, source.selection);
+      selection = await GpuGeometryStreamSelection.create(device, pool, instances, scene.capacity, track, source.selection, occlusion);
       const result = new GpuGeometryStream(scene, cache, pool, selection);
       // Initialization is cooperative and completes every root before the first
       // frame. The regular render path performs exactly one bounded upload tick.

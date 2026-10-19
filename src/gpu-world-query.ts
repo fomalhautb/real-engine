@@ -172,7 +172,7 @@ export class GpuWorldQuery {
     if (this.options.sceneAcceleration === 'bvh') {
       this.sceneBvh = await GpuQuerySceneBvh.create(this.device,
         (label, size, usage, data) => this.buffer(label, size, usage, data), this.rayBuffer, this.hitBuffer,
-        this.options.maxRays, this.options.maxTraceParameterSetsPerEncoder);
+        this.options.maxRays, this.options.maxTraceParameterSetsPerEncoder, this.options.maxBatches);
       this.candidateBuffer = this.sceneBvh.maskBuffer;
     } else this.candidateBuffer = this.buffer('unused world batch candidates', 4, GPUBufferUsage.STORAGE);
     const refitModule = await this.module(refitSource, 'world BVH refit');
@@ -204,7 +204,7 @@ export class GpuWorldQuery {
     if (this.disposed || this.frame) throw new Error('WORLD_QUERY_REGISTRATION_CLOSED');
     const { scene } = source, mesh = residentMesh(scene), proxy = queryProxy(scene);
     if (scene.emissiveSampling !== undefined && scene.emissiveSampling !== 'triangle-area') throw new Error('WORLD_QUERY_EMISSIVE_SAMPLING');
-    if (this.batches.length >= 256) throw new Error('WORLD_QUERY_BATCH_BUDGET');
+    if (this.batches.length >= this.options.maxBatches) throw new Error('WORLD_QUERY_BATCH_BUDGET');
     if (!Number.isSafeInteger(scene.capacity) || scene.capacity < 1 || scene.capacity > this.options.maxInstancesPerBatch) throw new Error('WORLD_QUERY_INSTANCE_BUDGET');
     const sourceIdentity = identity(scene);
     validateMeshColors(mesh.colors, mesh.vertexCount);
@@ -456,7 +456,7 @@ export class GpuWorldQuery {
         const params = new ArrayBuffer(96);
         new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
           ...batch.offsets, batch.colorOffset, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
-          batch.emissiveSampling === 'triangle-area' ? 1 : 0, this.sceneEnabled ? 1 : 0]);
+          batch.emissiveSampling === 'triangle-area' ? 1 : 0, this.sceneEnabled ? 1 : 0, this.sceneBvh?.maskWords ?? 0]);
         new Float32Array(params)[16] = textureLod;
         new Uint32Array(params).set(batch.instanceTree, 20);
         this.device.queue.writeBuffer(batch.params, parameterSlot * this.traceUniformStride, params);
@@ -517,6 +517,7 @@ export class GpuWorldQuery {
       acceleratedBatches: this.batches.filter(batch => batch.instanceTree[3]).length,
       sceneAcceleration: this.sceneEnabled ? 'batch-bvh' : 'linear-batches',
       sceneBvhNodes: this.sceneEnabled ? this.sceneBvh!.nodeCount : 0,
+      sceneCandidateWordsPerRay: this.sceneBvh?.maskWords ?? 0,
       sceneCandidateBytes: this.candidateBuffer.size,
       lastReadbackQuery: this.lastReadbackQuery && { ...this.lastReadbackQuery },
       refit: 'changed-batches', refitTiming: 'provided-by-caller', externalTraceTiming: false };

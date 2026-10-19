@@ -11,7 +11,7 @@ import { compileDeformation, conservativeDeformationBounds, evaluateDeformation,
   validateDeformationVertex, validateMorphTargets, type Bounds3 } from './deformation';
 import { compileRenderGraph } from './render-graph';
 import { GpuWorldQuery } from './gpu-world-query';
-import type { WorldQueryOptions, WorldRay, WorldQueryResult } from './world-query';
+import { resolveWorldQueryOptions, type WorldQueryOptions, type WorldRay, type WorldQueryResult } from './world-query';
 import { GpuGeometryLod, type GeometryLodBinding, type GeometryLodSettings, type GeometryLodProbe } from './gpu-geometry-lod';
 import { GpuDiffuseGi, diffuseGiSampleSource, diffuseGiFinalGatherSampleSource, type DiffuseGiProbeResult } from './gpu-diffuse-gi';
 import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
@@ -71,6 +71,8 @@ export interface DeformationVerification {
   samples: { batch: string; entityId: number; vertexIndex: number; current: number[]; previous: number[] }[];
 }
 export interface RendererOptions {
+  /** Scene primitive-batch budget, 1–4096 (default 256). Also the default query batch capacity. */
+  maxBatches?: number;
   /** Dedicated module Workers shared by every streamed batch; no inline runtime fallback. */
   geometryDecoding?: GeometryDecodeWorkerOptions;
   /** Single-frame display-space edge filtering. HDR and motion/depth attachments stay unfiltered. */
@@ -169,7 +171,15 @@ export class Renderer {
   private geometryLayout!: GPUBindGroupLayout;
 
   static async create(canvas: HTMLCanvasElement, scene: RenderBatch[], options: RendererOptions = {}): Promise<Renderer> {
-    if (scene.filter(batch => !!batch.geometryStream).length > 256) throw new Error('GEOMETRY_STREAM_BATCH_BUDGET');
+    const maxBatches = options.maxBatches ?? 256;
+    if (!Number.isSafeInteger(maxBatches) || maxBatches < 1 || maxBatches > 4096) throw new Error('INVALID_BATCH_BUDGET');
+    if (scene.length > maxBatches) throw new Error('SCENE_BATCH_BUDGET');
+    if (options.worldQueries) {
+      const worldQueries = resolveWorldQueryOptions({ ...options.worldQueries,
+        maxBatches: options.worldQueries.maxBatches ?? maxBatches });
+      if (scene.length > worldQueries.maxBatches) throw new Error('WORLD_QUERY_BATCH_BUDGET');
+      options = { ...options, worldQueries };
+    }
     if (options.antiAliasing !== undefined && options.antiAliasing !== 'none' && options.antiAliasing !== 'fxaa') throw new Error('INVALID_ANTI_ALIASING');
     resolveSunShadowOptions(options.sunShadow);
     if (options.volumetricFog) resolveVolumetricFogOptions(options.volumetricFog);

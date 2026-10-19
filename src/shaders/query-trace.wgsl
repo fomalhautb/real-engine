@@ -14,7 +14,7 @@ struct Params {
     shape: vec4u, // node count, vertex count, instance count, batch ID
     offsets: vec4u, // triangle IDs, indices, UVs, colors (0 = white)
     limits: vec4u, // ray count, work limit, frame, topology version
-    material: vec4u, // material revision, GI area-sampling source flag, scene candidates enabled
+    material: vec4u, // material revision, GI area-sampling source flag, candidates enabled, words per ray
     textureLod: vec4f,
     instanceTree: vec4u, // node offset, order offset, bounds offset, node count (0 = linear)
 }
@@ -75,7 +75,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= params.limits.x) { return; }
     if (params.material.z != 0u) {
         let batch = params.shape.w - 1u;
-        if ((batchCandidates[id.x * 8u + batch / 32u] & (1u << (batch % 32u))) == 0u) { return; }
+        if ((batchCandidates[id.x * params.material.w + batch / 32u] & (1u << (batch % 32u))) == 0u) { return; }
     }
     let ray = rays[id.x];
     var hit = hits[id.x];

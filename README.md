@@ -27,6 +27,8 @@
 
 世界空间查询默认对容量至少 8 的批次启用实例 BVH；注册至少 8 个批次时，还用场景 BVH 为每条射线筛选候选批次。物体移动或形变后，GPU 从共享三角形结果更新边界；静止批次复用缓存。`worldQueries.instanceAcceleration` 和 `sceneAcceleration` 各自可设为 `'linear'` 保留原路径供对照。材质仍逐批次 dispatch，工作量减少不等于已经证明整帧提速；具体预算与验收见[世界空间查询基础](docs/implementation.md#世界空间查询基础)。
 
+`RendererOptions.maxBatches` 为整个场景设置 primitive 批次预算（默认 256，硬上限 4096），包括普通和分页几何；超过预算在申请 GPU 前报错。世界查询默认继承此容量，直接使用 `GpuWorldQuery` 时可设 `WorldQueryOptions.maxBatches`。场景树与每条射线的候选位图按该容量分配并计入查询 `maxBytes`；显式较低的查询容量不会静默遗漏场景对象。这是容量接口，不是该规模的帧率保证。
+
 实例加速版本通过 378 项 CPU 测试、类型检查与构建、69 项原生 NVIDIA 完整浏览器回归及 4 项 Intel 定向测试。258 个共享形变实例的 11 条射线，工作单位从 5,685 降至 281，命中、画面与 GI 保持一致；此计数不是帧率提升比例。跨批次 BVH 提交 `d7c94d8` 的[远程 CI run 39267473217](https://github.com/fomalhautb/real-engine/actions/runs/39267473217) 已成功，包含 CPU 和 Linux 浏览器作业；旧提交 `41afdbc` 的失败记录仍保留在[实现状态](docs/implementation.md)。
 
 体积雾版本的完整本地 `npm run check` 通过 391 项 CPU 测试（51 文件）、类型检查及生产构建，日志见 `artifacts/fog-check-release-20261019-final.log`。NVIDIA 定向 GPU 数值用例已覆盖解析吸收、零消光发光、HG 太阳散射、局部重叠与高度衰减、共享阴影及形变遮挡后的恢复，另验证 GI 探针未被雾改写和资源释放归零；原生 NVIDIA 完整浏览器回归 74/74 通过，日志见 `artifacts/fog-browser-release-native-20261019-final.log`。Intel 定向 3/3 与 SwiftShader 定向 3/3 也已通过，日志分别见 `artifacts/fog-target-intel-20261019.log`、`artifacts/fog-target-software-20261019.log`；硬件性能验收尚待完成。这些是有限功能证据，不表示阶段 2 或最终画质已通过。

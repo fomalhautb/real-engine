@@ -11,6 +11,7 @@ const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes)
 type FileRef = { file: string; sha256: string; bytes: number };
 type BuiltPrimitive = {
   meshIndex: number; primitiveIndex: number; coverage: string; route: string;
+  textureUvSpan: number | 'unknown';
   sourceTriangleCount: number; triangleCount: number; removedTriangleCount: number;
   directory?: string; streamDirectoryFile?: string; queryProxy?: FileRef;
   pages?: FileRef[]; provenance?: {
@@ -86,7 +87,7 @@ function fixture(): { json: Buffer; binary: Buffer; opaqueIndices: number[]; ble
       { attributes: opaque, indices: opaqueIndexAccessor, material: 0, mode: 4 },
       { attributes: blend, indices: blendIndexAccessor, material: 1, mode: 4 },
     ] }],
-    nodes: [{ mesh: 0 }], scenes: [{ nodes: [0] }], scene: 0,
+    nodes: [{ mesh: 0, scale: [10, 2, 1] }], scenes: [{ nodes: [0] }], scene: 0,
   };
   return { json: Buffer.from(`${JSON.stringify(gltf, null, 2)}\n`), binary, opaqueIndices, blendIndices };
 }
@@ -198,6 +199,11 @@ describe('glTF geometry CLI', () => {
       ]);
       expect(opaque).toMatchObject({ sourceTriangleCount: 5, triangleCount: 4, removedTriangleCount: 1 });
       expect(blend).toMatchObject({ sourceTriangleCount: 2, triangleCount: 2, removedTriangleCount: 0 });
+      // The UV seam on the first surviving triangle dominates. The removed
+      // zero-area triangle would make the uncleaned estimator return unknown.
+      // The node's nonuniform scale does not change this local-space value.
+      expect(opaque.textureUvSpan).toBeCloseTo(Math.sqrt(73) / 3, 6);
+      expect(blend.textureUvSpan).toBeCloseTo(Math.SQRT2, 6);
       expect(opaque.directory).toBeTruthy();
       expect(opaque.streamDirectoryFile).toBe(`${opaque.directory}/stream-directory.json`);
       expect(opaque.queryProxy).toBeDefined();
@@ -217,6 +223,38 @@ describe('glTF geometry CLI', () => {
       expect(blend.pages ?? []).toHaveLength(0);
       expect(blend.queryProxy).toBeUndefined();
       expect(blend.provenance).toBeUndefined();
+    } finally {
+      await removeOwnTestRoot(temporary);
+    }
+  }, 120_000);
+
+  it('marks singular and absent UV0 explicitly unknown while retaining source coverage', async () => {
+    const temporary = await mkdtemp(join(resolve('.'), '.gltf-geometry-test-'));
+    try {
+      const source = fixture();
+      const doc = JSON.parse(source.json.toString('utf8'));
+      const opaque = doc.meshes[0].primitives[0];
+      const uvAccessor = doc.accessors[opaque.attributes.TEXCOORD_0];
+      const uvView = doc.bufferViews[uvAccessor.bufferView];
+      const binary = Buffer.from(source.binary);
+      for (let i = 0; i < uvAccessor.count * 2; i++) binary.writeFloatLE(0, uvView.byteOffset + i * 4);
+      const sourceRoute = doc.meshes[0].primitives[1];
+      delete sourceRoute.attributes.TEXCOORD_0;
+      doc.materials[1].alphaMode = 'MASK';
+      const input = join(temporary, 'scene.gltf');
+      const output = join(temporary, 'built');
+      await writeFile(input, `${JSON.stringify(doc)}\n`);
+      await writeFile(join(temporary, 'mesh.bin'), binary);
+      run(input, output, ['--remove-zero-area']);
+      const raw = await readFile(join(output, 'manifest.json'), 'utf8');
+      const manifest = JSON.parse(raw) as { primitives: BuiltPrimitive[] };
+      expect(manifest.primitives.map(p => [p.coverage, p.route, p.textureUvSpan])).toEqual([
+        ['opaque', 'paged', 'unknown'], ['mask', 'source', 'unknown'],
+      ]);
+      expect(raw).toContain('"textureUvSpan": "unknown"');
+      expect(raw).not.toContain('"textureUvSpan": null');
+      expect(manifest.primitives[0].removedTriangleCount).toBe(1);
+      expect(manifest.primitives[1].triangleCount).toBe(2);
     } finally {
       await removeOwnTestRoot(temporary);
     }

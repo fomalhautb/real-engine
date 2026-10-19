@@ -2,7 +2,29 @@
 
 更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 完整场景的批次容量与纹理密度
+
+`RendererOptions.maxBatches` 将场景 primitive 批次数量设为显式预算，默认 256、范围 1–4096；现在对全部批次检查，替代旧的仅分页批次 256 上限。超过预算或非法配置在申请适配器/设备前拒绝。`worldQueries.maxBatches` 默认继承渲染器容量，显式配置可以更小，但场景超出查询容量会整次初始化失败，不能只让前若干对象参与光照。独立 `GpuWorldQuery` 仍默认 256，并在逐批次注册时检查。对象身份、材质、形变和固定查询代理保持原来的独立接口。
+
+场景 BVH 按精确容量 N 建立 2N−1 个节点，不要求二次幂；候选存储为每条射线 `ceil(N / 32) * 4` 字节。容量 405 时为 809 节点和 52 字节/射线，4096 时为 8191 节点和 512 字节/射线。节点、排序、批次根、候选位图和参数缓冲全部沿用查询 `maxBytes` 与设备缓冲限制。候选及 refit 参数现在各 32 字节，记录容量和偏移；不同射线数量/LOD 继续使用不可变参数槽。材质命中读取动态位图步长，不新增材质 shader 变体。每射线/整次查询工作上限保持有效；仍逐材质批次 dispatch，扩大容量不等于目标规模性能已验收。
+
+离线 glTF 几何清单新增每 primitive 的 `textureUvSpan`：正有限数表示完整静态网格 UV0 到局部位置的保守尺度上界，字符串 `'unknown'` 明确表示无法证明，消费方此时不填写运行时 `SceneBatch.textureUvSpan`。分页 Opaque 从清理后的完整网格计算，不使用粗代理或相机选择的 LOD；Mask/Blend 源路径使用原网格，不改变覆盖或源数据。节点/实例变换不烘入此值，运行时再乘模型变换的伸长上界。旧清单没有该字段时同样保守回退；该值不自动证明后续形变的边界。
+
+对实际 Sponza 原始 glTF/BIN 的独立读取已得到 405 个 primitive 中 393 个有限尺度、12 个未知；有限值范围约 0.338–66,301.55 局部单位/UV。部分 UV 很窄，保守上界很大，仍可能要求最高精度；不能为了降低纹理请求而截断此值。记录在 `artifacts/sponza-uv-demand-20261020.json`，来源 SHA-256 与先前完整资产一致。此处只审计来源并输出独立元数据，尚未把该字段重新发布进既有 Sponza 几何包。
+
+本轮 `npm run check` 通过 **586 项 CPU 测试（71 文件）**、类型检查与构建，日志 `artifacts/scene-capacity-check-20261020.log`。CLI 测试以已知 UV 接缝和非均匀节点缩放核对局部尺度、零面积清理后的结果以及奇异/缺失 UV 的显式未知值；Mask/Blend 源路径保留原始覆盖和三角形。
+
+NVIDIA 定向首轮 4/5 通过，405 批次用例因页面执行上下文被销毁失败；随后加入浏览器导航/控制台日志，同一运行时代码的该用例 1/1 通过。没有观察到重现导航，首轮原因尚未确认，不删除失败记录。日志分别为 `artifacts/scene-capacity-target-native-20261020.log` 与 `artifacts/scene-capacity-recheck-native-20261020.log`。405 个独立批次逐个与已知位置、实体 ID、材质值核对，并对照线性路径；第 405 个对象移动、删除、复用 generation，以及第 257 个批次换材质均通过，错误为空、释放账本归零。该 405 射线查询的工作单位为 BVH 15,001、线性 328,860，三角测试均 810；这不代表等比例帧率提升。
+
+独立 GPU 位图用例覆盖容量 1、33、4096；直接写入已知批次根，检查不同射线和第 4096 个批次的最高位在移动/删除/恢复后准确清空或设置。它证明布局上限与查询候选正确，不代表已绘制 4096 批次完整场景。原有跨批次 GI 对照和多参数槽回归同样通过。
+
+完整 NVIDIA 浏览器回归 **109/109** 通过，实际为非 fallback `nvidia / ampere`，日志 `artifacts/scene-capacity-full-native-20261020.log`。范围包含既有 GI、反射、形变、阴影、几何/纹理流送和雾的功能检查，以及本轮两个新增容量用例；页面上下文失败在该完整运行中未重现。完整 Sponza 的场景加载、Blend decal、最终法线压缩质量、光照和连续游走仍待完成。
+
+同版容量、参数槽与跨批次 GI 的 5 项定向用例，在真实非 fallback `intel / gen-12lp` 和 fallback `google / swiftshader` 各 **5/5** 通过，日志 `artifacts/scene-capacity-target-intel-20261020.log`、`artifacts/scene-capacity-target-software-20261020.log`。405 个命中及工作量一致，GPU/页面错误为空、释放账本归零；这是功能验证，没有测量或宣称该规模的硬件帧率。
+
 ## 纹理包构建、清单加载与真实 Sponza 贴图
+
+该纹理包提交 `3a4910b` 的[远程 CI run 39325520894](https://github.com/fomalhautb/real-engine/actions/runs/39325520894) 已完整成功，包含 foundation 和四个软件 GPU 分片；该结果不覆盖随后新增的可配置批次容量。
 
 `npm run build:texture -- --input image.dds --output new-directory [--id asset-id] [--fallback-size 64]` 新增可重复的离线纹理打包入口。DDS 路径不启动编码器，接受 DX10 头的单张 2D RGBA8 / BC7、线性 / sRGB 及完整 mip 链；检查尺寸、行/块字节、数组/体积/立方体、截断和多余载荷，拒绝 premultiplied alpha 与当前 WebGPU 不可用的 BC7 顶级未对齐尺寸。每级数据复制为独立精确长度缓冲；此解析不解码或验证 BC7 块内位流。格式依据 [Microsoft DDS 文档](https://learn.microsoft.com/en-us/windows/win32/direct3ddds/dx-graphics-dds-pguide)。
 

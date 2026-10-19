@@ -4,6 +4,8 @@ export interface WorldQueryOptions {
   maxBytes?: number;
   maxTrianglesPerMesh?: number;
   maxInstancesPerBatch?: number;
+  /** Registered primitive batches; controls scene-tree and per-ray candidate storage. */
+  maxBatches?: number;
   /** Historical name: counts instance, node, and triangle work units per ray. */
   maxNodeVisits?: number;
   /** Shared cap across every ray and batch in one query. */
@@ -80,6 +82,7 @@ const DEFAULT_OPTIONS: NumericOptions = {
   maxBytes: 128 * 1024 * 1024,
   maxTrianglesPerMesh: 65_536,
   maxInstancesPerBatch: 256,
+  maxBatches: 256,
   maxNodeVisits: 262_144,
   maxTotalWorkUnits: 16_777_216,
   maxTraceParameterSetsPerEncoder: 8,
@@ -89,6 +92,7 @@ const HARD_OPTIONS: NumericOptions = {
   maxBytes: 512 * 1024 * 1024,
   maxTrianglesPerMesh: 262_144,
   maxInstancesPerBatch: 4_096,
+  maxBatches: 4_096,
   maxNodeVisits: 1_048_576,
   maxTotalWorkUnits: 67_108_864,
   maxTraceParameterSetsPerEncoder: 32,

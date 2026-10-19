@@ -52,10 +52,16 @@ describe('world query wire contract', () => {
   it('resolves defaults and rejects invalid or excessive allocations', () => {
     expect(resolveWorldQueryOptions()).toEqual({
       maxRays: 1024, maxBytes: 128 * 1024 * 1024, maxTrianglesPerMesh: 65536,
-      maxInstancesPerBatch: 256, maxNodeVisits: 262144, maxTotalWorkUnits: 16777216,
+      maxInstancesPerBatch: 256, maxBatches: 256, maxNodeVisits: 262144, maxTotalWorkUnits: 16777216,
       maxTraceParameterSetsPerEncoder: 8, instanceAcceleration: 'bvh', sceneAcceleration: 'bvh',
     });
     expect(resolveWorldQueryOptions({ maxRays: 2048, maxInstancesPerBatch: 16 }).maxRays).toBe(2048);
+    for (const maxBatches of [1, 31, 32, 33, 256, 405, 4096]) {
+      expect(resolveWorldQueryOptions({ maxBatches }).maxBatches).toBe(maxBatches);
+    }
+    for (const maxBatches of [0, -1, 4097, 1.5, Infinity, NaN]) {
+      expect(() => resolveWorldQueryOptions({ maxBatches })).toThrow(/maxBatches/);
+    }
     expect(resolveWorldQueryOptions({ instanceAcceleration: 'linear' }).instanceAcceleration).toBe('linear');
     expect(() => resolveWorldQueryOptions({ instanceAcceleration: 'unknown' as 'bvh' })).toThrow(/instanceAcceleration/);
     expect(resolveWorldQueryOptions({ sceneAcceleration: 'linear' }).sceneAcceleration).toBe('linear');

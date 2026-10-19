@@ -7,11 +7,10 @@ export type QueryBufferAllocator = (label: string, size: number, usage: GPUBuffe
 
 type RefitLevel = { count: number; bindGroup: GPUBindGroup };
 
-const CAPACITY = 256;
-const MASK_WORDS = 8;
+const MAX_CAPACITY = 4096;
 const MAX_RAYS = 65_536;
 const MAX_PARAMETER_SLOTS = 32;
-const PARAM_BYTES = 16;
+const PARAM_BYTES = 32;
 
 function integer(value: number, low: number, high: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < low || value > high) {
@@ -19,12 +18,13 @@ function integer(value: number, low: number, high: number, label: string): void 
   }
 }
 
-/** A fixed 256-leaf batch tree. The allocator owns and accounts for every buffer. */
+/** A bounded fixed-capacity batch tree. The allocator accounts for every buffer. */
 export class GpuQuerySceneBvh {
   readonly maskBuffer: GPUBuffer;
   readonly boundsBuffer: GPUBuffer;
   readonly levelCount: number;
   readonly nodeCount: number;
+  readonly maskWords: number;
 
   private readonly dataBuffer: GPUBuffer;
   private readonly candidateParams: GPUBuffer;
@@ -48,6 +48,7 @@ export class GpuQuerySceneBvh {
     parameterStride: number,
     nodeCount: number,
     maxRays: number,
+    private readonly capacity: number,
   ) {
     this.maskBuffer = maskBuffer;
     this.boundsBuffer = boundsBuffer;
@@ -61,27 +62,31 @@ export class GpuQuerySceneBvh {
     this.levelCount = refitLevels.length;
     this.nodeCount = nodeCount;
     this.maxRays = maxRays;
+    this.maskWords = Math.ceil(capacity / 32);
   }
 
   static async create(device: GPUDevice, allocate: QueryBufferAllocator, rays: GPUBuffer, hits: GPUBuffer,
-    maxRays: number, parameterSlots: number): Promise<GpuQuerySceneBvh> {
+    maxRays: number, parameterSlots: number, capacity = 256): Promise<GpuQuerySceneBvh> {
     integer(maxRays, 1, MAX_RAYS, 'maxRays');
     integer(parameterSlots, 1, MAX_PARAMETER_SLOTS, 'parameterSlots');
+    integer(capacity, 1, MAX_CAPACITY, 'capacity');
     const alignment = device.limits.minUniformBufferOffsetAlignment;
     const parameterStride = Math.ceil(PARAM_BYTES / alignment) * alignment;
     if (!Number.isSafeInteger(parameterStride) || parameterStride < PARAM_BYTES) {
       throw new RangeError('scene BVH uniform alignment is invalid');
     }
 
-    const topology = buildInstanceBvhTopology(CAPACITY);
+    const topology = buildInstanceBvhTopology(capacity);
+    const maskWords = Math.ceil(capacity / 32);
+    const sceneLayout = [capacity, topology.nodeCount, topology.nodeCount * 4, maskWords];
     const nodeWords = topology.nodes.length;
     const orderOffset = nodeWords;
     const levelOffsets: number[] = [];
-    let words = orderOffset + CAPACITY;
+    let words = orderOffset + capacity;
     for (const level of topology.levels) { levelOffsets.push(words); words += level.length; }
     const packed = new Uint32Array(words);
     packed.set(topology.nodes);
-    packed.fill(0xffff_ffff, orderOffset, orderOffset + CAPACITY);
+    packed.fill(0xffff_ffff, orderOffset, orderOffset + capacity);
     topology.levels.forEach((level, depth) => packed.set(level, levelOffsets[depth]));
 
     const module = device.createShaderModule({ code: shaderSource, label: 'world query scene BVH' });
@@ -104,10 +109,10 @@ export class GpuQuerySceneBvh {
 
     const dataBuffer = allocate('world query scene BVH topology and order', packed.byteLength,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, packed.buffer);
-    // The first 256 Bounds are written by the caller from the per-batch BLAS roots.
+    // The first capacity Bounds are copied from the per-batch BLAS roots.
     const boundsBuffer = allocate('world query scene BVH roots and nodes',
-      (CAPACITY + topology.nodeCount) * 32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    const maskBuffer = allocate('world query scene candidate masks', maxRays * MASK_WORDS * 4, GPUBufferUsage.STORAGE);
+      (capacity + topology.nodeCount) * 32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const maskBuffer = allocate('world query scene candidate masks', maxRays * maskWords * 4, GPUBufferUsage.STORAGE);
     const candidateParams = allocate('world query scene candidate parameter slots',
       parameterStride * parameterSlots, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const bindGroup = (params: GPUBuffer, offset = 0): GPUBindGroup => device.createBindGroup({ layout, entries: [
@@ -120,22 +125,22 @@ export class GpuQuerySceneBvh {
     ] });
     const refitLevels = topology.levels.map((level, depth) => {
       const params = allocate('world query scene BVH depth parameters', PARAM_BYTES,
-        GPUBufferUsage.UNIFORM, new Uint32Array([levelOffsets[depth], level.length, 0, 0]).buffer);
+        GPUBufferUsage.UNIFORM, new Uint32Array([levelOffsets[depth], level.length, 0, 0, ...sceneLayout]).buffer);
       return { count: level.length, bindGroup: bindGroup(params) };
     });
     const candidateGroups = Array.from({ length: parameterSlots }, (_, slot) =>
       bindGroup(candidateParams, slot * parameterStride));
     return new GpuQuerySceneBvh(device, maskBuffer, boundsBuffer, dataBuffer, candidateParams,
-      candidateGroups, refitLevels, refitPipeline, candidatePipeline, parameterStride, topology.nodeCount, maxRays);
+      candidateGroups, refitLevels, refitPipeline, candidatePipeline, parameterStride, topology.nodeCount, maxRays, capacity);
   }
 
   /** CPU boxes only sort candidates; the GPU refit reads the copied BLAS roots. */
   updateOrder(bounds: readonly (Bounds3 | null)[]): number {
-    if (!Array.isArray(bounds) || bounds.length > CAPACITY) throw new RangeError('scene BVH batch budget');
+    if (!Array.isArray(bounds) || bounds.length > this.capacity) throw new RangeError('scene BVH batch budget');
     const active: { index: number; bounds: Bounds3 }[] = [];
     bounds.forEach((entry, index) => { if (entry !== null) active.push({ index, bounds: entry }); });
-    const localOrder = orderInstanceBounds(active.map(entry => entry.bounds), CAPACITY);
-    const order = new Uint32Array(CAPACITY);
+    const localOrder = orderInstanceBounds(active.map(entry => entry.bounds), this.capacity);
+    const order = new Uint32Array(this.capacity);
     order.fill(0xffff_ffff);
     for (let i = 0; i < active.length; i++) order[i] = active[localOrder[i]].index;
     this.device.queue.writeBuffer(this.dataBuffer, this.nodeCount * 4 * 4, order);
@@ -156,7 +161,7 @@ export class GpuQuerySceneBvh {
     }
   }
 
-  /** Clears eight mask words per ray, then bounds-tests the fixed tree. */
+  /** Clears ceil(capacity/32) mask words per ray, then bounds-tests the tree. */
   encodeCandidates(encoder: GPUCommandEncoder, slot: number, count: number, workPerRay: number,
     upload: boolean): number {
     integer(slot, 0, this.candidateGroups.length - 1, 'slot');
@@ -164,7 +169,7 @@ export class GpuQuerySceneBvh {
     integer(workPerRay, 1, 1_048_576, 'workPerRay');
     if (count === 0) return 0;
     if (upload) this.device.queue.writeBuffer(this.candidateParams, slot * this.parameterStride,
-      new Uint32Array([count, workPerRay, 0, 0]));
+      new Uint32Array([count, workPerRay, 0, 0, this.capacity, this.nodeCount, this.nodeCount * 4, this.maskWords]));
     const pass = encoder.beginComputePass({ label: 'world scene BVH candidates' });
     pass.setPipeline(this.candidatePipeline);
     pass.setBindGroup(0, this.candidateGroups[slot]);

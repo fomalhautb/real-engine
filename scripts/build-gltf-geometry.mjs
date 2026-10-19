@@ -138,10 +138,18 @@ async function buildInto(config, temporary) {
     const { parseGlb } = await server.ssrLoadModule('/src/gltf-binary.ts');
     const { extractGltfStaticPrimitive } = await server.ssrLoadModule('/src/gltf-geometry-build.ts');
     const { cleanStaticGeometry } = await server.ssrLoadModule('/src/geometry-clean.ts');
+    const { meshWorldUnitsPerUv } = await server.ssrLoadModule('/src/texture-stream-demand.ts');
     const { buildGeometryHierarchy } = await server.ssrLoadModule('/src/geometry-hierarchy.ts');
     const { encodeGeometryPages } = await server.ssrLoadModule('/src/geometry-pages.ts');
     const { buildGeometryStreamDirectory } = await server.ssrLoadModule('/src/geometry-stream-directory.ts');
     const { buildGeometryQueryProxy, encodeGeometryQueryProxy } = await server.ssrLoadModule('/src/geometry-query-proxy.ts');
+    const textureUvSpanOf = mesh => {
+      // Source-routed primitives may exceed the demand estimator's bounded
+      // workload. Preserve them and mark their mip demand as unknown.
+      if (mesh.vertexCount > 1_048_576 || mesh.indices.length > 3_145_728) return 'unknown';
+      const span = meshWorldUnitsPerUv(mesh);
+      return Number.isFinite(span) && span > 0 ? span : 'unknown';
+    };
     const asset = await loadSource(config.input, parseGlb);
     const meshes = list(asset.doc.meshes ?? [], 'meshes');
     let count = 0;
@@ -172,14 +180,20 @@ async function buildInto(config, temporary) {
           ignoredAttributes: extracted.ignoredAttributes, warnings: extracted.warnings };
         totals.sourceTriangles += sourceTriangleCount;
         if (extracted.coverage !== 'opaque') {
+          // Source-routed coverage keeps its original triangles, including any
+          // degenerates; an unprovable UV bound requests finest-mip fallback.
           // Preserve the original primitive and optical definition. No transparent
           // geometry is relabelled opaque or silently absent from the manifest.
-          primitives.push({ ...entry, route: 'source', triangleCount: sourceTriangleCount, removedTriangleCount: 0,
+          primitives.push({ ...entry, route: 'source', textureUvSpan: textureUvSpanOf(extracted.mesh),
+            triangleCount: sourceTriangleCount, removedTriangleCount: 0,
             reason: 'virtual geometry currently requires opaque coverage; source primitive and material retained' });
           totals.triangles += sourceTriangleCount; totals.sourcePrimitives++;
           continue;
         }
         const clean = cleanStaticGeometry(extracted.mesh, { removeZeroAreaTriangles: config.removeZeroAreaTriangles });
+        // This is the full cleaned source, before hierarchy LOD or query-proxy
+        // simplification. Its units are local position distance per UV0 unit.
+        const textureUvSpan = textureUvSpanOf(clean.mesh);
         const primitiveKey = `gltf:${asset.identity}:mesh:${meshIndex}:primitive:${primitiveIndex}`;
         const hierarchy = await buildGeometryHierarchy({ primitiveKey, mesh: clean.mesh, coverage: 'opaque' });
         const encoded = await encodeGeometryPages(hierarchy, PAGE_OPTIONS);
@@ -206,7 +220,8 @@ async function buildInto(config, temporary) {
           }
         }
         const triangleCount = clean.mesh.indices.length / 3;
-        primitives.push({ ...entry, route: 'paged', directory: folder, primitiveKey,
+        primitives.push({ ...entry, route: 'paged', textureUvSpan,
+          directory: folder, primitiveKey,
           vertexCount: clean.mesh.vertexCount, triangleCount, removedTriangleCount: clean.removedTriangles.length,
           streamDirectoryFile: stream.file, streamDirectoryBytes: stream.bytes, streamDirectorySha256: stream.sha256,
           buildOptions: hierarchy.options, provenance, rootPages: directory.rootPages, pages,

@@ -2,6 +2,34 @@
 
 更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## glTF 离线几何构建与实际 Sponza 数据
+
+`npm run build:gltf-geometry -- --input scene.gltf --output new-directory [--remove-zero-area] [--query-error value] [--max-page-bytes value]` 新增本地 glTF / GLB 静态几何构建入口，复用现有 accessor 解码、层级、页面、目录及固定查询代理。逐 primitive 串行构建，不解码图片或启动 GPU。输入源文件和所有 BIN 按原字节保留；GLB / data URI 内嵌 BIN 另保存可独立校验的副本。完整节点、材质、灯光与图片定义留在原文档，输出不是已经可运行的材质/场景包。外部图片没有复制，原容器或 BIN 内的图片字节随完整源保留；`imageResourcesCopied: false` 表示没有独立收集图片资源。Mask / Blend 条目明确标为 `route: source`，保留原 primitive 和覆盖语义，不能把它们的存在计成透明材质或虚拟几何支持。
+
+几何提取要求三角形、原始法线以及法线贴图需要的切线；蒙皮、Morph 和未知 primitive 扩展明确拒绝，运行时已有动态导入路径不受影响。只有证明绑定材质的核心纹理均使用 UV0，且没有可能重新解释 UV 的未知扩展时，分页几何才可省略 UV1 等未用流；省略项进入清单，原始 BIN 仍完整保留。顶点色、UV0、切线、材质索引和 primitive 索引贯穿构建；本入口不自动修复或重生成源切线。
+
+`cleanStaticGeometry` 默认拒绝零面积三角，显式 `--remove-zero-area` 只删除经过精确 float32 共线核验的三角；双精度叉积为零时使用有界 BigInt 复核，避免极端尺度舍入误删。可见重复三角、绕序和属性接缝保留，只压紧未引用顶点。输出顶点/三角到原 primitive 的映射及被移除三角号分别保存为小端 uint32 文件，带长度和 SHA-256；现有层级构建仍独立检查归一化精度，清理不放宽精度或画质标准。
+
+本入口最多 4096 primitive、256 buffer；单源文件最多 512 MiB、累计输入 1 GiB、JSON 128 MiB、页面编码加解码累计默认 1 GiB（显式选项硬上限 4 GiB）、输出文件合计 2 GiB。CLI 每 primitive 的顶点/三角上限均为 100 万，沿用层级与页面工作预算；代理显式允许最多 1,048,576 顶点 / 262,144 三角 / 128 MiB，不改变运行时查询的默认限额。图片和远程 buffer 不在此命令中读取，本地 buffer 路径及真实路径必须位于输入资产目录内，载荷通过已打开文件句柄按预检大小有界读取并检查变化。上述限额不是 JS/WASM 进程峰值或驱动显存占用保证。
+
+构建先写私有临时目录，完成后独占创建目标目录，每个数据文件均以不可覆盖方式复制，最后用同一文件系统硬链接原子发布完整 `manifest.json`。消费方必须以 manifest 存在为完成标志，不能只检查目录；进程中断可能留下没有 manifest 的不完整输出。失败清理只删除本次成功创建的文件及空目录，保留其他写入者的文件。原 OBJ 入口共用该发布逻辑，替代此前目录 rename 重试，避免 POSIX 下检查与重命名之间覆盖并发创建的空目录。发布期会同时保留暂存与目标副本，磁盘空间需容纳重叠。
+
+Sponza 的真实 BIN 已从官方 ZIP 精确范围 `5351–98707636` 读取，最终 HTTP 206、98,702,286 字节压缩载荷，经限额解压得到 139,973,456 字节，ZIP CRC32 `214c24c0` 一致，SHA-256 为 `903d443b46b51c8397c25b65286d9f9e111121f12a3e0e303f19019982568d6b`。证据 `artifacts/sponza-range-audit/bin-manifest.json` 与 `bin-analysis.json` 保留先前元数据审计历史。405 个 primitive 的实值检查覆盖 2,049,137 顶点、3,747,018 三角，索引均有效，发现 30 个精确零面积三角；191,992 个 COLOR_0 顶点均为精确白色。最大 primitive 84,602 三角，9 个超过运行时默认 65,536 三角限额，全部 primitive 原样接成 batch 则超过 256 上限，仍需场景组织与代理预算设计。
+
+1,736,650 个源切线与法线的绝对点积大于 0.001；当前共享表面基会正交化，但源帧的退化及实际法线贴图保真仍需视觉检查，不能据此自动改写全部切线。上述数据读取和离线构建不等于 Sponza 已渲染或通过大场景性能验收。
+
+另对全部 72 张实际引用图片执行了严格限额的 ZIP Range / PNG 头部读取，总计 294,912 字节，均为 4096×4096。基础色使用 25 张 sRGB 图，金属粗糙度使用 24 张线性图，法线有 24 次引用、23 张独立线性图；ZIP 压缩载荷合计 2,024,745,525 字节。若按当前 RGBA8 保存所有 mip，逻辑纹理量为 6,442,450,848 字节，约 6 GiB，并非实测 GPU 分配。证据 `artifacts/sponza-range-audit/image-header-audit.json`；没有下载完整图片。纹理压缩、按 mip 分级加载及实际材质保真仍是完整场景接入的必要工作。
+
+第一次全资产离线构建在已完成 341/405 个 primitive 后触发默认 `GLTF_BUILD_TOTAL_PAGE_BUDGET`，失败日志保留于 `artifacts/sponza-build-20261020.log`，暂存清理完成。后续显式使用 2 GiB 离线页面预算继续测量；这不提高或改变运行时驻留池、帧时间及视觉验收门槛。
+
+第二次完整构建成功，产物为 `artifacts/sponza-geometry-20261020/manifest.json`，日志 `artifacts/sponza-build-20261020-v2.log`：401 个不透明 primitive、108,674 个簇、11,363 页；4 个 Blend primitive 的 8,140 三角完整留在源路径。仅移除 30 个精确零面积三角；不透明 LOD0 为 3,738,848 三角，连同 Blend 保留 3,746,988 三角。编码页合计 465,206,422 字节，解码页载荷合计 700,179,104 字节；固定代理合计 494,366 顶点、753,930 三角、61,608,733 文件字节。
+
+独立回查脚本 `artifacts/verify-sponza-build.mjs` 对照原 glTF/BIN，用生产解码器验证全部 11,363 页和 401 个查询代理；6,178,477 次页顶点引用的位置、归一化后法线、UV、切线与颜色逐分量精确一致。通过有向循环规范化的三角多重集，核对全部 LOD0 与保留源三角一一对应，且源 primitive 清单无遗漏、无重标覆盖。报告 `artifacts/sponza-build-verification-20261020.json`，日志 `artifacts/sponza-verify-20261020.log`。这验证离线内容保留，不证明 GPU 驻留、实时画质、场景批次容量或帧率。
+
+所有必须常驻的根页面解码载荷合计 186,751,088 字节，占全页约 26.67%；根簇自身载荷（含每簇 16 字节头）为 91,140,918 字节，混入非根簇使当前根页载荷放大约 2.049 倍。下一步优先把根簇与可流送细节分开打包，再实测物理 GPU 页池槽位、对齐及上传成本；上述格式字节不能直接当作实际显存或“独特数据为驻留池 4–8 倍”的成绩。
+
+本轮最终 `npm run check` 通过 478 项 CPU 测试（61 文件）、类型检查与构建，日志 `artifacts/gltf-geometry-check-20261020-release.log`。CLI 测试实际运行 glTF / GLB / data URI 构建，核对属性、原始文件与映射、字节确定性、输入/页面预算、路径边界和已有目标保护；独立文件系统测试验证并发发布仅一个胜出。前次完整检查中首项 CLI 测试耗时 125.692 秒，超过原有 120 秒门槛，失败日志保留于 `artifacts/gltf-geometry-check-20261020-final.log`。离线命令关闭不需要的 Vite 文件监听、WebSocket 与依赖预扫描后，保持原超时不变，全套 CPU 测试在 7.29 秒完成。本次未修改 GPU 路径，不将此前 GPU 回归说成本轮重跑结果。
+
 ## 线性顶点色与真实资产属性
 
 `MeshData.colors` 提供独立的线性 RGBA 浮点流，逐顶点四分量、有限且处于 `[0,1]`，缺省为白色。材质表达式新增 `m.vertexColor`，与实例颜色独立；游戏材质自行决定如何组合，既有默认材质行为不变。glTF `COLOR_0` 自动乘入 baseColor factor 与纹理，支持 VEC3/VEC4 浮点或归一化 unsigned byte/short，RGB 的 alpha 补 1；平面法线展开和 Mikk 切线接缝拆分同时重映射颜色。CPU 材质参考、主视图、Mask 阴影和世界查询共用该语义，查询在真实命中三角形上重心插值，使后续 GI/反射读取相同材质值。
@@ -15,6 +43,8 @@
 完整 NVIDIA 浏览器回归 **99/99** 通过，日志 `artifacts/vertex-color-full-native-20261020.log`。随后将既有离屏反射联合用例升级为带顶点色的 Mask/Morph/skin/wave 发光面，主视图同时启用 GI、Final Gather 与雾；独立反射参考由材质参数 `[2,1,0.5]` 乘线性顶点色 `[1,0.5,0.25]` 得到 `[2,0.5,0.125]`。NVIDIA 中心反射锚点约为 `[1.999822,0.499956,0.124989]`，移动/恢复与覆盖热更新通过，日志 `artifacts/vertex-color-reflection-native-20261020.log` 两项通过。完整回归后未修改运行时代码；测试场景与审计 CLI 的最后修正另通过类型检查和 5 项审计测试（`artifacts/vertex-color-audit-final-20261020.log`）。
 
 新增顶点色及反射两组共四项另在 Intel 与 SwiftShader 各 **4/4** 通过：`artifacts/vertex-color-target-intel-20261020` 实际为非 fallback `intel / gen-12lp`，`artifacts/vertex-color-target-software-20261020` 为 `google / swiftshader / fallback=true`；GPU/页面错误为空，释放账本为零。这是定向功能结果，不是完整 Intel 回归或硬件性能结果；软件适配器不提供性能依据。
+
+提交 `c0a6316` 的[远程 CI run 39300084353](https://github.com/fomalhautb/real-engine/actions/runs/39300084353) 已取消，不能计为通过。CPU 检查成功，99 项浏览器用例以单 worker 执行，在正常推进到法线材质用例时达到作业 25 分钟上限；日志末尾为操作取消，没有完整浏览器结论。后续需调整远程执行组织并完成全部用例，不能用局部日志替代整套结果。
 
 只读 `audit:gltf` 同步检查 `COLOR_0` 元数据格式与 POSITION 数量，明确记录 `valuesRead: false` / `valuesValidated: false`。对已保存的固定 Sponza glTF 重审，59 个 primitive 的颜色声明布局可支持；BIN 数值尚未读取，透明 decal、资产预算和完整导入障碍仍需解决，尚无 Sponza 实际画面或驻留规模成绩。
 

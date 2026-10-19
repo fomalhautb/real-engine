@@ -6,6 +6,10 @@
 
 本轮补齐线性 RGBA 顶点色：glTF `COLOR_0`、材质 IR、主视图/Mask 阴影、世界查询、共享形变、静态层级与分页、固定查询代理均保留同一属性。NVIDIA 定向测试按独立颜色场验证 HDR/深度/查询与彩色发光 GI；驻留及分页模型均从 512 三角形粗化至 70 并恢复到 512。完整检查通过 465 项 CPU 测试，GPU 回归范围与资源成本详见 [implementation.md](implementation.md#线性顶点色与真实资产属性)。Sponza 的颜色声明布局现可支持，BIN 值、透明 decal、完整资产导入与大场景验收仍未完成。
 
+新增 glTF / GLB 离线静态几何构建入口，包含显式零面积清理、未用 UV 审计、源顶点/三角映射、独立页面与固定代理；完整源文档/BIN 保留，Mask / Blend 仍为明确的源数据路径，图片、材质编译与场景批次组织尚未完成。Sponza BIN 已实际读取并通过 ZIP CRC32 / SHA-256 校验，发现 30 个精确零面积三角；先前“BIN 尚未读取”的文字属于历史快照。此构建准备不代表完整场景可游走或几何流送规模门槛通过，具体证据见 [implementation.md](implementation.md#gltf-离线几何构建与实际-sponza-数据)。
+
+Sponza 完整离线构建已完成，并逐页对照源数据：401 个不透明 primitive 的 11,363 页、3,738,848 个 LOD0 三角及全部属性验证通过，4 个 Blend primitive 保留在原文档/BIN。实际页载荷显示根簇和细节混页把必需根页量放大约 2.049 倍，下一步优化页面布局。另确认 72 张引用纹理均为 4K，按 RGBA8 全 mip 约 6 GiB；尚未解码/上传这些图片，压缩、纹理流送、透明材质与完整场景组织仍待实现。
+
 ## 阶段 1
 
 下述 250 项 CPU、50 项浏览器及早期性能数值来自法线贴图加入前的历史快照。法线贴图、glTF 切线生成、CPU 流送、物理页池及主 Renderer 接入的证据分别记录于 implementation.md；此前提交 `20e3508c`、`0267cbe1`、`8fdf9b61`、`e7214d3`、`c5f6cfb` 的远程 CI 均已成功。此前 Worker 页解码通过 365 项 CPU（47 文件）和 65 项完整原生 NVIDIA 浏览器回归；提交 `86358ff` 的[远程 CI run 39227014810](https://github.com/fomalhautb/real-engine/actions/runs/39227014810) 已成功。本轮固定代理版本通过 371 项 CPU（48 文件）及 67 项完整原生 NVIDIA 浏览器回归，固定代理提交 `789279c` 的[远程 CI run 39230781801](https://github.com/fomalhautb/real-engine/actions/runs/39230781801) 已成功。尚未测量目标规模的流送性能或大资产导入成本。

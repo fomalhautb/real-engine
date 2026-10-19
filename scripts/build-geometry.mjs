@@ -1,11 +1,10 @@
 #!/usr/bin/env node
-import { createHash, randomUUID } from 'node:crypto';
-import { cpSync, renameSync } from 'node:fs';
-import { readFile, stat, lstat, mkdir, mkdtemp, writeFile, rename, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, stat, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, resolve, join } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
+import { exists, publishDirectory, removeOwnTemporary } from './asset-output.mjs';
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SOURCE_BYTES = 32 * 1024 * 1024;
@@ -35,54 +34,6 @@ function argumentsOf(argv) {
 }
 
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
-
-async function exists(path) {
-  try { await lstat(path); return true; }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-}
-
-async function removeOwnTemporary(temporary, targetParent, output) {
-  if (!(await exists(temporary))) return;
-  const absolute = resolve(temporary);
-  if (dirname(absolute) !== resolve(targetParent) ||
-      !basename(absolute).startsWith(`.${basename(output)}.tmp-`)) {
-    throw new Error('refusing to remove a directory outside this build temporary root');
-  }
-  await rm(absolute, { recursive: true, force: true });
-}
-
-async function publishReplacement(replacement, output) {
-  const retryDelays = [0, 50, 100, 200, 400, 800, 1600, 3200];
-  for (const [attempt, waitMs] of retryDelays.entries()) {
-    if (waitMs) await delay(waitMs);
-    if (await exists(output)) throw new Error(`output already exists: ${output}`);
-    try { renameSync(replacement, output); return; }
-    catch (error) {
-      if (attempt === retryDelays.length - 1 ||
-          !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
-    }
-  }
-}
-
-async function publishDirectory(temporary, output) {
-  if (await exists(output)) throw new Error(`output already exists: ${output}`);
-  try { await rename(temporary, output); return; }
-  catch (error) {
-    if (process.platform !== 'win32' || !['EPERM', 'EACCES'].includes(error.code)) throw error;
-  }
-  // If Windows denies the original directory rename, retry with a fresh private
-  // copy. The final directory is still published by one rename, never file by file.
-  const targetParent = dirname(output);
-  const replacement = join(targetParent, `.${basename(output)}.tmp-${randomUUID()}`);
-  try {
-    cpSync(temporary, replacement, { recursive: true, force: false, errorOnExist: true });
-    if (await exists(output)) throw new Error(`output already exists: ${output}`);
-    await publishReplacement(replacement, output);
-    await removeOwnTemporary(temporary, targetParent, output);
-  } finally {
-    await removeOwnTemporary(replacement, targetParent, output);
-  }
-}
 
 function metadata(hierarchy) {
   const { source, ...rest } = hierarchy;
@@ -114,7 +65,8 @@ async function buildInto(input, temporary, sourceBytes, queryError) {
   const sourceHash = sha256(sourceBytes);
 
   const server = await createServer({ root: REPOSITORY_ROOT, configFile: false,
-    server: { middlewareMode: true }, appType: 'custom' });
+    server: { middlewareMode: true, watch: null, ws: false },
+    optimizeDeps: { noDiscovery: true, include: [] }, appType: 'custom' });
   try {
     const { parseObj } = await server.ssrLoadModule('/src/mesh-import.ts');
     const { buildGeometryHierarchy } = await server.ssrLoadModule('/src/geometry-hierarchy.ts');

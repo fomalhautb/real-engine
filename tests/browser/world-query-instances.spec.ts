@@ -47,6 +47,8 @@ test('batch instance BVH matches linear queries and GI while reducing measured G
   for (const stage of [result.initial, result.moved, result.reordered, result.empty, result.restored]) parity(stage);
   expect(result.pictureEqual).toBe(true);
   expect(result.overlapTraversalOrder).toBe(true);
+  expect(result.tieWitness.hits.map(value => hit(value).entityId)).toEqual([result.overlapFirst, result.overlapSecond]);
+  for (const value of result.tieWitness.hits) expect(hit(value).distance === 0).toBe(true);
   for (const count of [...result.initialVisiblePixels, ...result.finalVisiblePixels]) expect(count).toBeGreaterThan(50);
   if (process.env.PLAYWRIGHT_GPU === 'hardware') expect(result.adapter.isFallbackAdapter).toBe(false);
   if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) {

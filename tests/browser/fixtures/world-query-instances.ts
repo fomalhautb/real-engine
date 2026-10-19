@@ -82,7 +82,11 @@ function scene(mesh: MeshData, name: string): SceneBatch {
 function rayFor(id: number, moved = false, ignore?: WorldRay['ignore']): WorldRay {
   const [x, y] = id === OVERLAP_SECOND ? [19, 0] : moved && id === MOVED_ID ? [23, 6] : cell(id);
   const [localX, localY] = localHit(moved && id === MOVED_ID);
-  return { origin: [x + localX, y + localY, 5], direction: [0, 0, -1], ...(ignore ? { ignore } : {}) };
+  // The overlap ray starts exactly on the common z=0 plane. A zero numerator
+  // gives an exact distance tie on every adapter; coplanar triangles at a
+  // nonzero distance can differ by one ULP after independent f32 divisions.
+  return { origin: [x + localX, y + localY, id === OVERLAP_SECOND ? 0 : 5],
+    direction: [0, 0, -1], ...(id === OVERLAP_SECOND ? { tMin: 0 } : {}), ...(ignore ? { ignore } : {}) };
 }
 const MISS: WorldRay = { origin: [100, 100, 5], direction: [0, 0, -1] };
 function initialRays(): WorldRay[] {
@@ -152,6 +156,10 @@ export async function runWorldQueryInstancesFixture() {
     linear = await Renderer.create(linearCanvas, [linearScene], {
       worldQueries: { ...query, instanceAcceleration: 'linear' }, diffuseGi: gi });
     const initial = await capture(accelerated, linear, initialRays());
+    const tieWitness = await accelerated.traceRays([
+      rayFor(OVERLAP_SECOND, false, { entityId: OVERLAP_SECOND, generation: 1 }),
+      rayFor(OVERLAP_SECOND, false, { entityId: OVERLAP_FIRST, generation: 1 }),
+    ]);
     const pictureEqual = acceleratedCanvas.toDataURL('image/png') === linearCanvas.toDataURL('image/png');
     const initialVisiblePixels = (await Promise.all([stillImage(acceleratedCanvas), stillImage(linearCanvas)]))
       .map(snapshot => snapshot.visiblePixels);
@@ -198,7 +206,7 @@ export async function runWorldQueryInstancesFixture() {
     const overflowErrors = [...overflowRenderer.errors];
     overflowRenderer.dispose(); overflowAfterDispose = overflowRenderer.stats.ownedGpuBytes; overflowRenderer = undefined;
 
-    return { adapter, initial, moved, reordered, empty, restored, acceleratedGi, linearGi, pictureEqual,
+    return { adapter, initial, tieWitness, moved, reordered, empty, restored, acceleratedGi, linearGi, pictureEqual,
       initialVisiblePixels, finalVisiblePixels, overlapTraversalOrder,
       knownDeformedPosition: [cell(1000)[0] + localHit()[0], cell(1000)[1] + localHit()[1], 0] as Vec3,
       movedPosition: [23 + localHit(true)[0], 6 + localHit(true)[1], 0] as Vec3,

@@ -66,7 +66,7 @@ async function rejection(action: () => unknown): Promise<string> {
   try { await action(); return ''; } catch (error) { return String(error); }
 }
 
-async function setup(device: GPUDevice, options: WorldQueryOptions) {
+async function setup(device: GPUDevice, options: WorldQueryOptions, sceneBvh: boolean) {
   let ownedBytes = 0;
   const account = (delta: number) => { ownedBytes += delta; };
   const materials = new MaterialResources(device, account);
@@ -76,15 +76,23 @@ async function setup(device: GPUDevice, options: WorldQueryOptions) {
     const scene = triangle();
     const material = materials.create(scene.material);
     query = await GpuWorldQuery.create(device, materials.layout, account, {
-      maxRays: 4, maxTrianglesPerMesh: 1, maxInstancesPerBatch: 1, ...options,
+      maxRays: 4, maxTrianglesPerMesh: 1, maxInstancesPerBatch: 1,
+      sceneAcceleration: sceneBvh ? 'bvh' : 'linear', ...options,
     });
     buffers = gpuScene(device);
     account(buffers.output.size + buffers.instances.size);
     const pipeline = await query.createPipeline(material.program);
     query.addBatch({ scene, ...buffers, getMaterial: () => material, getPipeline: () => pipeline });
+    const names = [scene.name];
+    if (sceneBvh) for (let index = 1; index < 8; index++) {
+      const empty: SceneBatch = { ...scene, name: `parameter-empty-${index}`, instances: [],
+        queryIdentity: { assetId: 'parameter-empty', primitiveId: index, topologyVersion: 9 } };
+      query.addBatch({ scene: empty, ...buffers, getMaterial: () => material, getPipeline: () => pipeline });
+      names.push(empty.name);
+    }
     query.updateSnapshot(FRAME, REVISION);
     const readyQuery = query, readyBuffers = buffers;
-    return { query: readyQuery, scene, getOwnedBytes: () => ownedBytes,
+    return { query: readyQuery, scene, names, getOwnedBytes: () => ownedBytes,
       dispose: () => { readyQuery.dispose(); materials.dispose();
         readyBuffers.output.destroy(); readyBuffers.instances.destroy();
         account(-readyBuffers.output.size - readyBuffers.instances.size); } };
@@ -97,9 +105,17 @@ async function setup(device: GPUDevice, options: WorldQueryOptions) {
 }
 
 /** Each ray source is encoded as a GPU copy so later traces cannot alias queue.writeBuffer uploads. */
-function encodeRays(device: GPUDevice, encoder: GPUCommandEncoder, query: GpuWorldQuery, count: number): GPUBuffer {
-  const ray = { origin: [0, 0, 5] as [number, number, number], direction: [0, 0, -1] as [number, number, number] };
+function encodeRays(device: GPUDevice, encoder: GPUCommandEncoder, query: GpuWorldQuery, count: number,
+  mode: 'hit' | 'miss' | 'empty' = 'hit'): GPUBuffer {
+  const ray = { origin: [mode === 'miss' ? 5 : 0, 0, 5] as [number, number, number],
+    direction: [0, 0, -1] as [number, number, number] };
   const packed = packWorldRays(Array.from({ length: count }, () => ray), 4);
+  // GPU-generated inactive rays use an empty interval; the public CPU packer intentionally rejects one.
+  if (mode === 'empty') for (let i = 0; i < count; i++) {
+    const view = new DataView(packed);
+    view.setFloat32(i * 48 + 12, 6, true);
+    view.setFloat32(i * 48 + 28, 5, true);
+  }
   const staging = device.createBuffer({ size: Math.max(4, packed.byteLength),
     usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
   new Uint8Array(staging.getMappedRange()).set(new Uint8Array(packed));
@@ -108,7 +124,7 @@ function encodeRays(device: GPUDevice, encoder: GPUCommandEncoder, query: GpuWor
   return staging;
 }
 
-export async function runWorldQueryParametersFixture() {
+export async function runWorldQueryParametersFixture(sceneBvh = false) {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('WebGPU adapter unavailable');
   const device = await adapter.requestDevice();
@@ -117,12 +133,15 @@ export async function runWorldQueryParametersFixture() {
   let first: Awaited<ReturnType<typeof setup>> | undefined;
   const staging: GPUBuffer[] = [];
   let readback: GPUBuffer | undefined;
+  let maskReadback: GPUBuffer | undefined;
   let budgetReadback: GPUBuffer | undefined;
   let second: Awaited<ReturnType<typeof setup>> | undefined;
   const cleanup = { firstOwnedBytesAfterDispose: -1, secondOwnedBytesAfterDispose: -1 };
   try {
-    const readyFirst = await setup(device, { maxTraceParameterSetsPerEncoder: 3 });
+    const readyFirst = await setup(device, { maxTraceParameterSetsPerEncoder: 3 }, sceneBvh);
     first = readyFirst;
+    const sceneDiagnostics = { mode: readyFirst.query.diagnostics().sceneAcceleration,
+      nodes: readyFirst.query.diagnostics().sceneBvhNodes, batches: readyFirst.query.diagnostics().batches };
     const uniformAlignment = device.limits.minUniformBufferOffsetAlignment;
     const strides = { trace: readyFirst.query.diagnostics().traceUniformStride,
       reset: readyFirst.query.diagnostics().resetUniformStride, uniformAlignment };
@@ -137,6 +156,15 @@ export async function runWorldQueryParametersFixture() {
       uploads.push(readyFirst.query.encodeTrace(encoder, count, lod, REVISION));
       encoder.copyBufferToBuffer(readyFirst.query.hitBuffer, 0, readback!, index * 4 * WORLD_HIT_BYTES,
         count * WORLD_HIT_BYTES);
+    });
+    maskReadback = device.createBuffer({ size: 4 * WORLD_HIT_BYTES,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const maskUploads: number[] = [];
+    (['hit', 'miss', 'empty', 'hit'] as const).forEach((mode, index) => {
+      staging.push(encodeRays(device, encoder, readyFirst.query, 1, mode));
+      maskUploads.push(readyFirst.query.encodeTrace(encoder, 1, 1, REVISION));
+      encoder.copyBufferToBuffer(readyFirst.query.hitBuffer, 0, maskReadback!, index * WORLD_HIT_BYTES,
+        WORLD_HIT_BYTES);
     });
     const zeroUpload = readyFirst.query.encodeTrace(encoder, 0, 3, REVISION);
     const invalidCount = await rejection(() => readyFirst.query.encodeTrace(encoder, 5, 0, REVISION));
@@ -158,10 +186,18 @@ export async function runWorldQueryParametersFixture() {
     const mapped = readback.getMappedRange();
     const results = plans.map(({ count }, index) => decodeWorldHits(
       mapped.slice(index * 4 * WORLD_HIT_BYTES, index * 4 * WORLD_HIT_BYTES + count * WORLD_HIT_BYTES),
-      ['parameter-triangle'], count, FRAME, REVISION));
+      readyFirst.names, count, FRAME, REVISION));
     readback.unmap();
+    await maskReadback.mapAsync(GPUMapMode.READ);
+    const maskMapped = maskReadback.getMappedRange();
+    const maskResults = [0, 1, 2, 3].map(index => decodeWorldHits(
+      maskMapped.slice(index * WORLD_HIT_BYTES, (index + 1) * WORLD_HIT_BYTES),
+      readyFirst.names, 1, FRAME, REVISION));
+    const maskWork = [0, 1, 2, 3].map(index => new DataView(maskMapped).getUint32(
+      index * WORLD_HIT_BYTES + 144, true));
+    maskReadback.unmap();
 
-    second = await setup(device, { maxTraceParameterSetsPerEncoder: 2 });
+    second = await setup(device, { maxTraceParameterSetsPerEncoder: 2 }, sceneBvh);
     const budgetEncoder = device.createCommandEncoder();
     second.query.encodeRefit(budgetEncoder);
     staging.push(encodeRays(device, budgetEncoder, second.query, 1));
@@ -178,18 +214,20 @@ export async function runWorldQueryParametersFixture() {
     const budgetMapped = budgetReadback.getMappedRange();
     const preserved = [0, 1].map(index => decodeWorldHits(
       budgetMapped.slice(index * WORLD_HIT_BYTES, (index + 1) * WORLD_HIT_BYTES),
-      ['parameter-triangle'], 1, FRAME, REVISION));
+      second!.names, 1, FRAME, REVISION));
     budgetReadback.unmap();
     const freshEncoder = device.createCommandEncoder();
     staging.push(encodeRays(device, freshEncoder, second.query, 1));
     const freshUpload = second.query.encodeTrace(freshEncoder, 1, 2, REVISION);
     device.queue.submit([freshEncoder.finish()]);
     await device.queue.onSubmittedWorkDone();
-    return { results, uploads, zeroUpload, invalidCount, invalidLod, snapshotChange,
+    return { results, uploads, maskResults, maskWork, maskUploads, sceneDiagnostics,
+      zeroUpload, invalidCount, invalidLod, snapshotChange,
       frameChange, sourceCountChange, reuseAfterSnapshotReject,
       budgetUploads, budgetError, reuseAfterReject, preserved, freshUpload, strides, cleanup, validation };
   } finally {
     readback?.destroy();
+    maskReadback?.destroy();
     budgetReadback?.destroy();
     for (const buffer of staging) buffer.destroy();
     first?.dispose(); second?.dispose();

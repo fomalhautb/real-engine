@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>World query scene BVH regression</title>
+  <style>
+    body { margin: 0; padding: 24px; background: #111923; color: #e8eef5; font: 16px system-ui; }
+    h1 { margin: 0 0 8px; }
+    p { max-width: 900px; line-height: 1.45; }
+    main { display: flex; gap: 16px; }
+    figure { margin: 0; flex: 1; min-width: 0; }
+    canvas, figure img { display: block; width: 100%; aspect-ratio: 1; background: #080d12; }
+    figcaption { padding: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>Scene BVH and linear batch query parity</h1>
+  <p>Two renderers compare 64 spatially dispersed batches, shared deformation, Masked coverage, material edits, and GPU work.</p>
+  <main id="scene-pair">
+    <figure><canvas id="accelerated"></canvas><figcaption>Scene BVH</figcaption></figure>
+    <figure><canvas id="linear"></canvas><figcaption>Linear batches</figcaption></figure>
+  </main>
+</body>
+</html>

@@ -53,6 +53,11 @@ export async function runGeometryQueryProxyFixture() {
   const batchSets: RenderBatch[][] = [legacy, paged, fixed].map(first => [first,
     ...scene.batches.slice(1).map(batch => ({ ...batch, instances: batch.instances.map(state => ({ ...state })),
       material: { definition: { ...DEFAULT_MATERIAL_DEFINITION, shading: 'unlit' as const } } }))]);
+  // Register empty slots to exercise scene-tree invalid leaves alongside the
+  // real paged proxy. These slots add no visible or lighting geometry.
+  for (const batches of batchSets) while (batches.length < 8) batches.push({
+    ...scene.batches[1], name: `unused-query-batch-${batches.length}`, capacity: 1, instances: [], inputMode: 'committed',
+  });
   const panel = document.createElement('section'); panel.id = 'query-proxy-visual';
   panel.style.cssText = 'position:fixed;inset:0;z-index:10000;background:#11171d;color:#eaf1f6;padding:24px;font:16px system-ui;overflow:auto';
   panel.innerHTML = '<h1 style="font-size:26px">分页细节与固定光照代理</h1><p>中间：主画面读取压缩页，阴影和 GI 使用固定代理。右侧显示光照实际使用的较粗几何。</p>';
@@ -72,7 +77,7 @@ export async function runGeometryQueryProxyFixture() {
   const eye: [number, number, number] = [8, 9, 16], target: [number, number, number] = [0, -0.5, 0];
   try {
     for (let i = 0; i < 3; i++) renderers.push(await Renderer.create(canvases[i], batchSets[i], i === 2
-      ? { ...options, worldQueries: { ...options.worldQueries, instanceAcceleration: 'linear' } } : options));
+      ? { ...options, worldQueries: { ...options.worldQueries, instanceAcceleration: 'linear', sceneAcceleration: 'linear' } } : options));
     const [full, stream, reference] = renderers;
     for (const r of [full, stream]) r.setGeometryLod({ maxErrorPixels: 0, frustumCulling: false });
     for (const r of renderers) r.setDiffuseGiEnabled(false);

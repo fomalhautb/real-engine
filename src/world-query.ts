@@ -12,6 +12,8 @@ export interface WorldQueryOptions {
   maxTraceParameterSetsPerEncoder?: number;
   /** Batch-local instance BVH for capacities >= 8; linear retains the reference traversal. */
   instanceAcceleration?: 'bvh' | 'linear';
+  /** GPU batch candidates from a scene BVH when at least 8 batches are registered. */
+  sceneAcceleration?: 'bvh' | 'linear';
 }
 
 export interface WorldRay {
@@ -72,7 +74,7 @@ export const WORLD_HIT_BYTES = 160;
 
 const UINT32_MAX = 0xffff_ffff;
 const MAX_RAYS = 65_536;
-type NumericOptions = Required<Omit<WorldQueryOptions, 'instanceAcceleration'>>;
+type NumericOptions = Required<Omit<WorldQueryOptions, 'instanceAcceleration' | 'sceneAcceleration'>>;
 const DEFAULT_OPTIONS: NumericOptions = {
   maxRays: 1_024,
   maxBytes: 128 * 1024 * 1024,
@@ -112,6 +114,9 @@ export function resolveWorldQueryOptions(options: WorldQueryOptions = {}): Requi
   const acceleration = options.instanceAcceleration ?? 'bvh';
   if (acceleration !== 'bvh' && acceleration !== 'linear') throw new RangeError('instanceAcceleration must be bvh or linear');
   result.instanceAcceleration = acceleration;
+  const sceneAcceleration = options.sceneAcceleration ?? 'bvh';
+  if (sceneAcceleration !== 'bvh' && sceneAcceleration !== 'linear') throw new RangeError('sceneAcceleration must be bvh or linear');
+  result.sceneAcceleration = sceneAcceleration;
   return result;
 }
 

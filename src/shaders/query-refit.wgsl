@@ -68,3 +68,26 @@ fn refitInstances(@builtin(global_invocation_id) id: vec3u) {
     }
     bounds[params.offsets.z + node] = Bounds(vec4f(low, valid), vec4f(high, 0.0));
 }
+
+// One current root per batch for the scene BVH. shape.w is the output record;
+// offsets.xy are the optional instance-tree root offset and node count.
+@compute @workgroup_size(1)
+fn refitBatch() {
+    var low = vec3f(3.402823466e+38);
+    var high = -low;
+    var valid = 0.0;
+    if (params.shape.z != 0u) {
+        if (params.offsets.y != 0u) {
+            let root = bounds[params.offsets.x];
+            low = root.low.xyz; high = root.high.xyz; valid = root.low.w;
+        } else {
+            // Linear-instance reference: bounded by the existing 4096 hard cap.
+            for (var instance = 0u; instance < params.shape.z; instance++) {
+                let root = bounds[instance * params.shape.x];
+                low = min(low, root.low.xyz); high = max(high, root.high.xyz);
+            }
+            valid = 1.0;
+        }
+    }
+    bounds[params.shape.w] = Bounds(vec4f(low, valid), vec4f(high, 0.0));
+}

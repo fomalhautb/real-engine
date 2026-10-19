@@ -14,7 +14,7 @@ struct Params {
     shape: vec4u, // node count, vertex count, instance count, batch ID
     offsets: vec4u, // triangle IDs, indices, UVs, unused
     limits: vec4u, // ray count, work limit, frame, topology version
-    material: vec4u, // material revision, GI area-sampling source flag
+    material: vec4u, // material revision, GI area-sampling source flag, scene candidates enabled
     textureLod: vec4f,
     instanceTree: vec4u, // node offset, order offset, bounds offset, node count (0 = linear)
 }
@@ -26,6 +26,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read> rays: array<Ray>;
 @group(0) @binding(6) var<storage, read_write> hits: array<Hit>;
 @group(0) @binding(7) var<storage, read> identities: array<vec4u>;
+@group(0) @binding(8) var<storage, read> batchCandidates: array<u32>;
 struct MaterialParameters { values: array<vec4f, 16> }
 @group(1) @binding(0) var<uniform> materialParameters: MaterialParameters;
 @group(1) @binding(1) var materialImage0: texture_2d<f32>;
@@ -66,6 +67,10 @@ fn uvAt(vertex: u32) -> vec2f {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= params.limits.x) { return; }
+    if (params.material.z != 0u) {
+        let batch = params.shape.w - 1u;
+        if ((batchCandidates[id.x * 8u + batch / 32u] & (1u << (batch % 32u))) == 0u) { return; }
+    }
     let ray = rays[id.x];
     var hit = hits[id.x];
     if (hit.work.z != 0u) { return; }

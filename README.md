@@ -23,7 +23,7 @@
 
 固定代理版本的完整 `npm run check` 通过 371 项 CPU 测试（48 文件）、TypeScript 与生产构建；原生 NVIDIA 完整浏览器回归 67/67 通过，两个新增源网格可省略用例也在非 fallback Intel 核显定向通过。主视图分页 LOD0、阴影、查询、GI、Final Gather 和小池换页的有限数值联测及账本证据见[固定查询代理](docs/implementation.md#固定查询代理)。Intel 结果不是完整回归或性能成绩；固定代理提交 `789279c` 的[远程 CI run 39230781801](https://github.com/fomalhautb/real-engine/actions/runs/39230781801) 已成功。
 
-世界空间查询默认对容量至少 8 的批次启用实例 BVH：物体移动或形变后，GPU 从共享三角形结果更新边界；静止批次复用缓存。`worldQueries.instanceAcceleration: 'linear'` 保留原扫描路径供对照。此加速限于批次内部，尚无跨批次全场景 TLAS；具体预算与验收见[世界空间查询基础](docs/implementation.md#世界空间查询基础)。
+世界空间查询默认对容量至少 8 的批次启用实例 BVH；注册至少 8 个批次时，还用场景 BVH 为每条射线筛选候选批次。物体移动或形变后，GPU 从共享三角形结果更新边界；静止批次复用缓存。`worldQueries.instanceAcceleration` 和 `sceneAcceleration` 各自可设为 `'linear'` 保留原路径供对照。材质仍逐批次 dispatch，工作量减少不等于已经证明整帧提速；具体预算与验收见[世界空间查询基础](docs/implementation.md#世界空间查询基础)。
 
 实例加速版本通过 378 项 CPU 测试、类型检查与构建、69 项原生 NVIDIA 完整浏览器回归及 4 项 Intel 定向测试。258 个共享形变实例的 11 条射线，工作单位从 5,685 降至 281，命中、画面与 GI 保持一致；此计数不是帧率提升比例。代码变更、范围与证据同见实现状态，远程 CI 随新提交验证。
 

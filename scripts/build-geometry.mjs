@@ -113,58 +113,59 @@ async function buildInto(input, temporary, sourceBytes) {
 
   const server = await createServer({ root: REPOSITORY_ROOT, configFile: false,
     server: { middlewareMode: true }, appType: 'custom' });
-  let parseObj, buildGeometryHierarchy, encodeGeometryPages, buildGeometryStreamDirectory;
   try {
-    ({ parseObj } = await server.ssrLoadModule('/src/mesh-import.ts'));
-    ({ buildGeometryHierarchy } = await server.ssrLoadModule('/src/geometry-hierarchy.ts'));
-    ({ encodeGeometryPages } = await server.ssrLoadModule('/src/geometry-pages.ts'));
-    ({ buildGeometryStreamDirectory } = await server.ssrLoadModule('/src/geometry-stream-directory.ts'));
+    const { parseObj } = await server.ssrLoadModule('/src/mesh-import.ts');
+    const { buildGeometryHierarchy } = await server.ssrLoadModule('/src/geometry-hierarchy.ts');
+    const { encodeGeometryPages } = await server.ssrLoadModule('/src/geometry-pages.ts');
+    const { buildGeometryStreamDirectory } = await server.ssrLoadModule('/src/geometry-stream-directory.ts');
+
+    // Keep the module runner alive through asynchronous builds: the encoder is
+    // imported lazily so runtime decode Workers never initialize encoder WASM.
+    const asset = parseObj(sourceBytes.toString('utf8'));
+    if (asset.primitives.length > MAX_PRIMITIVES) throw new Error(`OBJ primitive count exceeds ${MAX_PRIMITIVES}`);
+    const primitives = [];
+    for (const [index, primitive] of asset.primitives.entries()) {
+      const key = `obj:${sourceHash}:primitive:${index}`;
+      const hierarchy = await buildGeometryHierarchy({
+        primitiveKey: key, mesh: primitive.mesh, coverage: 'opaque',
+      });
+      const encoded = await encodeGeometryPages(hierarchy, PAGE_OPTIONS);
+      const streamDirectory = await buildGeometryStreamDirectory(hierarchy, encoded);
+      const directory = `primitive-${index}`;
+      await mkdir(join(temporary, directory));
+      const hierarchyFile = `${directory}/hierarchy.json`;
+      await writeFile(join(temporary, directory, 'hierarchy.json'), `${JSON.stringify(metadata(hierarchy), null, 2)}\n`);
+      const streamDirectoryFile = `${directory}/stream-directory.json`;
+      const streamDirectoryData = Buffer.from(`${JSON.stringify(streamDirectory)}\n`, 'utf8');
+      await writeFile(join(temporary, directory, 'stream-directory.json'), streamDirectoryData);
+      const pages = [];
+      for (const page of encoded.pages) {
+        const file = `${directory}/page-${page.id}.bin`;
+        await writeFile(join(temporary, directory, `page-${page.id}.bin`), page.bytes);
+        pages.push({ id: page.id, file, clusterIds: page.clusterIds,
+          compressedBytes: page.bytes.byteLength, decodedBytes: page.decodedBytes,
+          sha256: sha256(page.bytes) });
+      }
+      primitives.push({ index, name: primitive.name, materialName: primitive.materialName ?? null,
+        sourceSha256: sourceHash, primitiveKey: key, hierarchyFile, streamDirectoryFile,
+        streamDirectorySha256: sha256(streamDirectoryData), streamDirectoryBytes: streamDirectoryData.byteLength,
+        buildOptions: hierarchy.options,
+        vertexCount: primitive.mesh.vertexCount, triangleCount: primitive.mesh.indices.length / 3,
+        clusterCount: hierarchy.clusters.length, groupCount: hierarchy.groups.length,
+        rootClusters: hierarchy.roots, rootPages: encoded.rootPages,
+        clusterPages: encoded.clusterPages, vertexStride: encoded.vertexStride,
+        pageFormatVersion: encoded.version, pages });
+    }
+    const manifest = { version: 1, format: 'real-engine-geometry', builder: 'meshoptimizer-1.3.0',
+      source: { name: basename(input), sha256: sourceHash, bytes: sourceBytes.byteLength },
+      config: { inputFormat: 'obj', coverage: 'opaque', coverageContract: 'caller asserts opaque; OBJ materials are not converted',
+        maxSourceBytes: MAX_SOURCE_BYTES, maxPrimitives: MAX_PRIMITIVES,
+        page: PAGE_OPTIONS },
+      materialLibraries: asset.materialLibraries, warnings: asset.warnings, primitives };
+    await writeFile(join(temporary, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   } finally {
     await server.close();
   }
-
-  const asset = parseObj(sourceBytes.toString('utf8'));
-  if (asset.primitives.length > MAX_PRIMITIVES) throw new Error(`OBJ primitive count exceeds ${MAX_PRIMITIVES}`);
-  const primitives = [];
-  for (const [index, primitive] of asset.primitives.entries()) {
-    const key = `obj:${sourceHash}:primitive:${index}`;
-    const hierarchy = await buildGeometryHierarchy({
-      primitiveKey: key, mesh: primitive.mesh, coverage: 'opaque',
-    });
-    const encoded = await encodeGeometryPages(hierarchy, PAGE_OPTIONS);
-    const streamDirectory = await buildGeometryStreamDirectory(hierarchy, encoded);
-    const directory = `primitive-${index}`;
-    await mkdir(join(temporary, directory));
-    const hierarchyFile = `${directory}/hierarchy.json`;
-    await writeFile(join(temporary, directory, 'hierarchy.json'), `${JSON.stringify(metadata(hierarchy), null, 2)}\n`);
-    const streamDirectoryFile = `${directory}/stream-directory.json`;
-    const streamDirectoryData = Buffer.from(`${JSON.stringify(streamDirectory)}\n`, 'utf8');
-    await writeFile(join(temporary, directory, 'stream-directory.json'), streamDirectoryData);
-    const pages = [];
-    for (const page of encoded.pages) {
-      const file = `${directory}/page-${page.id}.bin`;
-      await writeFile(join(temporary, directory, `page-${page.id}.bin`), page.bytes);
-      pages.push({ id: page.id, file, clusterIds: page.clusterIds,
-        compressedBytes: page.bytes.byteLength, decodedBytes: page.decodedBytes,
-        sha256: sha256(page.bytes) });
-    }
-    primitives.push({ index, name: primitive.name, materialName: primitive.materialName ?? null,
-      sourceSha256: sourceHash, primitiveKey: key, hierarchyFile, streamDirectoryFile,
-      streamDirectorySha256: sha256(streamDirectoryData), streamDirectoryBytes: streamDirectoryData.byteLength,
-      buildOptions: hierarchy.options,
-      vertexCount: primitive.mesh.vertexCount, triangleCount: primitive.mesh.indices.length / 3,
-      clusterCount: hierarchy.clusters.length, groupCount: hierarchy.groups.length,
-      rootClusters: hierarchy.roots, rootPages: encoded.rootPages,
-      clusterPages: encoded.clusterPages, vertexStride: encoded.vertexStride,
-      pageFormatVersion: encoded.version, pages });
-  }
-  const manifest = { version: 1, format: 'real-engine-geometry', builder: 'meshoptimizer-1.3.0',
-    source: { name: basename(input), sha256: sourceHash, bytes: sourceBytes.byteLength },
-    config: { inputFormat: 'obj', coverage: 'opaque', coverageContract: 'caller asserts opaque; OBJ materials are not converted',
-      maxSourceBytes: MAX_SOURCE_BYTES, maxPrimitives: MAX_PRIMITIVES,
-      page: PAGE_OPTIONS },
-    materialLibraries: asset.materialLibraries, warnings: asset.warnings, primitives };
-  await writeFile(join(temporary, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 async function build() {

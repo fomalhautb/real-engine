@@ -4,6 +4,8 @@ import { buildGeometryHierarchy } from '../src/geometry-hierarchy';
 import { encodeGeometryPages, type EncodedGeometryPages } from '../src/geometry-pages';
 import { buildGeometryStreamDirectory } from '../src/geometry-stream-directory';
 import { GeometryPageCache } from '../src/geometry-stream-cache';
+import { GeometryDecodeWorkerPool, type GeometryPageDecodeService } from '../src/geometry-decode-worker-pool';
+import { decodeVerifiedGeometryPage } from '../src/geometry-page-decode';
 import type { GeometryPageProvider, GeometryStreamDirectory } from '../src/geometry-stream-types';
 
 function grid(size = 12): MeshData {
@@ -76,6 +78,51 @@ describe('bounded CPU geometry page cache', () => {
     otherIds = directory.pages.map(page => page.id).filter(id => !directory.rootPages.includes(id));
     expect(directory.rootPages.length).toBeGreaterThan(0);
     expect(otherIds.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('shares capacity before fetching and aborts initializing caches when the decode service is disposed', async () => {
+    const workers = vi.fn((): Worker => { throw new Error('decode must not start'); });
+    const pool = new GeometryDecodeWorkerPool({ workers: 1 }, workers);
+    const held = heldProvider(new Set(directory.rootPages));
+    const creations = [0, 1].map(() => GeometryPageCache.create(directory, held.fetch, {}, pool)
+      .then(cache => { void cache.dispose(); return 'unexpected success'; }, error => String(error)));
+    try {
+      await eventually(() => held.started.length === 1 && pool.diagnostics().waitingRequests > 0);
+      const signal = [...held.waiting.values()][0].signal;
+      expect(signal.aborted).toBe(false);
+      expect(held.started).toHaveLength(1);
+      pool.dispose();
+      const errors = await Promise.all(creations);
+      expect(signal.aborted).toBe(true);
+      expect(String(signal.reason)).toContain('GEOMETRY_DECODE_DISPOSED');
+      expect(errors.every(error => error.includes('GEOMETRY_STREAM_ROOT_LOAD_FAILED'))).toBe(true);
+      expect(held.waiting.size).toBe(0);
+      expect(workers).not.toHaveBeenCalled();
+      expect(pool.diagnostics()).toMatchObject({ disposed: true, activeRequests: 0,
+        waitingRequests: 0, inFlightBytes: 0 });
+    } finally { pool.dispose(); }
+  });
+
+  it('defers a saturated shared decode queue until another request without spinning or poisoning a detail page', async () => {
+    let saturated = false, attempts = 0;
+    const decoder: GeometryPageDecodeService = { mode: 'worker', acquire: async (page, signal) => {
+      attempts++;
+      if (saturated) throw new Error('GEOMETRY_DECODE_QUEUE_BUDGET');
+      return { signal, decode: data => decodeVerifiedGeometryPage(page, data, signal), release: () => {} };
+    } };
+    const fetch = vi.fn(provider());
+    const cache = await GeometryPageCache.create(directory, fetch, {}, decoder);
+    try {
+      const beforeAttempts = attempts, beforeFetches = fetch.mock.calls.length;
+      saturated = true; cache.request(otherIds[0]); await cache.idle();
+      expect(attempts).toBe(beforeAttempts + 1);
+      expect(fetch).toHaveBeenCalledTimes(beforeFetches);
+      expect(cache.diagnostics()).toMatchObject({ decodeBudgetDeferred: 1, failedPages: [], activeRequests: 0 });
+      expect(cache.get(otherIds[0])).toBeUndefined();
+      saturated = false; cache.request(otherIds[0]); await cache.idle();
+      expect(cache.get(otherIds[0])).toBeDefined();
+      expect(attempts).toBe(beforeAttempts + 2);
+    } finally { await cache.dispose(); }
   });
 
   it('loads and pins every root before create resolves, then serves decoded metadata', async () => {

@@ -1,6 +1,6 @@
 # 阶段 1–2 实现状态
 
-更新日期：2026-10-19。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询及可选跨帧反馈的漫反射 GI 基础；本轮为主 Renderer 的静态 Opaque 分页表面增加整组预算准入、祖先页面保留和有界 CPU 传输窗口，减少小池下无效的反复加载淘汰。分页表面复用材质与当前/前帧变换语义，阴影、查询和 Masked 回退仍保留完整源网格。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何或 Lumen 类光照。
+更新日期：2026-10-19。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询及可选跨帧反馈的漫反射 GI 基础；本轮在整组预算流送上接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义，阴影、查询和 Masked 回退仍保留完整源网格。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何或 Lumen 类光照。
 
 ## 已实现的运行路径
 
@@ -66,6 +66,24 @@ CPU 回归以带属性接缝的曲面网格核对 LOD0 完整性、真实减面�
 
 此前 CPU 流送基础的完整本地验证：`npm run check` 通过 304 项 CPU 测试（39 文件）、TypeScript 和生产构建；Edge 实际非 fallback `nvidia / ampere` 的浏览器回归 57 项全部通过。证据为 `artifacts/geometry-stream-check-release-20261016.log` 和 `artifacts/geometry-stream-browser-release-native-20261016.log`。新增浏览器用例通过真实 localhost HTTP 服务加载 29 个压缩页、64 个簇，验证 gzip/CORS、先加载固定根页、SHA 损坏拒绝、整组回退与显式重试，重试后恢复全部 288 个 LOD0 三角形且 CPU 缓存释放归零；它不执行流送 GPU 绘制。该小网格有 28 个根页，根页准备后的选择已有 280 个三角形，仅用于流程正确性，不能证明根集效率或超驻留池场景。CPU 回归另验预算、LRU、取消/重入释放、稀疏元数据拒绝、混合层级根簇和几何边界覆盖；CLI 两次独立构建逐字节一致。开发服务器预打包实际使用的 meshoptimizer 子路径，避免首次按需加载触发页面刷新。该提交 `0267cbe1` 的 [CI run 38914399969](https://github.com/fomalhautb/real-engine/actions/runs/38914399969) 已完成并成功。
 
+## 共享 Worker 页解码
+
+主 `Renderer` 在存在流送批次时创建一个 `GeometryDecodeWorkerPool`，全部批次借用同一服务；未流送的场景不创建 Worker。`RendererOptions.geometryDecoding` 默认 2 个 module Worker（范围 1–4）、64 MiB 在途载荷预算（硬上限 256 MiB）、4096 个排队描述符（硬上限 4096），启动和解码超时为 30 秒（硬上限 120 秒）。根页初始化并发必须能放入所配置的工位与排队容量；不足会明确失败。独立 `GeometryPageCache` 默认保留 inline CPU 参考路径，也可借用该服务，不能释放其拥有者的 Worker。
+
+缓存先申请工位和 `2 × encodedBytes + 2 × decodedBytes` 字节预留，再调用 provider；等待者仅保留页描述符，不先下载并堆积载荷。空闲工位同步预订，真正等待的请求才计入队列。细节页遇到共享队列饱和时增加 `decodeBudgetDeferred`，保留可绘制祖先，随后由有界帧窗口重新请求；不会在微任务中忙循环，也不把饱和标记为损坏页。哈希/格式/身份等真实失败仍需显式重试。
+
+provider 保留原缓冲，缓存只复制一份独立、精确长度的输入快照并转移所有权。Worker 执行 SHA-256、页格式与校验和检查、meshopt 解码和有限值检查，再把各顶点/索引 TypedArray 的底层缓冲转移回缓存。解码模块不加载离线编码器 WASM；编码器按需导入，离线 CLI 的模块运行器保持到异步构建结束后才关闭。目录/簇身份校验、源属性核对与 GPU 上传打包仍在主线程；尚未完成通用资产导入或所有处理的 Worker 化。
+
+lease 的取消信号覆盖下载和解码；缓存取消、池释放或设备丢失可中止已获工位的下载，包括尚未登记到 Renderer 的根页初始化。运行中同步 WASM 不能靠消息抢占，因此取消会终止对应 Worker，下一次解码按需重建。Worker 启动失败、异常、消息错误、超时和清理失败均有结构化诊断，运行时不会静默回到主线程。自定义 provider 须遵守 AbortSignal；工位跨下载到解码整个过程，慢 provider 会占用工位，这是当前明确的背压策略。字节预算统计应用载荷，未包含 Worker/JS/WASM 堆、浏览器网络内部缓冲或垃圾回收峰值，不能解释为进程内存上限。
+
+本轮 `npm run check` 通过 365 项 CPU 测试（47 文件）、TypeScript 和生产构建，日志为 `artifacts/geometry-worker-check-release-20261019.log`。原生 Edge、非 fallback `nvidia / ampere` 的完整浏览器回归 **65 项通过**，日志为 `artifacts/geometry-worker-browser-release-native-20261019.log`。两个流送批次共用两个真实 Worker，完成 42 次页解码，共享在途载荷峰值 321,344 字节；既有材质、运动、阴影、查询、GI 及小池往返用例继续通过。HTTP 用例仍拒绝损坏页并显式重试恢复。释放后 Worker、活动项和在途字节归零。
+
+独立真实 Worker 用例检查输入缓冲被转移、provider 缓冲保留，取消后重建，47,919 字节返回数据与 inline 解码参考逐字节一致；运行中和排队请求在释放时均拒绝。两项设备丢失用例分别覆盖初始化完成后清理，以及根页 provider 等待期间显式销毁 device，后者检查下载中止、创建拒绝及 canvas 取消配置。这是显式故障注入，不是实际驱动故障恢复证明。`artifacts/geometry-worker-built-entry-native-20261019.log` 另记录使用生产打包的 `geometry-page.worker-B_c1Ro7J.js` 通过同一转移/取消/恢复用例；fixture 仍由开发服务器提供，不能推广为整个生产站点部署验收。以上均为功能验证，本轮未测 Worker 对整帧延迟或大资产吞吐的收益。
+
+原生 Edge、非 fallback `intel / gen-12lp` 另通过主 Renderer 联合流送、Worker 转移/恢复及两项设备丢失共四项定向回归，日志 `artifacts/geometry-worker-browser-intel-20261019.log`；这不是完整 Intel 回归或性能测量。
+
+此前整组预算调度提交 `c5f6cfb` 的 [CI run 39222797258](https://github.com/fomalhautb/real-engine/actions/runs/39222797258) 已完成并成功；本轮 Worker 改动的远程结果按新提交分别验证。
+
 ## 物理 GPU 几何页池与绘制诊断
 
 `packGeometryGpuPage` 将已解码页面转换为 128 字节 GPU 顶点记录：原始 80 字节 rest、UV/可选标志、切线及源顶点/簇/层级/稳定颜色身份，并输出页面局部 uint32 索引。它再次核对目录身份、大小、有限数、包围盒、源顶点身份与局部索引，再分配上传数组；目录由页池验证为深冻结快照。缺失 UV/切线有显式标志，不推断资产类别。
@@ -104,7 +122,7 @@ CPU 传输窗口保留尚在下载或已解码待上传的所需页；根页加�
 
 原生 `intel / gen-12lp` 非 fallback 另外通过小池往返换页与 GPU 组需求两项定向回归，日志 `artifacts/stream-working-set-browser-intel-20261019.log`。同样检查 160 帧切分与预算，释放后账本为零；这是新增路径的核显兼容性证据，不是完整 Intel 回归或性能测量。
 
-仍需完成 Worker 解码、阴影/查询的有界代理、动态简化、按活跃槽位而非全部容量调度，以及完整应用的全局资源预算。当前准入策略保守地保留全部已准入祖先页，先保证可达性；没有跨资产全局质量最优分配。GPU 每帧扫描组元数据，CPU 每次需求反馈排序组，二者虽有硬上限但仍需大规模测量与层级遍历优化。目前原始网格、完整变换结果、页池和分页输出同时存在，页池有界不等于整个应用脱离完整源几何；不能宣称已经通过超显存或目标规模性能验收。
+Worker 页解码已接入，仍需阴影/查询的有界代理、动态简化、按活跃槽位而非全部容量调度，以及完整应用的全局资源预算。当前准入策略保守地保留全部已准入祖先页，先保证可达性；没有跨资产全局质量最优分配。GPU 每帧扫描组元数据，CPU 每次需求反馈排序组，二者虽有硬上限但仍需大规模测量与层级遍历优化。目前原始网格、完整变换结果、页池和分页输出同时存在，页池有界不等于整个应用脱离完整源几何；不能宣称已经通过超显存或目标规模性能验收。
 
 ## 驻留 GPU LOD 与可视化
 

@@ -5,6 +5,7 @@ import type { GeometryPageProvider, GeometryStreamDirectory } from './geometry-s
 import type { SceneBatch } from './contracts';
 import type { Mat4 } from './math';
 import { GeometryStreamWorkingSet } from './geometry-stream-working-set';
+import type { GeometryPageDecodeService } from './geometry-decode-worker-pool';
 
 export interface GeometryStreamSource {
   readonly directory: GeometryStreamDirectory;
@@ -53,7 +54,8 @@ export class GpuGeometryStream {
     this.workingSet = new GeometryStreamWorkingSet(pool.directory, pool.slotCount);
     this.allocation = this.workingSet.plan([]);
   }
-  static async create(device: GPUDevice, scene: SceneBatch, instances: GPUBuffer, track: (bytes: number) => void) {
+  static async create(device: GPUDevice, scene: SceneBatch, instances: GPUBuffer, track: (bytes: number) => void,
+    decoder?: GeometryPageDecodeService) {
     const source = scene.geometryStream;
     if (!source || scene.geometryLod || scene.deformation.jointCount || scene.deformation.nodes.length || scene.morphTargets.length) {
       throw new Error('GEOMETRY_STREAM_REQUIRES_STATIC_SOURCE');
@@ -67,7 +69,7 @@ export class GpuGeometryStream {
     let cache: GeometryPageCache | undefined, pool: GpuGeometryPagePool | undefined, selection: GpuGeometryStreamSelection | undefined;
     try {
       pool = await GpuGeometryPagePool.create(device, source.directory, source.gpuPool, track);
-      cache = await GeometryPageCache.create(source.directory, source.provider, source.cpuCache);
+      cache = await GeometryPageCache.create(source.directory, source.provider, source.cpuCache, decoder);
       selection = await GpuGeometryStreamSelection.create(device, pool, instances, scene.capacity, track, source.selection);
       const result = new GpuGeometryStream(scene, cache, pool, selection);
       // Initialization is cooperative and completes every root before the first

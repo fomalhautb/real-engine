@@ -2,6 +2,7 @@ import { buildGeometryHierarchy } from '../../../src/geometry-hierarchy';
 import { encodeGeometryPages, type EncodedGeometryPages } from '../../../src/geometry-pages';
 import { buildGeometryStreamDirectory } from '../../../src/geometry-stream-directory';
 import { createHttpGeometryPageProvider } from '../../../src/geometry-page-provider';
+import { GeometryDecodeWorkerPool } from '../../../src/geometry-decode-worker-pool';
 import { GeometryPageCache } from '../../../src/geometry-stream-cache';
 import { GeometryStreamCut, type GeometryStreamView } from '../../../src/geometry-stream-cut';
 import type { GeometryStreamDirectory } from '../../../src/geometry-stream-types';
@@ -68,8 +69,10 @@ export async function runGeometryStreamFixture(failedPageId: number, baseUrl: st
   }
   const provider = createHttpGeometryPageProvider(baseUrl,
     directory.pages.map(page => `page-${page.id}.bin`));
-  const cache = await GeometryPageCache.create(directory, provider, { maxConcurrentRequests: 2 });
+  const decodePool = new GeometryDecodeWorkerPool({ workers: 2 });
+  let cache: GeometryPageCache | undefined;
   try {
+    cache = await GeometryPageCache.create(directory, provider, { maxConcurrentRequests: 2 }, decodePool);
     const planner = new GeometryStreamCut(directory);
     const rootState = cache.diagnostics();
     const rootPlan = planner.plan(cache.residentPageIds(), view);
@@ -86,15 +89,21 @@ export async function runGeometryStreamFixture(failedPageId: number, baseUrl: st
     await cache.idle();
     const fullState = cache.diagnostics();
     const fullPlan = planner.plan(cache.residentPageIds(), view);
-    const selectedPagesAvailable = fullPlan.selectedPages.every(id => cache.residentPageIds().has(id));
+    const residentPages = cache.residentPageIds();
+    const selectedPagesAvailable = fullPlan.selectedPages.every(id => residentPages.has(id));
     await cache.dispose();
+    const disposedState = cache.diagnostics();
+    const decodePoolState = decodePool.diagnostics();
+    decodePool.dispose();
     return { mode: 'CPU reference; cache availability simulates planner residency, no GPU upload',
       pageCount: directory.pages.length, rootPages: [...directory.rootPages],
       rootTriangles: rootPlan.selectedClusters.reduce((sum, id) => sum + directory.clusters[id].triangleCount, 0),
       fullTriangles: fullPlan.selectedClusters.reduce((sum, id) => sum + directory.clusters[id].triangleCount, 0),
       rootState, rootPlan, partialState, partialPlan, atomicFallback,
-      fullState, fullPlan, selectedPagesAvailable, failedPageId, disposedState: cache.diagnostics() };
+      fullState, fullPlan, selectedPagesAvailable, failedPageId, disposedState,
+      decodePoolState, disposedDecodePoolState: decodePool.diagnostics() };
   } finally {
-    await cache.dispose();
+    await cache?.dispose();
+    decodePool.dispose();
   }
 }

@@ -9,7 +9,9 @@ type Result = Awaited<ReturnType<typeof runGeometryStreamFixture>>;
 
 test('HTTP pages feed a bounded CPU cache and atomic reference cut with hash retry', async ({ page }) => {
   const pageErrors: string[] = [];
+  const workerUrls: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
+  page.on('worker', worker => workerUrls.push(worker.url()));
   await page.goto('/?trees=1');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
@@ -85,11 +87,28 @@ test('HTTP pages feed a bounded CPU cache and atomic reference cut with hash ret
   expect(result.fullTriangles).toBe(prepared.sourceTriangles);
   expect(result.fullTriangles).toBeGreaterThan(result.rootTriangles);
   expect(result.selectedPagesAvailable).toBe(true);
+  expect(workerUrls.some(url => url.includes('geometry-page.worker'))).toBe(true);
+  expect(result.rootState.decoding).toBe('worker');
+  expect(result.fullState.decoding).toBe('worker');
+  expect(result.decodePoolState.completed).toBeGreaterThan(0);
+  expect(result.decodePoolState.failed).toBeGreaterThanOrEqual(1);
+  expect(result.decodePoolState.limits.workers).toBe(2);
+  expect(result.decodePoolState.workers).toBeGreaterThan(0);
+  expect(result.decodePoolState.workers).toBeLessThanOrEqual(result.decodePoolState.limits.workers);
+  expect(result.decodePoolState.peakInFlightBytes).toBeGreaterThan(0);
+  expect(result.decodePoolState.peakInFlightBytes)
+    .toBeLessThanOrEqual(result.decodePoolState.limits.maxInFlightBytes);
+  expect(result.decodePoolState.inFlightBytes).toBe(0);
+  expect(result.decodePoolState.activeRequests).toBe(0);
+  expect(result.decodePoolState.waitingRequests).toBe(0);
   expect(requests.slice(0, prepared.rootPages.length).sort((a, b) => a - b))
     .toEqual([...prepared.rootPages].sort((a, b) => a - b));
   expect(attempts.get(failedPageId!)).toBe(2);
   expect(result.disposedState).toMatchObject({ residentBytes: 0, reservedBytes: 0, inFlightBytes: 0,
-    activeRequests: 0, queuedRequests: 0, residentPages: [], disposed: true, gpuResidency: false });
+    activeRequests: 0, queuedRequests: 0, residentPages: [], disposed: true, gpuResidency: false,
+    decoding: 'worker' });
+  expect(result.disposedDecodePoolState).toMatchObject({ disposed: true, workers: 0,
+    inFlightBytes: 0, activeRequests: 0, waitingRequests: 0 });
   expect(pageErrors).toEqual([]);
   console.log('GEOMETRY_STREAM_CPU_REFERENCE_DIAGNOSTIC', JSON.stringify({
     pages: result.pageCount, clusters: prepared.clusterCount, roots: result.rootPages,
@@ -97,5 +116,7 @@ test('HTTP pages feed a bounded CPU cache and atomic reference cut with hash ret
     fineSelectedPages: result.fullPlan.selectedPages, failedPageId, failedAttempts: attempts.get(failedPageId!),
     rootTriangles: result.rootTriangles, fullTriangles: result.fullTriangles,
     ownedCpuBytesAfterDispose: result.disposedState.residentBytes,
+    decodeCompleted: result.decodePoolState.completed, decodeFailed: result.decodePoolState.failed,
+    decodePeakBytes: result.decodePoolState.peakInFlightBytes,
   }));
 });

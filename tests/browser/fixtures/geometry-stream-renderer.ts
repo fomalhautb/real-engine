@@ -144,6 +144,7 @@ export async function runGeometryStreamRendererFixture() {
     return { adapter, pages: directory.pages.length, rootPages: [...directory.rootPages], sourceTriangles: hierarchy.sourceTriangleCount,
       rootsOnly, requestedPages: [...requested], loadedFrames, coarse, detailed, opaque, normalUpdate, moving, mask, gi,
       variants, variantsAfterParameters, queryCoarse, queryDetailed, queryReference, depth, velocity, maskCuts, maskQuery,
-      diagnostics, visiblePixels, errors: [...a.errors, ...b.errors], ownedAfterDispose: [a.stats.ownedGpuBytes, b.stats.ownedGpuBytes] };
+      diagnostics, decoderAfterDispose: b.diagnostics().geometryDecoding, visiblePixels,
+      errors: [...a.errors, ...b.errors], ownedAfterDispose: [a.stats.ownedGpuBytes, b.stats.ownedGpuBytes] };
   } finally { reference?.dispose(); streamed?.dispose(); }
 }

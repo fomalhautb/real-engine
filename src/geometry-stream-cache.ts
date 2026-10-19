@@ -1,4 +1,6 @@
-import { decodeGeometryPage, type DecodedGeometryPage } from './geometry-pages';
+import type { DecodedGeometryPage } from './geometry-pages';
+import { decodeVerifiedGeometryPage } from './geometry-page-decode';
+import type { GeometryPageDecodeService } from './geometry-decode-worker-pool';
 import { validateGeometryStreamDirectory } from './geometry-stream-directory';
 import type { GeometryPageProvider, GeometryStreamDirectory, GeometryStreamPage } from './geometry-stream-types';
 
@@ -45,10 +47,11 @@ export class GeometryPageCache {
   private cacheHits = 0;
   private mergedRequests = 0;
   private evictions = 0;
+  private decodeBudgetDeferred = 0;
 
   static async create(directory: GeometryStreamDirectory, provider: GeometryPageProvider,
-    options: GeometryPageCacheOptions = {}): Promise<GeometryPageCache> {
-    const result = new GeometryPageCache(directory, provider, options);
+    options: GeometryPageCacheOptions = {}, decoder?: GeometryPageDecodeService): Promise<GeometryPageCache> {
+    const result = new GeometryPageCache(directory, provider, options, decoder);
     try {
       for (const page of result.directory.rootPages) result.request(page, Number.MAX_SAFE_INTEGER);
       await result.idle();
@@ -60,7 +63,7 @@ export class GeometryPageCache {
   }
 
   private constructor(directory: GeometryStreamDirectory, private readonly provider: GeometryPageProvider,
-    options: GeometryPageCacheOptions) {
+    options: GeometryPageCacheOptions, private readonly decoder?: GeometryPageDecodeService) {
     this.directory = validateGeometryStreamDirectory(directory);
     if (typeof provider !== 'function') throw new Error('GEOMETRY_STREAM_PROVIDER');
     this.options = {
@@ -211,7 +214,14 @@ export class GeometryPageCache {
         this.resident.set(id, { page: decoded, bytes: page.decodedBytes, touched: ++this.sequence });
         this.residentBytes += page.decodedBytes;
       }).catch(error => {
-        if (!this.disposed && !active.discarded) this.failures.set(id, error instanceof Error ? error.message : String(error));
+        if (!this.disposed && !active.discarded) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message === 'GEOMETRY_DECODE_QUEUE_BUDGET' && !this.directory.rootPages.includes(id)) {
+            // The bounded frame request window may revisit this page. Do not
+            // spin/requeue here, or mark transient shared capacity as bad data.
+            this.decodeBudgetDeferred++;
+          } else this.failures.set(id, message);
+        }
       }).finally(() => {
         if (reservationHeld) this.reservedBytes -= page.decodedBytes;
         this.inFlightBytes -= work; this.active.delete(id);
@@ -223,16 +233,21 @@ export class GeometryPageCache {
 
   private async load(page: GeometryStreamPage, signal: AbortSignal): Promise<DecodedGeometryPage> {
     signal.throwIfAborted();
-    const response = await this.provider(page, signal);
-    signal.throwIfAborted();
-    if (!(response instanceof Uint8Array) || response.byteLength !== page.encodedBytes) throw new Error('GEOMETRY_STREAM_ENCODED_LENGTH: ' + page.id);
-    // Snapshot external buffers before hashing/decoding, never trust a mutable provider view.
-    const bytes = new Uint8Array(response);
-    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-    signal.throwIfAborted();
-    const actual = Array.from(hash, byte => byte.toString(16).padStart(2, '0')).join('');
-    if (actual !== page.sha256) throw new Error('GEOMETRY_STREAM_HASH: ' + page.id);
-    const decoded = await decodeGeometryPage(bytes, { maxPageBytes: page.decodedBytes, maxEncodedBytes: page.encodedBytes });
+    // Reserve shared decode capacity before fetching: many assets cannot fill an
+    // unbounded worker queue with encoded payloads. A cache never owns the service.
+    const lease = await this.decoder?.acquire(page, signal);
+    const workSignal = lease?.signal ?? signal;
+    let decoded: DecodedGeometryPage;
+    try {
+      workSignal.throwIfAborted();
+      const response = await this.provider(page, workSignal);
+      workSignal.throwIfAborted();
+      if (!(response instanceof Uint8Array) || response.byteLength !== page.encodedBytes) throw new Error('GEOMETRY_STREAM_ENCODED_LENGTH: ' + page.id);
+      // The provider keeps its input. Only this exact-sized private copy transfers.
+      const bytes = new Uint8Array(response);
+      decoded = lease ? await lease.decode(bytes) : await decodeVerifiedGeometryPage(page, bytes, workSignal);
+      workSignal.throwIfAborted();
+    } finally { lease?.release(); }
     signal.throwIfAborted();
     if (decoded.vertexStride !== this.directory.vertexStride || decoded.sourceVertexCount !== this.directory.sourceVertexCount
       || decoded.hierarchyClusterCount !== this.directory.clusters.length || decoded.clusters.length !== page.clusterIds.length) {
@@ -253,7 +268,9 @@ export class GeometryPageCache {
       residentPages: [...this.resident.keys()].sort((a, b) => a - b), pinnedPages: [...this.pinned].sort((a, b) => a - b),
       failedPages: [...this.failures].map(([pageId, message]) => ({ pageId, message })),
       requestsStarted: this.requestsStarted, cacheHits: this.cacheHits, mergedRequests: this.mergedRequests,
-      evictions: this.evictions, disposed: this.disposed, limits: { ...this.options }, gpuResidency: false as const };
+      evictions: this.evictions, decodeBudgetDeferred: this.decodeBudgetDeferred,
+      disposed: this.disposed, limits: { ...this.options }, gpuResidency: false as const,
+      decoding: this.decoder?.mode ?? 'inline' };
   }
 
   dispose(): Promise<void> {

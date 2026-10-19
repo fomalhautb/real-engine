@@ -1,5 +1,4 @@
 import { MeshoptDecoder } from 'meshoptimizer/decoder';
-import { MeshoptEncoder } from 'meshoptimizer/encoder';
 import type { GeometryHierarchy, GeometryCluster } from './geometry-hierarchy-types';
 
 /** Self-contained, lossless page encoding for offline geometry residency experiments. */
@@ -98,11 +97,14 @@ function validateRestFloats(view: DataView, byteOffset: number, label: string): 
   }
 }
 
-async function requireEncoder(): Promise<void> {
+async function requireEncoder() {
+  // Offline encoding must not initialize its WASM module in decode-only Workers.
+  const { MeshoptEncoder } = await import('meshoptimizer/encoder');
   if (!MeshoptEncoder.supported) throw new Error('GEOMETRY_PAGE_MESHOPT_ENCODER_UNSUPPORTED');
   try { await MeshoptEncoder.ready; }
   catch (error) { throw new Error(`GEOMETRY_PAGE_MESHOPT_ENCODER_UNAVAILABLE: ${String(error)}`); }
   if (!MeshoptEncoder.supported) throw new Error('GEOMETRY_PAGE_MESHOPT_ENCODER_UNSUPPORTED');
+  return MeshoptEncoder;
 }
 
 async function requireDecoder(): Promise<void> {
@@ -211,7 +213,7 @@ export async function encodeGeometryPages(
     if (bytes > limits.maxPageBytes) throw new RangeError(`Cluster ${id} exceeds maxPageBytes decoded residency`);
     return bytes;
   });
-  await requireEncoder();
+  const MeshoptEncoder = await requireEncoder();
   const pages: GeometryPage[] = [];
   const clusterPages = new Array<number>(hierarchy.clusters.length);
   let decodedTotal = 0, encodedTotal = 0;

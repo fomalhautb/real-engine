@@ -19,6 +19,7 @@ import { DEFORMED_VERTEX_BYTES } from './geometry';
 import { snapshotMeshTangents } from './tangent-frame';
 import { GpuGeometryStream } from './gpu-geometry-stream';
 import { GpuGeometryPagePool, type GeometryGpuFrameLease } from './gpu-geometry-page-pool';
+import { GeometryDecodeWorkerPool, type GeometryDecodeWorkerOptions } from './geometry-decode-worker-pool';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; surfaceStream?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
@@ -53,6 +54,8 @@ export interface DeformationVerification {
   samples: { batch: string; entityId: number; vertexIndex: number; current: number[]; previous: number[] }[];
 }
 export interface RendererOptions {
+  /** Dedicated module Workers shared by every streamed batch; no inline runtime fallback. */
+  geometryDecoding?: GeometryDecodeWorkerOptions;
   /** Single-frame display-space edge filtering. HDR and motion/depth attachments stay unfiltered. */
   antiAliasing?: 'none' | 'fxaa';
   /** Directional shadow budget and world bounds, including off-screen casters. Defaults to the legacy 1024 / 50 m map. */
@@ -118,6 +121,8 @@ export class Renderer {
   private readonly worldQueryOptions?: WorldQueryOptions;
   private worldQueries?: GpuWorldQuery;
   private geometryLod?: GpuGeometryLod;
+  private geometryDecoder?: GeometryDecodeWorkerPool;
+  private readonly geometryDecodeOptions?: GeometryDecodeWorkerOptions;
   private diffuseGi?: GpuDiffuseGi;
   private readonly diffuseGiOptions?: DiffuseGiOptions;
   private defaultClusterVertices!: GPUBuffer;
@@ -190,10 +195,15 @@ export class Renderer {
     };
     device.addEventListener('uncapturederror', event => this.errors.push(event.error.message));
     void device.lost.then(loss => {
-      if (!this.disposed) this.errors.push('DEVICE_LOST: ' + loss.reason + ' ' + loss.message);
+      if (!this.disposed) {
+        this.errors.push('DEVICE_LOST: ' + loss.reason + ' ' + loss.message);
+        for (const batch of this.batches) if (batch.stream) void batch.stream.runtime.dispose().catch(error => this.errors.push(String(error)));
+        this.geometryDecoder?.dispose();
+      }
     });
     this.materialVariantLimit = options.materialVariantLimit ?? 128;
     this.worldQueryOptions = options.worldQueries;
+    this.geometryDecodeOptions = options.geometryDecoding;
     this.diffuseGiOptions = options.diffuseGi && resolveDiffuseGiOptions(options.diffuseGi);
     this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0)
       + (this.diffuseGiOptions?.finalGather ? 2 : 0);
@@ -256,6 +266,7 @@ export class Renderer {
   }
 
   private async initialize(format: GPUTextureFormat, scene: SceneBatch[]): Promise<void> {
+    if (this.hasGeometryStream) this.geometryDecoder = new GeometryDecodeWorkerPool(this.geometryDecodeOptions);
     this.format = format;
     this.resolveLayout = this.device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
@@ -604,7 +615,8 @@ export class Renderer {
       batch.render = this.device.createBindGroup({ layout: this.geometryLayout,
         entries: [output, instances, params, uvs, batch.geometryLod?.vertices ?? this.defaultClusterVertices].map((buffer, binding) => ({ binding, resource: { buffer } })) });
       if (scene.geometryStream) {
-        const runtime = await GpuGeometryStream.create(this.device, scene, instances, bytes => { this.stats.ownedGpuBytes += bytes; });
+        const runtime = await GpuGeometryStream.create(this.device, scene, instances,
+          bytes => { this.stats.ownedGpuBytes += bytes; }, this.geometryDecoder);
         try {
           const vertexCount = runtime.selection.physicalVertexCount;
           if (Math.ceil(vertexCount * capacity / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('GEOMETRY_STREAM_DEFORMATION_BUDGET');
@@ -865,6 +877,7 @@ export class Renderer {
       worldQueries: this.worldQueries?.diagnostics() ?? null,
       geometryLod: this.geometryLod?.diagnostics() ?? null,
       geometryStreams: this.batches.filter(batch => batch.stream).map(batch => ({ name: batch.scene.name, ...batch.stream!.runtime.diagnostics() })),
+      geometryDecoding: this.geometryDecoder?.diagnostics() ?? null,
       diffuseGi: this.diffuseGi?.diagnostics() ?? null,
       sunShadow: { resolution: this.sunShadowOptions.resolution, bytes: this.sunShadowOptions.bytes,
         focusBounds: this.sunShadowOptions.focusBounds ?? null, width: this.sunShadowProjection.width,
@@ -1085,6 +1098,7 @@ export class Renderer {
     this.worldQueries?.dispose();
     this.geometryLod?.dispose();
     for (const batch of this.batches) if (batch.stream) void batch.stream.runtime.dispose().catch(error => this.errors.push(String(error)));
+    this.geometryDecoder?.dispose();
     this.materialResources.dispose(); this.materialPipelines.clear();
     for (const buffer of this.buffers) buffer.destroy();
     this.shadow.destroy(); this.depth?.destroy(); this.velocity?.destroy(); this.hdr?.destroy(); this.querySet?.destroy();

@@ -4,6 +4,7 @@ import type { runGeometryStreamRendererFixture } from './fixtures/geometry-strea
 test('main renderer consumes streamed pages with shared material, motion, shadow, query and GI semantics', async ({ page }, testInfo) => {
   test.setTimeout(120000);
   const pageErrors: string[] = []; page.on('pageerror', error => pageErrors.push(error.message));
+  const workers: string[] = []; page.on('worker', worker => workers.push(worker.url()));
   await page.goto('/?trees=1'); await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
   const r = await page.evaluate(async () => {
@@ -27,10 +28,17 @@ test('main renderer consumes streamed pages with shared material, motion, shadow
   expect(r.maskCuts.every(cut => cut.indices === 0)).toBe(true);
   expect(r.maskQuery.streamed.hits).toEqual(r.maskQuery.reference.hits);
   expect(r.diagnostics.geometryStreams).toHaveLength(2);
+  expect(r.diagnostics.geometryStreams.every(stream => stream.cache.decoding === 'worker')).toBe(true);
+  expect(workers.filter(url => url.includes('geometry-page.worker'))).toHaveLength(2);
+  expect(r.diagnostics.geometryDecoding).toMatchObject({ workers: 2, failed: 0, waitingRequests: 0, activeRequests: 0 });
+  expect(r.diagnostics.geometryDecoding!.completed).toBe(r.pages * 2);
+  expect(r.diagnostics.geometryDecoding!.peakInFlightBytes).toBeLessThanOrEqual(r.diagnostics.geometryDecoding!.limits.maxInFlightBytes);
+  expect(r.decoderAfterDispose).toMatchObject({ disposed: true, workers: 0, activeRequests: 0, waitingRequests: 0, inFlightBytes: 0 });
   expect(r.visiblePixels.every(count => count > 10000)).toBe(true);
   expect(r.errors).toEqual([]); expect(pageErrors).toEqual([]); expect(r.ownedAfterDispose).toEqual([0, 0]);
   if (process.env.PLAYWRIGHT_GPU === 'hardware') expect(r.adapter.isFallbackAdapter).toBe(false);
   const screenshot = testInfo.outputPath('streamed-main-renderer.png'); await page.locator('#stream-renderer-visual').screenshot({ path: screenshot });
   await testInfo.attach('Streamed main renderer and resident reference', { path: screenshot, contentType: 'image/png' });
-  console.log('STREAM_RENDERER_DIAGNOSTIC', JSON.stringify({ ...r, velocity: { samples: r.velocity.streamed.length }, diagnostics: r.diagnostics.geometryStreams }));
+  console.log('STREAM_RENDERER_DIAGNOSTIC', JSON.stringify({ ...r, velocity: { samples: r.velocity.streamed.length },
+    decoder: r.diagnostics.geometryDecoding, diagnostics: r.diagnostics.geometryStreams }));
 });

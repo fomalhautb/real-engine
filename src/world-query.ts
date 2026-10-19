@@ -20,10 +20,22 @@ export interface WorldRay {
   ignore?: { entityId: number; generation?: number };
 }
 
+/** Triangle indices are local to the named representation, never interchangeable. */
+export type WorldHitGeometry = { kind: 'source' } | {
+  kind: 'fixed-query-proxy';
+  primitiveKey: string;
+  directorySha256: string;
+  topologyVersion: number;
+  approximateObjectSpaceError: number;
+  errorMetric: 'accumulated-simplification';
+};
+
 export interface WorldHit {
   batch: string;
+  geometry: WorldHitGeometry;
   entityId: number;
   entityGeneration: number;
+  /** Index into geometry's triangle namespace. Proxy indices are not source IDs. */
   triangleIndex: number;
   distance: number;
   position: [number, number, number];
@@ -39,6 +51,7 @@ export interface WorldHit {
   emissive: [number, number, number];
   shading: 'pbr' | 'unlit';
   historyVersion: number;
+  /** Caller queryIdentity version; proxy topology version is in geometry. */
   topologyVersion: number;
 }
 
@@ -173,12 +186,16 @@ export function decodeWorldHits(
   count: number,
   frame: number,
   materialRevision: number,
+  batchGeometry?: readonly WorldHitGeometry[],
 ): WorldQueryResult {
   boundedInteger(count, 'count', 0, MAX_RAYS);
   uint32(frame, 'frame');
   uint32(materialRevision, 'materialRevision');
   if (data.byteLength !== count * WORLD_HIT_BYTES) {
     throw new RangeError('World hit byte length does not match count');
+  }
+  if (batchGeometry && (!Array.isArray(batchGeometry) || batchGeometry.length !== batchNames.length)) {
+    throw new RangeError('World hit geometry metadata must match batch names');
   }
   const view = new DataView(data);
   const hits: (WorldHit | null)[] = [];
@@ -252,7 +269,8 @@ export function decodeWorldHits(
     const geometryLength = Math.hypot(x, y, z);
     const geometricNormal: [number, number, number] = [x / geometryLength, y / geometryLength, z / geometryLength];
     hits.push({
-      batch: batchNames[batchId - 1], entityId, entityGeneration: generation, triangleIndex,
+      batch: batchNames[batchId - 1], geometry: { ...(batchGeometry?.[batchId - 1] ?? { kind: 'source' }) },
+      entityId, entityGeneration: generation, triangleIndex,
       distance, position, normal, geometricNormal, previousPosition, uv, baseColor, opacity, metallic,
       roughness, emissive, shading: isUnlit === 1 ? 'unlit' : 'pbr',
       historyVersion, topologyVersion,

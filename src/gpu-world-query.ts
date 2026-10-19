@@ -2,14 +2,17 @@ import refitSource from './shaders/query-refit.wgsl?raw';
 import traceSource from './shaders/query-trace.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { buildBvhTopology } from './bvh-topology';
-import type { SceneBatch } from './contracts';
+import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
+import type { MeshData } from './geometry';
 import type { GpuMaterial } from './gpu-material';
 import type { MaterialProgram } from './material';
 import { decodeWorldHits, packWorldRays, resolveWorldQueryOptions, WORLD_HIT_BYTES, WORLD_RAY_BYTES,
-  type WorldQueryOptions, type WorldQueryResult, type WorldRay } from './world-query';
+  type WorldHitGeometry, type WorldQueryOptions, type WorldQueryResult, type WorldRay } from './world-query';
+
+type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
 interface QuerySource {
-  scene: SceneBatch;
+  scene: RenderBatch;
   output: GPUBuffer;
   instances: GPUBuffer;
   getMaterial(): GpuMaterial;
@@ -17,9 +20,10 @@ interface QuerySource {
   getDirty?(): boolean;
 }
 type QueryBatch = {
-  source: QuerySource; mesh: SceneBatch['mesh']; name: string; capacity: number; identity: string;
+  source: QuerySource; mesh: MeshData; name: string; capacity: number; identity: string;
+  proxy?: QueryProxy; proxyIdentity: string; geometry: WorldHitGeometry;
   topologyVersion: number; nodeCount: number; offsets: number[]; count: number; dirty: boolean;
-  emissiveSampling: SceneBatch['emissiveSampling'];
+  emissiveSampling: RenderBatch['emissiveSampling'];
   vertexCount: number; vertices: ArrayBuffer; indices: Uint32Array; uvs?: Float32Array; tangents?: Float32Array;
   identities: GPUBuffer; metadata: Uint32Array<ArrayBuffer>; params: GPUBuffer; trace: GPUBindGroup[];
   levels: { params: GPUBuffer; bindGroup: GPUBindGroup; count: number; offset: number }[];
@@ -48,11 +52,24 @@ function u32(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0 || value > 0xffffffff) throw new Error('WORLD_QUERY_' + label);
   return value;
 }
-function identity(scene: SceneBatch): string {
+function identity(scene: RenderBatch): string {
   const source = scene.queryIdentity;
   if (!source) return '';
   if (typeof source.assetId !== 'string' || !source.assetId.length || source.assetId.length > 1024) throw new Error('WORLD_QUERY_ASSET_ID');
   return JSON.stringify([source.assetId, u32(source.primitiveId, 'PRIMITIVE_ID'), u32(source.topologyVersion, 'TOPOLOGY_VERSION')]);
+}
+function queryProxy(scene: RenderBatch): QueryProxy | undefined {
+  return scene.mesh ? undefined : scene.geometryStream.queryProxy;
+}
+function proxyIdentity(proxy: QueryProxy | undefined): string {
+  return proxy ? JSON.stringify([proxy.version, proxy.primitiveKey, proxy.directorySha256,
+    proxy.topologyVersion, proxy.requestedError, proxy.approximateObjectSpaceError]) : '';
+}
+function geometryMetadata(proxy: QueryProxy | undefined): WorldHitGeometry {
+  return proxy ? { kind: 'fixed-query-proxy', primitiveKey: proxy.primitiveKey,
+    directorySha256: proxy.directorySha256, topologyVersion: proxy.topologyVersion,
+    approximateObjectSpaceError: proxy.approximateObjectSpaceError,
+    errorMetric: 'accumulated-simplification' } : { kind: 'source' };
 }
 
 /** Camera-independent, refitted triangle queries over the renderer's shared
@@ -159,7 +176,7 @@ export class GpuWorldQuery {
   }
   addBatch(source: QuerySource): void {
     if (this.disposed || this.frame) throw new Error('WORLD_QUERY_REGISTRATION_CLOSED');
-    const { scene } = source, { mesh } = scene;
+    const { scene } = source, mesh = residentMesh(scene), proxy = queryProxy(scene);
     if (scene.emissiveSampling !== undefined && scene.emissiveSampling !== 'triangle-area') throw new Error('WORLD_QUERY_EMISSIVE_SAMPLING');
     if (this.batches.length >= 256) throw new Error('WORLD_QUERY_BATCH_BUDGET');
     if (!Number.isSafeInteger(scene.capacity) || scene.capacity < 1 || scene.capacity > this.options.maxInstancesPerBatch) throw new Error('WORLD_QUERY_INSTANCE_BUDGET');
@@ -195,6 +212,7 @@ export class GpuWorldQuery {
           entries: [params, source.output, data, bounds].map((buffer, binding) => ({ binding, resource: { buffer } })) }) };
     });
     this.batches.push({ source, mesh, name: scene.name, capacity: scene.capacity, identity: sourceIdentity,
+      proxy, proxyIdentity: proxyIdentity(proxy), geometry: geometryMetadata(proxy),
       emissiveSampling: scene.emissiveSampling,
       topologyVersion: scene.queryIdentity?.topologyVersion ?? 0, nodeCount: topology.nodeCount, offsets, count: 0, dirty: true,
       vertexCount: mesh.vertexCount, vertices: mesh.vertices, indices: mesh.indices, uvs: mesh.uvs, tangents: mesh.tangents,
@@ -204,8 +222,10 @@ export class GpuWorldQuery {
     if (this.disposed) throw new Error('WORLD_QUERY_DISPOSED');
     for (const batch of this.batches) {
       const scene = batch.source.scene;
-      if (scene.mesh !== batch.mesh || scene.mesh.vertexCount !== batch.vertexCount || scene.mesh.vertices !== batch.vertices
-        || scene.mesh.indices !== batch.indices || scene.mesh.uvs !== batch.uvs || scene.mesh.tangents !== batch.tangents || scene.capacity !== batch.capacity
+      const mesh = residentMesh(scene), proxy = queryProxy(scene);
+      if (mesh !== batch.mesh || mesh.vertexCount !== batch.vertexCount || mesh.vertices !== batch.vertices
+        || mesh.indices !== batch.indices || mesh.uvs !== batch.uvs || mesh.tangents !== batch.tangents || scene.capacity !== batch.capacity
+        || proxy !== batch.proxy || proxyIdentity(proxy) !== batch.proxyIdentity
         || scene.name !== batch.name || identity(scene) !== batch.identity || scene.emissiveSampling !== batch.emissiveSampling) {
         throw new Error('WORLD_QUERY_TOPOLOGY_CHANGED: recreate the renderer for a new immutable mesh/topology');
       }
@@ -351,13 +371,15 @@ export class GpuWorldQuery {
       encoder.copyBufferToBuffer(this.hitBuffer, 0, this.readBuffer, 0, count * WORLD_HIT_BYTES);
       this.device.queue.submit([encoder.finish()]);
       await this.readBuffer.mapAsync(GPUMapMode.READ);
-      try { return decodeWorldHits(this.readBuffer.getMappedRange().slice(0, count * WORLD_HIT_BYTES), names, count, frame, materialRevision); }
+      try { return decodeWorldHits(this.readBuffer.getMappedRange().slice(0, count * WORLD_HIT_BYTES), names,
+        count, frame, materialRevision, this.batches.map(batch => batch.geometry)); }
       finally { this.readBuffer.unmap(); }
     } finally { this.pending = false; }
   }
   diagnostics() {
     return { frame: this.frame, batches: this.batches.length, ownedGpuBytes: this.bytes,
       topologyNodes: this.batches.reduce((sum, batch) => sum + batch.nodeCount, 0),
+      geometryRepresentations: this.batches.map(batch => ({ batch: batch.name, geometry: { ...batch.geometry } })),
       instances: this.batches.reduce((sum, batch) => sum + batch.count, 0), options: { ...this.options },
       traceParameters: 'aligned-immutable-slots-per-encoder', traceUniformStride: this.traceUniformStride,
       resetUniformStride: this.resetUniformStride,

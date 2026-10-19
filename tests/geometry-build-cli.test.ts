@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, truncate, writeFile } from 'node
 import { basename, dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { decodeGeometryPage } from '../src/geometry-pages';
+import { decodeGeometryQueryProxy } from '../src/geometry-query-proxy';
 import { validateGeometryStreamDirectory } from '../src/geometry-stream-directory';
 import type { GeometryStreamDirectory } from '../src/geometry-stream-types';
 
@@ -112,6 +113,17 @@ describe('offline geometry CLI', () => {
         expect(directory.rootPages).toEqual(primitive.rootPages);
         expect((directory as unknown as Record<string, unknown>).source).toBeUndefined();
         expect(directory.clusters.every(cluster => !('vertices' in cluster) && !('triangles' in cluster))).toBe(true);
+        const proxyBytes = new Uint8Array(await readFile(join(first, primitive.queryProxy.file)));
+        expect(proxyBytes.byteLength).toBe(primitive.queryProxy.bytes);
+        expect(sha256(proxyBytes)).toBe(primitive.queryProxy.sha256);
+        const proxy = await decodeGeometryQueryProxy(directory, proxyBytes, primitive.queryProxy.sha256);
+        expect(proxy.directorySha256).toBe(primitive.queryProxy.directorySha256);
+        expect(proxy.mesh.vertexCount).toBe(primitive.queryProxy.vertexCount);
+        expect(proxy.mesh.indices.length / 3).toBe(primitive.queryProxy.triangleCount);
+        expect(proxy.mesh.indices.length / 3).toBeLessThan(primitive.triangleCount);
+        expect(proxy.approximateObjectSpaceError).toBe(primitive.queryProxy.approximateObjectSpaceError);
+        expect(proxy.requestedError).toBe(manifest.config.queryProxy.maxError);
+        expect(proxy.selectedClusters).toEqual([...directory.roots].sort((a, b) => a - b));
         for (const page of primitive.pages) {
           const bytes = await readFile(join(first, page.file));
           expect(bytes.byteLength).toBe(page.compressedBytes);
@@ -154,6 +166,9 @@ describe('offline geometry CLI', () => {
       await writeFile(oversized, '');
       await truncate(oversized, 32 * 1024 * 1024 + 1);
       expect(() => run(oversized, join(temporary, 'oversized-output'))).toThrow();
+      expect(() => execFileSync(process.execPath,
+        [script, '--input', input, '--output', join(temporary, 'invalid-error'), '--coverage', 'opaque', '--query-error', '-1'],
+        { cwd: resolve('.'), windowsHide: true, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] })).toThrow();
       expect((await readdir(temporary)).sort()).toEqual(['existing', 'grid.obj', 'oversized.obj']);
     } finally {
       await removeOwnTestRoot(temporary);

@@ -3,7 +3,7 @@ import surfaceSource from './shaders/surface.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import resolveSource from './shaders/resolve.wgsl?raw';
 import { identity, lookAt, multiply, perspective, transformPoint, type Mat4 } from './math';
-import type { InstanceState, SceneBatch, MaterialBinding } from './contracts';
+import { residentMesh, type InstanceState, type RenderBatch, type MaterialBinding } from './contracts';
 import { MaterialResources, type GpuMaterial } from './gpu-material';
 import { compileDeformation, conservativeDeformationBounds, evaluateDeformation,
   validateDeformationVertex, validateMorphTargets, type Bounds3 } from './deformation';
@@ -15,7 +15,7 @@ import { GpuDiffuseGi, diffuseGiSampleSource, diffuseGiFinalGatherSampleSource, 
 import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
 import { resolveSunShadowOptions, sunShadowProjection, type SunShadowOptions, type ResolvedSunShadowOptions } from './sun-shadow';
 import type { FinalGatherProbeResult } from './gpu-final-gather';
-import { DEFORMED_VERTEX_BYTES } from './geometry';
+import { DEFORMED_VERTEX_BYTES, type MeshData } from './geometry';
 import { snapshotMeshTangents } from './tangent-frame';
 import { GpuGeometryStream } from './gpu-geometry-stream';
 import { GpuGeometryPagePool, type GeometryGpuFrameLease } from './gpu-geometry-page-pool';
@@ -24,7 +24,7 @@ import { GeometryDecodeWorkerPool, type GeometryDecodeWorkerOptions } from './ge
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; surfaceStream?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
 type Batch = {
-  scene: SceneBatch; rest: GPUBuffer; indices: GPUBuffer; params: GPUBuffer;
+  scene: RenderBatch; mesh: MeshData; rest: GPUBuffer; indices: GPUBuffer; params: GPUBuffer;
   instances: GPUBuffer; palettes: GPUBuffer; output: GPUBuffer; scalars: GPUBuffer;
   compute: GPUBindGroup; render: GPUBindGroup;
   geometryLod?: GeometryLodBinding;
@@ -34,7 +34,7 @@ type Batch = {
   tangentData: Float32Array<ArrayBuffer>;
   morphBounds: Bounds3[]; bounds: Map<number, Bounds3>;
   history: Map<number, Previous>;
-  dirty: boolean; lastInstances: InstanceState[]; lastInputMode?: SceneBatch['inputMode'];
+  dirty: boolean; lastInstances: InstanceState[]; lastInputMode?: RenderBatch['inputMode'];
   /** Reused [start, end) slot ranges, bounded to 16 writes per input stream. */
   uploadRanges: number[];
   material: GpuMaterial; materialPipelines: MaterialPipelines; materialRequest: number;
@@ -131,7 +131,7 @@ export class Renderer {
   private computeLayout!: GPUBindGroupLayout;
   private geometryLayout!: GPUBindGroupLayout;
 
-  static async create(canvas: HTMLCanvasElement, scene: SceneBatch[], options: RendererOptions = {}): Promise<Renderer> {
+  static async create(canvas: HTMLCanvasElement, scene: RenderBatch[], options: RendererOptions = {}): Promise<Renderer> {
     if (scene.filter(batch => !!batch.geometryStream).length > 256) throw new Error('GEOMETRY_STREAM_BATCH_BUDGET');
     if (options.antiAliasing !== undefined && options.antiAliasing !== 'none' && options.antiAliasing !== 'fxaa') throw new Error('INVALID_ANTI_ALIASING');
     resolveSunShadowOptions(options.sunShadow);
@@ -265,7 +265,7 @@ export class Renderer {
     return shader;
   }
 
-  private async initialize(format: GPUTextureFormat, scene: SceneBatch[]): Promise<void> {
+  private async initialize(format: GPUTextureFormat, scene: RenderBatch[]): Promise<void> {
     if (this.hasGeometryStream) this.geometryDecoder = new GeometryDecodeWorkerPool(this.geometryDecodeOptions);
     this.format = format;
     this.resolveLayout = this.device.createBindGroupLayout({ entries: [
@@ -435,6 +435,9 @@ export class Renderer {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     const batch = this.batches.find(item => item.scene.name === batchName);
     if (!batch) throw new Error('BATCH_NOT_FOUND: ' + batchName);
+    if (batch.scene.geometryStream?.queryProxy && binding.definition.alphaMode !== 'opaque') {
+      throw new Error('GEOMETRY_PROXY_MASK_REQUIRES_FULL_SOURCE');
+    }
     const request = ++batch.materialRequest;
     const replacement = await this.prepareMaterial(binding);
     if (this.disposed) { this.materialResources.release(replacement.material); throw new Error('RENDERER_DISPOSED'); }
@@ -559,9 +562,13 @@ export class Renderer {
     this.lightMatrix = projection.matrix;
   }
 
-  private async createBatch(scene: SceneBatch): Promise<Batch> {
+  private async createBatch(scene: RenderBatch): Promise<Batch> {
     const capacity = scene.capacity;
-    const mesh = scene.mesh;
+    if (scene.geometryStream?.queryProxy && scene.mesh) throw new Error('GEOMETRY_STREAM_AMBIGUOUS_REPRESENTATION');
+    if (scene.geometryStream?.queryProxy && scene.material && scene.material.definition.alphaMode !== 'opaque') {
+      throw new Error('GEOMETRY_PROXY_MASK_REQUIRES_FULL_SOURCE');
+    }
+    const mesh = residentMesh(scene);
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('INVALID_BATCH_CAPACITY');
     if (!Number.isSafeInteger(mesh.vertexCount) || mesh.vertexCount < 1
       || Math.ceil(capacity * mesh.vertexCount / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('DEFORMATION_DISPATCH_BUDGET');
@@ -603,7 +610,7 @@ export class Renderer {
     const material = await this.prepareMaterial(scene.material);
     const batch: Batch = {
       ...material, materialRequest: 0,
-      scene, rest, indices, params, instances, palettes, output, scalars, program, pipeline, morphBounds, bounds: new Map(), tangentData,
+      scene, mesh, rest, indices, params, instances, palettes, output, scalars, program, pipeline, morphBounds, bounds: new Map(), tangentData,
       compute: this.device.createBindGroup({ layout: this.computeLayout,
         entries: [params, rest, instances, palettes, output, morphs, scalars, tangents].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
       render: undefined as unknown as GPUBindGroup,
@@ -682,7 +689,7 @@ export class Renderer {
       else if (ranges.length && ranges[ranges.length - 1] === i) ranges[ranges.length - 1] = i + 1;
       else if (ranges.length < 32) ranges.push(i, i + 1);
       else { ranges[1] = i + 1; ranges.length = 2; coalesced = true; }
-      const bounds = conservativeDeformationBounds(batch.program, batch.scene.mesh.bounds, batch.morphBounds, state.bones, state.deformScalars, state.model);
+      const bounds = conservativeDeformationBounds(batch.program, batch.mesh.bounds, batch.morphBounds, state.bones, state.deformScalars, state.model);
       if (!previous || previous.version !== state.historyVersion || previous.generation !== generation) {
         previous = { model: state.model.slice(), bones: state.bones.map(b => b.slice()), scalars: [...state.deformScalars], version: state.historyVersion, generation, settled: true };
         batch.history.set(state.entityId, previous);
@@ -709,7 +716,7 @@ export class Renderer {
     }
     for (const id of batch.history.keys()) if (!alive.has(id)) { batch.history.delete(id); batch.bounds.delete(id); }
     if (states.length !== batch.lastInstances.length) {
-      this.device.queue.writeBuffer(batch.params, 0, new Uint32Array([batch.scene.mesh.vertexCount, states.length, joints, scalarCount]));
+      this.device.queue.writeBuffer(batch.params, 0, new Uint32Array([batch.mesh.vertexCount, states.length, joints, scalarCount]));
       this.stats.uploadedBytes += 16;
     }
     for (let r = 0; r < ranges.length; r += 2) {
@@ -810,8 +817,8 @@ export class Renderer {
     if (readTiming) void this.readTiming(this.stats.frames + 1);
     this.stats.frames++;
     this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2 + 1;
-    this.stats.triangles = this.batches.reduce((sum, batch) => sum + batch.scene.mesh.indices.length / 3 * batch.scene.instances.length, 0);
-    this.stats.deformedVertices = this.batches.reduce((sum, batch) => sum + (batch.dirty ? batch.scene.mesh.vertexCount * batch.scene.instances.length : 0)
+    this.stats.triangles = this.batches.reduce((sum, batch) => sum + (batch.scene.geometryStream?.directory.sourceTriangleCount ?? batch.mesh.indices.length / 3) * batch.scene.instances.length, 0);
+    this.stats.deformedVertices = this.batches.reduce((sum, batch) => sum + (batch.dirty ? batch.mesh.vertexCount * batch.scene.instances.length : 0)
       + (batch.stream && batch.material.program.alphaMode === 'opaque' ? batch.stream.runtime.selection.physicalVertexCount * batch.scene.instances.length : 0), 0);
     this.stats.cpuSubmitMs = performance.now() - started;
   }
@@ -836,7 +843,7 @@ export class Renderer {
       }
       if (!batch.scene.instances.length || !batch.dirty) continue;
       compute.setPipeline(batch.pipeline); compute.setBindGroup(0, batch.compute);
-      compute.dispatchWorkgroups(Math.ceil(batch.scene.mesh.vertexCount * batch.scene.instances.length / 64));
+      compute.dispatchWorkgroups(Math.ceil(batch.mesh.vertexCount * batch.scene.instances.length / 64));
       this.stats.deformationDispatches++;
     }
     compute.end();
@@ -912,7 +919,7 @@ export class Renderer {
         continue;
       }
       pass.setBindGroup(1, batch.render); pass.setIndexBuffer(batch.indices, 'uint32');
-      pass.drawIndexed(batch.scene.mesh.indices.length, batch.scene.instances.length);
+      pass.drawIndexed(batch.mesh.indices.length, batch.scene.instances.length);
     }
   }
   private async readTiming(frame: number): Promise<void> {
@@ -1025,7 +1032,7 @@ export class Renderer {
     for (const batch of this.batches) {
       if (!batch.scene.instances.length) continue;
       const instanceCount = options.allInstances ? batch.scene.instances.length : 1;
-      const count = batch.scene.mesh.vertexCount * instanceCount;
+      const count = batch.mesh.vertexCount * instanceCount;
       const read = this.device.createBuffer({ size: count * DEFORMED_VERTEX_BYTES, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const joints = batch.program.jointCount, scalarCount = Math.max(1, batch.program.scalarCount);
       const instances = batch.instanceData.slice(0, instanceCount * 56), palette = batch.paletteData.slice(0, instanceCount * joints * 32), scalars = batch.scalarData.slice(0, instanceCount * scalarCount * 2);
@@ -1036,9 +1043,9 @@ export class Renderer {
       this.device.queue.submit([encoder.finish()]);
       try {
         await read.mapAsync(GPUMapMode.READ);
-        const result = new Float32Array(read.getMappedRange()), source = new DataView(batch.scene.mesh.vertices);
+        const result = new Float32Array(read.getMappedRange()), source = new DataView(batch.mesh.vertices);
         for (let vertex = 0; vertex < count; vertex++) {
-          const instanceIndex = Math.floor(vertex / batch.scene.mesh.vertexCount), vertexIndex = vertex % batch.scene.mesh.vertexCount;
+          const instanceIndex = Math.floor(vertex / batch.mesh.vertexCount), vertexIndex = vertex % batch.mesh.vertexCount;
           const instance = instances.subarray(instanceIndex * 56, instanceIndex * 56 + 56), bounds = instanceBounds[instanceIndex];
           if (sampleVertices.has(vertexIndex)) samples.push({ batch: batch.scene.name, entityId: entityIds[instanceIndex], vertexIndex,
             current: Array.from(result.subarray(vertex * 16, vertex * 16 + 3)), previous: Array.from(result.subarray(vertex * 16 + 8, vertex * 16 + 11)) });

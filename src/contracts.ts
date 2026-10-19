@@ -5,6 +5,7 @@ import type { MaterialDefinition } from './material';
 import type { TextureAsset } from './texture-assets';
 import type { GeometryHierarchy } from './geometry-hierarchy-types';
 import type { GeometryStreamSource } from './gpu-geometry-stream';
+import type { GeometryQueryProxy } from './geometry-query-proxy';
 
 export interface MaterialBinding {
   definition: MaterialDefinition;
@@ -56,4 +57,23 @@ export interface SceneBatch {
   instances: InstanceState[];
   deformation: DeformationGraph;
   morphTargets: MorphTarget[];
+}
+
+/** Source-free streamed surface with an explicit, fixed shadow/query proxy.
+ * The proxy shares instance/material state and never follows camera LOD. */
+export interface StreamedSceneBatch extends Omit<SceneBatch, 'mesh' | 'geometryLod' | 'geometryStream'> {
+  mesh?: never;
+  geometryLod?: never;
+  geometryStream: GeometryStreamSource & { queryProxy: GeometryQueryProxy };
+}
+
+export type RenderBatch = SceneBatch | StreamedSceneBatch;
+
+/** Resident representation for shared deformation, shadows and world queries.
+ * A paged main surface reads its own physical page pool instead. */
+export function residentMesh(scene: RenderBatch): MeshData {
+  if (scene.mesh) return scene.mesh;
+  const proxy = scene.geometryStream?.queryProxy;
+  if (!proxy) throw new Error('GEOMETRY_STREAM_QUERY_PROXY_REQUIRED');
+  return proxy.mesh;
 }

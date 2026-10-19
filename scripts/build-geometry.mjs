@@ -13,12 +13,12 @@ const MAX_PRIMITIVES = 4096;
 const PAGE_OPTIONS = { maxPageBytes: 65_536, maxTotalBytes: 256 * 1024 * 1024 };
 
 function argumentsOf(argv) {
-  if (argv.length !== 6) throw new Error('usage: node scripts/build-geometry.mjs --input path.obj --output directory --coverage opaque');
+  if (argv.length !== 6 && argv.length !== 8) throw new Error('usage: node scripts/build-geometry.mjs --input path.obj --output directory --coverage opaque [--query-error object-space-error]');
   const values = new Map();
   for (let index = 0; index < argv.length; index += 2) {
     const name = argv[index];
-    if (!['--input', '--output', '--coverage'].includes(name) || values.has(name) || !argv[index + 1]) {
-      throw new Error('expected exactly --input path.obj --output directory --coverage opaque');
+    if (!['--input', '--output', '--coverage', '--query-error'].includes(name) || values.has(name) || !argv[index + 1]) {
+      throw new Error('expected --input path.obj --output directory --coverage opaque [--query-error object-space-error]');
     }
     values.set(name, argv[index + 1]);
   }
@@ -29,7 +29,9 @@ function argumentsOf(argv) {
   const output = resolve(values.get('--output'));
   if (extname(input).toLowerCase() !== '.obj') throw new Error('only .obj input is supported');
   if (input === output) throw new Error('output must differ from input');
-  return { input, output };
+  const queryError = values.has('--query-error') ? Number(values.get('--query-error')) : 1e30;
+  if (!Number.isFinite(queryError) || queryError < 0 || queryError > 1e30) throw new Error('query-error must be finite and in [0, 1e30]');
+  return { input, output, queryError };
 }
 
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -108,7 +110,7 @@ async function sourceOf(input) {
   return sourceBytes;
 }
 
-async function buildInto(input, temporary, sourceBytes) {
+async function buildInto(input, temporary, sourceBytes, queryError) {
   const sourceHash = sha256(sourceBytes);
 
   const server = await createServer({ root: REPOSITORY_ROOT, configFile: false,
@@ -118,6 +120,7 @@ async function buildInto(input, temporary, sourceBytes) {
     const { buildGeometryHierarchy } = await server.ssrLoadModule('/src/geometry-hierarchy.ts');
     const { encodeGeometryPages } = await server.ssrLoadModule('/src/geometry-pages.ts');
     const { buildGeometryStreamDirectory } = await server.ssrLoadModule('/src/geometry-stream-directory.ts');
+    const { buildGeometryQueryProxy, encodeGeometryQueryProxy } = await server.ssrLoadModule('/src/geometry-query-proxy.ts');
 
     // Keep the module runner alive through asynchronous builds: the encoder is
     // imported lazily so runtime decode Workers never initialize encoder WASM.
@@ -131,6 +134,9 @@ async function buildInto(input, temporary, sourceBytes) {
       });
       const encoded = await encodeGeometryPages(hierarchy, PAGE_OPTIONS);
       const streamDirectory = await buildGeometryStreamDirectory(hierarchy, encoded);
+      const queryProxy = await buildGeometryQueryProxy(streamDirectory,
+        async request => encoded.pages[request.id].bytes, { maxError: queryError });
+      const queryProxyData = encodeGeometryQueryProxy(queryProxy);
       const directory = `primitive-${index}`;
       await mkdir(join(temporary, directory));
       const hierarchyFile = `${directory}/hierarchy.json`;
@@ -138,6 +144,8 @@ async function buildInto(input, temporary, sourceBytes) {
       const streamDirectoryFile = `${directory}/stream-directory.json`;
       const streamDirectoryData = Buffer.from(`${JSON.stringify(streamDirectory)}\n`, 'utf8');
       await writeFile(join(temporary, directory, 'stream-directory.json'), streamDirectoryData);
+      const queryProxyFile = `${directory}/query-proxy.bin`;
+      await writeFile(join(temporary, queryProxyFile), queryProxyData);
       const pages = [];
       for (const page of encoded.pages) {
         const file = `${directory}/page-${page.id}.bin`;
@@ -149,6 +157,11 @@ async function buildInto(input, temporary, sourceBytes) {
       primitives.push({ index, name: primitive.name, materialName: primitive.materialName ?? null,
         sourceSha256: sourceHash, primitiveKey: key, hierarchyFile, streamDirectoryFile,
         streamDirectorySha256: sha256(streamDirectoryData), streamDirectoryBytes: streamDirectoryData.byteLength,
+        queryProxy: { file: queryProxyFile, sha256: sha256(queryProxyData), bytes: queryProxyData.byteLength,
+          directorySha256: queryProxy.directorySha256, topologyVersion: queryProxy.topologyVersion,
+          requestedError: queryProxy.requestedError, approximateObjectSpaceError: queryProxy.approximateObjectSpaceError,
+          errorMetric: 'accumulated-simplification', vertexCount: queryProxy.mesh.vertexCount,
+          triangleCount: queryProxy.mesh.indices.length / 3 },
         buildOptions: hierarchy.options,
         vertexCount: primitive.mesh.vertexCount, triangleCount: primitive.mesh.indices.length / 3,
         clusterCount: hierarchy.clusters.length, groupCount: hierarchy.groups.length,
@@ -160,7 +173,8 @@ async function buildInto(input, temporary, sourceBytes) {
       source: { name: basename(input), sha256: sourceHash, bytes: sourceBytes.byteLength },
       config: { inputFormat: 'obj', coverage: 'opaque', coverageContract: 'caller asserts opaque; OBJ materials are not converted',
         maxSourceBytes: MAX_SOURCE_BYTES, maxPrimitives: MAX_PRIMITIVES,
-        page: PAGE_OPTIONS },
+        page: PAGE_OPTIONS, queryProxy: { maxError: queryError, maxVertices: 262_144,
+          maxTriangles: 65_536, maxBytes: 32 * 1024 * 1024 } },
       materialLibraries: asset.materialLibraries, warnings: asset.warnings, primitives };
     await writeFile(join(temporary, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   } finally {
@@ -169,7 +183,7 @@ async function buildInto(input, temporary, sourceBytes) {
 }
 
 async function build() {
-  const { input, output } = argumentsOf(process.argv.slice(2));
+  const { input, output, queryError } = argumentsOf(process.argv.slice(2));
   if (await exists(output)) throw new Error(`output already exists: ${output}`);
   const sourceBytes = await sourceOf(input);
   const targetParent = dirname(output);
@@ -177,7 +191,7 @@ async function build() {
   const temporary = await mkdtemp(join(targetParent, `.${basename(output)}.tmp-`));
   let published = false;
   try {
-    await buildInto(input, temporary, sourceBytes);
+    await buildInto(input, temporary, sourceBytes, queryError);
     await publishDirectory(temporary, output);
     published = true;
     process.stdout.write(`${output}\n`);

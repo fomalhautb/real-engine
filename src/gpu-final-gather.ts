@@ -3,13 +3,15 @@ import interpolateSource from './shaders/diffuse-gi-interpolate.wgsl?raw';
 import updateSource from './shaders/final-gather-update.wgsl?raw';
 import sampleSource from './shaders/final-gather-sample.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
-import type { SceneBatch } from './contracts';
+import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
 import { DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import { planFinalGatherGrid, resolveFinalGatherOptions, type FinalGatherGridPlan, type ResolvedFinalGatherOptions } from './final-gather';
 import type { GpuWorldQuery } from './gpu-world-query';
 import { WORLD_HIT_BYTES, WORLD_RAY_BYTES } from './world-query';
-import { DEFORMED_VERTEX_BYTES } from './geometry';
+import { DEFORMED_VERTEX_BYTES, type MeshData } from './geometry';
+
+type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
 export const finalGatherSampleSource = sampleSource;
 export const FINAL_GATHER_ANCHOR_BYTES = 96;
@@ -50,8 +52,10 @@ export interface FinalGatherProbeResult {
   }[];
 }
 interface AreaBatch {
-  scene: SceneBatch;
-  mesh: SceneBatch['mesh'];
+  scene: RenderBatch;
+  mesh: MeshData;
+  proxy?: QueryProxy;
+  proxyIdentity: string;
   vertices: ArrayBuffer;
   indices: Uint32Array;
   vertexCount: number;
@@ -71,9 +75,16 @@ function uint(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) throw new Error('FINAL_GATHER_' + label);
   return value;
 }
-function topologyIdentity(scene: SceneBatch): string {
+function topologyIdentity(scene: RenderBatch): string {
   const identity = scene.queryIdentity;
   return identity ? JSON.stringify([identity.assetId, identity.primitiveId, identity.topologyVersion]) : '';
+}
+function queryProxy(scene: RenderBatch): QueryProxy | undefined {
+  return scene.mesh ? undefined : scene.geometryStream.queryProxy;
+}
+function proxyIdentity(proxy: QueryProxy | undefined): string {
+  return proxy ? JSON.stringify([proxy.version, proxy.primitiveKey, proxy.directorySha256,
+    proxy.topologyVersion, proxy.requestedError, proxy.approximateObjectSpaceError]) : '';
 }
 /** Bounded 4x4 inversion, independent of the affine-only simulation helpers. */
 function inverseProjection(matrix: ArrayLike<number>): Float32Array<ArrayBuffer> {
@@ -104,7 +115,7 @@ function inverseProjection(matrix: ArrayLike<number>): Float32Array<ArrayBuffer>
   return output;
 }
 
-/** Exact first-segment diffuse transport at a bounded screen grid. The world
+/** World-query first-segment diffuse transport at a bounded screen grid. The world
  * irradiance field supplies secondary bounces at the actual first hit. Camera
  * motion reprojects raw history through validated surface identities/geometry. */
 export class GpuFinalGather {
@@ -243,14 +254,14 @@ export class GpuFinalGather {
       [[0, this.parameters], [6, this.filteredAnchors], [7, input]]));
   }
 
-  registerBatch(scene: SceneBatch, output: GPUBuffer, sourceId: number): void {
+  registerBatch(scene: RenderBatch, output: GPUBuffer, sourceId: number): void {
     this.assertAlive();
     if (this.updated) throw new Error('FINAL_GATHER_REGISTRATION_CLOSED');
     if (scene.emissiveSampling === undefined) return;
     if (scene.emissiveSampling !== 'triangle-area') throw new Error('FINAL_GATHER_EMISSIVE_SAMPLING');
     uint(sourceId, 'SOURCE_ID');
     if (sourceId === 0 || this.batches.some(batch => batch.scene === scene || batch.sourceId === sourceId)) throw new Error('FINAL_GATHER_DUPLICATE_SOURCE');
-    const mesh = scene.mesh;
+    const mesh = residentMesh(scene), proxy = queryProxy(scene);
     if (!(mesh.indices instanceof Uint32Array) || mesh.indices.length < 3 || mesh.indices.length % 3 !== 0
       || mesh.indices.length / 3 > this.queries.options.maxTrianglesPerMesh
       || !Number.isSafeInteger(mesh.vertexCount) || mesh.vertexCount < 1 || !(mesh.vertices instanceof ArrayBuffer)
@@ -269,7 +280,8 @@ export class GpuFinalGather {
       const group = this.bind(this.pipelines.generateArea, [[0, this.parameters], [1, this.giParameterBuffer],
         [2, this.queries.rayBuffer], [4, this.cameraHits], [9, parameters], [10, output], [11, indices],
         [12, identities], [13, this.areaSamples]]);
-      this.batches.push({ scene, mesh, vertices: mesh.vertices, indices: mesh.indices, vertexCount: mesh.vertexCount,
+      this.batches.push({ scene, mesh, proxy, proxyIdentity: proxyIdentity(proxy),
+        vertices: mesh.vertices, indices: mesh.indices, vertexCount: mesh.vertexCount,
         indexCount: mesh.indices.length, name: scene.name, identity: topologyIdentity(scene), capacity: scene.capacity,
         sourceId, count: 0, parameters, identities, metadata: new Uint32Array(scene.capacity * 4), group });
     } catch (error) {
@@ -291,8 +303,10 @@ export class GpuFinalGather {
     let sourceBlocks = 0, activeEmitters = 0;
     this.batches.forEach((batch, index) => {
       const { scene } = batch;
-      if (scene.mesh !== batch.mesh || scene.mesh.vertices !== batch.vertices || scene.mesh.indices !== batch.indices
-        || scene.mesh.vertexCount !== batch.vertexCount || scene.mesh.indices.length !== batch.indexCount
+      const mesh = residentMesh(scene), proxy = queryProxy(scene);
+      if (mesh !== batch.mesh || mesh.vertices !== batch.vertices || mesh.indices !== batch.indices
+        || mesh.vertexCount !== batch.vertexCount || mesh.indices.length !== batch.indexCount
+        || proxy !== batch.proxy || proxyIdentity(proxy) !== batch.proxyIdentity
         || scene.name !== batch.name || scene.capacity !== batch.capacity || topologyIdentity(scene) !== batch.identity
         || scene.emissiveSampling !== 'triangle-area') throw new Error('FINAL_GATHER_TOPOLOGY_CHANGED');
       if (scene.instances.length > batch.capacity) throw new Error('FINAL_GATHER_INSTANCE_BUDGET');
@@ -477,7 +491,15 @@ export class GpuFinalGather {
     const hemisphere = this.enabled ? this.grid.rayCount : 0;
     const area = this.enabled ? this.areaRayCount : 0;
     return { enabled: this.enabled, frame: this.encodedFrame, options: this.options, ownedGpuBytes: this.bytes,
-      representation: 'exact-camera-hit-screen-grid-irradiance', update: 'full-grid-every-frame',
+      representation: this.queries.diagnostics().geometryRepresentations.some(entry => entry.geometry.kind === 'fixed-query-proxy')
+        ? 'fixed-query-proxy-camera-hit-screen-grid-irradiance' : 'exact-camera-hit-screen-grid-irradiance',
+      queryGeometryRepresentations: this.queries.diagnostics().geometryRepresentations,
+      emissiveGeometryRepresentations: this.batches.map(batch => ({ batch: batch.name,
+        geometry: batch.proxy ? { kind: 'fixed-query-proxy' as const, primitiveKey: batch.proxy.primitiveKey,
+          directorySha256: batch.proxy.directorySha256, topologyVersion: batch.proxy.topologyVersion,
+          approximateObjectSpaceError: batch.proxy.approximateObjectSpaceError,
+          errorMetric: 'accumulated-simplification' as const } : { kind: 'source' as const } })),
+      update: 'full-grid-every-frame',
       actualSpacing: this.grid.spacing, columns: this.grid.columns, rows: this.grid.rows,
       anchorCapacity: this.anchorCapacity, anchorsPerUpdate: anchors, hemisphereRaysPerUpdate: hemisphere,
       areaRaysPerUpdate: area, areaRayCapacity: this.queries.options.maxRays,
@@ -492,7 +514,9 @@ export class GpuFinalGather {
       cameraMoving: this.cameraMoving, cameraMotionHistoryCap: Math.min(this.options.maxHistory, 8),
       cameraReprojectionCandidates: 4, cameraReprojectionMaxWorldDistance: 0.10,
       cameraReprojectionPlaneTolerance: 0.001, cameraReprojectionNormalThreshold: 0.98,
-      cameraReprojectionInput: 'previous-rendered-surface-position-and-exact-previous-view-projection',
+      cameraReprojectionInput: this.queries.diagnostics().geometryRepresentations.some(entry => entry.geometry.kind === 'fixed-query-proxy')
+        ? 'previous-fixed-query-proxy-position-and-exact-previous-view-projection'
+        : 'previous-rendered-surface-position-and-exact-previous-view-projection',
       dynamicOcclusionHistory: 'conservative-global-reset-on-geometry-change',
       diagnosticMaxAnchors: MAX_PROBE_ANCHORS, diagnosticReadbackBytes: READBACK_BYTES,
       diagnosticReadbackPending: this.readbackPending,

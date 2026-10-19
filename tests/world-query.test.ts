@@ -120,7 +120,7 @@ describe('world query wire contract', () => {
     expect(result.frame).toBe(19);
     expect(result.materialRevision).toBe(31);
     expect(result.hits[0]).toEqual({
-      batch: 'character', entityId: 42, entityGeneration: 3, triangleIndex: 7, distance: 5,
+      batch: 'character', geometry: { kind: 'source' }, entityId: 42, entityGeneration: 3, triangleIndex: 7, distance: 5,
       position: [1, 2, 3], normal: [0, 1, 0], geometricNormal: [0, 1, 0], previousPosition: [0.5, 2, 3],
       uv: [0.75, 0.125], baseColor: [Math.fround(0.2), Math.fround(0.3), Math.fround(0.4)],
       opacity: Math.fround(0.8), metallic: Math.fround(0.6), roughness: Math.fround(0.4),
@@ -128,6 +128,25 @@ describe('world query wire contract', () => {
     });
     expect(result.hits[1]).toBeNull();
     expect(decodeWorldHits(new ArrayBuffer(0), [], 0, 0, 0).hits).toEqual([]);
+  });
+
+  it('labels proxy triangle numbering and clones geometry metadata for each hit', () => {
+    const data = new ArrayBuffer(2 * WORLD_HIT_BYTES);
+    new Uint8Array(data).set(new Uint8Array(hitRecord()));
+    new Uint8Array(data, WORLD_HIT_BYTES).set(new Uint8Array(hitRecord()));
+    const geometry = { kind: 'fixed-query-proxy' as const, primitiveKey: 'asset/primitive',
+      directorySha256: 'a'.repeat(64), topologyVersion: 12, approximateObjectSpaceError: 0.25,
+      errorMetric: 'accumulated-simplification' as const };
+    const hits = decodeWorldHits(data, ['ground', 'character'], 2, 19, 31,
+      [{ kind: 'source' }, geometry]).hits;
+    expect(hits.map(hit => hit?.geometry)).toEqual([geometry, geometry]);
+    expect(hits[0]?.geometry).not.toBe(geometry);
+    expect(hits[1]?.geometry).not.toBe(geometry);
+    expect(hits[0]?.geometry).not.toBe(hits[1]?.geometry);
+    expect(hits[0]?.triangleIndex).toBe(7);
+    expect(hits[0]?.topologyVersion).toBe(29);
+    expect(() => decodeWorldHits(data, ['ground', 'character'], 2, 19, 31, [geometry]))
+      .toThrow(/geometry metadata/);
   });
 
   it('preserves finite nonnegative Unlit HDR color while keeping PBR reflectance bounded', () => {

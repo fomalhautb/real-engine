@@ -2,12 +2,16 @@ import { GeometryPageCache, type GeometryPageCacheOptions } from './geometry-str
 import { GpuGeometryPagePool, type GeometryGpuPoolOptions } from './gpu-geometry-page-pool';
 import { GpuGeometryStreamSelection, type GeometryStreamSelectionFeedback, type GeometryStreamSelectionOptions } from './gpu-geometry-stream-selection';
 import type { GeometryPageProvider, GeometryStreamDirectory } from './geometry-stream-types';
-import type { SceneBatch } from './contracts';
+import { residentMesh, type RenderBatch } from './contracts';
+import { validateGeometryQueryProxy, type GeometryQueryProxy } from './geometry-query-proxy';
 import type { Mat4 } from './math';
 import { GeometryStreamWorkingSet } from './geometry-stream-working-set';
 import type { GeometryPageDecodeService } from './geometry-decode-worker-pool';
+import type { MeshData } from './geometry';
 
 export interface GeometryStreamSource {
+  /** Explicit fixed representation for a source-free StreamedSceneBatch. */
+  readonly queryProxy?: GeometryQueryProxy;
   readonly directory: GeometryStreamDirectory;
   readonly provider: GeometryPageProvider;
   readonly cpuCache?: GeometryPageCacheOptions;
@@ -17,12 +21,13 @@ export interface GeometryStreamSource {
   readonly maxRequestsPerFrame?: number;
 }
 
-/** Renderer bridge. Surface geometry is physically paged; the existing mesh
- * remains an exact full-detail shadow/query/Masked compatibility representation.
- * This is not yet a bounded-memory query proxy or dynamic simplification path. */
+/** Renderer bridge. Paged surfaces share instance/material state with either
+ * an exact resident mesh or an explicit fixed shadow/query proxy. */
 export class GpuGeometryStream {
   private source: GeometryStreamSource;
-  private readonly sourceMesh: SceneBatch['mesh'];
+  private readonly sourceMesh: MeshData;
+  private readonly fullSource?: MeshData;
+  private readonly proxy?: GeometryQueryProxy;
   private readonly sourceVertexCount: number;
   private readonly sourceVertices: ArrayBuffer;
   private readonly sourceIndices: Uint32Array;
@@ -44,17 +49,19 @@ export class GpuGeometryStream {
   private readonly checkedPages = new Set<number>();
   private cleanup?: Promise<void>;
 
-  private constructor(readonly scene: SceneBatch, readonly cache: GeometryPageCache,
+  private constructor(readonly scene: RenderBatch, readonly cache: GeometryPageCache,
     readonly pool: GpuGeometryPagePool, readonly selection: GpuGeometryStreamSelection) {
     this.source = scene.geometryStream!;
-    this.sourceMesh = scene.mesh; this.sourceVertexCount = scene.mesh.vertexCount;
-    this.sourceVertices = scene.mesh.vertices; this.sourceIndices = scene.mesh.indices;
-    this.sourceUvs = scene.mesh.uvs; this.sourceTangents = scene.mesh.tangents;
+    this.fullSource = scene.mesh; this.proxy = this.source.queryProxy;
+    const mesh = this.sourceMesh = residentMesh(scene);
+    this.sourceVertexCount = mesh.vertexCount;
+    this.sourceVertices = mesh.vertices; this.sourceIndices = mesh.indices;
+    this.sourceUvs = mesh.uvs; this.sourceTangents = mesh.tangents;
     this.requestsPerFrame = this.source.maxRequestsPerFrame ?? 16;
     this.workingSet = new GeometryStreamWorkingSet(pool.directory, pool.slotCount);
     this.allocation = this.workingSet.plan([]);
   }
-  static async create(device: GPUDevice, scene: SceneBatch, instances: GPUBuffer, track: (bytes: number) => void,
+  static async create(device: GPUDevice, scene: RenderBatch, instances: GPUBuffer, track: (bytes: number) => void,
     decoder?: GeometryPageDecodeService) {
     const source = scene.geometryStream;
     if (!source || scene.geometryLod || scene.deformation.jointCount || scene.deformation.nodes.length || scene.morphTargets.length) {
@@ -62,8 +69,11 @@ export class GpuGeometryStream {
     }
     const visits = source.maxRequestsPerFrame ?? 16;
     if (!Number.isSafeInteger(visits) || visits < 1 || visits > 256) throw new Error('GEOMETRY_STREAM_REQUEST_VISIT_BUDGET');
-    if (source.directory.sourceVertexCount !== scene.mesh.vertexCount || source.directory.sourceTriangleCount * 3 !== scene.mesh.indices.length
-      || source.directory.vertexStride !== 80 + (scene.mesh.uvs ? 8 : 0) + (scene.mesh.tangents ? 16 : 0)) {
+    if (source.queryProxy && scene.mesh) throw new Error('GEOMETRY_STREAM_AMBIGUOUS_REPRESENTATION');
+    const mesh = residentMesh(scene);
+    if (source.queryProxy) await validateGeometryQueryProxy(source.directory, source.queryProxy);
+    else if (source.directory.sourceVertexCount !== mesh.vertexCount || source.directory.sourceTriangleCount * 3 !== mesh.indices.length
+      || source.directory.vertexStride !== 80 + (mesh.uvs ? 8 : 0) + (mesh.tangents ? 16 : 0)) {
       throw new Error('GEOMETRY_STREAM_SOURCE_MISMATCH');
     }
     let cache: GeometryPageCache | undefined, pool: GpuGeometryPagePool | undefined, selection: GpuGeometryStreamSelection | undefined;
@@ -93,9 +103,11 @@ export class GpuGeometryStream {
   validateSources() {
     if (this.disposed) throw new Error('GEOMETRY_STREAM_DISPOSED');
     if (this.error) throw new Error(this.error);
-    if (this.scene.geometryStream !== this.source || this.scene.mesh !== this.sourceMesh || this.scene.mesh.vertexCount !== this.sourceVertexCount
-      || this.scene.mesh.vertices !== this.sourceVertices || this.scene.mesh.indices !== this.sourceIndices
-      || this.scene.mesh.uvs !== this.sourceUvs || this.scene.mesh.tangents !== this.sourceTangents
+    const mesh = residentMesh(this.scene);
+    if (this.scene.geometryStream !== this.source || this.source.queryProxy !== this.proxy || this.scene.mesh !== this.fullSource
+      || mesh !== this.sourceMesh || mesh.vertexCount !== this.sourceVertexCount
+      || mesh.vertices !== this.sourceVertices || mesh.indices !== this.sourceIndices
+      || mesh.uvs !== this.sourceUvs || mesh.tangents !== this.sourceTangents
       || this.scene.capacity !== this.selection.capacity || this.scene.deformation.jointCount || this.scene.deformation.nodes.length || this.scene.morphTargets.length) {
       throw new Error('GEOMETRY_STREAM_ASSET_CHANGED');
     }
@@ -103,6 +115,9 @@ export class GpuGeometryStream {
   private checkPage(id: number) {
     if (this.checkedPages.has(id)) return;
     const page = this.cache.get(id); if (!page) throw new Error('GEOMETRY_STREAM_CPU_PAGE_MISSING');
+    // Proxy assets and pages are bound to the same validated directory hashes.
+    // Source-free inputs have no original attribute arrays to compare against.
+    if (this.proxy) { this.checkedPages.add(id); return; }
     const original = new Uint8Array(this.sourceVertices);
     // Exact rest attributes/UV/tangents are shared with the full-detail query
     // representation. Source topology is immutable by the scene asset contract.
@@ -179,7 +194,13 @@ export class GpuGeometryStream {
   }
   retry(page: number) { this.validateSources(); this.cache.retry(page); }
   diagnostics() { return { pool: this.pool.diagnostics(), cache: this.cache.diagnostics(), selection: this.selection.diagnostics(),
-    error: this.error, feedback: this.lastFeedback, sourceRepresentation: 'full-detail-shadow-query-and-masked' as const,
+    error: this.error, feedback: this.lastFeedback,
+    sourceRepresentation: this.proxy ? 'fixed-shadow-query-proxy' as const : 'full-detail-shadow-query-and-masked' as const,
+    queryProxy: this.proxy ? { primitiveKey: this.proxy.primitiveKey, directorySha256: this.proxy.directorySha256,
+      topologyVersion: this.proxy.topologyVersion, vertices: this.sourceVertexCount, triangles: this.sourceIndices.length / 3,
+      residentPayloadBytes: this.sourceVertices.byteLength + this.sourceIndices.byteLength + (this.sourceUvs?.byteLength ?? 0) + (this.sourceTangents?.byteLength ?? 0),
+      approximateObjectSpaceError: this.proxy.approximateObjectSpaceError, errorMetric: 'accumulated-simplification',
+      cameraDependent: false, exactSourceRetained: false } : null,
     scheduling: 'group-budget-with-ancestor-retention' as const, allocation: { ...this.allocation,
       pages: [...this.allocation.pages], admittedGroups: [...this.allocation.admittedGroups],
       budgetDeferredGroups: [...this.allocation.budgetDeferredGroups], dependencyDeferredGroups: [...this.allocation.dependencyDeferredGroups],

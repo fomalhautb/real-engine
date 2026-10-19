@@ -8,7 +8,7 @@ import { DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, buildGiDistanceWeights } from './gi-visibility';
 import { WORLD_HIT_BYTES } from './world-query';
 import type { GpuWorldQuery } from './gpu-world-query';
-import type { SceneBatch } from './contracts';
+import type { RenderBatch } from './contracts';
 import { GpuGiEmissiveSampler } from './gpu-gi-emissive';
 import { GpuFinalGather, finalGatherSampleSource, type FinalGatherProbeResult } from './gpu-final-gather';
 import type { Mat4 } from './math';
@@ -155,7 +155,7 @@ export class GpuDiffuseGi {
   private checkMemoryBudget(): void {
     if (this.bytes > this.options.maxBytes) throw new Error('DIFFUSE_GI_MEMORY_BUDGET');
   }
-  registerEmissiveBatch(scene: SceneBatch, output: GPUBuffer, sourceId: number): void {
+  registerEmissiveBatch(scene: RenderBatch, output: GPUBuffer, sourceId: number): void {
     this.emissiveSampler?.addBatch(scene, output, sourceId);
     this.finalGather?.registerBatch(scene, output, sourceId);
     this.checkMemoryBudget();
@@ -289,6 +289,7 @@ export class GpuDiffuseGi {
       visibility: 'octahedral-distance-moments', visibilityResolution: GI_DISTANCE_RESOLUTION,
       visibilityCapture: 'normalized-cosine-power-32', distanceCaptureSamplesPerUpdate: GI_DISTANCE_CELLS * this.options.rayCount,
       placement: 'caller-provided-free-space-grid',
+      queryGeometryRepresentations: this.queries.diagnostics().geometryRepresentations,
       finalGather: gather ?? null,
       emissiveSampling: emissive ? { ...emissive, enabled: this.enabled && emissive.enabled,
         samplesPerUpdate: this.enabled ? emissive.samplesPerUpdate : 0,

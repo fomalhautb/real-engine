@@ -1,19 +1,23 @@
 import commonSource from './shaders/diffuse-gi-common.wgsl?raw';
 import areaSource from './shaders/gi-emissive.wgsl?raw';
-import type { SceneBatch } from './contracts';
+import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
 import { DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import type { GpuWorldQuery } from './gpu-world-query';
 import { WORLD_HIT_BYTES, WORLD_RAY_BYTES } from './world-query';
-import { DEFORMED_VERTEX_BYTES } from './geometry';
+import { DEFORMED_VERTEX_BYTES, type MeshData } from './geometry';
+
+type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
 const SAMPLE_BYTES = 48;
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 const HARD_MAX_BYTES = 128 * 1024 * 1024;
 const PARAMETER_BYTES = 32;
 interface EmissiveBatch {
-  scene: SceneBatch;
-  mesh: SceneBatch['mesh'];
+  scene: RenderBatch;
+  mesh: MeshData;
+  proxy?: QueryProxy;
+  proxyIdentity: string;
   vertices: ArrayBuffer;
   indices: Uint32Array;
   vertexCount: number;
@@ -33,9 +37,16 @@ function uint(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0 || value > 0xffffffff) throw new Error('GI_EMISSIVE_' + label);
   return value;
 }
-function topologyIdentity(scene: SceneBatch): string {
+function topologyIdentity(scene: RenderBatch): string {
   const identity = scene.queryIdentity;
   return identity ? JSON.stringify([identity.assetId, identity.primitiveId, identity.topologyVersion]) : '';
+}
+function queryProxy(scene: RenderBatch): QueryProxy | undefined {
+  return scene.mesh ? undefined : scene.geometryStream.queryProxy;
+}
+function proxyIdentity(proxy: QueryProxy | undefined): string {
+  return proxy ? JSON.stringify([proxy.version, proxy.primitiveKey, proxy.directorySha256,
+    proxy.topologyVersion, proxy.requestedError, proxy.approximateObjectSpaceError]) : '';
 }
 
 /** Bounded area importance sampling of opted-in deformed scene triangles.
@@ -132,7 +143,7 @@ export class GpuGiEmissiveSampler {
       ],
     }));
   }
-  addBatch(scene: SceneBatch, output: GPUBuffer, sourceId: number): void {
+  addBatch(scene: RenderBatch, output: GPUBuffer, sourceId: number): void {
     this.assertAlive();
     if (this.updated) throw new Error('GI_EMISSIVE_REGISTRATION_CLOSED');
     if (scene.emissiveSampling === undefined) return;
@@ -142,7 +153,7 @@ export class GpuGiEmissiveSampler {
     if (sourceId === 0 || this.batches.some(batch => batch.sourceId === sourceId || batch.scene === scene)) {
       throw new Error('GI_EMISSIVE_DUPLICATE_SOURCE');
     }
-    const mesh = scene.mesh;
+    const mesh = residentMesh(scene), proxy = queryProxy(scene);
     if (!(mesh.indices instanceof Uint32Array) || mesh.indices.length === 0 || mesh.indices.length % 3 !== 0
       || mesh.indices.length / 3 > this.queries.options.maxTrianglesPerMesh
       || !Number.isSafeInteger(mesh.vertexCount) || mesh.vertexCount < 1 || !(mesh.vertices instanceof ArrayBuffer)
@@ -172,7 +183,8 @@ export class GpuGiEmissiveSampler {
         { binding: 4, resource: { buffer: identities } }, { binding: 5, resource: { buffer: this.queries.rayBuffer } },
         { binding: 6, resource: { buffer: this.samples } },
       ] });
-      this.batches.push({ scene, mesh, vertices: mesh.vertices, indices: mesh.indices, vertexCount: mesh.vertexCount,
+      this.batches.push({ scene, mesh, proxy, proxyIdentity: proxyIdentity(proxy),
+        vertices: mesh.vertices, indices: mesh.indices, vertexCount: mesh.vertexCount,
         indexCount: mesh.indices.length, capacity: scene.capacity, name: scene.name, identity: topologyIdentity(scene),
         sourceId, count: 0, parameters, identities, metadata: new Uint32Array(scene.capacity * 4), group });
     } catch (error) {
@@ -186,8 +198,10 @@ export class GpuGiEmissiveSampler {
     // Validate the complete snapshot before publishing any queue writes.
     for (const batch of this.batches) {
       const { scene } = batch;
-      if (scene.mesh !== batch.mesh || scene.mesh.vertices !== batch.vertices || scene.mesh.indices !== batch.indices
-        || scene.mesh.vertexCount !== batch.vertexCount || scene.mesh.indices.length !== batch.indexCount
+      const mesh = residentMesh(scene), proxy = queryProxy(scene);
+      if (mesh !== batch.mesh || mesh.vertices !== batch.vertices || mesh.indices !== batch.indices
+        || mesh.vertexCount !== batch.vertexCount || mesh.indices.length !== batch.indexCount
+        || proxy !== batch.proxy || proxyIdentity(proxy) !== batch.proxyIdentity
         || scene.capacity !== batch.capacity || scene.name !== batch.name || topologyIdentity(scene) !== batch.identity
         || scene.emissiveSampling !== 'triangle-area') throw new Error('GI_EMISSIVE_TOPOLOGY_CHANGED');
       if (scene.instances.length > batch.capacity) throw new Error('GI_EMISSIVE_INSTANCE_BUDGET');
@@ -257,6 +271,12 @@ export class GpuGiEmissiveSampler {
       maxWorkUnitsPerUpdate: this.currentRayCount ? this.queries.options.maxTotalWorkUnits : 0,
       ownedGpuBytes: this.bytes, maxBytes: this.maxBytes, representation: 'triangle-area-to-radiance-SH9',
       coverage: 'shared-world-query', geometry: 'shared-current-deformation',
+      geometryRepresentations: this.batches.map(batch => ({ batch: batch.name,
+        geometry: batch.proxy ? { kind: 'fixed-query-proxy' as const, primitiveKey: batch.proxy.primitiveKey,
+          directorySha256: batch.proxy.directorySha256, topologyVersion: batch.proxy.topologyVersion,
+          approximateObjectSpaceError: batch.proxy.approximateObjectSpaceError,
+          errorMetric: 'accumulated-simplification' as const } : { kind: 'source' as const } })),
+      queryGeometryRepresentations: this.queries.diagnostics().geometryRepresentations,
       sampling: 'fixed-probe-source-hashed-triangles-rotated-Hammersley',
       nearEmitterVariance: 'uniform-triangle-area-estimator', temporalAccumulation: false };
   }

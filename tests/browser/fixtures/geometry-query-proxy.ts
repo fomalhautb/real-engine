@@ -41,7 +41,8 @@ export async function runGeometryQueryProxyFixture() {
       { width: 2, height: 1, colorSpace: 'linear', pixels: new Uint8Array([166, 128, 248, 255, 100, 155, 250, 255]) },
     ], samplers: [{ addressModeU: 'repeat', addressModeV: 'repeat' }, { addressModeU: 'repeat', addressModeV: 'repeat' }] };
   const { mesh: _source, geometryLod: _lod, geometryStream: _stream, ...common } = scene.batches[0];
-  const base = { ...common, material, queryIdentity: { assetId: directory.primitiveKey, primitiveId: 0, topologyVersion: 3 },
+  // Capacity above the instance-BVH threshold also exercises inactive leaves.
+  const base = { ...common, capacity: 8, material, queryIdentity: { assetId: directory.primitiveKey, primitiveId: 0, topologyVersion: 3 },
     emissiveSampling: 'triangle-area' as const };
   const streamedSource = { directory, provider, gpuPool: { maxUploadBytesPerFrame: 16384, maxUploadWritesPerFrame: 16 } };
   const legacy: SceneBatch = { ...base, mesh: attributed, geometryStream: streamedSource,
@@ -70,7 +71,8 @@ export async function runGeometryQueryProxyFixture() {
   const renderers: Renderer[] = [];
   const eye: [number, number, number] = [8, 9, 16], target: [number, number, number] = [0, -0.5, 0];
   try {
-    for (let i = 0; i < 3; i++) renderers.push(await Renderer.create(canvases[i], batchSets[i], options));
+    for (let i = 0; i < 3; i++) renderers.push(await Renderer.create(canvases[i], batchSets[i], i === 2
+      ? { ...options, worldQueries: { ...options.worldQueries, instanceAcceleration: 'linear' } } : options));
     const [full, stream, reference] = renderers;
     for (const r of [full, stream]) r.setGeometryLod({ maxErrorPixels: 0, frustumCulling: false });
     for (const r of renderers) r.setDiffuseGiEnabled(false);

@@ -10,6 +10,8 @@ export interface WorldQueryOptions {
   maxTotalWorkUnits?: number;
   /** Distinct count/textureLod parameter snapshots retained within one GPU encoder; identical snapshots reuse a slot. */
   maxTraceParameterSetsPerEncoder?: number;
+  /** Batch-local instance BVH for capacities >= 8; linear retains the reference traversal. */
+  instanceAcceleration?: 'bvh' | 'linear';
 }
 
 export interface WorldRay {
@@ -70,7 +72,8 @@ export const WORLD_HIT_BYTES = 160;
 
 const UINT32_MAX = 0xffff_ffff;
 const MAX_RAYS = 65_536;
-const DEFAULT_OPTIONS: Required<WorldQueryOptions> = {
+type NumericOptions = Required<Omit<WorldQueryOptions, 'instanceAcceleration'>>;
+const DEFAULT_OPTIONS: NumericOptions = {
   maxRays: 1_024,
   maxBytes: 128 * 1024 * 1024,
   maxTrianglesPerMesh: 65_536,
@@ -79,7 +82,7 @@ const DEFAULT_OPTIONS: Required<WorldQueryOptions> = {
   maxTotalWorkUnits: 16_777_216,
   maxTraceParameterSetsPerEncoder: 8,
 };
-const HARD_OPTIONS: Required<WorldQueryOptions> = {
+const HARD_OPTIONS: NumericOptions = {
   maxRays: MAX_RAYS,
   maxBytes: 512 * 1024 * 1024,
   maxTrianglesPerMesh: 262_144,
@@ -103,9 +106,12 @@ function uint32(value: number, label: string): number {
 /** Defaults and hard caps apply before any CPU or GPU allocation. */
 export function resolveWorldQueryOptions(options: WorldQueryOptions = {}): Required<WorldQueryOptions> {
   const result = {} as Required<WorldQueryOptions>;
-  for (const key of Object.keys(DEFAULT_OPTIONS) as (keyof WorldQueryOptions)[]) {
+  for (const key of Object.keys(DEFAULT_OPTIONS) as (keyof NumericOptions)[]) {
     result[key] = boundedInteger(options[key] ?? DEFAULT_OPTIONS[key], key, 1, HARD_OPTIONS[key]);
   }
+  const acceleration = options.instanceAcceleration ?? 'bvh';
+  if (acceleration !== 'bvh' && acceleration !== 'linear') throw new RangeError('instanceAcceleration must be bvh or linear');
+  result.instanceAcceleration = acceleration;
   return result;
 }
 

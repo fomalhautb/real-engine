@@ -45,7 +45,7 @@ async function rejection(operation: () => Promise<unknown> | unknown): Promise<s
 }
 
 /** Exact rays against authored planes; no production CPU triangle traversal is used as an oracle. */
-export async function runWorldQueryFixture() {
+export async function runWorldQueryFixture(instanceBvh = false) {
   const mesh = plane();
   const morphPositions = new Float32Array(4 * 3);
   for (let i = 0; i < 4; i++) morphPositions[i * 3] = 1;
@@ -75,12 +75,14 @@ export async function runWorldQueryFixture() {
     instances: [pose(500, 1, 6)], deformation: { jointCount: 0, nodes: [] }, morphTargets: [],
     material: { definition: { ...DEFAULT_MATERIAL_DEFINITION, doubleSided: true } } };
   const batches = [staticBatch, movingBatch, sharedBatch, backBatch, frontBatch, doubleSidedBatch];
+  if (instanceBvh) for (const batch of batches) batch.capacity = 8;
   const canvas = document.createElement('canvas');
   canvas.style.cssText = 'position:fixed;left:0;top:0;width:256px;height:256px;';
   document.body.appendChild(canvas);
   let renderer: Renderer | undefined;
   try {
-    renderer = await Renderer.create(canvas, batches, { worldQueries: { maxRays: 16, maxTrianglesPerMesh: 8, maxInstancesPerBatch: 4 } });
+    renderer = await Renderer.create(canvas, batches, { worldQueries: { maxRays: 16, maxTrianglesPerMesh: 8,
+      maxInstancesPerBatch: instanceBvh ? 8 : 4 } });
     renderer.render(camera.eye, camera.target);
     const initialRays: Ray[] = [
       ray(-5), ray(-2), ray(0), ray(2.5, 1), ray(4), ray(4.32, 0.32),
@@ -117,7 +119,7 @@ export async function runWorldQueryFixture() {
       { ...ray(0), ignore: { entityId: 300, generation: 1 } },
       { ...ray(0), ignore: { entityId: 300, generation: 2 } }]);
 
-    const errors = [...renderer.errors], frames = renderer.stats.frames;
+    const errors = [...renderer.errors], frames = renderer.stats.frames, diagnostics = renderer.diagnostics().worldQueries;
     staticBatch.queryIdentity = { assetId: 'query-plane', primitiveId: 0, topologyVersion: 2 };
     const topologyRejected = await rejection(async () => {
       try { await renderer!.traceRays([ray(-5)]); }
@@ -133,6 +135,6 @@ export async function runWorldQueryFixture() {
     finally { noQuery.dispose(); }
     return { initial, empty, normalizedDirection, invalidDirection, invalidInterval, overBudget,
       beforeRender, moved, reordered, removed, reused, topologyRejected, disabledQuery,
-      frames, errors, ownedGpuBytesAfterDispose, noQueryBytesAfterDispose: noQuery.stats.ownedGpuBytes };
+      frames, errors, diagnostics, ownedGpuBytesAfterDispose, noQueryBytesAfterDispose: noQuery.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }
 }

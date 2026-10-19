@@ -53,9 +53,11 @@ describe('world query wire contract', () => {
     expect(resolveWorldQueryOptions()).toEqual({
       maxRays: 1024, maxBytes: 128 * 1024 * 1024, maxTrianglesPerMesh: 65536,
       maxInstancesPerBatch: 256, maxNodeVisits: 262144, maxTotalWorkUnits: 16777216,
-      maxTraceParameterSetsPerEncoder: 8,
+      maxTraceParameterSetsPerEncoder: 8, instanceAcceleration: 'bvh',
     });
     expect(resolveWorldQueryOptions({ maxRays: 2048, maxInstancesPerBatch: 16 }).maxRays).toBe(2048);
+    expect(resolveWorldQueryOptions({ instanceAcceleration: 'linear' }).instanceAcceleration).toBe('linear');
+    expect(() => resolveWorldQueryOptions({ instanceAcceleration: 'unknown' as 'bvh' })).toThrow(/instanceAcceleration/);
     expect(resolveWorldQueryOptions({ maxTotalWorkUnits: 67108864 }).maxTotalWorkUnits).toBe(67108864);
     expect(resolveWorldQueryOptions({ maxTraceParameterSetsPerEncoder: 1 }).maxTraceParameterSetsPerEncoder).toBe(1);
     expect(resolveWorldQueryOptions({ maxTraceParameterSetsPerEncoder: 32 }).maxTraceParameterSetsPerEncoder).toBe(32);

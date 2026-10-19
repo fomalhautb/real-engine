@@ -16,6 +16,7 @@ struct Params {
     limits: vec4u, // ray count, work limit, frame, topology version
     material: vec4u, // material revision, GI area-sampling source flag
     textureLod: vec4f,
+    instanceTree: vec4u, // node offset, order offset, bounds offset, node count (0 = linear)
 }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> vertices: array<Deformed>;
@@ -71,11 +72,25 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // GPU consumers use an empty interval for inactive work (e.g. sky rays
     // needing no sun-visibility query). Preserve the reset miss at zero cost.
     if (ray.direction.w < ray.origin.w) { return; }
-    // Instance roots are currently scanned linearly; per-instance triangle
-    // traversal is accelerated by a refitted, stackless preorder BVH.
-    for (var instance = 0u; instance < params.shape.z; instance++) {
+    var instanceCursor = 0u;
+    var winningInstance = 0xffffffffu;
+    loop {
+        let accelerated = params.instanceTree.w != 0u;
+        if (instanceCursor >= select(params.shape.z, params.instanceTree.w, accelerated)) { break; }
         if (hit.work.x >= params.limits.y) { hit.work.z = 1u; break; }
         hit.work.x++;
+        var instance = instanceCursor;
+        if (accelerated) {
+            let start = params.instanceTree.x + instanceCursor * 4u;
+            let box = bounds[params.instanceTree.z + instanceCursor];
+            if (box.low.w == 0.0 || !intersectsBox(ray, box, hit.metric.x)) {
+                instanceCursor = source[start + 2u]; continue;
+            }
+            instanceCursor++;
+            if (source[start + 3u] == 0u) { continue; }
+            instance = source[params.instanceTree.y + source[start]];
+            if (instance >= params.shape.z) { continue; }
+        } else { instanceCursor++; }
         let identity = identities[instance];
         if (ray.ignore.z != 0u && all(ray.ignore.xy == identity.xy)) { continue; }
         var node = 0u;
@@ -113,7 +128,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 if (v < 0.0 || u + v > 1.0) { continue; }
                 let distance = dot(edge2, crossDelta) / determinant;
                 if (distance < ray.origin.w || distance > ray.direction.w || distance > hit.metric.x
-                    || (distance == hit.metric.x && hit.identity.x != 0u)) { continue; }
+                    // Traversal order must not change equal-distance identity:
+                    // earlier batch, then lower instance slot, then BLAS order.
+                    || (distance == hit.metric.x && hit.identity.x != 0u
+                        && (hit.identity.x != params.shape.w || instance >= winningInstance))) { continue; }
                 let weights = vec3f(1.0 - u - v, u, v);
                 let uv = uvAt(v0) * weights.x + uvAt(v1) * weights.y + uvAt(v2) * weights.z;
                 let inst = instances[instance];
@@ -139,6 +157,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 hit.versions = vec4u(params.limits.z, identity.z, params.limits.w, params.material.x);
                 hit.uvInfo = vec4f(uv, params.textureLod.x, encodedGeometry.y);
                 hit.work.w = params.material.y;
+                winningInstance = instance;
             }
             if (hit.work.z != 0u) { break; }
             node++;

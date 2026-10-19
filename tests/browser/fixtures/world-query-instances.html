@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>动态实例查询加速验证</title>
+  <link rel="icon" href="data:,">
+  <style>
+    body { margin: 0; padding: 24px; background: #111923; color: #e8eef5; font: 16px system-ui; }
+    h1 { margin: 0 0 8px; }
+    p { max-width: 900px; line-height: 1.45; }
+    main { display: flex; gap: 16px; }
+    figure { margin: 0; flex: 1; min-width: 0; }
+    canvas, figure img { display: block; width: 100%; aspect-ratio: 1; background: #080d12; }
+    figcaption { padding: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>动态实例查询：加速前后结果一致</h1>
+  <p>258 个共享 Morph、蒙皮与风动算子的实例。验证移动、重排、删除与恢复后的射线命中和 GI；这是正确性测试场景。</p>
+  <main id="scene-pair">
+    <figure><canvas id="accelerated"></canvas><figcaption>实例 BVH：按空间排除无关对象</figcaption></figure>
+    <figure><canvas id="linear"></canvas><figcaption>原路径：逐个检查实例</figcaption></figure>
+  </main>
+</body>
+</html>

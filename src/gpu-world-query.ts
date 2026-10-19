@@ -2,6 +2,8 @@ import refitSource from './shaders/query-refit.wgsl?raw';
 import traceSource from './shaders/query-trace.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { buildBvhTopology } from './bvh-topology';
+import { buildInstanceBvhTopology, orderInstanceBounds } from './instance-bvh';
+import type { Bounds3 } from './deformation';
 import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
 import type { MeshData } from './geometry';
 import type { GpuMaterial } from './gpu-material';
@@ -18,7 +20,10 @@ interface QuerySource {
   getMaterial(): GpuMaterial;
   getPipeline(): GPUComputePipeline;
   getDirty?(): boolean;
+  /** Ordering only: GPU refit always uses actual deformed triangle bounds. */
+  getInstanceBounds?(): readonly Bounds3[];
 }
+type RefitLevel = { params: GPUBuffer; bindGroup: GPUBindGroup; count: number; offset: number };
 type QueryBatch = {
   source: QuerySource; mesh: MeshData; name: string; capacity: number; identity: string;
   proxy?: QueryProxy; proxyIdentity: string; geometry: WorldHitGeometry;
@@ -26,7 +31,8 @@ type QueryBatch = {
   emissiveSampling: RenderBatch['emissiveSampling'];
   vertexCount: number; vertices: ArrayBuffer; indices: Uint32Array; uvs?: Float32Array; tangents?: Float32Array;
   identities: GPUBuffer; metadata: Uint32Array<ArrayBuffer>; params: GPUBuffer; trace: GPUBindGroup[];
-  levels: { params: GPUBuffer; bindGroup: GPUBindGroup; count: number; offset: number }[];
+  levels: RefitLevel[];
+  data: GPUBuffer; instanceTree: readonly [number, number, number, number]; instanceLevels: RefitLevel[];
 };
 
 const resetSource = `
@@ -100,6 +106,9 @@ export class GpuWorldQuery {
   private resetPipeline!: GPUComputePipeline;
   private resetGroups!: GPUBindGroup[];
   private refitPipeline!: GPUComputePipeline;
+  private instanceRefitPipeline!: GPUComputePipeline;
+  private lastReadbackQuery: { frame: number; rays: number; workUnits: number; triangleTests: number;
+    maxWorkUnits: number; overflows: number } | null = null;
 
   static async create(device: GPUDevice, materialLayout: GPUBindGroupLayout,
     account: (bytes: number) => void, options: WorldQueryOptions): Promise<GpuWorldQuery> {
@@ -111,7 +120,7 @@ export class GpuWorldQuery {
     private readonly account: (bytes: number) => void, options: WorldQueryOptions) {
     this.options = Object.freeze(resolveWorldQueryOptions(options));
     const alignment = device.limits.minUniformBufferOffsetAlignment;
-    this.traceUniformStride = Math.ceil(80 / alignment) * alignment;
+    this.traceUniformStride = Math.ceil(96 / alignment) * alignment;
     this.resetUniformStride = Math.ceil(16 / alignment) * alignment;
     this.refitLayout = device.createBindGroupLayout({ entries: [0, 1, 2, 3].map(binding => ({
       binding, visibility: GPUShaderStage.COMPUTE,
@@ -153,10 +162,12 @@ export class GpuWorldQuery {
     });
     this.readBuffer = this.buffer('world hit diagnostics', sizes[2], GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     this.resetParams = this.buffer('world query reset parameter slots', sizes[3], GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    this.refitPipeline = await this.device.createComputePipelineAsync({
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.refitLayout] }),
-      compute: { module: await this.module(refitSource, 'world BVH refit'), entryPoint: 'main' },
-    });
+    const refitModule = await this.module(refitSource, 'world BVH refit');
+    const refitPipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.refitLayout] });
+    this.refitPipeline = await this.device.createComputePipelineAsync({ layout: refitPipelineLayout,
+      compute: { module: refitModule, entryPoint: 'main' } });
+    this.instanceRefitPipeline = await this.device.createComputePipelineAsync({ layout: refitPipelineLayout,
+      compute: { module: refitModule, entryPoint: 'refitInstances' } });
     this.resetPipeline = await this.device.createComputePipelineAsync({ layout: 'auto',
       compute: { module: await this.module(resetSource, 'world ray reset'), entryPoint: 'main' } });
     this.resetGroups = Array.from({ length: this.options.maxTraceParameterSetsPerEncoder }, (_, slot) =>
@@ -186,9 +197,20 @@ export class GpuWorldQuery {
     offsets.push(offsets[1] + mesh.indices.length);
     let length = offsets[2] + mesh.vertexCount * 2;
     const levelOffsets = topology.levels.map(level => { const start = length; length += level.length; return start; });
-    const boundsSize = topology.nodeCount * scene.capacity * 32;
+    const instanceTopology = this.options.instanceAcceleration === 'bvh' && scene.capacity >= 8
+      ? buildInstanceBvhTopology(scene.capacity) : undefined;
+    const instanceNodesOffset = length;
+    length += instanceTopology?.nodes.length ?? 0;
+    const instanceOrderOffset = length;
+    length += instanceTopology ? scene.capacity : 0;
+    const instanceLevelOffsets = instanceTopology?.levels.map(level => { const start = length; length += level.length; return start; }) ?? [];
+    const instanceBoundsOffset = topology.nodeCount * scene.capacity;
+    const instanceTree = [instanceNodesOffset, instanceOrderOffset, instanceBoundsOffset,
+      instanceTopology?.nodeCount ?? 0] as const;
+    const boundsSize = (instanceBoundsOffset + instanceTree[3]) * 32;
     const parameterBytes = this.traceUniformStride * this.options.maxTraceParameterSetsPerEncoder;
-    this.preflight([length * 4, boundsSize, scene.capacity * 16, parameterBytes, ...topology.levels.map(() => 48)]);
+    this.preflight([length * 4, boundsSize, scene.capacity * 16, parameterBytes,
+      ...topology.levels.map(() => 48), ...instanceLevelOffsets.map(() => 48)]);
     for (const level of topology.levels) {
       if (Math.ceil(level.length * scene.capacity / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('WORLD_QUERY_REFIT_DISPATCH_LIMIT');
     }
@@ -196,7 +218,12 @@ export class GpuWorldQuery {
     packed.set(topology.nodes); packed.set(topology.triangles, offsets[0]); packed.set(mesh.indices, offsets[1]);
     if (mesh.uvs) new Float32Array(packed.buffer).set(mesh.uvs, offsets[2]);
     topology.levels.forEach((level, i) => packed.set(level, levelOffsets[i]));
-    const data = this.buffer('world BVH topology and UVs', packed.byteLength, GPUBufferUsage.STORAGE, packed.buffer);
+    if (instanceTopology) {
+      packed.set(instanceTopology.nodes, instanceNodesOffset);
+      packed.fill(0xffff_ffff, instanceOrderOffset, instanceOrderOffset + scene.capacity);
+      instanceTopology.levels.forEach((level, i) => packed.set(level, instanceLevelOffsets[i]));
+    }
+    const data = this.buffer('world BVH topology and UVs', packed.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, packed.buffer);
     const bounds = this.buffer('world BVH instance bounds', boundsSize, GPUBufferUsage.STORAGE);
     const identities = this.buffer('world entity identities', scene.capacity * 16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const params = this.buffer('world batch parameter slots', parameterBytes, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -204,19 +231,21 @@ export class GpuWorldQuery {
     const trace = Array.from({ length: this.options.maxTraceParameterSetsPerEncoder }, (_, slot) =>
       this.device.createBindGroup({ layout: this.traceLayout,
       entries: traceBuffers.map((buffer, binding) => ({ binding, resource: binding === 0
-        ? { buffer, offset: slot * this.traceUniformStride, size: 80 } : { buffer } })) }));
-    const levels = topology.levels.map((level, i) => {
+        ? { buffer, offset: slot * this.traceUniformStride, size: 96 } : { buffer } })) }));
+    const createLevels = (input: readonly Uint32Array[], starts: readonly number[]): RefitLevel[] => input.map((level, i) => {
       const params = this.buffer('world refit depth parameters', 48, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-      return { params, count: level.length, offset: levelOffsets[i],
+      return { params, count: level.length, offset: starts[i],
         bindGroup: this.device.createBindGroup({ layout: this.refitLayout,
           entries: [params, source.output, data, bounds].map((buffer, binding) => ({ binding, resource: { buffer } })) }) };
     });
+    const levels = createLevels(topology.levels, levelOffsets);
+    const instanceLevels = createLevels(instanceTopology?.levels ?? [], instanceLevelOffsets);
     this.batches.push({ source, mesh, name: scene.name, capacity: scene.capacity, identity: sourceIdentity,
       proxy, proxyIdentity: proxyIdentity(proxy), geometry: geometryMetadata(proxy),
       emissiveSampling: scene.emissiveSampling,
       topologyVersion: scene.queryIdentity?.topologyVersion ?? 0, nodeCount: topology.nodeCount, offsets, count: 0, dirty: true,
       vertexCount: mesh.vertexCount, vertices: mesh.vertices, indices: mesh.indices, uvs: mesh.uvs, tangents: mesh.tangents,
-      identities, metadata: new Uint32Array(scene.capacity * 4), params, trace, levels });
+      identities, metadata: new Uint32Array(scene.capacity * 4), params, trace, levels, data, instanceTree, instanceLevels });
   }
   private validateTopology(): void {
     if (this.disposed) throw new Error('WORLD_QUERY_DISPOSED');
@@ -265,6 +294,22 @@ export class GpuWorldQuery {
         batch.nodeCount, batch.mesh.vertexCount, batch.count, 0,
         ...batch.offsets, level.offset, level.count, 0, 0, 0,
       ]));
+      if (batch.instanceTree[3]) {
+        // CPU centers only determine traversal quality. Bounds used for culling
+        // come from GPU BLAS roots, including skin, Morph and wave deformation.
+        const sortBounds = batch.source.getInstanceBounds?.() ?? batch.source.scene.instances.map(state => {
+          const center: [number, number, number] = [state.model[12], state.model[13], state.model[14]];
+          return { min: center, max: center };
+        });
+        if (sortBounds.length !== batch.count) throw new Error('WORLD_QUERY_INSTANCE_BOUNDS_COUNT');
+        const order = orderInstanceBounds(sortBounds, batch.capacity);
+        this.device.queue.writeBuffer(batch.data, batch.instanceTree[1] * 4, order);
+        uploadedBytes += order.byteLength + batch.instanceLevels.length * 48;
+        for (const level of batch.instanceLevels) this.device.queue.writeBuffer(level.params, 0, new Uint32Array([
+          batch.nodeCount, 0, batch.count, 0,
+          ...batch.instanceTree.slice(0, 3), level.offset, level.count, 0, 0, 0,
+        ]));
+      }
     }
     if (historyChanged) this.sceneHistoryRevision = (this.sceneHistoryRevision + 1) >>> 0;
     return uploadedBytes;
@@ -272,24 +317,28 @@ export class GpuWorldQuery {
   /** Discrete identity/history changes; ordinary current/previous pose motion does not advance it. */
   get historyRevision(): number { return this.sceneHistoryRevision; }
   encodeRefit(encoder: GPUCommandEncoder, timing?: GPUComputePassTimestampWrites): void {
-    let remaining = this.batches.reduce((sum, batch) => sum + (batch.count && batch.dirty ? batch.levels.length : 0), 0);
+    let remaining = this.batches.reduce((sum, batch) => sum + (batch.count && batch.dirty
+      ? batch.levels.length + batch.instanceLevels.length : 0), 0);
     let first = true;
     if (!remaining && timing) {
       encoder.beginComputePass({ label: 'cached world BVH refit', timestampWrites: timing }).end();
     }
     for (const batch of this.batches) {
       if (!batch.count || !batch.dirty) continue;
-      for (let depth = batch.levels.length - 1; depth >= 0; depth--) {
-        const level = batch.levels[depth];
-        const timestampWrites = timing && (first || remaining === 1) ? {
-          querySet: timing.querySet,
-          beginningOfPassWriteIndex: first ? timing.beginningOfPassWriteIndex : undefined,
-          endOfPassWriteIndex: remaining === 1 ? timing.endOfPassWriteIndex : undefined,
-        } : undefined;
-        const pass = encoder.beginComputePass({ label: `world BVH refit ${batch.name} depth ${depth}`, timestampWrites });
-        pass.setPipeline(this.refitPipeline); pass.setBindGroup(0, level.bindGroup);
-        pass.dispatchWorkgroups(Math.ceil(level.count * batch.count / 64)); pass.end();
-        first = false; remaining--;
+      for (const instanceLevel of [false, true]) {
+        const levels = instanceLevel ? batch.instanceLevels : batch.levels;
+        for (let depth = levels.length - 1; depth >= 0; depth--) {
+          const level = levels[depth];
+          const timestampWrites = timing && (first || remaining === 1) ? {
+            querySet: timing.querySet,
+            beginningOfPassWriteIndex: first ? timing.beginningOfPassWriteIndex : undefined,
+            endOfPassWriteIndex: remaining === 1 ? timing.endOfPassWriteIndex : undefined,
+          } : undefined;
+          const pass = encoder.beginComputePass({ label: `world ${instanceLevel ? 'instance' : 'triangle'} BVH refit ${batch.name} depth ${depth}`, timestampWrites });
+          pass.setPipeline(instanceLevel ? this.instanceRefitPipeline : this.refitPipeline); pass.setBindGroup(0, level.bindGroup);
+          pass.dispatchWorkgroups(Math.ceil(level.count * (instanceLevel ? 1 : batch.count) / 64)); pass.end();
+          first = false; remaining--;
+        }
       }
     }
   }
@@ -339,13 +388,14 @@ export class GpuWorldQuery {
       const batch = this.batches[index];
       if (!batch.count) continue;
       if (upload) {
-        const params = new ArrayBuffer(80);
+        const params = new ArrayBuffer(96);
         new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
           ...batch.offsets, 0, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
           batch.emissiveSampling === 'triangle-area' ? 1 : 0]);
         new Float32Array(params)[16] = textureLod;
+        new Uint32Array(params).set(batch.instanceTree, 20);
         this.device.queue.writeBuffer(batch.params, parameterSlot * this.traceUniformStride, params);
-        uploadedBytes += 80;
+        uploadedBytes += 96;
       }
       // Distinct passes provide ordering for closest-hit updates between batches.
       const pass = encoder.beginComputePass({ label: 'world rays ' + batch.name });
@@ -362,7 +412,10 @@ export class GpuWorldQuery {
     const packed = packWorldRays(rays, this.options.maxRays), count = rays.length, textureLod = options.textureLod ?? 0;
     if (!Number.isFinite(textureLod) || textureLod < 0 || textureLod > 32) throw new Error('WORLD_QUERY_TEXTURE_LOD');
     const frame = this.frame, names = this.batches.map(batch => batch.name);
-    if (!count) return { frame, materialRevision, hits: [] };
+    if (!count) {
+      this.lastReadbackQuery = { frame, rays: 0, workUnits: 0, triangleTests: 0, maxWorkUnits: 0, overflows: 0 };
+      return { frame, materialRevision, hits: [] };
+    }
     this.pending = true;
     try {
       this.device.queue.writeBuffer(this.rayBuffer, 0, packed);
@@ -371,8 +424,19 @@ export class GpuWorldQuery {
       encoder.copyBufferToBuffer(this.hitBuffer, 0, this.readBuffer, 0, count * WORLD_HIT_BYTES);
       this.device.queue.submit([encoder.finish()]);
       await this.readBuffer.mapAsync(GPUMapMode.READ);
-      try { return decodeWorldHits(this.readBuffer.getMappedRange().slice(0, count * WORLD_HIT_BYTES), names,
-        count, frame, materialRevision, this.batches.map(batch => batch.geometry)); }
+      try {
+        const data = this.readBuffer.getMappedRange().slice(0, count * WORLD_HIT_BYTES);
+        const view = new DataView(data);
+        const work = { frame, rays: count, workUnits: 0, triangleTests: 0, maxWorkUnits: 0, overflows: 0 };
+        for (let ray = 0; ray < count; ray++) {
+          const offset = ray * WORLD_HIT_BYTES + 144, units = view.getUint32(offset, true);
+          work.workUnits += units; work.triangleTests += view.getUint32(offset + 4, true);
+          work.maxWorkUnits = Math.max(work.maxWorkUnits, units);
+          work.overflows += view.getUint32(offset + 8, true) ? 1 : 0;
+        }
+        this.lastReadbackQuery = work;
+        return decodeWorldHits(data, names, count, frame, materialRevision, this.batches.map(batch => batch.geometry));
+      }
       finally { this.readBuffer.unmap(); }
     } finally { this.pending = false; }
   }
@@ -383,7 +447,11 @@ export class GpuWorldQuery {
       instances: this.batches.reduce((sum, batch) => sum + batch.count, 0), options: { ...this.options },
       traceParameters: 'aligned-immutable-slots-per-encoder', traceUniformStride: this.traceUniformStride,
       resetUniformStride: this.resetUniformStride,
-      instanceAcceleration: 'linear-root-scan', refit: 'changed-batches', refitTiming: 'provided-by-caller', externalTraceTiming: false };
+      instanceAcceleration: this.batches.some(batch => batch.instanceTree[3]) ? 'batch-bvh' : 'linear-root-scan',
+      instanceBvhNodes: this.batches.reduce((sum, batch) => sum + batch.instanceTree[3], 0),
+      acceleratedBatches: this.batches.filter(batch => batch.instanceTree[3]).length,
+      lastReadbackQuery: this.lastReadbackQuery && { ...this.lastReadbackQuery },
+      refit: 'changed-batches', refitTiming: 'provided-by-caller', externalTraceTiming: false };
   }
   dispose(): void {
     if (this.disposed) return;

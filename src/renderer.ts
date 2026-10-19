@@ -299,7 +299,8 @@ export class Renderer {
       const batch = await this.createBatch(entry);
       this.batches.push(batch);
       this.worldQueries?.addBatch({ scene: batch.scene, output: batch.output, instances: batch.instances,
-        getMaterial: () => batch.material, getPipeline: () => batch.materialPipelines.query!, getDirty: () => batch.dirty });
+        getMaterial: () => batch.material, getPipeline: () => batch.materialPipelines.query!, getDirty: () => batch.dirty,
+        getInstanceBounds: () => batch.scene.instances.map(state => batch.bounds.get(state.entityId)!) });
       this.diffuseGi?.registerEmissiveBatch(batch.scene, batch.output, this.batches.length);
     }
     this.graph = compileRenderGraph<GPUCommandEncoder>([

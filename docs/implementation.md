@@ -130,7 +130,7 @@ Worker 页解码与固定阴影/查询代理已接入，仍需代理的更广质
 
 `WorldHit.geometry` 明确标记 `source` 或 `fixed-query-proxy`。代理命中携带 primitive、规范化目录摘要、代理拓扑版本、近似局部空间误差及误差指标；`triangleIndex` 属于该表示自己的三角形编号空间，不是源三角形 ID。原有 `QueryIdentity.topologyVersion` 保持独立，160 字节 GPU 命中布局未变。阴影、世界查询、发光面积采样、GI 和 Final Gather 相机射线在源网格可省略批次上共用代理的三角形空间，故 Final Gather 命中也不是高模分页表面的精确像素命中。分页主视图仍可独立选到 LOD0。
 
-原生非 fallback `nvidia / ampere` 定向联测把 2,560 顶点/5,120 三角形的完整源缩为 245 顶点/488 三角形的固定代理，而主视图仍选择每实例 5,120 个 LOD0 三角形。768 个 Unlit HDR 样本与保留完整源网格的旧流送路径对照，最大差为零；99 个阴影点、3 个实例查询、运动查询及速度、8 条 GI 探针记录、168 个 Final Gather 锚点（83 个有效）与各自参考一致。旧完整源流送 Renderer 的应用 GPU 账本为 9,545,716 字节，源网格可省略版为 8,155,460 字节；两者释放后归零。主用例见 `artifacts/query-proxy-integration-native-20261019.log`；源网格可省略小池 A→B→A→B→A 换页用例也通过，见 `artifacts/query-proxy-target-native-20261019.log` 中该项结果。这些有限数值与内存结果不证明复杂资产的代理阴影/UV 质量、大场景吞吐或进程内存节省。完整 `npm run check` 通过 371 项 CPU 测试（48 文件）、TypeScript 与生产构建，日志 `artifacts/query-proxy-check-release-20261019.log`；原生 NVIDIA 完整浏览器回归 67/67 通过，日志 `artifacts/query-proxy-browser-release-native-20261019.log`。另外，实际非 fallback `intel / gen-12lp` 上两个新增源网格可省略浏览器用例通过，GPU 错误为空且释放后账本归零，见 `artifacts/query-proxy-browser-intel-20261019.log`；这不是完整 Intel 回归或性能成绩。此前 Worker 提交 `86358ff` 的 [远程 CI run 39227014810](https://github.com/fomalhautb/real-engine/actions/runs/39227014810) 已成功；本轮代理远程 CI 随新提交验证。
+原生非 fallback `nvidia / ampere` 定向联测把 2,560 顶点/5,120 三角形的完整源缩为 245 顶点/488 三角形的固定代理，而主视图仍选择每实例 5,120 个 LOD0 三角形。768 个 Unlit HDR 样本与保留完整源网格的旧流送路径对照，最大差为零；99 个阴影点、3 个实例查询、运动查询及速度、8 条 GI 探针记录、168 个 Final Gather 锚点（83 个有效）与各自参考一致。旧完整源流送 Renderer 的应用 GPU 账本为 9,545,716 字节，源网格可省略版为 8,155,460 字节；两者释放后归零。主用例见 `artifacts/query-proxy-integration-native-20261019.log`；源网格可省略小池 A→B→A→B→A 换页用例也通过，见 `artifacts/query-proxy-target-native-20261019.log` 中该项结果。这些有限数值与内存结果不证明复杂资产的代理阴影/UV 质量、大场景吞吐或进程内存节省。完整 `npm run check` 通过 371 项 CPU 测试（48 文件）、TypeScript 与生产构建，日志 `artifacts/query-proxy-check-release-20261019.log`；原生 NVIDIA 完整浏览器回归 67/67 通过，日志 `artifacts/query-proxy-browser-release-native-20261019.log`。另外，实际非 fallback `intel / gen-12lp` 上两个新增源网格可省略浏览器用例通过，GPU 错误为空且释放后账本归零，见 `artifacts/query-proxy-browser-intel-20261019.log`；这不是完整 Intel 回归或性能成绩。此前 Worker 提交 `86358ff` 的 [远程 CI run 39227014810](https://github.com/fomalhautb/real-engine/actions/runs/39227014810) 已成功；固定代理提交 `789279c` 的[远程 CI run 39230781801](https://github.com/fomalhautb/real-engine/actions/runs/39230781801) 已成功。
 
 ## 驻留 GPU LOD 与可视化
 
@@ -148,7 +148,13 @@ Worker 页解码与固定阴影/查询代理已接入，仍需代理的更广质
 
 ## 世界空间查询基础
 
-`Renderer.create(canvas, batches, { worldQueries: {} })` 显式启用软件 BVH 查询。禁用时不分配查询缓存，也不执行 refit。CPU 对不可变网格建立确定性、中位数划分的先序 BVH；每叶默认至多四个三角形。GPU 从光栅与阴影共享的当前世界空间形变缓冲计算叶边界，再按深度从下到上更新内部节点，每层独立 compute pass，避免依赖跨工作组屏障。静止、已缓存的批次跳过 refit。此处是可验证的基线实现，不是 GPU 层级构建、TLAS 或针对大规模动态场景优化后的查询器。
+实例加速版本的完整 `npm run check` 通过 378 项 CPU 测试（49 文件）、TypeScript 与生产构建，日志 `artifacts/instance-bvh-check-release-20261019.log`。原生 Edge 的非 fallback `nvidia / ampere` 完整浏览器回归 69/69 通过，日志 `artifacts/instance-bvh-browser-release-native-20261019.log`；同机非 fallback `intel / gen-12lp` 上新增多实例查询、原有查询的两种容量路径及固定代理联合用例 4/4 通过，日志 `artifacts/instance-bvh-browser-intel-20261019.log`。两种适配器的多实例查询计数一致，验证错误为空、资源释放归零。Intel 是定向功能验证，未运行完整套件或性能验收；本轮实例加速的远程 CI 随新提交验证。
+
+`Renderer.create(canvas, batches, { worldQueries: {} })` 显式启用软件 BVH 查询。禁用时不分配查询缓存，也不执行 refit。CPU 对不可变网格建立确定性、中位数划分的先序 BVH；每叶默认至多四个三角形。GPU 从光栅与阴影共享的当前世界空间形变缓冲计算叶边界，再按深度从下到上更新内部节点，每层独立 compute pass，避免依赖跨工作组屏障。静止、已缓存的批次跳过 refit。
+
+`worldQueries.instanceAcceleration` 默认 `bvh`：容量至少 8 的批次额外建立实例 BVH，较小批次沿用线性扫描；显式 `linear` 保留原路径供对照。固定容量拓扑每实例一叶，节点数为 `2 × capacity − 1`，4096 实例硬上限下最大深度 12。变化批次在 CPU 按现有保守世界包围盒中心计算每轴 10 位 Morton 顺序，相同编码以当前实例槽位破平局；排序只影响遍历质量。低层直接使用 `GpuWorldQuery` 时可提供 `getInstanceBounds`，缺省仅用模型平移作排序中心。真正用于剔除的边界由 GPU 从已完成的三角形 BVH 根合并，读取当前共享形变，因此 Morph、蒙皮、wave、仿射变换和固定查询代理使用同一机制，不读取几何回 CPU。删除后的非活动叶显式无效，恢复实例时重新排序并 refit。
+
+实例与三角形均采用有界、无栈先序遍历；精确等距离时保持原语义：先注册批次优先，再按当前实例槽位，最后按该实例三角形 BVH 的遍历顺序。实例顺序、节点及分层索引复用原拓扑 storage 缓冲，实例边界追加到原 bounds 缓冲，不增加 trace 的 storage 绑定数；每组查询参数由 80 增至 96 字节，仍按设备要求对齐且独立保留。CPU 排序、顺序上传和每层实例 refit 都有成本，完全静止的 committed 批次继续复用缓存。这是**批次内部**的实例加速，尚无跨批次全场景 TLAS、GPU 空间排序或按脏实例的局部 refit，不能据此声称目标动态场景吞吐已经达标。
 
 `traceRays(rays, { textureLod: 0 })` 返回最近命中的批次/实体/generation/三角形、距离、当前与前帧位置、着色法线 `normal`、实际三角面的 `geometricNormal`、UV、PBR/Unlit 参数和拓扑/历史版本。输入方向归一化，距离按世界单位，`tMin`/`tMax` 为闭区间；可以忽略指定实体及 generation。几何来自最近一次 `render` 提交，与相机可见范围无关；返回的 `frame` 标识这份几何。材质程序和参数使用查询开始时已原子发布的状态，返回独立 `materialRevision`，无需为了更换材质重复形变。两者构成显式版本对，不承诺所有数据都是同一历史帧。实例增删、变换及形变变化需先提交 `render`。`WorldHit.geometry` 区分源与固定查询代理；代理的 `triangleIndex` 属于独立三角形空间，并携带独立代理拓扑版本，不改变原 `QueryIdentity.topologyVersion`。GPU `WorldHit` 仍为 160 字节，几何法线经八面体编码复用 `position.w` 和 `uvInfo.w`，没有扩大命中记录。
 
@@ -156,7 +162,11 @@ Worker 页解码与固定阴影/查询代理已接入，仍需代理的更广质
 
 默认限制为 1,024 条射线、每网格 65,536 三角形、每批次 256 个实例、总查询分配 128 MiB，批次数硬上限 256。单条遍历上限默认 262,144 个工作单位；一次提交默认至多 16,777,216 个工作单位，平均分配到射线并与单条上限取小值。工作单位包括实例检查、BVH 节点与三角形测试，跨全部批次累计；超预算显式返回 overflow，诊断 API 抛错，不以不完整命中或 miss 冒充正确结果。此上限限制算法工作量，不保证所有硬件都满足帧预算。
 
-GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供后续光照直接消费；CPU `traceRays` 仅按需读回有界命中记录，不读取整份几何。同一编码器可按顺序多次查询；不可变、对齐的 uniform 槽位允许各次使用不同的 ray count 与 LOD 参数，相同参数复用槽位。默认每 encoder 最多 8 组，硬上限 32 组，超出明确报 `WORLD_QUERY_ENCODER_PARAMETER_BUDGET`。同一 encoder 内仍须保持同一帧、材质、批次数量与拓扑快照；跨 encoder 查询仍按编码、提交、再编码的顺序执行。外部 GPU 射线生产者必须遵守有效输入合约并检查 overflow。当前遍历各实例根边界为线性扫描，三角形部分使用无栈 BVH；材质仍按批次分别 dispatch。新增缓冲均计入应用 GPU 账本并随 renderer 释放。BVH refit 在首末 compute pass 之间计时，静止批次复用缓存；新增元数据/层级参数上传计入当前帧上传统计。额外显式射线查询不在普通 render 帧计时范围内。
+GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供光照直接消费；CPU `traceRays` 仅按需读回有界命中记录，不读取整份几何。同一编码器可按顺序多次查询；不可变、对齐的 uniform 槽位允许各次使用不同的 ray count 与 LOD 参数，相同参数复用槽位。默认每 encoder 最多 8 组，硬上限 32 组，超出明确报 `WORLD_QUERY_ENCODER_PARAMETER_BUDGET`。同一 encoder 内仍须保持同一帧、材质、批次数量与拓扑快照；跨 encoder 查询仍按编码、提交、再编码的顺序执行。外部 GPU 射线生产者必须遵守有效输入合约并检查 overflow。材质仍按批次分别 dispatch。新增缓冲均计入应用 GPU 账本并随 renderer 释放。BVH refit 在首末 compute pass 之间计时，包含三角形和实例层级；新增元数据、实例顺序及层级参数上传计入当前帧上传统计。额外显式射线查询不在普通 render 帧计时范围内。诊断 `lastReadbackQuery` 只统计最近一次显式 `traceRays` 的 GPU 工作量、三角形检查数、单射线最大工作量和溢出射线数，复用已有命中读回，不包含后台 GI 的所有查询，也不是毫秒计时。
+
+本轮实例 BVH 的原生 NVIDIA 定向回归见 `artifacts/instance-bvh-target-native-20261019.log`。258 个空间乱序、共享 Morph → skin → wave 的实例构成 515 节点实例树；11 条有命中、miss 与 ignore 的射线，工作单位由线性路径的 5,685 降至 281（减少约 95.06%），三角形测试都为 10 次，单射线最大工作量由 518 降至 43。命中记录与线性路径完全一致，画面像素一致且有 63,603 个有效前景像素；8 个 GI 探针的 SH 与最大辐亮度逐通道差小于 0.0001，并验证能量非零。移动对象同时改变模型、骨骼、Morph 权重与 wave 相位，独立解析位置命中、旧位置 miss、逆序重排、全部删除/恢复 generation、精确等距离且空间顺序相反的重叠对象、显式 overflow 和释放归零均通过。原有离屏 Masked、双面、闭区间、前帧与多批次查询用例另外以容量 8 启用实例树再验证一次。这些计数证明该用例减少了遍历工作，不是吞吐或整帧提速比例。
+
+固定代理联测 `artifacts/instance-bvh-proxy-native-20261019.log` 把雕塑批次容量扩至 8，保留 3 个活跃实例，分页代理路径启用实例 BVH，普通代理参考使用 `linear`；表面 HDR、阴影、运动查询、GI 与 Final Gather 对照均通过。此用例同时验证空叶和固定代理的实例层级。更大独特资产、跨批次 TLAS、CPU 排序与动态更新成本、复杂遮挡和目标硬件性能仍待验收。
 
 提交 `63f2bd8` 已通过本地及远程 TypeScript、176 项 CPU 单元测试、生产构建，以及 [远程 Linux 软件 GPU 的 14 项浏览器回归](https://github.com/fomalhautb/real-engine/actions/runs/38509599939)。GPU 查询覆盖离屏静态/刚体、独立蒙皮＋Morph、重排/删除/generation 复用、Mask 洞口、双面、前帧位置、多层 refit、闭区间命中、Unlit HDR 材质即时修改和预算错误；无 GPU 验证错误，释放后账本归零。这是该提交的功能证据，未测查询吞吐。后续本地硬件与基础压力场景的 30 分钟运行另见本文末节；此前被中止的运行不计为通过。
 

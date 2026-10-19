@@ -33,6 +33,8 @@ test('source-free paged surface shares a fixed proxy for shadows, queries, GI an
   expect(r.giEqual).toBe(true); expect(r.giInvalid).toEqual([0, 0]);
   expect(r.gatherEqual).toBe(true); expect(r.gatherValid).toBeGreaterThan(20);
   expect(r.diagnostics.geometryStreams[0].sourceRepresentation).toBe('fixed-shadow-query-proxy');
+  expect(r.diagnostics.worldQueries?.instanceAcceleration).toBe('batch-bvh');
+  expect(r.diagnostics.worldQueries?.instanceBvhNodes).toBeGreaterThanOrEqual(15);
   expect(r.diagnostics.geometryStreams[0].queryProxy).toMatchObject({ exactSourceRetained: false, cameraDependent: false });
   expect(r.visiblePixels.every(count => count > 10000)).toBe(true);
   expect(r.errors).toEqual([]); expect(pageErrors).toEqual([]); expect(r.afterDispose).toEqual([0, 0, 0]);

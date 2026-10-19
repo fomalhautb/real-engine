@@ -14,20 +14,20 @@ function near(actual: readonly number[], expected: readonly number[], tolerance 
   for (let axis = 0; axis < expected.length; axis++) expect(Math.abs(actual[axis] - expected[axis])).toBeLessThan(tolerance);
 }
 
-test('GPU world queries follow shared deformation and stable scene identities offscreen', async ({ page }) => {
+for (const instanceBvh of [false, true]) test(`GPU world queries follow shared deformation and stable scene identities offscreen (${instanceBvh ? 'instance BVH' : 'small batch'})`, async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   page.on('console', message => { if (message.type() === 'error') console.log('WORLD_QUERY_BROWSER_ERROR ' + message.text()); });
   await page.goto('/?trees=1');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async (instanceBvh) => {
     window.__REAL_ENGINE__!.pause(true);
     window.__REAL_ENGINE__!.dispose();
     // Playwright's Node transform must not try to import WGSL from the renderer.
     const module = await import('/tests/browser/fixtures/' + 'world-query.ts') as { runWorldQueryFixture: typeof runWorldQueryFixture };
-    return module.runWorldQueryFixture();
-  });
+    return module.runWorldQueryFixture(instanceBvh);
+  }, instanceBvh);
   console.log('WORLD_QUERY_GPU_DIAGNOSTIC ' + JSON.stringify({
     frames: result.frames, initialHits: result.initial.hits.map((value: Hit | null) => value?.batch ?? null),
     movedHits: result.moved.hits.map((value: Hit | null) => value?.batch ?? null),
@@ -116,6 +116,7 @@ test('GPU world queries follow shared deformation and stable scene identities of
   expect(result.topologyRejected).not.toBe('');
   expect(result.disabledQuery).not.toBe('');
   expect(result.frames).toBe(5);
+  expect(result.diagnostics?.acceleratedBatches).toBe(instanceBvh ? 6 : 0);
   expect(result.errors).toEqual([]);
   expect(result.ownedGpuBytesAfterDispose).toBe(0);
   expect(result.noQueryBytesAfterDispose).toBe(0);

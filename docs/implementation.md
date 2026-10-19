@@ -2,6 +2,22 @@
 
 更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 共享纹理原子发布与分片上传
+
+`Renderer.replaceTexture(source, replacement)` 按不可变图像对象身份，一次替换所有当前保留的材质引用，返回受影响的材质数与纹理槽数；也包含已分配、正在等待异步 pipeline 完成的材质。先为所有受影响者准备新 uniform 和 bind group，再同步发布；参数热更新的最新值、各槽 sampler、源 mip 坐标及同一材质句柄保留，不编译新 pipeline。任一步准备失败时销毁本次临时资源，所有旧绑定和材质版本不变。成功的整组替换仅增加一次 `materialRevision`，从而使共享世界查询、GI、反射及历史读取同一更新。后来提交的独立 `setMaterial` 仍按自己的请求顺序生效；该接口不永久重定向旧资产身份。资源管理器最多保留 4096 个活材质，包含等待编译者，整组遍历与临时 uniform 数量有界。
+
+`Renderer.stageTexture(preparedAsset)` 为预制 mip 链预留完整 GPU 分配，返回 `PreparedTextureUpload`。`upload(maxBytes)` 每次按完整原生块行提交，返回本次字节且不超过给定预算，可跨 mip 推进；预算低于下一行时返回零，`diagnostics().nextRowBytes` 提示最低可推进量。`GpuTextureUpload` 不解码、不生成 mip、不复制源 payload；使用原数组的 `subarray`，分片 y 坐标、尾层物理块范围和 `rowsPerImage` 与格式一致。写入抛错时尚未成功的片段不前移，可重试；此前成功片段由 remainingBytes 反映。调用方保持预制载荷不可变，且需自行汇总多句柄的每帧预算，当前不是自动全局上传调度。
+
+上传未完整排队前，图像不能被 `create` / `replaceTexture` 引用；原材质仍绘制完整旧 mip。`complete` 表示同队列之后可使用，不要求 CPU 等待 GPU。SwiftShader 的压缩图像只在全部片段完成后执行既有一次准备。完成句柄继续固定该图像，可随后调用 `replaceTexture` 原子发布，再 `dispose` 释放这份固定引用；材质自己的引用继续有效。取消未完成句柄销毁其 GPU 分配，不影响旧图像；资源管理器销毁会取消所有剩余句柄。最多同时 64 个句柄，同一资产的未完成上传禁止重复启动；完整/未完整分配和旧图像同时计入原有纹理预算。`materialTextureUploads` 公开 active、pending、pendingImageBytes；`materials.imageBytes` 包含预留，`materials.images` 只计可绑定图像。这些字节仍不代表驱动显存。
+
+本轮 `npm run check` 通过 **531 项 CPU 测试（65 文件）**、类型检查和构建，日志 `artifacts/texture-residency-check-20261020.log`。新增检查覆盖块行边界、NPOT、预算不超额、源 byteOffset/无复制、失败重试、同图多材质/多槽、不同 sampler、热更新参数保留、第二个绑定创建失败的整组回滚、共享图像只上传一次、分片上传句柄、取消/释放及并发预留。自动视图需求、网络请求/缓存、CPU 数据淘汰和全局上传调度尚未接入，不能把这些接口计为完整自动纹理流送。
+
+新增 NVIDIA 定向两项通过（`artifacts/texture-residency-target-native-20261020.log`），随后同源码完整原生 NVIDIA 浏览器回归 **104/104** 通过（`artifacts/texture-residency-full-native-20261020.log`）。双材质场景以 20 字节粗 mip 保持旧画面，将 340 字节完整 RGBA8 图像分为每次最多 32 字节上传，预留峰值恰为 360 字节；中途取消释放回 20，重试中各次不完整发布均被拒绝且 HDR/阴影/查询保持旧值。最终整组发布同时更新两个现有材质与一个等待异步 `setMaterial` 的材质，原子替换报告 3 材质 / 3 槽；后者完成后未重新引入旧图像。每材质的参数及固定源 mip sampler 保留，材质变体数不变；换为 20 字节 Mask 尾链时两者的主视图/阴影/世界查询同时变为孔洞，再恢复原粗链。实际 PNG 和 JSON 位于定向输出的 `texture-residency-bounded--b99ba-eserve-pending-replacements` 目录，最终资源账本归零。
+
+另一新增用例以每次最多 16 个原生字节逐片上传离屏发光材质，保持原有 GI、反射、Mask 和 Morph 的数值断言；BC7 尾链为 48 字节，RGBA8 尾链为 84 字节。上传期间材质版本不变，每次完整发布只增加一次版本且材质变体不增；GPU/页面错误为空、释放归零。这些是有界小场景的正确性与应用字节验证，不代表帧时间、完整自动流送或最终场景观感通过。
+
+同源码在 Intel 与 SwiftShader 各通过 **5/5 定向浏览器用例**，日志为 `artifacts/texture-residency-intel-20261020.log` 与 `artifacts/texture-residency-software-20261020.log`；范围包括两个新增上传/发布用例及三个原有预制纹理/独立计算用例。Intel 实际为非 fallback `intel / gen-12lp`，验证 RGBA8 与 BC7；SwiftShader 实际为 `google / swiftshader`，另外覆盖 ETC2 RGBA8 和 ASTC 4×4。两者均验证取消、完整发布、共享引用、异步材质、离屏 GI/反射与释放归零；GPU 错误为空。软件独立计算的 35 个样本最大误差为 `6.56e-6`，原生 Intel 不启用压缩准备附件。此为跨适配器定向功能验证，不是完整 Intel 回归或软件适配器性能证据。
+
 ## 预制 mip 与 GPU 压缩纹理输入
 
 `MaterialBinding.textures` 现在接受原有解码 RGBA8 `TextureAsset`，以及 `texture-storage.ts` 的 `PreparedTextureAsset`。后者给出完整源图尺寸、色彩空间、`rgba8` / `bc7` / `etc2-rgba8` / `astc-4x4` 格式、第一层驻留的源 `baseMipLevel`，以及从该层连续到 1×1 的全部载荷。源尺寸上限仍为 8192；布局预检验证每级尺寸和精确字节数，只生成元数据。预制载荷直接上传，不重新生成 mip、不在 CPU 解压压缩块；旧 RGBA8 输入继续使用原有线性光 mip 构建器。
@@ -27,6 +43,8 @@ SwiftShader 首轮新增四项为 **3/4**，日志 `artifacts/prepared-texture-t
 兼容处理后的完整原生 NVIDIA 浏览器回归再次 **102/102** 通过，日志 `artifacts/prepared-texture-compat-native-20261020.log`，实际适配器为 `nvidia / ampere`。计算材质的 27 个样本通过，明确核对 `texturePreparation` 为 `mode: none`、准备次数 0、额外字节 0；原有阴影、GI、形变、几何流送、反射和雾用例没有被跳过。本轮为功能回归，没有重新测量或宣称目标大场景帧率。
 
 兼容处理后的 Intel 定向四项也 **4/4** 通过，日志 `artifacts/prepared-texture-compat-intel-20261020.log`，实际为非 fallback `intel / gen-12lp`。27 个计算样本通过，明确核对准备模式、次数和字节均未启用；GPU/页面错误为空，释放账本归零。Intel / NVIDIA 均不支持本轮 ETC2 / ASTC 特性，这两种格式的实际解码证据来自 SwiftShader，仍缺对应原生硬件验证。
+
+该预制纹理提交 `fa1bf55` 的[远程 CI run 39313959514](https://github.com/fomalhautb/real-engine/actions/runs/39313959514) 已完整成功，包含 foundation 和四个软件 GPU 分片。它不覆盖随后新增的整组原子替换及分片上传接口。
 
 生产 Renderer 验证完整与尾 mip、显式源 LOD、sampler clamp、参数更新、Mask 主视图/阴影/世界查询，以及预算或缺失特性导致的原子替换失败。9×5 非整数尺寸纹理在解析源 LOD 1.5 下，完整链和从 4×2 开始的尾链读回同一 HDR `[0.0941162,0.4392090,0.4077148]`，对照两层哨兵颜色的等权混合；图像账本分别为 224 / 44 字节。8×8 RGBA8 全链 / 从 4×4 开始的尾链 / BC7 同尺寸尾链分别计 340 / 84 / 48 字节。离屏 PBR 发光通过同一纹理参与 GI 与反射，Morph 移走及 Mask 透明时贡献归零，恢复后返回；测试同时启用 Final Gather 和雾的基础绑定，不代表 GI 已照亮空气。静态普通网格、驻留 GPU LOD 和源网格可省略的分页路径，在 512→70→512 三角形切换中均保留 prepared 尾链乘顶点色的 HDR 与命中材质。新增用例的错误为空，释放后应用 GPU 账本归零；JSON 与 PNG 在同名结果目录内。上述小样本字节量和功能检查不是大场景性能或驱动显存成绩。
 

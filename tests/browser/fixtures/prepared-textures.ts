@@ -146,7 +146,7 @@ export async function runPreparedTextureSurfaceFixture() {
 }
 
 /** Prepared mip-tail emitters remain present offscreen to both GI and reflections. */
-export async function runPreparedTextureLightingFixture() {
+export async function runPreparedTextureLightingFixture(staged = false) {
   const canvas = canvasOf(32);
   const mirror = batch('prepared-mirror', quad(), { definition: { ...DEFAULT_MATERIAL_DEFINITION,
     baseColor: m.constant([1, 1, 1, 1]), metallic: 1, roughness: 0.045 } });
@@ -178,6 +178,40 @@ export async function runPreparedTextureLightingFixture() {
     const active = renderer;
     active.setSun({ direction: [0, 0, 1], color: [0, 0, 0] });
     active.setDiffuseGiMultiBounce(false);
+    let current: PreparedTextureAsset = tail;
+    const stagedUploads: { name: string; bytes: number[]; total: number; layoutBytes: number;
+      beforeRevision: number; afterRevision: number; beforeVariants: number; afterVariants: number;
+      materials: number; slots: number }[] = [];
+    const switchEmitter = async (name: string, asset: PreparedTextureAsset) => {
+      if (!staged) {
+        await active.setMaterial(emitter.name, emitterBinding(asset));
+        current = asset;
+        return;
+      }
+      if (current === asset) return;
+      const layoutBytes = textureStorageLayout(asset).byteLength;
+      const before = active.diagnostics();
+      const handle = active.stageTexture(asset);
+      const bytes: number[] = [];
+      try {
+        while (!handle.complete) {
+          const written = handle.upload(16);
+          if (written < 1) throw new Error('STAGED_TEXTURE_UPLOAD_STALLED');
+          bytes.push(written);
+          active.render([0, 0, 3], TARGET);
+          if (active.diagnostics().materialRevision !== before.materialRevision) {
+            throw new Error('STAGED_TEXTURE_PUBLISHED_BEFORE_REPLACE');
+          }
+        }
+        const replacement = active.replaceTexture(current, asset);
+        const after = active.diagnostics();
+        stagedUploads.push({ name, bytes, total: bytes.reduce((sum, value) => sum + value, 0), layoutBytes,
+          beforeRevision: before.materialRevision, afterRevision: after.materialRevision,
+          beforeVariants: before.materialVariants, afterVariants: after.materialVariants,
+          materials: replacement.materials, slots: replacement.slots });
+        current = asset;
+      } finally { handle.dispose(); }
+    };
     const capture = async (name: string, expected: readonly number[]) => {
       for (let i = 0; i < 8; i++) active.render([0, 0, 3], TARGET);
       const [gi, reflections] = await Promise.all([active.probeDiffuseGi(), active.probeReflections([16 * 32 + 16])]);
@@ -193,13 +227,13 @@ export async function runPreparedTextureLightingFixture() {
     for (const sample of compressedSolidBlockCases) {
       const asset = blockTexture(sample.format, sample.bytes), layout = textureStorageLayout(asset);
       if (!active.info.features.includes(layout.requiredFeature!)) continue;
-      await active.setMaterial(emitter.name, emitterBinding(asset));
+      await switchEmitter(sample.name, asset);
       samples.push(await capture(sample.name, sample.expected[3] < 0.5 ? [0, 0, 0] : sample.expected.slice(0, 3)));
     }
-    await active.setMaterial(emitter.name, emitterBinding(tail));
+    await switchEmitter('rgba-restored', tail);
     samples.push(await capture('rgba-restored', expected));
     const errors = [...active.errors], adapter = active.info.adapterInfo, features = active.info.features;
     active.dispose();
-    return { samples, errors, adapter, features, afterDispose: active.stats.ownedGpuBytes };
+    return { samples, stagedUploads, errors, adapter, features, afterDispose: active.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }
 }

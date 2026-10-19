@@ -105,3 +105,43 @@ test('offscreen prepared and compressed emitters update GI and reflection throug
   }
   expect(result.errors).toEqual([]); expect(result.afterDispose).toBe(0); expect(errors).toEqual([]);
 });
+
+test('bounded staged texture uploads publish once while GI and reflections retain their values', async ({ page }, info) => {
+  test.setTimeout(180_000);
+  const errors: string[] = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.goto('/?trees=1');
+  await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
+  await expect(page.locator('#error')).toBeHidden();
+  const result = await page.evaluate(async () => {
+    window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose();
+    const module = await import('/tests/browser/fixtures/' + 'prepared-textures.ts') as {
+      runPreparedTextureLightingFixture: typeof runPreparedTextureLightingFixture };
+    return module.runPreparedTextureLightingFixture(true);
+  });
+  const report = JSON.stringify(result, null, 2);
+  await writeFile(info.outputPath('prepared-lighting-staged.json'), report);
+  await info.attach('prepared-lighting-staged.json', { body: report, contentType: 'application/json' });
+  adapterCheck(result.adapter);
+  const formatCount = result.features.filter(feature => ['texture-compression-bc', 'texture-compression-etc2', 'texture-compression-astc'].includes(feature)).length;
+  expect(result.samples).toHaveLength(4 + formatCount * 2);
+  expect(result.stagedUploads).toHaveLength(formatCount ? 1 + formatCount * 2 : 0);
+  for (const upload of result.stagedUploads) {
+    expect(upload.bytes.length).toBeGreaterThan(0);
+    for (const bytes of upload.bytes) expect(bytes).toBeGreaterThan(0);
+    for (const bytes of upload.bytes) expect(bytes).toBeLessThanOrEqual(16);
+    expect(upload.total).toBe(upload.layoutBytes);
+    expect(upload.total).toBe(upload.bytes.reduce((sum, bytes) => sum + bytes, 0));
+    expect(upload.afterRevision).toBe(upload.beforeRevision + 1);
+    expect(upload.afterVariants).toBe(upload.beforeVariants);
+    expect(upload.materials).toBe(1);
+    expect(upload.slots).toBe(1);
+  }
+  for (const sample of result.samples) {
+    expect(sample.anchor.valid, sample.name).toBe(true);
+    expect(sample.anchor.failedQueries, sample.name).toBe(0);
+    near(sample.anchor.radiance, sample.expected, 0.015, sample.name + ' reflection');
+    near(sample.giMax, sample.expected, 0.015, sample.name + ' GI');
+  }
+  expect(result.errors).toEqual([]); expect(result.afterDispose).toBe(0); expect(errors).toEqual([]);
+});

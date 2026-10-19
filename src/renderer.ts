@@ -6,7 +6,7 @@ import resolveSource from './shaders/resolve.wgsl?raw';
 import { identity, lookAt, multiply, perspective, transformPoint, type Mat4 } from './math';
 import { residentMesh, type InstanceState, type RenderBatch, type MaterialBinding } from './contracts';
 import { MaterialResources, type GpuMaterial } from './gpu-material';
-import { TEXTURE_COMPRESSION_FEATURES } from './texture-storage';
+import { TEXTURE_COMPRESSION_FEATURES, type MaterialTextureAsset, type PreparedTextureAsset } from './texture-storage';
 import { compileDeformation, conservativeDeformationBounds, evaluateDeformation,
   validateDeformationVertex, validateMorphTargets, type Bounds3 } from './deformation';
 import { compileRenderGraph } from './render-graph';
@@ -571,6 +571,24 @@ export class Renderer {
     this.materialRevision++;
   }
 
+  /** Atomically replace all currently retained references to an immutable image.
+   * Used by residency managers: all material paths change together, preserving
+   * each material's latest parameters and sampler. New+old images must fit the
+   * texture budget until publication. No pipeline compilation is needed. */
+  replaceTexture(source: MaterialTextureAsset, replacement: MaterialTextureAsset) {
+    if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    const result = this.materialResources.replaceTexture(source, replacement);
+    if (result.materials) this.materialRevision++;
+    return result;
+  }
+
+  /** Reserve a prepared image and obtain a bounded upload handle. A complete
+   * handle pins its image until disposed; replaceTexture publishes all uses. */
+  stageTexture(asset: PreparedTextureAsset) {
+    if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    return this.materialResources.stageTexture(asset);
+  }
+
   setGeometryLod(settings: GeometryLodSettings): void {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.geometryLod) throw new Error('GEOMETRY_LOD_DISABLED');
@@ -1109,6 +1127,7 @@ export class Renderer {
       output: { sceneFormat: 'rgba16float', exposureEV: this.exposureEV, antiAliasing: this.antiAliasing,
         transfer: 'sRGB', toneMap: 'filmic-fit', maxSceneRadiance: 65504 },
       materials: this.materialResources.diagnostics(), materialTexturePreparation: this.materialResources.preparationDiagnostics(),
+      materialTextureUploads: this.materialResources.uploadDiagnostics(),
       materialRevision: this.materialRevision, passes: this.graph.order,
       lifetimes: Object.fromEntries(this.graph.lifetimes),
       bounds: this.batches.flatMap(batch => Array.from(batch.bounds, ([entityId, bounds]) => ({ entityId, ...bounds }))) };

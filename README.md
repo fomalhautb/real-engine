@@ -15,7 +15,7 @@
 
 阶段 1.2 进行中：代码定义的 Morph/蒙皮/wave 算子编译为共享 GPU 程序，主视图与阴影共用当前/前帧形变；动态包围盒、generation 场景句柄、增量帧提交和 Render Graph 已接入实际场景。现有代码生成材质表达式支持 PBR/Unlit、Opaque/Masked、双面、纹理与共享阴影覆盖；glTF/GLB 蒙皮与 Morph 动画、缺失切线时的按需生成、OBJ 卡片、纹理地面及 Rapier 固定步刚体同场运行。
 
-阶段 2 已建立离线几何簇层级、简化与压缩分页，并接入 GPU LOD、视锥剔除、间接绘制和分簇颜色演示；共享形变的世界空间查询供有界漫反射 GI 使用，另有可选的跨帧多次反弹反馈与实验性 Final Gather。物理 GPU 页池现已接入主 Renderer 的静态 Opaque 表面：GPU 根据实际驻留状态整组选簇并间接绘制，独立组需求驱动预算内的整组准入、祖先保留和有界下载/上传。全部流送批次共用有界 Worker 解码池，哈希、解压和载荷检查在后台执行；取消覆盖下载与解码。分页表面复用材质、法线贴图和当前/前帧变换语义。新增 `RenderBatch` 的源网格可省略 `StreamedSceneBatch`：固定有界查询代理供阴影、世界查询和 GI 使用，分页表面仍可绘制更细的相机 LOD；旧的完整 `mesh` 流送路径仍可用。当前只支持静态 Opaque，源网格可省略批次切换到 Masked 会显式拒绝，实例仍可仿射运动。代理命中具有独立的三角形编号与拓扑版本，不能当成高模表面的精确命中；遮挡剔除、完整 GI、镜面反射和参与介质尚未交付，路线图中的目标规模与性能门槛仍待验证。当前形变和材质编译器均有明确上限；现有基础法线贴图及 glTF `normalTexture`，仍无多层材质或透射。阶段 2 后期将通过大规模完整场景联合验收画质和性能；现有小模型用于正确性验证及有限场景的性能基线。完整边界与后续工作见 [实现状态](docs/implementation.md)。
+阶段 2 已建立离线几何簇层级、简化与压缩分页，并接入 GPU LOD、视锥剔除、间接绘制和分簇颜色演示；共享形变的世界空间查询供有界漫反射 GI 使用，另有可选的跨帧多次反弹反馈与实验性 Final Gather。物理 GPU 页池现已接入主 Renderer 的静态 Opaque 表面：GPU 根据实际驻留状态整组选簇并间接绘制，独立组需求驱动预算内的整组准入、祖先保留和有界下载/上传。全部流送批次共用有界 Worker 解码池，哈希、解压和载荷检查在后台执行；取消覆盖下载与解码。分页表面复用材质、法线贴图和当前/前帧变换语义。新增 `RenderBatch` 的源网格可省略 `StreamedSceneBatch`：固定有界查询代理供阴影、世界查询和 GI 使用，分页表面仍可绘制更细的相机 LOD；旧的完整 `mesh` 流送路径仍可用。当前只支持静态 Opaque，源网格可省略批次切换到 Masked 会显式拒绝，实例仍可仿射运动。代理命中具有独立的三角形编号与拓扑版本，不能当成高模表面的精确命中；遮挡剔除、完整 GI 和镜面反射尚未交付。主视图已有有界 GPU 体积雾：全局高度介质、局部盒/球体积、共享太阳阴影与线性 HDR 合成；点/聚光灯、空气中的低频 GI、反射及透明路径的介质积分和时序重建仍未实现。路线图中的目标规模与性能门槛仍待验证。当前形变和材质编译器均有明确上限；现有基础法线贴图及 glTF `normalTexture`，仍无多层材质或透射。阶段 2 后期将通过大规模完整场景联合验收画质和性能；现有小模型用于正确性验证及有限场景的性能基线。完整边界与后续工作见 [实现状态](docs/implementation.md)。
 
 此前画质快照提供代码配置的阴影范围/分辨率、单帧 FXAA、共享形变/材质/遮挡的发光面主动采样，以及可选的实验性 Final Gather。旧地面六点远场参考平均误差由约 8.0% 降至 5.6%，但使用 3 cm 射线起点偏移，不能证明接触区正确。在独立 4096 路径、最多 12 段、0.1 mm 起点偏移的接触区参考中，开启 Final Gather 后五个可比较像素的平均 RGB 相对误差由 52.18% 降至 11.29%，最差仍为 30.77%，尚未达到目标的平均 10% / 单项 20% 门槛。1 cm 目标位置对应的像素命中白块，不参与地面 HDR 对比。此前本地 250 项 CPU 与 50 项原生 NVIDIA 浏览器回归，以及法线贴图版本的 262 项 CPU（34 文件）与 55 项原生 NVIDIA 浏览器回归，均为历史快照。此前 glTF 切线生成版本的 `npm run check` 通过 280 项 CPU 测试（36 文件）、TypeScript 与生产构建；原生 Edge `nvidia / ampere` 非 fallback 浏览器回归 56 项全部通过，GPU validation 错误为空且释放后应用账本归零。实际 glTF 的 GPU 联合用例覆盖生成切线、Morph/仿射蒙皮、法线贴图 PBR、世界查询和几何法线；位置/法线/切线误差小于 `3e-4`，边界越界为零。证据见 `artifacts/mikk-tangents-check-20261015.log` 与 `artifacts/mikk-tangents-browser-native-20261015.log`。此结果只覆盖测试资产；此前三轮硬件镜头基准未启用该 glTF 生成路径，不能证明复杂资产导入成本或大场景性能。完整边界见 [实现状态](docs/implementation.md)。
 
@@ -25,7 +25,9 @@
 
 世界空间查询默认对容量至少 8 的批次启用实例 BVH；注册至少 8 个批次时，还用场景 BVH 为每条射线筛选候选批次。物体移动或形变后，GPU 从共享三角形结果更新边界；静止批次复用缓存。`worldQueries.instanceAcceleration` 和 `sceneAcceleration` 各自可设为 `'linear'` 保留原路径供对照。材质仍逐批次 dispatch，工作量减少不等于已经证明整帧提速；具体预算与验收见[世界空间查询基础](docs/implementation.md#世界空间查询基础)。
 
-实例加速版本通过 378 项 CPU 测试、类型检查与构建、69 项原生 NVIDIA 完整浏览器回归及 4 项 Intel 定向测试。258 个共享形变实例的 11 条射线，工作单位从 5,685 降至 281，命中、画面与 GI 保持一致；此计数不是帧率提升比例。代码变更、范围与证据同见实现状态，远程 CI 随新提交验证。
+实例加速版本通过 378 项 CPU 测试、类型检查与构建、69 项原生 NVIDIA 完整浏览器回归及 4 项 Intel 定向测试。258 个共享形变实例的 11 条射线，工作单位从 5,685 降至 281，命中、画面与 GI 保持一致；此计数不是帧率提升比例。跨批次 BVH 提交 `d7c94d8` 的[远程 CI run 39267473217](https://github.com/fomalhautb/real-engine/actions/runs/39267473217) 已成功，包含 CPU 和 Linux 浏览器作业；旧提交 `41afdbc` 的失败记录仍保留在[实现状态](docs/implementation.md)。
+
+体积雾版本的完整本地 `npm run check` 通过 391 项 CPU 测试（51 文件）、类型检查及生产构建，日志见 `artifacts/fog-check-release-20261019-final.log`。NVIDIA 定向 GPU 数值用例已覆盖解析吸收、零消光发光、HG 太阳散射、局部重叠与高度衰减、共享阴影及形变遮挡后的恢复，另验证 GI 探针未被雾改写和资源释放归零；原生 NVIDIA 完整浏览器回归 74/74 通过，日志见 `artifacts/fog-browser-release-native-20261019-final.log`。Intel 定向 3/3 与 SwiftShader 定向 3/3 也已通过，日志分别见 `artifacts/fog-target-intel-20261019.log`、`artifacts/fog-target-software-20261019.log`；硬件性能验收尚待完成。这些是有限功能证据，不表示阶段 2 或最终画质已通过。
 
 ## 本地运行
 
@@ -45,6 +47,8 @@ npm run dev
 `/gi.html` 展示世界空间漫反射 GI：红蓝墙面和发光条通过真实场景查询照亮白色物体，可切换单次/跨帧多次反弹（演示默认多次）、开关 GI、改变墙色及太阳参数、暂停逐帧、按 H 隐藏面板。引擎的 `diffuseGi.multiBounce` 默认 `false`，运行时用 `setDiffuseGiMultiBounce(boolean)` 切换，`invalidateDiffuseGiHistory()` 可显式丢弃旧反馈。探针使用 8×8 八面体方向距离矩和低置信度平滑权重；`visibilityWeightThreshold` 默认 0.2、设 0 可关闭额外曲线。固定网格仍每帧全量更新；无镜面反弹、时域平均、自动布点或探针流送。关闭 GI 时没有旧常量环境补光。
 
 `/gi.html?finalGather=1` 额外开启实验性 Final Gather 预览，起始为固定镜头，持续渲染以积累近场样本；常规 `/gi.html` 保持世界探针路径。代码可通过 `DiffuseGiOptions.finalGather` 配置，并用 `setDiffuseGiFinalGatherEnabled(boolean)` 单独启停。普通镜头运动可将前帧原始锚点重投影；切镜头、动态几何或光照/材质突变仍保守地整体重置。此预览的近场误差和帧间隔仍有未通过门槛，见 [实现状态](docs/implementation.md#实验性屏幕-final-gather)。
+
+`/fog.html` 展示柱廊中的局部盒状雾，可切换雾、密度、太阳和镜头轨迹，查看网格与资源诊断。实际 NVIDIA 截图：[开启](artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png) / [关闭](artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-off.png)。画面可见采样颗粒且没有时序重建；截图只展示当前功能场景，不代表最终画质或性能。
 
 ```sh
 npm run check

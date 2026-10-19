@@ -1,6 +1,6 @@
 # 阶段 1–2 实现状态
 
-更新日期：2026-10-19。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询及可选跨帧反馈的漫反射 GI 基础；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何或 Lumen 类光照。
+更新日期：2026-10-19。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础及主视图有界 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
 ## 已实现的运行路径
 
@@ -16,7 +16,7 @@ SceneStore 使用 index/generation 句柄和按影响分类的资源版本，显
 
 CPU 打包和实例/骨骼/标量上传按变化的槽位执行，相邻槽位合并；超过 16 个分散区间时，上传从首个到末个变化槽位的一个连续区间，限制 queue.writeBuffer 调用数量。数量变化才更新批次参数；未变化槽位保留已有 GPU 输入。移动后的下一静止帧仍更新 previous=current；重排按槽位重写而历史按实体/generation 查找，删除后清理历史。同批实体 ID 必须唯一，ID/generation 为 uint32。mutable 输入每帧重打包全部活动槽位，从 mutable 切回 committed 也强制更新一次。变化批次的 GPU 形变和可选 BVH refit 仍整批执行，尚未实现按脏实例的 GPU dispatch 或逐帧上传字节预算。未启用 GI/LOD 的完全静止场景只上传 256 字节相机/光照参数；可选模块各自的参数上传另计。
 
-实际 deformation、shadow、surface、resolve pass 通过 Render Graph 执行，编译时检查读写依赖、未初始化读取、纹理同 pass 读写和环路，记录资源使用区间。开启世界查询时还执行 BVH refit。当前 GPU 分配仍由 Renderer 持有，没有自动资源别名分配器。
+实际 deformation、shadow、surface、resolve pass 通过 Render Graph 执行，编译时检查读写依赖、未初始化读取、纹理同 pass 读写和环路，记录资源使用区间。开启世界查询时还执行 BVH refit；配置体积雾时增加介质/太阳光注入、前后积分与全分辨率 HDR 合成三步。当前 GPU 分配仍由 Renderer 持有，没有自动资源别名分配器。
 
 材质由有界、无副作用的表达式图定义，支持常量、vec4 参数、实例颜色/金属度/粗糙度、RGBA8 纹理、加法、乘法与插值。编译上限为 128 个节点、深度 32、16 个 vec4 参数和 4 个纹理槽。当前覆盖金属度/粗糙度 PBR 与 Unlit、Opaque 与 Masked、单面与双面；同一材质定义产生主视图和阴影 pass 的覆盖函数，Masked 丢弃在两条路径一致。材质 shader/pipeline 按静态图缓存，默认至多 128 个变体；达到上限时仅按最近使用顺序淘汰未被引用且不在编译的变体。`setMaterial(batchName, binding)` 异步准备并原子替换，多个并发请求以最后一次为准；失败保留旧材质。`setMaterialParameters` 更新运行时数据，不重新编译 shader。
 
@@ -180,7 +180,7 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供光照直接消�
 
 跨批次版本最终 `npm run check` 通过 378 项 CPU（49 文件）、TypeScript 与生产构建，日志 `artifacts/scene-bvh-check-release-20261019-v2.log`；非 fallback `nvidia / ampere` 完整浏览器回归 **71/71** 通过，日志 `artifacts/scene-bvh-browser-release-native-20261019-v2.log`；非 fallback `intel / gen-12lp` 两种实例模式的场景查询、实例平局、同 encoder 参数/候选复用和固定代理联合回归 **5/5** 通过，日志 `artifacts/scene-bvh-browser-intel-20261019.log`。同 encoder 测试先后查询 3/1/2/3 条射线和不同 mip LOD，另以同参数槽执行 hit→miss→空区间→hit；场景外 miss 仅访问 1 个根节点，空区间工作量为 0，拒绝超限槽位后原槽仍有效。SwiftShader 定向的两个场景模式和参数槽通过，见 `artifacts/scene-bvh-browser-software-20261019.log`；该次未设置 `tMin=0` 的零距离平局输入失败，修正后在上述独立软件日志通过。软件测试证明功能，不证明性能。
 
-首轮本地完整浏览器运行有 1 项切线模块初始化失败，其余 70 项通过；同期第二次 CPU 检查有 1 项离线 CLI 目录重命名 `EPERM`。随后串行运行的完整检查及浏览器回归通过，但没有据此确认两个偶发失败的根因或宣布它们已永久修复。原失败日志分别保留于 `artifacts/scene-bvh-browser-release-native-20261019.log` 与 `artifacts/scene-bvh-check-release-20261019.log`。本轮没有新增硬件帧时间/吞吐基准，也不改变 GI 接触区质量目标未通过的状态；远程 CI 随新提交另行确认。
+首轮本地完整浏览器运行有 1 项切线模块初始化失败，其余 70 项通过；同期第二次 CPU 检查有 1 项离线 CLI 目录重命名 `EPERM`。随后串行运行的完整检查及浏览器回归通过，但没有据此确认两个偶发失败的根因或宣布它们已永久修复。原失败日志分别保留于 `artifacts/scene-bvh-browser-release-native-20261019.log` 与 `artifacts/scene-bvh-check-release-20261019.log`。旧实例提交 `41afdbc` 的[远程 run 39234201870](https://github.com/fomalhautb/real-engine/actions/runs/39234201870) 仍有 1 项平局测试失败；修正后的跨批次 BVH 提交 `d7c94d8` 的[远程 run 39267473217](https://github.com/fomalhautb/real-engine/actions/runs/39267473217) 已完成且全部作业成功，包含 CPU 和 Linux 浏览器。本轮没有新增硬件帧时间/吞吐基准，也不改变 GI 接触区质量目标未通过的状态。
 
 提交 `63f2bd8` 已通过本地及远程 TypeScript、176 项 CPU 单元测试、生产构建，以及 [远程 Linux 软件 GPU 的 14 项浏览器回归](https://github.com/fomalhautb/real-engine/actions/runs/38509599939)。GPU 查询覆盖离屏静态/刚体、独立蒙皮＋Morph、重排/删除/generation 复用、Mask 洞口、双面、前帧位置、多层 refit、闭区间命中、Unlit HDR 材质即时修改和预算错误；无 GPU 验证错误，释放后账本归零。这是该提交的功能证据，未测查询吞吐。后续本地硬件与基础压力场景的 30 分钟运行另见本文末节；此前被中止的运行不计为通过。
 
@@ -232,9 +232,15 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供光照直接消�
 
 表面材质现在先输出线性的 `rgba16float` 场景颜色。原有距离混色已移除；雾、GI 和反射应在这个线性空间合成，最后由独立 resolve pass 应用曝光、现有 filmic 拟合曲线和准确的 sRGB 传递函数。`setExposure(ev)` 支持 −16 至 +16 档，只改变输出曝光，不改材质程序、场景辐亮度或运动历史。当前没有自动曝光、局部曝光、色彩分级、TAA 或 HDR 显示器输出；场景内部 HDR 与显示设备 HDR 是不同能力。
 
-场景附件在写入时限制到 half-float 的非负有限范围 `[0, 65504]`。这是一项公开的存储上限，超出上限的材质/光照会截断；尚未实现预曝光来扩大可用范围。全分辨率深度、运动向量与 HDR 颜色共占 16 字节/像素，resize 对称释放和重建。`probeHdr` 仅按需读取最多 1024 个像素的线性颜色。resolve 和可选 BVH refit 已进入 GPU 时间、基准 CSV、分位统计和总和；不包含浏览器合成/扫描输出或额外诊断查询。
+场景附件在写入时限制到 half-float 的非负有限范围 `[0, 65504]`。这是一项公开的存储上限，超出上限的材质/光照会截断；尚未实现预曝光来扩大可用范围。全分辨率深度、运动向量与表面 HDR 颜色共占 16 字节/像素，resize 对称释放和重建；启用雾另计独立的全分辨率 HDR 附件。`probeHdr` 按需读取最多 1024 个雾后线性像素，`probeSurfaceHdr` 读取雾前表面/天空附件。resolve、可选 BVH refit 和体积雾已进入 GPU 时间、基准 CSV、分位统计和总和；不包含浏览器合成/扫描输出或额外诊断查询。
 
-`participating-media.ts` 是均匀介质的 CPU 解析参考：米制消光、RGB 散射反照率、每米发光和有界 HG 各向异性，支持 Beer–Lambert 透射率、零消光稳定极限、分段前后合成及 `L_medium + T * L_surface`。七项数值测试覆盖真空、纯发光、微小光学厚度、分段等价和相函数归一化。它尚未注入 GPU 网格，也不代表 F01–F05 或完整体积雾已经通过。
+`participating-media.ts` 保留独立的均匀介质 CPU 解析参考：米制消光、RGB 散射反照率、每米发光和有界 HG 各向异性，支持 Beer–Lambert 透射率、零消光稳定极限、分段前后合成及 `L_medium + T * L_surface`。GPU 路径在 `RendererOptions.volumetricFog` 下启用：全局高度密度为 `exp(-heightFalloff × max(y − baseHeight, 0))`，另可配置最多 64 个世界空间盒或球体积；重叠介质分别求 HG 光源项，再将消光与源项相加。主视锥使用平方分布的相机前向深度切片，先把密度、发光和共享太阳阴影单次散射注入网格，再逐列前后积分，最后按全分辨率表面深度对末格做部分积分并在线性 HDR 合成。天空积分截于 `maxViewDepth`，合成输出截于 65504。介质定义不依赖相机选出的渲染 LOD，主视图仅是视图缓存。
+
+`pixelSize/slices/maxViewDepth/maxFroxels/maxBytes` 默认分别为 `8/64/80 m/1,048,576/64 MiB`。尺寸变化时在给定 `pixelSize` 及以上选择满足格数与字节上限的最小整数像素尺寸，设备 storage/dispatch 限额也预检；超过预算明确拒绝，不静默扩大。每格源和累计结果各占 16 字节，另有 8 字节/输出像素的 HDR 附件、256 字节 uniform 和 5,120 字节体积缓冲；`maxBytes` 与 `diagnostics().volumetricFog.ownedGpuBytes` 是模块应用账本，不是 JS RSS、驱动显存驻留或整帧全部资源。`setVolumetricFogEnabled(boolean)` 开关雾；禁用时跳过 compute，但仍以表面颜色写合成附件。`setVolumetricFogMedia({ global?, volumes? })` 原子替换整套介质，省略的项清空。介质变更和 resize 下一帧即重算；当前不持有雾时序历史。初始化、pipeline 和 resize 部分失败路径释放已拥有资源，`dispose()` 后模块及 Renderer 应用账本归零。
+
+启用雾时，太阳辐亮度每通道上限为 1e20；超过时 setSun 在提交状态前明确拒绝，独立模块也检查，避免多个介质、HG 与长斜射线的 float32 乘积溢出。光源目前只有共享阴影贴图的方向太阳单次散射；阴影覆盖范围外按无遮挡处理。没有点/聚光灯、空气中的低频 GI、反射介质、透明分段积分、介质自阴影或多重散射。雾与 GI 同时启用的功能用例只验证共存及 GI 探针不被主视图雾改写，不表示 GI 已照亮空气。`/fog.html` 是柱廊内局部盒状雾的代码演示，可切换雾/密度/太阳/镜头；[雾开](../artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png)与[雾关](../artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-off.png)是实际截图，仍有明显采样颗粒且无时序重建，不是最终次世代画质或性能证据。
+
+本轮完整本地 `npm run check` 通过 391 项 CPU 测试（51 文件）、类型检查与生产构建，日志 `artifacts/fog-check-release-20261019-final.log`。NVIDIA 定向 GPU 数值回归以实际绘制后的 HDR 读回对照独立 CPU 解析式：纯吸收、零消光发光、HG 太阳散射覆盖距相机 0.2–136 m 的表面与天空截断；重叠局部介质的 9 个像素对照每条射线 16,384 步独立积分，最大 HDR 绝对误差 0.00225978，高度介质为 0.000230491。另验证 Mask/Morph/skin 的离屏阴影遮挡及移除恢复、雾开关、运行时替换、尺寸预算、GI 探针不变、构造/pipeline/resize 部分失败后的资源清理和释放账本归零。原生 NVIDIA 完整浏览器回归 74/74 通过，日志 `artifacts/fog-browser-release-native-20261019-final.log`；Intel 定向 3/3 与 SwiftShader 定向 3/3 也已通过，日志分别为 `artifacts/fog-target-intel-20261019.log`、`artifacts/fog-target-software-20261019.log`。这些功能用例不证明大场景帧时间、完整 F01–F05 或阶段 2 完成。
 
 提交 `2454e22` 已通过本地及远程 TypeScript、184 项单元测试和生产构建，以及 [远程 Linux 软件 GPU 的 16 项浏览器回归](https://github.com/fomalhautb/real-engine/actions/runs/38510988726)。HDR 附件在曝光前后及 resize 后均读到 `[5, 0.75, 0.125, 1]`；EV 0 的 canvas RGB 为 `[0.99216, 0.87451, 0.45098]`，EV −2 为 `[0.92941, 0.56471, 0.15686]`，符合 filmic＋sRGB 解析预期和 8-bit 量化。曝光不重编材质或清除对象运动历史；resize 的账本增量为 16 字节/像素。
 
@@ -268,12 +274,12 @@ Rapier 以独立适配器提供盒子刚体和地面碰撞、最近命中射线�
 | --- | --- |
 | 统一形变执行 | 有界顺序算子编译；多 Morph、可变骨骼数蒙皮、wave；刚性或显式仿射骨骼模式 |
 | 法线 | Morph 目标法线/切线增量、蒙皮线性切线与逆转置法线、wave 雅可比、实例 handedness；glTF 缺失切线按需生成 MikkTSpace-compatible 角点帧及接缝/Morph 重映射；代码网格仍可选无 Mikk 一致性保证的 UV 导数回退 |
-| 渲染调度 | 依赖编译和实际执行；默认四个 pass，可选世界查询 BVH refit 和 GPU LOD 选择/完成；尚无资源自动分配/别名 |
+| 渲染调度 | 依赖编译和实际执行；默认四个 pass，可选世界查询 BVH refit、GPU LOD 选择/完成和体积雾三步；尚无资源自动分配/别名 |
 | 材质 | 有界表达式图；PBR/Unlit、Opaque/Masked、双面、纹理与参数，基础法线贴图；无多层材质、透射或通用透明 |
 | 资源 | 固定容量批次；材质变体和纹理预算；静态 Opaque 几何有 CPU 缓存、GPU 页池、每帧上传预算、整组准入、祖先保留及默认预算内固定阴影/查询代理；尚无全应用资源预算或纹理流送 |
 | 几何/动画资产 | OBJ、glTF/GLB、蒙皮/Morph；静态 Opaque 离线簇层级、压缩页面、GPU LOD/视锥剔除/间接绘制与分簇演示；主 Renderer 已接入分页表面和自动调度，源网格可省略时以固定代理供阴影/查询/GI，旧完整源流送仍可用；源网格可省略批次拒绝 Masked，尚无遮挡剔除、动态形变简化或大型流送联合验收 |
 | 光照 | 可更新的单方向太阳光、直接光与阴影；共享形变世界查询上的固定探针漫反射 GI、可选跨帧反馈和实验性屏幕 Final Gather；无镜面反射或完整 GI |
-| 体积雾 | 仅有线性 HDR 合成基础和 CPU 均匀介质解析参考；GPU 网格、光照、积分与时序重建尚未实现，仍按阶段 2 路线交付 |
+| 体积雾 | 主视图有界 GPU 高度雾和最多 64 个局部盒/球体积，太阳共享阴影的单次散射、平方深度切片积分与全分辨率深度 HDR 合成；无点/聚光灯、空气 GI、反射/透明介质路径、时序重建、自阴影或多散射 |
 | 物理 | 地面、盒子刚体、最近命中射线与球形重叠查询；无角色控制器、ragdoll、布料或破坏 |
 | 平台 | WebGPU 必需；初始化失败明确报错，设备丢失报告后停止帧循环，恢复需要重新加载 |
 | 性能 | 基础压力场景已在 NVIDIA 完成一次 30 分钟无验证错误/资源漂移运行；rAF p95 超过初始 33.3 ms 门槛，尚未完成目标规模、GI/LOD/体积雾联合长测及硬件性能验收 |
@@ -328,7 +334,7 @@ CI 将失败时的运行状态直接输出到日志。截图附件上传属于�
 
 压力模式每 1800 帧循环增删 16 个刚体、两个已预热材质间替换、1920×1080 与 1440×810 切换、场景重置和镜头切换。每个完整循环检查基础资源恢复为 6 个刚体、7 个材质绑定、2 张共享图像及初始 GPU 账本；重置也复位下一次生成位置，避免后续循环的刚体生成高度不断累积。结束时验证全部活动实例的形变/法线/边界，读回在计时窗口之外；释放后应用 GPU 账本必须为零。
 
-统计记录 rAF 间隔、场景更新、压力事件、CPU 编码提交、上传字节、工作量和 GPU 账本；timestamp 结果携带原始帧号，缺失样本留空，不把旧结果重复算作新帧。当前 GPU 合计包含 deformation/shadow/surface/resolve 和启用时的 BVH refit、GPU LOD 与 diffuse GI，不含浏览器合成与呈现；旧的三项输入仍可读取，新增项按零兼容。逐帧遥测使用按需分配的有界 Float64 块，上限 100 万帧；遥测本身会增加 JS 内存。脚本每 15 秒通过 CDP 观察 JS 堆与页面对象数，未强制 GC，也尚未单独量化观察开销。场景更新目前合并物理、动画与帧提交，不提供各项独立耗时。
+统计记录 rAF 间隔、场景更新、压力事件、CPU 编码提交、上传字节、工作量和 GPU 账本；timestamp 结果携带原始帧号，缺失样本留空，不把旧结果重复算作新帧。当前 GPU 合计包含 deformation/shadow/surface/resolve 和启用时的 BVH refit、GPU LOD、diffuse GI、Final Gather 与 volumetricFog，不含浏览器合成与呈现；旧的三项输入仍可读取，新增项按零兼容。逐帧遥测使用按需分配的有界 Float64 块，上限 100 万帧；遥测本身会增加 JS 内存。脚本每 15 秒通过 CDP 观察 JS 堆与页面对象数，未强制 GC，也尚未单独量化观察开销。场景更新目前合并物理、动画与帧提交，不提供各项独立耗时。
 
 环境清单记录 OS/CPU、可查询到的 GPU 驱动、浏览器版本/flags、WebGPU features/limits、代码提交与 dirty 状态、源码逐文件及聚合 SHA-256。构建前后源码哈希不一致时失败；完成的构建副本另记录逐文件及聚合哈希，因此实际运行内容可追溯。秒数运行另设请求时长加 10 分钟的故障超时；帧数运行有显式有限超时，超时只判失败，不充当稳定性通过。浏览器隐藏、页面错误、验证错误和资源漂移均拒绝结果。
 

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#111918" />
+    <title>Real Engine — 体积雾与太阳光柱</title>
+  </head>
+  <body>
+    <div class="fog-app">
+      <header class="topbar">
+        <a class="brand" href="./">r<span>.</span> <small>REAL ENGINE</small></a>
+        <span class="topbar-title">VOLUMETRIC LIGHT / 001</span>
+        <span id="status" class="status" role="status">正在初始化 WebGPU</span>
+      </header>
+      <main class="layout">
+        <section class="stage" aria-label="真实 WebGPU 体积雾场景">
+          <canvas id="viewport" aria-label="柱廊与屋顶格栅投射太阳光柱"></canvas>
+          <div class="stage-copy">
+            <span class="eyebrow">SUNLIGHT · OCCLUSION · MEDIUM</span>
+            <h1>光从屋顶的<br /><em>缝隙落下。</em></h1>
+            <p>实体屋顶、柱廊与墙洞遮住太阳；光在参与介质中形成可见的明暗体积。</p>
+          </div>
+          <div class="stage-bottom"><span id="stage-mode">雾已开启 · 太阳单次散射</span><span>固定相机轨迹 · 无预制光柱</span></div>
+          <div id="error" class="error" role="alert" hidden></div>
+        </section>
+        <aside class="panel" aria-label="雾与太阳控制">
+          <div class="panel-heading"><span class="eyebrow">FIELD NOTES / 04</span><h2>看见光的路径</h2><p>在同一实体场景里比较光照、遮挡和雾密度。</p></div>
+          <section class="section">
+            <div class="section-title"><h3>参与介质</h3><span>01 / MEDIUM</span></div>
+            <label class="toggle"><span>开启体积雾<small>仅柱廊内部的盒状介质；室外保持清晰</small></span><input id="fog-enabled" type="checkbox" checked /></label>
+            <label class="range"><span>消光密度 <output id="density-value" for="density">0.14 / m</output></span><input id="density" type="range" min="0.02" max="0.32" step="0.01" value="0.14" /></label>
+          </section>
+          <section class="section">
+            <div class="section-title"><h3>太阳</h3><span>02 / LIGHT</span></div>
+            <label class="range"><span>方位角 <output id="azimuth-value" for="azimuth">150°</output></span><input id="azimuth" type="range" min="95" max="220" step="1" value="150" /></label>
+            <label class="range"><span>高度角 <output id="elevation-value" for="elevation">50°</output></span><input id="elevation" type="range" min="20" max="80" step="1" value="50" /></label>
+            <label class="range"><span>强度 <output id="intensity-value" for="intensity">9.0</output></span><input id="intensity" type="range" min="0" max="16" step="0.2" value="9" /></label>
+          </section>
+          <section class="section">
+            <div class="section-title"><h3>镜头</h3><span>03 / CAMERA</span></div>
+            <label class="toggle"><span>固定轨迹<small>轻微绕行，保持光柱可见</small></span><input id="trajectory" type="checkbox" checked /></label>
+            <div class="actions"><button id="pause" type="button">暂停轨迹</button><button id="step" type="button">逐帧前进</button></div>
+          </section>
+          <section class="section metrics">
+            <div class="section-title"><h3>运行诊断</h3><span>GPU / FRAME</span></div>
+            <dl>
+              <div><dt>雾网格</dt><dd id="grid">—</dd></div>
+              <div><dt>Froxel</dt><dd id="froxels">—</dd></div>
+              <div><dt>GPU 雾时间</dt><dd id="gpu-time">—</dd></div>
+              <div><dt>GPU 采样帧</dt><dd id="gpu-frame">—</dd></div>
+              <div><dt>资源账本</dt><dd id="gpu-bytes">—</dd></div>
+              <div><dt>视口</dt><dd id="viewport-size">—</dd></div>
+              <div><dt>场景三角形</dt><dd id="triangles">—</dd></div>
+              <div><dt>帧</dt><dd id="frame">—</dd></div>
+            </dl>
+          </section>
+          <p class="scope">盒状局部介质内的太阳单次散射；尚无 GI 或时序雾。此页展示可验证的局部场景，不代表完整体积照明画质或性能目标。</p>
+          <p id="adapter" class="adapter">等待 WebGPU 适配器…</p>
+        </aside>
+      </main>
+    </div>
+    <script type="module" src="/src/fog-demo.ts"></script>
+  </body>
+</html>

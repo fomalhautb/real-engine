@@ -208,7 +208,7 @@ async function measureDemo({ pageName, warmup, frames, width, height, expectVend
     if (stats.gpuSampleFrame <= result.warmupLastRenderFrame ||
         stats.gpuSampleFrame > result.lastRenderFrame || !stats.gpuMs) return;
     const values = { ...stats.gpuMs };
-    const passNames = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi', 'finalGather'];
+    const passNames = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi', 'finalGather', 'volumetricFog'];
     if (passNames.some(name => !Number.isFinite(values[name]) || values[name] < 0)) throw new Error('INVALID_GPU_TIMING');
     result.gpuSamples.push({ renderFrame: stats.gpuSampleFrame, ...values,
       fullGpuMs: passNames.reduce((total, name) => total + values[name], 0) });
@@ -371,7 +371,7 @@ async function main() {
           cameraMode: options.camera,
         }), timeoutMs, `BENCHMARK_RUN_${repeat}`);
         if (pageErrors.length) throw new Error('BENCHMARK_PAGE_ERROR: ' + JSON.stringify(pageErrors));
-        const passes = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi', 'finalGather'];
+        const passes = ['deformation', 'shadow', 'surface', 'resolve', 'worldQueryRefit', 'geometryLod', 'diffuseGi', 'finalGather', 'volumetricFog'];
         const metrics = { cpuSubmitMs: summary(result.frameSamples.map(row => row.cpuSubmitMs)),
           rafDeltaMs: summary(result.frameSamples.map(row => row.rafDeltaMs).filter(value => value !== null)),
           fullGpuMs: summary(result.gpuSamples.map(row => row.fullGpuMs)),

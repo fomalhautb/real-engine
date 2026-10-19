@@ -20,6 +20,8 @@ import { snapshotMeshTangents } from './tangent-frame';
 import { GpuGeometryStream } from './gpu-geometry-stream';
 import { GpuGeometryPagePool, type GeometryGpuFrameLease } from './gpu-geometry-page-pool';
 import { GeometryDecodeWorkerPool, type GeometryDecodeWorkerOptions } from './geometry-decode-worker-pool';
+import { GpuVolumetricFog } from './gpu-volumetric-fog';
+import { resolveVolumetricFogOptions, type VolumetricFogOptions } from './volumetric-fog';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; surfaceStream?: GPURenderPipeline; shadow: GPURenderPipeline; query?: GPUComputePipeline };
@@ -43,7 +45,7 @@ export interface FrameStats {
   /** triangles is source instance-expanded geometry; use probeGeometryLod for actual selected triangles. */
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
-  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number } | null;
+  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number; volumetricFog: number } | null;
   /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
   gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
@@ -68,6 +70,8 @@ export interface RendererOptions {
   worldQueries?: WorldQueryOptions;
   /** Fixed world-space probe grid; requires worldQueries with sufficient ray capacity. */
   diffuseGi?: DiffuseGiOptions;
+  /** Bounded view-space integration of world media and shared directional shadows. */
+  volumetricFog?: VolumetricFogOptions;
 }
 
 export interface RendererAdapterInfo {
@@ -125,6 +129,8 @@ export class Renderer {
   private readonly geometryDecodeOptions?: GeometryDecodeWorkerOptions;
   private diffuseGi?: GpuDiffuseGi;
   private readonly diffuseGiOptions?: DiffuseGiOptions;
+  private readonly volumetricFogOptions?: VolumetricFogOptions;
+  private volumetricFog?: GpuVolumetricFog;
   private defaultClusterVertices!: GPUBuffer;
   private materialRevision = 0;
   private format!: GPUTextureFormat;
@@ -135,6 +141,7 @@ export class Renderer {
     if (scene.filter(batch => !!batch.geometryStream).length > 256) throw new Error('GEOMETRY_STREAM_BATCH_BUDGET');
     if (options.antiAliasing !== undefined && options.antiAliasing !== 'none' && options.antiAliasing !== 'fxaa') throw new Error('INVALID_ANTI_ALIASING');
     resolveSunShadowOptions(options.sunShadow);
+    if (options.volumetricFog) resolveVolumetricFogOptions(options.volumetricFog);
     const limit = options.materialVariantLimit ?? 128;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 4096) throw new Error('INVALID_MATERIAL_VARIANT_LIMIT');
     if (options.textureBudgetBytes !== undefined && (!Number.isSafeInteger(options.textureBudgetBytes) || options.textureBudgetBytes < 0)) throw new Error('INVALID_TEXTURE_BUDGET');
@@ -205,8 +212,9 @@ export class Renderer {
     this.worldQueryOptions = options.worldQueries;
     this.geometryDecodeOptions = options.geometryDecoding;
     this.diffuseGiOptions = options.diffuseGi && resolveDiffuseGiOptions(options.diffuseGi);
+    this.volumetricFogOptions = options.volumetricFog && resolveVolumetricFogOptions(options.volumetricFog);
     this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0)
-      + (this.diffuseGiOptions?.finalGather ? 2 : 0);
+      + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.volumetricFog ? 6 : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes);
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -295,6 +303,8 @@ export class Renderer {
     }
     if (this.diffuseGiOptions) this.diffuseGi = await GpuDiffuseGi.create(this.device, this.worldQueries!, this.diffuseGiOptions,
       bytes => { this.stats.ownedGpuBytes += bytes; });
+    if (this.volumetricFogOptions) this.volumetricFog = await GpuVolumetricFog.create(this.device, this.volumetricFogOptions,
+      bytes => { this.stats.ownedGpuBytes += bytes; });
     for (const entry of scene) {
       const batch = await this.createBatch(entry);
       this.batches.push(batch);
@@ -317,6 +327,12 @@ export class Renderer {
       { name: 'scene-hdr', kind: 'texture', source: 'transient' },
       { name: 'depth', kind: 'texture', source: 'transient' },
       { name: 'velocity', kind: 'texture', source: 'transient' },
+      ...(this.volumetricFog ? [
+        { name: 'fog-media', kind: 'buffer' as const, source: 'imported' as const },
+        { name: 'fog-source', kind: 'buffer' as const, source: 'transient' as const },
+        { name: 'fog-integrated', kind: 'buffer' as const, source: 'transient' as const },
+        { name: 'fog-hdr', kind: 'texture' as const, source: 'transient' as const },
+      ] : []),
     ], [
       { name: 'deformation', uses: [{ resource: 'scene-input', access: 'read' },
         ...(this.hasGeometryStream ? [{ resource: 'stream-pages', access: 'read' as const }] : []),
@@ -355,7 +371,16 @@ export class Renderer {
         ...(this.diffuseGi ? [{ resource: 'diffuse-gi-probes', access: 'read' as const }] : []),
         ...(this.diffuseGiOptions?.finalGather ? [{ resource: 'final-gather-anchors', access: 'read' as const }] : []),
         { resource: 'scene-hdr', access: 'write' }, { resource: 'depth', access: 'write' }, { resource: 'velocity', access: 'write' }], execute: encoder => this.encodeSurface(encoder) },
-      { name: 'resolve', uses: [{ resource: 'scene-hdr', access: 'read' }, { resource: 'canvas', access: 'write' }], execute: encoder => this.encodeResolve(encoder) },
+      ...(this.volumetricFog ? [
+        { name: 'fog-inject', uses: [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const }, { resource: 'fog-source', access: 'write' as const }],
+          execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeInject(encoder, this.timestamp(this.timestampCount - 6)) },
+        { name: 'fog-integrate', uses: [{ resource: 'fog-source', access: 'read' as const }, { resource: 'fog-integrated', access: 'write' as const }],
+          execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeIntegrate(encoder, this.timestamp(this.timestampCount - 4)) },
+        { name: 'fog-compose', uses: [{ resource: 'fog-source', access: 'read' as const }, { resource: 'fog-integrated', access: 'read' as const },
+          { resource: 'scene-hdr', access: 'read' as const }, { resource: 'depth', access: 'read' as const }, { resource: 'fog-hdr', access: 'write' as const }],
+          execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeCompose(encoder, this.timestamp(this.timestampCount - 2)) },
+      ] : []),
+      { name: 'resolve', uses: [{ resource: this.volumetricFog ? 'fog-hdr' : 'scene-hdr', access: 'read' }, { resource: 'canvas', access: 'write' }], execute: encoder => this.encodeResolve(encoder) },
     ]);
   }
 
@@ -484,6 +509,19 @@ export class Renderer {
     if (!stream) throw new Error('GEOMETRY_STREAM_BATCH_NOT_FOUND'); stream.runtime.retry(pageId);
   }
 
+  /** Disabled media leave surface radiance unchanged; resources remain allocated. */
+  setVolumetricFogEnabled(enabled: boolean): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.volumetricFog) throw new Error('VOLUMETRIC_FOG_DISABLED');
+    this.volumetricFog.setEnabled(enabled);
+  }
+
+  setVolumetricFogMedia(media: Pick<VolumetricFogOptions, 'global' | 'volumes'>): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.volumetricFog) throw new Error('VOLUMETRIC_FOG_DISABLED');
+    this.volumetricFog.setMedia(media);
+  }
+
   /** Disabling GI removes indirect lighting; it does not restore the legacy ambient fill. */
   setDiffuseGiEnabled(enabled: boolean): void {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
@@ -546,6 +584,7 @@ export class Renderer {
     if (sun.direction.length !== 3 || sun.color.length !== 3 || ![...sun.direction, ...sun.color].every(value => Number.isFinite(value) && Number.isFinite(Math.fround(value))) ||
         Math.hypot(...sun.direction) < 1e-6 || sun.color.some(value => value < 0 || !Number.isFinite(Math.fround(value)))) throw new Error('INVALID_SUN');
     const length = Math.hypot(...sun.direction);
+    if (this.volumetricFogOptions) GpuVolumetricFog.validateSunColor(sun.color);
     const d = sun.direction.map(value => value / length) as [number, number, number];
     const projection = sunShadowProjection(d, this.sunShadowOptions);
     this.sunDirection = d; this.sunColor = [...sun.color];
@@ -736,6 +775,7 @@ export class Renderer {
     const width = Math.max(1, Math.min(this.device.limits.maxTextureDimension2D, Math.round(this.canvas.clientWidth * ratio)));
     const height = Math.max(1, Math.min(this.device.limits.maxTextureDimension2D, Math.round(this.canvas.clientHeight * ratio)));
     if (width === this.stats.width && height === this.stats.height) return;
+    this.volumetricFog?.planResize(width, height);
     if (this.depth) {
       this.stats.ownedGpuBytes -= this.stats.width * this.stats.height * 16;
       this.depth.destroy(); this.velocity!.destroy(); this.hdr!.destroy();
@@ -746,8 +786,9 @@ export class Renderer {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     this.hdr = this.device.createTexture({ label: 'scene-linear HDR', size: [width, height], format: 'rgba16float',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING });
+    this.volumetricFog?.resize(width, height, this.depth, this.hdr, this.shadow);
     this.resolveGroup = this.device.createBindGroup({ layout: this.resolveLayout, entries: [
-      { binding: 0, resource: this.hdr.createView() }, { binding: 1, resource: { buffer: this.exposureBuffer } },
+      { binding: 0, resource: (this.volumetricFog?.colorTexture ?? this.hdr).createView() }, { binding: 1, resource: { buffer: this.exposureBuffer } },
     ] });
     this.stats.width = width; this.stats.height = height;
     this.stats.ownedGpuBytes += width * height * 16;
@@ -781,6 +822,8 @@ export class Renderer {
     const debug = this.geometryLod?.settings.debug;
     new Uint32Array(this.frameData.buffer)[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : 0;
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
+    this.stats.uploadedBytes += this.volumetricFog?.update(eye, target, Math.PI / 3.2, 0.1, 150,
+      this.sunDirection, this.sunColor, this.lightMatrix) ?? 0;
     this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
     for (const batch of this.batches) if (batch.stream) {
       const count = batch.material.program.alphaMode === 'opaque' ? batch.scene.instances.length : 0;
@@ -817,7 +860,7 @@ export class Renderer {
     for (const batch of this.batches) batch.stream?.runtime.afterSubmit();
     if (readTiming) void this.readTiming(this.stats.frames + 1);
     this.stats.frames++;
-    this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2 + 1;
+    this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2 + 1 + (this.volumetricFog ? 1 : 0);
     this.stats.triangles = this.batches.reduce((sum, batch) => sum + (batch.scene.geometryStream?.directory.sourceTriangleCount ?? batch.mesh.indices.length / 3) * batch.scene.instances.length, 0);
     this.stats.deformedVertices = this.batches.reduce((sum, batch) => sum + (batch.dirty ? batch.mesh.vertexCount * batch.scene.instances.length : 0)
       + (batch.stream && batch.material.program.alphaMode === 'opaque' ? batch.stream.runtime.selection.physicalVertexCount * batch.scene.instances.length : 0), 0);
@@ -887,6 +930,7 @@ export class Renderer {
       geometryStreams: this.batches.filter(batch => batch.stream).map(batch => ({ name: batch.scene.name, ...batch.stream!.runtime.diagnostics() })),
       geometryDecoding: this.geometryDecoder?.diagnostics() ?? null,
       diffuseGi: this.diffuseGi?.diagnostics() ?? null,
+      volumetricFog: this.volumetricFog?.diagnostics() ?? null,
       sunShadow: { resolution: this.sunShadowOptions.resolution, bytes: this.sunShadowOptions.bytes,
         focusBounds: this.sunShadowOptions.focusBounds ?? null, width: this.sunShadowProjection.width,
         depth: this.sunShadowProjection.depth, texelWorldSize: this.sunShadowProjection.texelWorldSize,
@@ -933,7 +977,9 @@ export class Renderer {
         worldQueryRefit: this.worldQueries ? Number(values[9] - values[8]) / 1e6 : 0,
         geometryLod: this.geometryLod ? Number(values[this.worldQueries ? 11 : 9] - values[this.worldQueries ? 10 : 8]) / 1e6 : 0,
         diffuseGi: this.diffuseGi ? Number(values[this.geometryLod ? 13 : 11] - values[this.geometryLod ? 12 : 10]) / 1e6 : 0,
-        finalGather: this.diffuseGiOptions?.finalGather ? Number(values[this.geometryLod ? 15 : 13] - values[this.geometryLod ? 14 : 12]) / 1e6 : 0 };
+        finalGather: this.diffuseGiOptions?.finalGather ? Number(values[this.geometryLod ? 15 : 13] - values[this.geometryLod ? 14 : 12]) / 1e6 : 0,
+        volumetricFog: this.volumetricFog ? [6, 4, 2].reduce((sum, offset) => sum
+          + Number(values[this.timestampCount - offset + 1] - values[this.timestampCount - offset]) / 1e6, 0) : 0 };
       this.stats.gpuSampleFrame = frame;
       this.queryRead!.unmap();
     } catch (error) { if (!this.disposed) this.errors.push('TIMESTAMP_READBACK: ' + String(error)); }
@@ -983,8 +1029,14 @@ export class Renderer {
     return this.readFloat16Pixels(this.velocity, points, 2, 'VELOCITY');
   }
 
-  /** Diagnostic only: linear scene radiance before exposure and display transfer. */
+  /** Diagnostic only: linear scene radiance including media, before exposure/display transfer. */
   async probeHdr(points: readonly { x: number; y: number }[]): Promise<number[][]> {
+    if (this.disposed || !this.hdr || !this.lastViewProjection) throw new Error('NO_RENDERED_HDR');
+    return this.readFloat16Pixels(this.volumetricFog?.colorTexture ?? this.hdr, points, 4, 'HDR');
+  }
+
+  /** Diagnostic only: surface/sky radiance before participating media. */
+  async probeSurfaceHdr(points: readonly { x: number; y: number }[]): Promise<number[][]> {
     if (this.disposed || !this.hdr || !this.lastViewProjection) throw new Error('NO_RENDERED_HDR');
     return this.readFloat16Pixels(this.hdr, points, 4, 'HDR');
   }
@@ -1102,6 +1154,7 @@ export class Renderer {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.volumetricFog?.dispose();
     this.diffuseGi?.dispose();
     this.worldQueries?.dispose();
     this.geometryLod?.dispose();

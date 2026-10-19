@@ -122,6 +122,8 @@ export class FoundationBenchmark {
             shadow: gpuMs.shadow, surface: gpuMs.surface, resolve: gpuMs.resolve,
             worldQueryRefit: gpuMs.worldQueryRefit, geometryLod: gpuMs.geometryLod,
             diffuseGi: gpuMs.diffuseGi, finalGather: gpuMs.finalGather,
+            reflections: 'reflections' in gpuMs && typeof gpuMs.reflections === 'number'
+              ? gpuMs.reflections : 0,
             volumetricFog: 'volumetricFog' in gpuMs && typeof gpuMs.volumetricFog === 'number'
               ? gpuMs.volumetricFog : 0 });
           lastGpuFrame = gpuSampleFrame;

@@ -1,7 +1,9 @@
 import common from './shaders/volumetric-fog-common.wgsl?raw';
+import worldSource from './shaders/volumetric-fog-world.wgsl?raw';
 import computeSource from './shaders/volumetric-fog.wgsl?raw';
 import composeSource from './shaders/volumetric-fog-compose.wgsl?raw';
 import temporalSource from './shaders/volumetric-fog-temporal.wgsl?raw';
+import reflectionSource from './shaders/reflections-fog.wgsl?raw';
 import { lookAt, type Mat4 } from './math';
 import { resolveVolumetricFogOptions, selectFogGrid, type VolumetricFogOptions, type ResolvedVolumetricFogOptions } from './volumetric-fog';
 
@@ -11,6 +13,15 @@ export type FogHistoryCell = { x: number; y: number; z: number };
 type HistoryView = { source: GPUBuffer; count: GPUBuffer; compute: GPUBindGroup; temporal: GPUBindGroup; compose: GPUBindGroup };
 const FIXED_BYTES = 384 + 64 * 80;
 const LIGHT_COMPONENTS = [20, 21, 22, 23, 24, 25, 26, ...Array.from({ length: 16 }, (_, i) => i + 48)];
+
+/** Common world medium and Beer-Lambert integration for secondary reflection rays. */
+export const reflectionFogSource = common
+  .replace('@group(0) @binding(0) var<uniform> frame:', '@group(1) @binding(0) var<uniform> frame:')
+  + '\n' + worldSource
+    .replace('@group(0) @binding(1) var<storage, read> volumes:', '@group(1) @binding(1) var<storage, read> volumes:')
+    .replace('@group(0) @binding(4) var shadowMap:', '@group(1) @binding(2) var shadowMap:')
+    .replace('@group(0) @binding(5) var shadowSampler:', '@group(1) @binding(3) var shadowSampler:')
+  + '\n' + reflectionSource;
 
 function radicalInverse(value: number, base: number): number {
   let factor = 1 / base, result = 0;
@@ -103,7 +114,7 @@ export class GpuVolumetricFog {
     const resolvedSource = this.options.temporal
       ? '@group(0) @binding(6) var<storage, read> historySource: array<vec4f>;\nfn resolvedSource(index:u32)->vec4f { if(frame.reserved.w > 0.5){return historySource[index];}return sources[index];}'
       : 'fn resolvedSource(index:u32)->vec4f {return sources[index];}';
-    const compute = await shader(computeSource.replace('// FOG_RESOLVED_SOURCE', resolvedSource), 'fog source and integration');
+    const compute = await shader(worldSource + '\n' + computeSource.replace('// FOG_RESOLVED_SOURCE', resolvedSource), 'fog source and integration');
     const computeLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
     this.injectPipeline = await this.device.createComputePipelineAsync({ label: 'fog density and sun', layout: computeLayout, compute: { module: compute, entryPoint: 'inject' } });
     this.integratePipeline = await this.device.createComputePipelineAsync({ label: 'fog front-to-back integral', layout: computeLayout, compute: { module: compute, entryPoint: 'integrate' } });
@@ -343,6 +354,16 @@ export class GpuVolumetricFog {
       history: { configured: !!this.options.temporal, valid: this.historyValid, framesSinceReset: this.historyFrames,
         maxFrames: this.options.temporal ? this.options.temporal.maxHistoryFrames : 0, lastResetReason: this.resetReason },
       shadowOutsideCoverage: 'unshadowed' as const, ownedGpuBytes: this.disposed ? 0 : this.grid?.bytes ?? FIXED_BYTES };
+  }
+  /** Borrowed world-medium parameters; owned and destroyed by this fog instance. */
+  get worldParameters(): GPUBuffer {
+    if (this.disposed) throw new Error('FOG_DISPOSED');
+    return this.uniform;
+  }
+  /** Borrowed local-volume definitions; owned and destroyed by this fog instance. */
+  get worldVolumes(): GPUBuffer {
+    if (this.disposed) throw new Error('FOG_DISPOSED');
+    return this.volumes;
   }
   private releaseView(): void {
     this.sources?.destroy(); this.integrated?.destroy(); this.output?.destroy();

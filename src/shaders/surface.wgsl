@@ -12,7 +12,8 @@ struct Instance {
     previousModel: mat4x4f,
     normalMatrix: mat4x4f,
     color: vec4f,
-    material: vec4f,
+    material: vec2f,
+    surfaceIdentity: vec2u,
 }
 struct Deformed { position: vec4f, normal: vec4f, previous: vec4f, tangent: vec4f }
 struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, padding: u32 }
@@ -54,6 +55,7 @@ struct Varyings {
     @location(7) uv: vec2f,
     @location(8) @interpolate(flat) clusterDebug: vec3u,
     @location(9) tangent: vec4f,
+    @location(10) @interpolate(flat) surfaceIdentity: vec2u,
 }
 fn geometryVaryings(vertex: Deformed, instanceIndex: u32, uv: vec2f) -> Varyings {
     let instance = instances[instanceIndex];
@@ -66,6 +68,7 @@ fn geometryVaryings(vertex: Deformed, instanceIndex: u32, uv: vec2f) -> Varyings
     result.tangent = vertex.tangent;
     result.color = instance.color;
     result.material = instance.material.xy;
+    result.surfaceIdentity = instance.surfaceIdentity;
     result.light = frame.lightViewProjection * vertex.position;
     result.uv = uv;
     result.clusterDebug = vec3u(0u);
@@ -173,6 +176,7 @@ fn visibility(light: vec4f) -> f32 {
     }
     return sum / 9.0;
 }
+// REFLECTION_PROGRAM
 struct FragmentOutput { @location(0) color: vec4f, @location(1) velocity: vec2f }
 @fragment
 fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> FragmentOutput {
@@ -192,29 +196,15 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     }
     let v = normalize(frame.camera.xyz - input.world);
     let l = normalize(frame.sunDirection.xyz);
-    let h = (l + v) / max(length(l + v), 0.00001);
-    let nv = max(dot(n, v), 0.001);
-    let nl = select(0.0, max(dot(n, l), 0.0), dot(geometricNormal, l) > 0.0);
-    let nh = max(dot(n, h), 0.0);
-    let vh = max(dot(v, h), 0.0);
     let metalness = surface.metallic;
     let roughness = surface.roughness;
     let base = surface.baseColor;
-    let alpha = roughness * roughness;
-    let a2 = alpha * alpha;
-    // This form avoids subtracting nearly equal values for smooth surfaces at normal incidence.
-    let denominator = (1.0 - nh * nh) + nh * nh * a2;
-    let distribution = a2 / max(3.14159265 * denominator * denominator, 1e-20);
-    let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
-    let geometry = (nv / (nv * (1.0 - k) + k)) * (nl / (nl * (1.0 - k) + k));
-    let f0 = mix(vec3f(0.04), base, metalness);
-    let fresnel = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
-    let specular = distribution * geometry * fresnel / max(4.0 * nv * nl, 0.001);
-    let diffuse = (1.0 - fresnel) * (1.0 - metalness) * base / 3.14159265;
-    let direct = (diffuse + specular) * frame.sunColor.rgb * nl * shadowVisibility;
+    let direct = surfaceDirectBrdf(base, metalness, roughness, n, geometricNormal, v, l)
+        * frame.sunColor.rgb * shadowVisibility;
     // Compiled world-space irradiance, or the legacy fill when GI is unconfigured.
     // INDIRECT_LIGHTING
-    let lighting = select(direct + ambient + surface.emissive, base + surface.emissive, MATERIAL_UNLIT);
+    // REFLECTED_LIGHTING
+    let lighting = select(direct + ambient + reflected + surface.emissive, base + surface.emissive, MATERIAL_UNLIT);
     var output: FragmentOutput;
     // rgba16float is the bounded scene-linear transport buffer. Exposure and
     // display transfer belong to the final resolve, after lighting and media.

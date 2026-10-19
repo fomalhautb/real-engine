@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101820" />
+    <title>Real Engine — 世界空间反射</title>
+  </head>
+  <body>
+    <div class="reflection-app">
+      <header class="topbar">
+        <a class="brand" href="./">r<span>.</span> <small>REAL ENGINE</small></a>
+        <span class="topbar-title">WORLD-SPACE REFLECTION / 001</span>
+        <span id="status" class="status" role="status">正在初始化 WebGPU</span>
+      </header>
+      <main class="layout">
+        <section class="stage" aria-label="真实 WebGPU 镜面画廊">
+          <canvas id="viewport" aria-label="镜面反射相机后方的彩色实体几何"></canvas>
+          <div class="stage-caption"><span>镜中的彩色物体位于相机身后</span><span id="stage-mode">单段世界反射 · 开启</span></div>
+          <div id="error" class="error" role="alert" hidden></div>
+        </section>
+        <aside class="panel" aria-label="反射画廊控制">
+          <div class="panel-heading">
+            <span class="eyebrow">LIGHT STUDY / 05</span>
+            <h1>镜子里的<br /><em>另一侧。</em></h1>
+            <p>改变镜面粗糙度，让相机身后的彩色实体在真实世界空间反射里由清晰变得柔和。</p>
+          </div>
+          <section class="section">
+            <div class="section-title"><h2>镜面</h2><span>01 / MATERIAL</span></div>
+            <label class="toggle"><span>开启反射<small>关闭后保留镜面的 PBR 直接光照</small></span><input id="reflections-enabled" type="checkbox" checked /></label>
+            <label class="range"><span>粗糙度 <output id="roughness-value" for="roughness">0.045</output></span><input id="roughness" type="range" min="0.045" max="0.45" step="0.005" value="0.045" /></label>
+            <label class="toggle subtle"><span>开启薄雾<small>世界介质同时作用于主视线与反射光路</small></span><input id="fog-enabled" type="checkbox" checked /></label>
+          </section>
+          <section class="section">
+            <div class="section-title"><h2>场景</h2><span>02 / MOTION</span></div>
+            <p class="section-copy">暖金物体在镜子另一侧缓慢移动；暂停后仍可逐帧检查。</p>
+            <div class="actions"><button id="pause" type="button">暂停物体</button><button id="step" type="button">逐帧前进</button></div>
+          </section>
+          <section class="section metrics">
+            <div class="section-title"><h2>运行诊断</h2><span>GPU / FRAME</span></div>
+            <dl>
+              <div><dt>反射网格</dt><dd id="reflection-grid">—</dd></div>
+              <div><dt>锚点 / 光线</dt><dd id="reflection-rays">—</dd></div>
+              <div><dt>反射 GPU 时间</dt><dd id="gpu-time">—</dd></div>
+              <div><dt>采样帧</dt><dd id="gpu-frame">—</dd></div>
+              <div><dt>反射资源</dt><dd id="reflection-bytes">—</dd></div>
+              <div><dt>全部 GPU 资源</dt><dd id="gpu-bytes">—</dd></div>
+              <div><dt>视口</dt><dd id="viewport-size">—</dd></div>
+              <div><dt>渲染帧</dt><dd id="frame">—</dd></div>
+            </dl>
+          </section>
+          <p class="scope">单段世界空间反射、有限锚点与采样；目前没有镜中镜反射或反射时序重建。此页是功能展示，不代表大场景性能目标。</p>
+          <p id="adapter" class="adapter">等待 WebGPU 适配器…</p>
+        </aside>
+      </main>
+    </div>
+    <script type="module" src="/src/reflection-demo.ts"></script>
+  </body>
+</html>

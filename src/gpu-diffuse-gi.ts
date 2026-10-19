@@ -35,6 +35,8 @@ export class GpuDiffuseGi {
   private distanceWeights!: GPUBuffer;
   private probeBuffers!: [GPUBuffer, GPUBuffer];
   private surfaceGroups!: GPUBindGroup[][];
+  private surfaceLayoutEntries!: GPUBindGroupLayoutEntry[];
+  private surfaceVariants!: GPUBindGroupEntry[][];
   private currentIndex = 1;
   private readback!: GPUBuffer;
   private computeLayout!: GPUBindGroupLayout;
@@ -59,6 +61,15 @@ export class GpuDiffuseGi {
   private finalGatherEnabled = true;
 
   get surfaceGroup(): GPUBindGroup { return this.surfaceGroups[this.currentIndex][this.finalGather?.currentIndex ?? 0]; }
+  /** Borrowed resources; the GI owner retains allocation and disposal responsibility. */
+  get lightingParameters(): GPUBuffer { return this.parameters; }
+  get lightingProbeBuffers(): readonly [GPUBuffer, GPUBuffer] { return this.probeBuffers; }
+  get lightingIndex(): number { return this.currentIndex; }
+  get surfaceBindingLayoutEntries(): readonly GPUBindGroupLayoutEntry[] { return this.surfaceLayoutEntries; }
+  get surfaceBindingVariants(): readonly (readonly GPUBindGroupEntry[])[] { return this.surfaceVariants; }
+  get surfaceBindingIndex(): number {
+    return this.currentIndex * (this.finalGather?.outputBuffers.length ?? 1) + (this.finalGather?.currentIndex ?? 0);
+  }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: DiffuseGiOptions,
     account: (bytes: number) => void): Promise<GpuDiffuseGi> {
@@ -107,14 +118,15 @@ export class GpuDiffuseGi {
     this.computeGroups = this.probeBuffers.map((output, index) => device.createBindGroup({ layout: this.computeLayout,
       entries: [this.parameters, queries.rayBuffer, this.primary, queries.hitBuffer, output, this.probeBuffers[1 - index], this.distanceWeights]
         .map((buffer, binding) => ({ binding, resource: { buffer } })) }));
-    const surfaceLayout = device.createBindGroupLayout({ entries: [
+    this.surfaceLayoutEntries = [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
       ...(options.finalGather ? [
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' as const } },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' as const } },
       ] : []),
-    ] });
+    ];
+    const surfaceLayout = device.createBindGroupLayout({ entries: this.surfaceLayoutEntries });
     Object.assign(this, { surfaceLayout });
   }
   private buffer(label: string, size: number, usage: GPUBufferUsageFlags): GPUBuffer {
@@ -145,12 +157,15 @@ export class GpuDiffuseGi {
         this.options.maxBytes - this.bytes);
       this.checkMemoryBudget();
     }
-    this.surfaceGroups = this.probeBuffers.map(buffer => (this.finalGather?.outputBuffers ?? [undefined]).map(anchors =>
-      this.device.createBindGroup({ layout: this.surfaceLayout, entries: [
+    const gatherBuffers = this.finalGather?.outputBuffers ?? [undefined];
+    this.surfaceVariants = this.probeBuffers.flatMap(buffer => gatherBuffers.map(anchors => [
         { binding: 0, resource: { buffer: this.parameters } }, { binding: 1, resource: { buffer } },
         ...(anchors ? [{ binding: 2, resource: { buffer: this.finalGather!.surfaceParameters } },
           { binding: 3, resource: { buffer: anchors } }] : []),
-      ] })));
+      ]));
+    this.surfaceGroups = this.probeBuffers.map((_, probeIndex) => gatherBuffers.map((_, gatherIndex) =>
+      this.device.createBindGroup({ layout: this.surfaceLayout,
+        entries: this.surfaceVariants[probeIndex * gatherBuffers.length + gatherIndex] })));
   }
   private checkMemoryBudget(): void {
     if (this.bytes > this.options.maxBytes) throw new Error('DIFFUSE_GI_MEMORY_BUDGET');

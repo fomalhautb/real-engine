@@ -5,5 +5,5 @@ export default defineConfig({
   // so the first dynamic import cannot trigger a dependency-driven full reload.
   optimizeDeps: { include: ['meshoptimizer', 'meshoptimizer/clusterizer', 'meshoptimizer/simplifier',
     'meshoptimizer/encoder', 'meshoptimizer/decoder', 'meshoptimizer/tangents', '@dimforge/rapier3d-compat'] },
-  build: { rolldownOptions: { input: { main: 'index.html', benchmark: 'benchmark.html', geometry: 'geometry.html', gi: 'gi.html', fog: 'fog.html' } } },
+  build: { rolldownOptions: { input: { main: 'index.html', benchmark: 'benchmark.html', geometry: 'geometry.html', gi: 'gi.html', fog: 'fog.html', reflection: 'reflection.html' } } },
 });

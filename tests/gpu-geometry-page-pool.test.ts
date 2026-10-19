@@ -150,6 +150,100 @@ describe('GPU geometry page pool CPU lifecycle with deferred fake queue', () => 
     expect(pool.diagnostics().stagingBytes).toBe(0);
   });
 
+  it('retains root uploads while cancelling only undesired queued payloads', async () => {
+    const device = new FakeDevice();
+    const pool = await poolWithSlots(device, roots.length + 1);
+    enqueueRoots(pool);
+    const rootStaging = pool.diagnostics().stagingBytes;
+    const a = details[0], b = details[1];
+    pool.enqueue(a, pages[a]); pool.enqueue(b, pages[b]);
+    const allStaging = pool.diagnostics().stagingBytes;
+    pool.retainPendingPages([a]);
+    expect(pool.diagnostics()).toMatchObject({ pendingPages: [...roots, a], activePage: null });
+    expect(pool.diagnostics().stagingBytes).toBeLessThan(allStaging);
+    expect(pool.diagnostics().stagingBytes).toBeGreaterThan(rootStaging);
+    pool.retainPendingPages([]);
+    expect(pool.diagnostics().pendingPages).toEqual(roots);
+    expect(pool.diagnostics().stagingBytes).toBe(rootStaging);
+    expect(pool.enqueue(a, pages[a])).toBe('queued');
+  });
+
+  it('cancels a partial unpublished page and reuses its slot with a newer generation', async () => {
+    const device = new FakeDevice();
+    const pool = await poolWithSlots(device, roots.length + 1, {
+      maxUploadBytesPerFrame: 1024, maxUploadWritesPerFrame: 2,
+    });
+    enqueueRoots(pool);
+    let frame = uploadUntil(pool, roots);
+    const a = details[0], b = details[1];
+    pool.enqueue(a, pages[a]);
+    const staging = pool.diagnostics().stagingBytes;
+    const partial = pool.uploadFrame(frame++);
+    expect(partial.writes).toBeGreaterThan(0);
+    expect(pool.diagnostics()).toMatchObject({ pendingPages: [a], activePage: a, stagingBytes: staging });
+    expect(pool.clusterLocation(directory.pages[a].clusterIds[0])).toBeUndefined();
+    const writesBeforeCancellation = device.writes.length;
+    pool.retainPendingPages([]);
+    expect(device.writes).toHaveLength(writesBeforeCancellation);
+    expect(pool.diagnostics()).toMatchObject({ pendingPages: [], activePage: null, stagingBytes: 0,
+      residentPages: [...roots].sort((x, y) => x - y), evictions: 0 });
+    expect(new DataView(device.buffer('publication flags').data.buffer).getUint32(a * 4, true)).toBe(0);
+    pool.enqueue(b, pages[b]);
+    frame = uploadUntil(pool, [b], frame);
+    const replacement = pool.clusterLocation(directory.pages[b].clusterIds[0])!;
+    expect(replacement.slot).toBe(roots.length);
+    expect(replacement.generation).toBe(2);
+    expect(pool.enqueue(a, pages[a])).toBe('queued');
+    uploadUntil(pool, [a], frame);
+    expect(pool.clusterLocation(directory.pages[a].clusterIds[0])!.generation).toBeGreaterThan(replacement.generation);
+  });
+
+  it('does not alter published pages or held and submitted leases while cancelling pending uploads', async () => {
+    const device = new FakeDevice();
+    const pool = await poolWithSlots(device, roots.length + 2, { maxUploadBytesPerFrame: 1024 });
+    enqueueRoots(pool);
+    let frame = uploadUntil(pool, roots);
+    const a = details[0], b = details[1];
+    pool.enqueue(a, pages[a]); frame = uploadUntil(pool, [a], frame);
+    const location = pool.clusterLocation(directory.pages[a].clusterIds[0])!;
+    const held = pool.acquireFrame([a]), submitted = pool.acquireFrame([a]);
+    const completion = pool.submitFrame(submitted, [command]);
+    pool.enqueue(b, pages[b]); pool.uploadFrame(frame++);
+    expect(pool.diagnostics().activePage).toBe(b);
+    pool.retainPendingPages([]);
+    expect(pool.diagnostics()).toMatchObject({ pendingPages: [], activePage: null, framesInFlight: 2, leasedPages: [a] });
+    expect(pool.clusterLocation(directory.pages[a].clusterIds[0])).toMatchObject(location);
+    expect(new DataView(device.buffer('publication flags').data.buffer).getUint32(a * 4, true)).toBe(1);
+    expect(() => pool.cancelFrame(submitted)).toThrow(/FRAME_LEASE/);
+    pool.cancelFrame(held);
+    device.completeNext();
+    await expect(completion).resolves.toEqual({ error: null });
+    expect(pool.diagnostics().framesInFlight).toBe(0);
+    expect(pool.residentPageIds().has(a)).toBe(true);
+  });
+
+  it('validates the complete desired set before changing pending uploads', async () => {
+    const device = new FakeDevice();
+    const pool = await poolWithSlots(device, roots.length + 1, { maxUploadBytesPerFrame: 1024 });
+    enqueueRoots(pool);
+    let frame = uploadUntil(pool, roots);
+    const a = details[0], b = details[1];
+    pool.enqueue(a, pages[a]); pool.enqueue(b, pages[b]);
+    pool.uploadFrame(frame++);
+    const before = pool.diagnostics();
+    const writes = device.writes.length;
+    expect(() => pool.retainPendingPages([a, directory.pages.length])).toThrow(/PAGE_ID/);
+    expect(() => pool.retainPendingPages([a, -1])).toThrow(/PAGE_ID/);
+    expect(() => pool.retainPendingPages([a, 1.5])).toThrow(/PAGE_ID/);
+    expect(() => pool.retainPendingPages(Array(directory.pages.length + 1).fill(a))).toThrow(/PAGE_SET/);
+    expect(() => pool.retainPendingPages(new Set([a]) as unknown as number[])).toThrow(/PAGE_SET/);
+    expect(pool.diagnostics()).toMatchObject({ pendingPages: before.pendingPages, activePage: before.activePage,
+      stagingBytes: before.stagingBytes, residentPages: before.residentPages, evictions: before.evictions });
+    expect(device.writes).toHaveLength(writes);
+    pool.retainPendingPages([a]);
+    expect(pool.diagnostics().pendingPages).toEqual([a]);
+  });
+
   it('keeps pinned and held or submitted frame pages out of LRU reuse until release', async () => {
     const device = new FakeDevice();
     const pool = await poolWithSlots(device, roots.length + 1);

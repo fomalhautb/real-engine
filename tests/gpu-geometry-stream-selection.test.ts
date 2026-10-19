@@ -146,7 +146,7 @@ describe('GPU streamed selection ownership and failure lifecycle', () => {
     const device = new FakeDevice();
     const current = await selection(device);
     const { gpuBytes, maxFeedbackBytes } = current.diagnostics();
-    expect(maxFeedbackBytes).toBe(32 + directory.pages.length * 4 + directory.clusters.length * 4);
+    expect(maxFeedbackBytes).toBe(32 + (directory.pages.length + directory.groups.length + directory.clusters.length) * 4);
     const allocations = device.buffers.length;
     await expect(selection(device, () => {}, gpuBytes + maxFeedbackBytes - 1))
       .rejects.toThrow('GEOMETRY_STREAM_RESOURCE_BUDGET');

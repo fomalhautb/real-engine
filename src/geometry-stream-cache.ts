@@ -12,7 +12,7 @@ export interface GeometryPageCacheOptions {
 }
 type Resident = { page: DecodedGeometryPage; bytes: number; touched: number };
 type Request = { priority: number; sequence: number };
-type Active = { controller: AbortController; promise: Promise<void> };
+type Active = { controller: AbortController; promise: Promise<void>; discarded: boolean };
 
 function limit(value: number | undefined, fallback: number, maximum: number, label: string): number {
   const result = value ?? fallback;
@@ -134,6 +134,32 @@ export class GeometryPageCache {
     this.pinned = next; this.schedule();
   }
 
+  /** Retain the requested CPU working set, including pages still awaiting decode.
+   * Roots are always included. This does not enqueue missing pages. */
+  setRequestWindow(ids: readonly number[]): void {
+    this.live();
+    if (!Array.isArray(ids) || ids.length > this.directory.pages.length) throw new Error('GEOMETRY_STREAM_WINDOW_BUDGET');
+    const next = new Set(this.directory.rootPages);
+    let bytes = [...next].reduce((sum, id) => sum + this.directory.pages[id].decodedBytes, 0);
+    for (const id of ids) {
+      const page = this.page(id);
+      if (next.has(id)) continue;
+      next.add(id);
+      bytes += page.decodedBytes;
+      if (bytes > this.options.maxResidentBytes) throw new Error('GEOMETRY_STREAM_WINDOW_BUDGET');
+    }
+
+    this.pinned = next;
+    for (const id of this.queued.keys()) if (!next.has(id)) this.queued.delete(id);
+    // Abort listeners may reenter with a newer window; check its current pins each time.
+    for (const [id, entry] of [...this.active]) {
+      if (this.active.get(id) !== entry || this.pinned.has(id)) continue;
+      entry.discarded = true;
+      entry.controller.abort();
+    }
+    this.schedule();
+  }
+
   /** Wait for runnable queued work and active requests. Capacity-blocked requests may remain queued. */
   idle(): Promise<void> {
     if (this.disposed && !this.active.size) return Promise.resolve();
@@ -174,18 +200,18 @@ export class GeometryPageCache {
       }
       this.queued.delete(id);
       this.reservedBytes += page.decodedBytes; this.inFlightBytes += work; this.requestsStarted++;
-      const active: Active = { controller: new AbortController(), promise: Promise.resolve() };
+      const active: Active = { controller: new AbortController(), promise: Promise.resolve(), discarded: false };
       let reservationHeld = true;
       this.active.set(id, active);
       // Publish the actual lifetime promise before invoking external provider code.
       // A provider may synchronously trigger disposal or enqueue another request.
       active.promise = Promise.resolve().then(() => this.load(page, active.controller.signal)).then(decoded => {
         this.reservedBytes -= page.decodedBytes; reservationHeld = false;
-        if (this.disposed) return;
+        if (this.disposed || active.discarded) return;
         this.resident.set(id, { page: decoded, bytes: page.decodedBytes, touched: ++this.sequence });
         this.residentBytes += page.decodedBytes;
       }).catch(error => {
-        if (!this.disposed) this.failures.set(id, error instanceof Error ? error.message : String(error));
+        if (!this.disposed && !active.discarded) this.failures.set(id, error instanceof Error ? error.message : String(error));
       }).finally(() => {
         if (reservationHeld) this.reservedBytes -= page.decodedBytes;
         this.inFlightBytes -= work; this.active.delete(id);

@@ -3,12 +3,15 @@ import { packGeometryStreamSelection } from './geometry-stream-selection-data';
 import type { GpuGeometryPagePool } from './gpu-geometry-page-pool';
 import type { GeometryLodSettings } from './gpu-geometry-lod';
 import type { Mat4 } from './math';
+import type { GeometryGroupDemand } from './geometry-stream-working-set';
 
 /** Includes persistent buffers and the maximum one-at-a-time feedback buffer. */
 export interface GeometryStreamSelectionOptions { maxGpuBytes?: number }
 export interface GeometryStreamSelectionFeedback {
   frame: number;
   requestedPages: { pageId: number; priority: number }[];
+  /** Visible group demand independent of residency; used only for bounded allocation. */
+  desiredGroups: GeometryGroupDemand[];
   indices: number;
   overflow: boolean;
   /** Present only for explicit diagnostics, never required for page scheduling. */
@@ -36,7 +39,7 @@ export class GpuGeometryStreamSelection {
   private readonly parameterData: Uint32Array<ArrayBuffer>;
   private readonly parameterStride: number;
   private readonly viewData = new Float32Array(24);
-  private pipelines!: Record<'initialize' | 'refine' | 'compact' | 'finalize', GPUComputePipeline>;
+  private pipelines!: Record<'demand' | 'initialize' | 'refine' | 'compact' | 'finalize', GPUComputePipeline>;
   private hasView = false;
   private count = 0;
   private frame = 0;
@@ -58,8 +61,8 @@ export class GpuGeometryStreamSelection {
       const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
       if (errors.length) throw new Error(errors.map(e => `GEOMETRY_STREAM_SHADER:${e.lineNum}: ${e.message}`).join('\n'));
       const pipelines = {} as GpuGeometryStreamSelection['pipelines'];
-      for (const entryPoint of ['initialize', 'refine', 'compact', 'finalize'] as const) {
-        const layout = entryPoint === 'initialize' || entryPoint === 'refine' ? result.selectLayout : result.compactLayout;
+      for (const entryPoint of ['demand', 'initialize', 'refine', 'compact', 'finalize'] as const) {
+        const layout = ['demand', 'initialize', 'refine'].includes(entryPoint) ? result.selectLayout : result.compactLayout;
         pipelines[entryPoint] = await device.createComputePipelineAsync({ label: 'stream geometry ' + entryPoint,
           layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module, entryPoint } });
       }
@@ -90,13 +93,13 @@ export class GpuGeometryStreamSelection {
     for (let slot = 0; slot <= this.packed.levels.length; slot++) {
       const level = this.packed.levels[slot - 1];
       this.parameterData.set([directory.clusters.length, this.physicalVertexCount, 0, maxIndices,
-        level?.firstGroup ?? 0, level?.groupCount ?? 0, this.packed.clusterOffset, this.packed.groupOffset,
+        level?.firstGroup ?? 0, level?.groupCount ?? directory.groups.length, this.packed.clusterOffset, this.packed.groupOffset,
         this.packed.edgeOffset, directory.pages.length, level?.level ?? 0, 0], slot * this.parameterStride / 4);
     }
     const sizes = [96, this.parameterData.byteLength, this.packed.words.byteLength, pairs * 4,
-      directory.pages.length * 4, maxIndices * 4, 32];
+      (directory.pages.length + directory.groups.length) * 4, maxIndices * 4, 32];
     const budget = options.maxGpuBytes ?? 128 * 1024 * 1024;
-    this.feedbackBudget = 32 + directory.pages.length * 4 + pairs * 4;
+    this.feedbackBudget = 32 + sizes[4] + pairs * 4;
     this.maxGpuBytes = budget;
     if (!Number.isSafeInteger(budget) || budget < 1 || budget > 256 * 1024 * 1024
       || sizes.some(size => size > device.limits.maxBufferSize || size > device.limits.maxStorageBufferBindingSize)
@@ -107,7 +110,7 @@ export class GpuGeometryStreamSelection {
       this.params = this.buffer('immutable per-level stream parameters', sizes[1], GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
       const metadata = this.buffer('stream topology metadata', sizes[2], GPUBufferUsage.STORAGE, this.packed.words.buffer);
       this.selected = this.buffer('stream cut and visible flags', sizes[3], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-      this.requests = this.buffer('stream page request priorities', sizes[4], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+      this.requests = this.buffer('stream page requests and group demand', sizes[4], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
       this.indices = this.buffer('stream selected physical indices', sizes[5], GPUBufferUsage.STORAGE | GPUBufferUsage.INDEX | GPUBufferUsage.COPY_SRC);
       this.arguments = this.buffer('stream indirect draw arguments', sizes[6], GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
       const layouts = (bindings: number[]) => device.createBindGroupLayout({ entries: bindings.map(binding => ({ binding,
@@ -162,9 +165,10 @@ export class GpuGeometryStreamSelection {
     const dispatch = (entry: keyof GpuGeometryStreamSelection['pipelines'], work: number, offset = 0) => {
       if (!work) return;
       const pass = encoder.beginComputePass({ label: 'stream geometry ' + entry }); pass.setPipeline(this.pipelines[entry]);
-      pass.setBindGroup(0, entry === 'initialize' || entry === 'refine' ? this.selectGroup : this.compactGroup, [offset]);
+      pass.setBindGroup(0, ['demand', 'initialize', 'refine'].includes(entry) ? this.selectGroup : this.compactGroup, [offset]);
       pass.dispatchWorkgroups(entry === 'finalize' ? 1 : Math.ceil(work / 64)); pass.end();
     };
+    dispatch('demand', this.packed.directory.groups.length * this.count);
     dispatch('initialize', this.packed.directory.clusters.length * this.count);
     this.packed.levels.forEach((level, index) => dispatch('refine', level.groupCount * this.count, (index + 1) * this.parameterStride));
     dispatch('compact', this.packed.directory.clusters.length * this.count); dispatch('finalize', this.count);
@@ -175,24 +179,30 @@ export class GpuGeometryStreamSelection {
     this.live(); if (!this.encodedFrame) throw new Error('GEOMETRY_STREAM_NO_FRAME');
     if (this.reading) throw new Error('GEOMETRY_STREAM_FEEDBACK_BUSY');
     const frame = this.encodedFrame, directory = this.packed.directory, pairs = directory.clusters.length * this.count;
-    const bytes = 32 + directory.pages.length * 4 + (includeSelected ? pairs * 4 : 0);
+    const requestBytes = (directory.pages.length + directory.groups.length) * 4;
+    const bytes = 32 + requestBytes + (includeSelected ? pairs * 4 : 0);
     const read = this.device.createBuffer({ label: 'bounded stream requests and counters', size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     this.reading = read;
     try {
       this.track(bytes);
       const encoder = this.device.createCommandEncoder(); encoder.copyBufferToBuffer(this.arguments, 0, read, 0, 32);
-      encoder.copyBufferToBuffer(this.requests, 0, read, 32, directory.pages.length * 4);
-      if (includeSelected && pairs) encoder.copyBufferToBuffer(this.selected, 0, read, 32 + directory.pages.length * 4, pairs * 4);
+      encoder.copyBufferToBuffer(this.requests, 0, read, 32, requestBytes);
+      if (includeSelected && pairs) encoder.copyBufferToBuffer(this.selected, 0, read, 32 + requestBytes, pairs * 4);
       this.device.queue.submit([encoder.finish()]); await read.mapAsync(GPUMapMode.READ);
       const values = new Uint32Array(read.getMappedRange()), requestedPages: GeometryStreamSelectionFeedback['requestedPages'] = [];
       for (let id = 0; id < directory.pages.length; id++) if (values[8 + id]) requestedPages.push({ pageId: id, priority: values[8 + id] - 1 });
       requestedPages.sort((a, b) => b.priority - a.priority || a.pageId - b.pageId);
+      const floats = new Float32Array(values.buffer), desiredGroups: GeometryGroupDemand[] = [];
+      for (let ordinal = 0; ordinal < directory.groups.length; ordinal++) {
+        const projectedError = floats[8 + directory.pages.length + ordinal];
+        if (projectedError > 0) desiredGroups.push({ groupId: this.packed.groupIds[ordinal], projectedError });
+      }
       const selectedClusters = includeSelected ? [] as NonNullable<GeometryStreamSelectionFeedback['selectedClusters']> : undefined;
       if (selectedClusters) for (let i = 0; i < pairs; i++) {
-        const flag = values[8 + directory.pages.length + i], clusterId = i % directory.clusters.length;
+        const flag = values[8 + requestBytes / 4 + i], clusterId = i % directory.clusters.length;
         if (flag) selectedClusters.push({ clusterId, instanceIndex: Math.floor(i / directory.clusters.length), level: directory.clusters[clusterId].level, visible: flag === 2 });
       }
-      return { frame, requestedPages, indices: values[0], overflow: values[6] !== 0, selectedClusters };
+      return { frame, requestedPages, desiredGroups, indices: values[0], overflow: values[6] !== 0, selectedClusters };
     } finally { read.destroy(); if (this.reading === read) { this.reading = undefined; this.track(-bytes); } }
   }
   diagnostics() { return { frame: this.encodedFrame, instances: this.count, gpuBytes: this.bytes + (this.reading?.size ?? 0), disposed: this.disposed,

@@ -163,6 +163,21 @@ export class GpuGeometryPagePool {
     this.pending.set(pageId, { packed, bytes, priority, sequence: ++this.sequence, phase: 0, offset: 0 });
     this.stagingBytes += bytes; return 'queued';
   }
+  /** Discard upload payloads outside the desired set. Root uploads are retained;
+   * published pages and frame leases are independent of this staging decision. */
+  retainPendingPages(ids: readonly number[]): void {
+    this.live();
+    if (!Array.isArray(ids) || ids.length > this.directory.pages.length) throw new Error('GEOMETRY_GPU_POOL_PAGE_SET');
+    const desired = new Set<number>(this.directory.rootPages);
+    for (const id of ids) { this.page(id); desired.add(id); }
+    for (const [id, pending] of this.pending) {
+      if (desired.has(id)) continue;
+      if (pending.slot !== undefined) this.slots[pending.slot].page = null;
+      if (this.activePage === id) this.activePage = undefined;
+      this.pending.delete(id);
+      this.stagingBytes -= pending.bytes;
+    }
+  }
   residentPageIds(): ReadonlySet<number> { return new Set(this.resident.keys()); }
   private pageSet(ids: readonly number[]): Set<number> {
     if (!Array.isArray(ids) || ids.length > this.directory.pages.length) throw new Error('GEOMETRY_GPU_POOL_PAGE_SET');

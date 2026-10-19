@@ -17,6 +17,9 @@ test('native GPU stream cuts agree with per-instance CPU plans across residency,
   });
   expect(result.pages).toBeGreaterThan(1);
   expect(result.rootOnly.requests).toBeGreaterThan(0);
+  expect(result.rootOnly.desiredGroups.length).toBeGreaterThan(0);
+  expect(result.rootOnly.desiredGroups).toEqual(result.fine.desiredGroups);
+  expect(result.swapped.desiredGroups).toEqual(result.fine.desiredGroups);
   expect(result.fine.requests).toBe(0);
   expect(result.middle.requests).toBe(0);
   expect(result.coarse.requests).toBe(0);
@@ -24,10 +27,16 @@ test('native GPU stream cuts agree with per-instance CPU plans across residency,
   expect(result.middle.clusters).toBeGreaterThan(result.coarse.clusters);
   expect(result.frozen.clusters).toBe(result.middle.clusters);
   expect(result.frozen.indices).toBe(result.middle.indices);
+  expect(result.frozen.desiredGroups).toEqual(result.middle.desiredGroups);
   expect(result.farCount).not.toBe(result.middle.clusters);
+  expect(result.coarse.desiredGroups).toEqual([]);
   expect(result.culled.culledInstanceClusters).toBeGreaterThan(0);
   expect(result.culled.visibleClusters).toBeLessThan(result.culled.clusters);
   expect(result.zero).toMatchObject({ count: 0, clusters: 0, indices: 0, requests: 0, visibleClusters: 0 });
+  expect(result.zero.desiredGroups).toEqual([]);
+  expect(result.allOffscreen.visibleClusters).toBe(0);
+  expect(result.allOffscreen.indices).toBe(0);
+  expect(result.allOffscreen.desiredGroups).toEqual([]);
   expect(result.poolOwned).toBe(0);
   expect(result.selectionOwned).toBe(0);
   expect(result.pool).toMatchObject({ disposed: true, allocatedGpuBytes: 0, framesInFlight: 0 });

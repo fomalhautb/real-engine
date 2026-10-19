@@ -176,6 +176,122 @@ describe('bounded CPU geometry page cache', () => {
     } finally { await cache.dispose(); }
   });
 
+  it('validates a request window atomically and charges unique pages plus roots', async () => {
+    const [first, second] = otherIds;
+    const capacity = rootBytes() + directory.pages[first].decodedBytes;
+    const cache = await GeometryPageCache.create(directory, provider(), { maxResidentBytes: capacity });
+    try {
+      cache.setRequestWindow([first, first, directory.rootPages[0]]);
+      const pinned = cache.diagnostics().pinnedPages;
+      expect(pinned).toContain(first);
+      expect(pinned).toEqual(expect.arrayContaining([...directory.rootPages]));
+      expect(() => cache.setRequestWindow([first, second])).toThrow(/GEOMETRY_STREAM_WINDOW_BUDGET/);
+      expect(() => cache.setRequestWindow([first, -1])).toThrow(/GEOMETRY_STREAM_PAGE_ID/);
+      expect(() => cache.setRequestWindow(Array(directory.pages.length + 1).fill(first)))
+        .toThrow(/GEOMETRY_STREAM_WINDOW_BUDGET/);
+      expect(cache.diagnostics().pinnedPages).toEqual(pinned);
+      expect(cache.diagnostics().queuedRequests).toBe(0);
+    } finally { await cache.dispose(); }
+  });
+
+  it('retains a future decoded page until the window changes, then unblocks queued work', async () => {
+    const [first, second] = otherIds;
+    const capacity = rootBytes() + Math.max(directory.pages[first].decodedBytes, directory.pages[second].decodedBytes);
+    const cache = await GeometryPageCache.create(directory, provider(), { maxResidentBytes: capacity });
+    try {
+      cache.setRequestWindow([first]);
+      expect(cache.get(first)).toBeUndefined();
+      cache.request(first);
+      await cache.idle();
+      expect(cache.get(first)).toBeDefined();
+      cache.request(second);
+      await cache.idle();
+      expect(cache.diagnostics().queuedRequests).toBe(1);
+      expect(cache.get(first)).toBeDefined();
+      cache.setRequestWindow([second]);
+      await cache.idle();
+      expect(cache.get(first)).toBeUndefined();
+      expect(cache.get(second)).toBeDefined();
+      for (const root of directory.rootPages) expect(cache.get(root)).toBeDefined();
+    } finally { await cache.dispose(); }
+  });
+
+  it('removes excluded queued requests without starting them', async () => {
+    const [active, queued] = otherIds;
+    const held = heldProvider(new Set([active]));
+    const cache = await GeometryPageCache.create(directory, held.fetch, { maxConcurrentRequests: 1 });
+    try {
+      cache.request(active);
+      await eventually(() => held.waiting.has(active));
+      cache.request(queued);
+      cache.setRequestWindow([active]);
+      expect(cache.diagnostics().queuedRequests).toBe(0);
+      held.waiting.get(active)!.release();
+      await cache.idle();
+      expect(held.started).not.toContain(queued);
+    } finally { await cache.dispose(); }
+  });
+
+  it('aborts excluded active requests and discards late results and errors', async () => {
+    const [lateResult, lateError] = otherIds;
+    const waiting = new Map<number, { signal: AbortSignal; resolve: (value: Uint8Array) => void;
+      reject: (error: Error) => void }>();
+    const fetch: GeometryPageProvider = (page, signal) => {
+      if (directory.rootPages.includes(page.id)) return Promise.resolve(bytes(page.id));
+      return new Promise((resolve, reject) => waiting.set(page.id, { signal, resolve, reject }));
+    };
+    const cache = await GeometryPageCache.create(directory, fetch, { maxConcurrentRequests: 2 });
+    try {
+      cache.request(lateResult);
+      cache.request(lateError);
+      await eventually(() => waiting.size === 2);
+      const reservation = cache.diagnostics().reservedBytes;
+      cache.setRequestWindow([]);
+      expect(waiting.get(lateResult)!.signal.aborted).toBe(true);
+      expect(waiting.get(lateError)!.signal.aborted).toBe(true);
+      expect(cache.diagnostics().reservedBytes).toBe(reservation);
+      expect(cache.diagnostics().activeRequests).toBe(2);
+      waiting.get(lateResult)!.resolve(bytes(lateResult));
+      waiting.get(lateError)!.reject(new Error('late provider failure'));
+      await cache.idle();
+      expect(cache.get(lateResult)).toBeUndefined();
+      expect(cache.get(lateError)).toBeUndefined();
+      expect(cache.diagnostics().failedPages).toEqual([]);
+      expect(cache.diagnostics().reservedBytes).toBe(0);
+      expect(cache.diagnostics().inFlightBytes).toBe(0);
+      expect(cache.diagnostics().pinnedPages).toEqual([...directory.rootPages].sort((a, b) => a - b));
+    } finally { await cache.dispose(); }
+  });
+
+  it('lets a reentrant newer window retain an active page', async () => {
+    const [first, second] = otherIds;
+    const waiting = new Map<number, { signal: AbortSignal; release: () => void }>();
+    let cache!: GeometryPageCache;
+    const fetch: GeometryPageProvider = (page, signal) => {
+      if (directory.rootPages.includes(page.id)) return Promise.resolve(bytes(page.id));
+      return new Promise(resolve => {
+        waiting.set(page.id, { signal, release: () => resolve(bytes(page.id)) });
+        if (page.id === first) signal.addEventListener('abort', () => cache.setRequestWindow([second]), { once: true });
+      });
+    };
+    cache = await GeometryPageCache.create(directory, fetch, { maxConcurrentRequests: 2,
+      maxResidentBytes: rootBytes() + directory.pages[first].decodedBytes + directory.pages[second].decodedBytes });
+    try {
+      cache.request(first);
+      cache.request(second);
+      await eventually(() => waiting.size === 2);
+      cache.setRequestWindow([]);
+      expect(waiting.get(first)!.signal.aborted).toBe(true);
+      expect(waiting.get(second)!.signal.aborted).toBe(false);
+      waiting.get(first)!.release();
+      waiting.get(second)!.release();
+      await cache.idle();
+      expect(cache.get(first)).toBeUndefined();
+      expect(cache.get(second)).toBeDefined();
+      expect(cache.diagnostics().failedPages).toEqual([]);
+    } finally { await cache.dispose(); }
+  });
+
   it('evicts the least recently used unpinned leaf after a read refreshes its age', async () => {
     const bySize = [...otherIds].sort((a, b) => directory.pages[a].decodedBytes - directory.pages[b].decodedBytes);
     const incoming = bySize[0], oldest = bySize[bySize.length - 1], recent = bySize[1];

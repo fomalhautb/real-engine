@@ -46,6 +46,22 @@ fn visible(at:u32,model:mat4x4f)->bool {
         || center.y+center.w+radius.y+radius.w<0 || center.w-center.y+radius.w+radius.y<0
         || center.z+radius.z<0 || center.w-center.z+radius.w+radius.z<0);
 }
+// Demand is independent of the current cut. Otherwise a missing ancestor hides
+// descendant demand and an LRU scheduler can repeatedly throw away its own path.
+// Positive f32 bits are ordered as u32, allowing one maximum across instances.
+@compute @workgroup_size(64)
+fn demand(@builtin(global_invocation_id) invocation:vec3u) {
+    let index=invocation.x;
+    if(index>=params.groupCount*params.instanceCount){return;}
+    let group=index%params.groupCount; let at=params.groupOffset+group*12u;
+    if(metadata[at+7u]!=0u){return;}
+    let model=instances[index/params.groupCount].model;
+    if(!visible(at,model)){return;}
+    let bounds=worldBounds(vector(at),vector(at+4u),model);
+    let distance=length(max(abs(view.eye.xyz-bounds.center)-bounds.extent,vec3f(0)));
+    let pixels=bitcast<f32>(metadata[at+3u])*scaleBound(model)*view.lod.x/max(view.lod.y,distance);
+    if(pixels>view.lod.z){atomicMax(&requests[params.pageCount+group],bitcast<u32>(min(pixels,1e30)));}
+}
 @compute @workgroup_size(64)
 fn initialize(@builtin(global_invocation_id) invocation:vec3u) {
     let index=invocation.x;

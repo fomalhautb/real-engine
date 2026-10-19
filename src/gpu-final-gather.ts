@@ -115,8 +115,8 @@ function inverseProjection(matrix: ArrayLike<number>): Float32Array<ArrayBuffer>
   return output;
 }
 
-/** World-query first-segment diffuse transport at a bounded screen grid. The world
- * irradiance field supplies secondary bounces at the actual first hit. Camera
+/** Bounded world-query diffuse transport at a screen grid. The world
+ * irradiance field supplies remaining bounces at the terminal hit. Camera
  * motion reprojects raw history through validated surface identities/geometry. */
 export class GpuFinalGather {
   readonly options: ResolvedFinalGatherOptions;
@@ -135,6 +135,7 @@ export class GpuFinalGather {
   private sourceBlocks = 0;
   private activeEmitters = 0;
   private areaRayCount = 0;
+  private pathSegments = 1;
   private grid: FinalGatherGridPlan = { spacing: 1, columns: 0, rows: 0, anchorCount: 0, rayCount: 0 };
   private historyUpdates = 0;
   private historyResetReason = 'initial';
@@ -144,13 +145,16 @@ export class GpuFinalGather {
   private parameters!: GPUBuffer;
   private cameraHits!: GPUBuffer;
   private primaryHits!: GPUBuffer;
+  private throughput!: GPUBuffer;
+  private pathParameters!: GPUBuffer[];
   private anchors!: [GPUBuffer, GPUBuffer];
   private filteredAnchors!: GPUBuffer;
   private readback!: GPUBuffer;
   private areaSamples!: GPUBuffer;
   private pipelines!: Record<EntryPoint, GPUComputePipeline>;
-  private groups!: Record<Exclude<EntryPoint, 'integrate' | 'generateArea' | 'integrateArea' | 'accumulate' | 'denoise'>, GPUBindGroup>;
-  private integrateGroups!: GPUBindGroup[][];
+  private groups!: Record<Exclude<EntryPoint, 'generateHemisphere' | 'integrate' | 'generateArea' | 'integrateArea' | 'accumulate' | 'denoise'>, GPUBindGroup>;
+  private hemisphereGroups!: GPUBindGroup[];
+  private integrateGroups!: GPUBindGroup[][][];
   private areaIntegrateGroups!: GPUBindGroup[];
   private accumulateGroups!: GPUBindGroup[];
   private denoiseGroups!: GPUBindGroup[];
@@ -210,14 +214,19 @@ export class GpuFinalGather {
     const cap = this.anchorCapacity, rayCapacity = cap * this.options.raysPerAnchor;
     this.preflight([PARAMETER_BYTES, cap * WORLD_HIT_BYTES, rayCapacity * WORLD_HIT_BYTES,
       cap * FINAL_GATHER_ANCHOR_BYTES, cap * FINAL_GATHER_ANCHOR_BYTES, cap * FINAL_GATHER_ANCHOR_BYTES,
-      this.queries.options.maxRays * AREA_SAMPLE_BYTES, READBACK_BYTES]);
+      this.queries.options.maxRays * AREA_SAMPLE_BYTES, READBACK_BYTES, rayCapacity * 16,
+      ...Array<number>(this.options.pathSegments).fill(16)]);
     if (Math.ceil(this.queries.options.maxRays / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) {
       throw new Error('FINAL_GATHER_DISPATCH_LIMIT');
     }
     this.parameters = this.buffer('surface final gather parameters', PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.cameraHits = this.buffer('surface final gather exact camera hits', cap * WORLD_HIT_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    this.primaryHits = this.buffer('surface final gather first-segment hits', rayCapacity * WORLD_HIT_BYTES,
+    this.primaryHits = this.buffer('surface final gather current-segment hits', rayCapacity * WORLD_HIT_BYTES,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    this.throughput = this.buffer('surface final gather path throughput', rayCapacity * 16, GPUBufferUsage.STORAGE);
+    this.pathParameters = Array.from({ length: this.options.pathSegments }, (_, segment) =>
+      this.buffer('surface final gather immutable path segment ' + segment, 16, GPUBufferUsage.UNIFORM,
+        new Uint32Array([segment, this.options.pathSegments, 0, 0])));
     this.anchors = [this.buffer('surface final gather A', cap * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC),
       this.buffer('surface final gather B', cap * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC)];
     this.filteredAnchors = this.buffer('surface final gather filtered output', cap * FINAL_GATHER_ANCHOR_BYTES,
@@ -239,13 +248,16 @@ export class GpuFinalGather {
     const p = this.pipelines, q = this.queries;
     this.groups = {
       generateCamera: this.bind(p.generateCamera, [[0, this.parameters], [2, q.rayBuffer]]),
-      generateHemisphere: this.bind(p.generateHemisphere, [[0, this.parameters], [1, this.giParameterBuffer], [2, q.rayBuffer], [4, this.cameraHits]]),
-      generateShadows: this.bind(p.generateShadows, [[0, this.parameters], [1, this.giParameterBuffer], [2, q.rayBuffer], [5, this.primaryHits]]),
+      generateShadows: this.bind(p.generateShadows, [[0, this.parameters], [1, this.giParameterBuffer], [2, q.rayBuffer],
+        [5, this.primaryHits], [15, this.throughput]]),
       clearArea: this.bind(p.clearArea, [[0, this.parameters], [2, q.rayBuffer], [13, this.areaSamples]]),
     };
-    this.integrateGroups = this.anchors.map(output => this.giProbeBuffers.map(probes => this.bind(p.integrate,
+    this.hemisphereGroups = this.pathParameters.map(path => this.bind(p.generateHemisphere,
+      [[0, this.parameters], [1, this.giParameterBuffer], [2, q.rayBuffer], [4, this.cameraHits],
+        [5, this.primaryHits], [14, path], [15, this.throughput]]));
+    this.integrateGroups = this.anchors.map(output => this.giProbeBuffers.map(probes => this.pathParameters.map(path => this.bind(p.integrate,
       [[0, this.parameters], [1, this.giParameterBuffer], [3, q.hitBuffer], [4, this.cameraHits],
-        [5, this.primaryHits], [6, output], [8, probes]])));
+        [5, this.primaryHits], [6, output], [8, probes], [14, path], [15, this.throughput]]))));
     this.areaIntegrateGroups = this.anchors.map(output => this.bind(p.integrateArea,
       [[0, this.parameters], [3, q.hitBuffer], [6, output], [13, this.areaSamples]]));
     this.accumulateGroups = this.anchors.map((output, index) => this.bind(p.accumulate,
@@ -354,6 +366,7 @@ export class GpuFinalGather {
     this.grid = grid; this.frame = input.frame; this.materialRevision = input.materialRevision;
     this.cameraMoving = cameraMoving;
     this.enabled = input.enabled; this.sourceBlocks = sourceBlocks; this.activeEmitters = activeEmitters;
+    this.pathSegments = input.multiBounce ? this.options.pathSegments : 1;
     this.areaRayCount = input.enabled ? sourceBlocks * grid.anchorCount : 0;
     const data = new Float32Array(PARAMETER_BYTES / 4), integers = new Uint32Array(data.buffer);
     data.set(inverse); data.set(previousProjection, 16); data.set(input.eye, 32);
@@ -404,12 +417,14 @@ export class GpuFinalGather {
         timing && { querySet: timing.querySet, beginningOfPassWriteIndex: timing.beginningOfPassWriteIndex });
       let uploaded = this.queries.encodeTrace(encoder, grid.anchorCount, 0, materialRevision);
       encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.cameraHits, 0, grid.anchorCount * WORLD_HIT_BYTES);
-      dispatch('generateHemisphere', grid.rayCount, this.groups.generateHemisphere);
-      uploaded += this.queries.encodeTrace(encoder, grid.rayCount, 0, materialRevision);
-      encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.primaryHits, 0, grid.rayCount * WORLD_HIT_BYTES);
-      dispatch('generateShadows', grid.rayCount, this.groups.generateShadows);
-      uploaded += this.queries.encodeTrace(encoder, grid.rayCount, 0, materialRevision);
-      dispatch('integrate', grid.anchorCount, this.integrateGroups[output][giIndex]);
+      for (let segment = 0; segment < this.pathSegments; segment++) {
+        dispatch('generateHemisphere', grid.rayCount, this.hemisphereGroups[segment]);
+        uploaded += this.queries.encodeTrace(encoder, grid.rayCount, 0, materialRevision);
+        encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.primaryHits, 0, grid.rayCount * WORLD_HIT_BYTES);
+        dispatch('generateShadows', grid.rayCount, this.groups.generateShadows);
+        uploaded += this.queries.encodeTrace(encoder, grid.rayCount, 0, materialRevision);
+        dispatch('integrate', grid.anchorCount, this.integrateGroups[output][giIndex][segment]);
+      }
       if (this.areaRayCount) {
         dispatch('clearArea', this.areaRayCount, this.groups.clearArea);
         for (const batch of this.batches) if (batch.count) dispatch('generateArea', grid.anchorCount, batch.group);
@@ -488,8 +503,9 @@ export class GpuFinalGather {
 
   diagnostics() {
     const anchors = this.enabled ? this.grid.anchorCount : 0;
-    const hemisphere = this.enabled ? this.grid.rayCount : 0;
+    const hemisphere = this.enabled ? this.grid.rayCount * this.pathSegments : 0;
     const area = this.enabled ? this.areaRayCount : 0;
+    const queryPasses = this.enabled ? 1 + 2 * this.pathSegments + Number(area > 0) : 0;
     return { enabled: this.enabled, frame: this.encodedFrame, options: this.options, ownedGpuBytes: this.bytes,
       representation: this.queries.diagnostics().geometryRepresentations.some(entry => entry.geometry.kind === 'fixed-query-proxy')
         ? 'fixed-query-proxy-camera-hit-screen-grid-irradiance' : 'exact-camera-hit-screen-grid-irradiance',
@@ -502,12 +518,15 @@ export class GpuFinalGather {
       update: 'full-grid-every-frame',
       actualSpacing: this.grid.spacing, columns: this.grid.columns, rows: this.grid.rows,
       anchorCapacity: this.anchorCapacity, anchorsPerUpdate: anchors, hemisphereRaysPerUpdate: hemisphere,
+      pathSegmentsPerUpdate: this.enabled ? this.pathSegments : 0,
+      pathTermination: 'completed-world-GI-at-terminal-hit',
+      throughputBytes: this.throughput.size, immutablePathParameterBytes: this.pathParameters.length * 16,
       areaRaysPerUpdate: area, areaRayCapacity: this.queries.options.maxRays,
       activeEmitters: this.activeEmitters, registeredEmitters: this.batches.length,
       inactiveEmitterBlockRaysPerUpdate: this.enabled ? (this.sourceBlocks - this.activeEmitters) * anchors : 0,
       queryRaysPerUpdate: anchors + hemisphere * 2 + area,
-      queryPassesPerUpdate: this.enabled ? 3 + Number(area > 0) : 0,
-      maxWorkUnitsPerUpdate: this.enabled ? this.queries.options.maxTotalWorkUnits * (3 + Number(area > 0)) : 0,
+      queryPassesPerUpdate: queryPasses,
+      maxWorkUnitsPerUpdate: this.queries.options.maxTotalWorkUnits * queryPasses,
       historyUpdates: this.historyUpdates, nominalHistoryUpdates: this.historyUpdates,
       historyUpdatesMeaning: 'nominal-completed-updates-since-global-reset', historyResetReason: this.historyResetReason,
       temporalAccumulation: 'surface-validated-raw-camera-reprojection', cameraReprojection: true,

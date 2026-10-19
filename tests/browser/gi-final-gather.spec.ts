@@ -37,7 +37,7 @@ test('surface final gather preserves sky energy and responds to offscreen occlud
   expect(result.resized.gi?.finalGather?.enabled).toBe(true);
 });
 
-test('surface final gather is compared with matched near-contact path references', async ({ page }, testInfo) => {
+for (const pathSegments of [1, 2]) test(`surface final gather ${pathSegments} segments is compared with matched near-contact path references`, async ({ page }, testInfo) => {
   test.skip(process.env.PLAYWRIGHT_GPU !== 'hardware',
     'Dense contact accuracy capture requires native hardware; software CI retains sky, emission and base-reference coverage.');
   test.setTimeout(360_000);
@@ -46,12 +46,12 @@ test('surface final gather is compared with matched near-contact path references
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
   await page.evaluate(() => { window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose(); });
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async (pathSegments: number) => {
     const module = await import('/tests/browser/fixtures/' + 'gi-contact-reference.ts') as {
       runGiContactReferenceFixture: typeof runGiContactReferenceFixture;
     };
-    return module.runGiContactReferenceFixture({ finalGather: true });
-  });
+    return module.runGiContactReferenceFixture({ finalGather: true, pathSegments });
+  }, pathSegments);
   const profile = result.samples.flatMap((sample, index) => {
     if (!sample.pixelReference || !result.gather) return [];
     const off = result.cases.off.hdr[index];
@@ -63,7 +63,13 @@ test('surface final gather is compared with matched near-contact path references
       relativeAfter: gathered.map((x, c) => Math.abs(x - reference[c]) / reference[c]) }];
   });
   console.log('FINAL_GATHER_CONTACT ' + JSON.stringify({ profile,
-    diagnostics: result.gather?.multi.gi?.finalGather }));
+    diagnostics: result.gather?.multi.gi?.finalGather,
+    anchors: result.gather?.multiAnchors.anchors.map(anchor => ({ index: anchor.index,
+      position: anchor.position, identity: anchor.identity, raw: anchor.irradiance,
+      filtered: anchor.filteredIrradiance })),
+    anchorReferences: result.anchorReferences.map(item => ({ nearSample: item.nearSample,
+      anchorIndex: item.anchorIndex, position: item.anchorPosition,
+      one: item.estimate.oneBounce.mean, twelve: item.estimate.twelveBounce.mean })) }));
   const jsonPath = testInfo.outputPath('gi-final-gather-contact.json');
   await writeFile(jsonPath, JSON.stringify({ ...result, profile }, null, 2));
   await testInfo.attach('gi-final-gather-contact.json', { path: jsonPath, contentType: 'application/json' });
@@ -76,12 +82,20 @@ test('surface final gather is compared with matched near-contact path references
   expect(result.errors).toEqual([]); expect(result.afterDispose).toBe(0);
   expect(result.gather?.multi.gi?.finalGather?.enabled).toBe(true);
   expect(result.gather?.multi.gi?.finalGather?.actualSpacing).toBe(4);
+  expect(result.gather?.single.gi?.finalGather?.pathSegmentsPerUpdate).toBe(1);
+  expect(result.gather?.multi.gi?.finalGather?.pathSegmentsPerUpdate).toBe(pathSegments);
+  expect(result.anchorReferences).toHaveLength(2);
   expect(profile).toHaveLength(5);
   for (const sample of profile) for (const value of sample.gathered) expect(Number.isFinite(value)).toBe(true);
   const meanBefore = profile.flatMap(sample => sample.relativeBefore).reduce((a, b) => a + b, 0) / 15;
   const meanAfter = profile.flatMap(sample => sample.relativeAfter).reduce((a, b) => a + b, 0) / 15;
   expect(meanAfter).toBeLessThan(meanBefore * 0.5);
   expect(meanAfter).toBeLessThan(0.2);
-  // Improvement regression, not the complete GI acceptance gate: individual
-  // contact channels and moving-camera quality still require further work.
+  if (pathSegments === 2) {
+    // Original frozen contact gate; neither reference locations nor tolerances
+    // change when evaluating the extra exact diffuse segment.
+    expect(meanAfter).toBeLessThan(0.1);
+    for (const sample of profile) for (const error of sample.relativeAfter) expect(error).toBeLessThan(0.2);
+  }
+  // This contact gate does not cover complete-scene or moving-camera quality.
 });

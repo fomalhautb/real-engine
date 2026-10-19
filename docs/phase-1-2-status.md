@@ -23,6 +23,12 @@
 
 ## 阶段 2
 
+本轮多段 Final Gather 新增 `pathSegments: 1–4`（API 默认 1，GI 演示采用 2）。两段精确表面追踪后再读取世界探针，原五个地面接触像素对独立参考的平均 / 最差 RGB 相对误差降至 **4.844% / 12.036%**，通过这组原定 **10% / 20%** 门槛；一段仍为 11.288% / 30.774%。相机移动回归也通过，额外查询量增加 50%，整幅图的噪声、复杂漏光和目标规模性能仍待验收。新结果与旧快照分开记录于 [implementation.md](implementation.md#有界多段-final-gather-与接触区验收)，不将该接触区测试等同整个 GI 工作包完成。
+
+大型场景已实际审计 Intel 新版 Sponza 的 ZIP 目录、glTF 和许可：声明约 205 万独特 POSITION 顶点、374.7 万 primitive 三角形，识别出 UV1、顶点色、透明、灯光扩展和导入预算的直接障碍。新只读 `audit:gltf` CLI 可复用；几何 BIN / 贴图尚未下载或导入，场景驻留量与视觉验收仍未完成。范围与资产哈希见 implementation.md。
+
+多段版本本地检查为 455 项 CPU / 57 文件、完整 NVIDIA 浏览器 97/97；随后升级为两段的联合用例另在 NVIDIA 通过，新增路径与联合用例在 Intel 和 SwiftShader 各 10/10。相同源码/构建的 1080p 三轮性能中，两段后两轮 GPU p95 约 28 ms、rAF p95 约 28 ms，稳定性能门槛未通过；随后带温度/频率观察的单轮回到约 6 ms，原因仍未隔离，不能据成功复测删去失败证据。目标规模和联合长测仍未完成。
+
 两阶段遮挡版已通过 444 项 CPU 测试（55 文件）、类型/构建及完整原生 NVIDIA 浏览器回归 86/86；三个新增用例另在 Intel 核显与 SwiftShader 分别通过。驻留/分页背板在所测遮挡下从 2,048 个三角形分别降至 672 / 216，移墙首帧恢复全部暂缓簇；另有实际 PBR 恢复表面与 GI、Final Gather、反射和雾共同启用的数值对照。日志、失败修正和范围见 [implementation.md](implementation.md#可选两阶段遮挡剔除)。这不是目标大场景帧率或整个可见性工作包的完成证明。
 
 新增有界单段世界空间反射，接入主 Renderer，支持离屏几何、共享材质/形变、太阳阴影、可选世界 GI 探针和沿反射光程的世界介质积分。已验证实际 HDR/锚点数值、移动/增删、粗糙度与材质更新、GI＋Final Gather＋雾配置、离屏 Mask/Morph/skin/wave 响应，以及独立 PBR/太阳遮挡参考、非零 GI、掠射角 BRDF/PDF 和完整 uint32 身份。`/reflection.html` 提供实际镜面和相机身后实体的演示与开关。本轮 420 项 CPU 测试（53 文件）、类型和构建通过；NVIDIA 完整浏览器回归 83/83 通过，日志 `artifacts/reflections-check-release-20261020-final.log`、`artifacts/reflections-browser-final-native-20261020.log`。跨适配器结果和软件浮点容差复核详见 implementation.md。仍无反射时序积累、多段递归、最终画质/性能证明；分页代理与细节主表面的重建兼容、目标规模及全部组合仍需继续验收，不能把该功能切片计为整个反射工作包完成。此前时序雾提交 `8c5184d` 的[远程 CI run 39278309763](https://github.com/fomalhautb/real-engine/actions/runs/39278309763) 已成功；该结果不覆盖本轮反射提交。

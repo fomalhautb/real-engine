@@ -5,7 +5,7 @@ describe('final gather CPU contract', () => {
   it('resolves immutable defaults and independent normal bias', () => {
     const defaults = resolveFinalGatherOptions();
     expect(defaults).toEqual({ pixelSpacing: 8, maxAnchors: 16_384, raysPerAnchor: 2,
-      maxHistory: 64, normalBias: 0.0001, maxBytes: 16 * 1024 * 1024 });
+      pathSegments: 1, maxHistory: 64, normalBias: 0.0001, maxBytes: 16 * 1024 * 1024 });
     expect(Object.isFrozen(defaults)).toBe(true);
     expect(resolveFinalGatherOptions({ pixelSpacing: 1, normalBias: 0.01 }).normalBias).toBe(0.01);
     expect(resolveFinalGatherOptions({ pixelSpacing: 128, normalBias: 0 }).normalBias).toBe(0);
@@ -17,6 +17,7 @@ describe('final gather CPU contract', () => {
     for (const [key, bad] of [
       ['pixelSpacing', 0], ['pixelSpacing', 129], ['maxAnchors', 0], ['maxAnchors', 65_537],
       ['raysPerAnchor', 0], ['raysPerAnchor', 17], ['maxHistory', 0], ['maxHistory', 257],
+      ['pathSegments', 0], ['pathSegments', 5], ['pathSegments', 1.5],
       ['normalBias', -1], ['normalBias', 0.011], ['maxBytes', 0], ['maxBytes', 64 * 1024 * 1024 + 1],
     ] as const) {
       expect(() => resolveFinalGatherOptions({ [key]: bad })).toThrow();

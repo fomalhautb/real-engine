@@ -47,6 +47,9 @@ struct FinalGatherAreaSample {
 @group(0) @binding(11) var<storage, read> indices: array<u32>;
 @group(0) @binding(12) var<storage, read> identities: array<vec4u>;
 @group(0) @binding(13) var<storage, read_write> areaSamples: array<FinalGatherAreaSample>;
+// Immutable per-dispatch path parameters; no queue overwrite between encoded segments.
+@group(0) @binding(14) var<uniform> path: vec4u; // segment index, configured segment count, reserved
+@group(0) @binding(15) var<storage, read_write> throughput: array<vec4f>;
 
 // GI_INTERPOLATE
 
@@ -67,7 +70,7 @@ fn gatherRandom(value: u32) -> f32 {
     return f32(gatherHash(value) >> 8u) * (1.0 / 16777216.0);
 }
 fn gatherDirection(anchor: u32, sample: u32, normal: vec3f) -> vec3f {
-    let seed = gatherHash(anchor ^ (gather.state.x * 0x9e3779b9u));
+    let seed = gatherHash(anchor ^ (gather.state.x * 0x9e3779b9u) ^ (path.x * 0x85ebca6bu));
     let u = (f32(sample) + gatherRandom(seed)) / f32(gather.settings.z);
     let v = gatherRandom(seed ^ (sample * 0x632be59bu) ^ 0xa511e9b3u);
     let radius = sqrt(u);
@@ -103,17 +106,26 @@ fn generateCamera(@builtin(global_invocation_id) id: vec3u) {
 fn generateHemisphere(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= gather.settings.y * gather.settings.z) { return; }
     let anchor = id.x / gather.settings.z;
-    let hit = cameraHits[anchor];
+    var hit = cameraHits[anchor];
+    var weight = vec3f(1.0);
+    if (path.x != 0u) {
+        hit = primaryHits[id.x];
+        weight = throughput[id.x].xyz * hit.baseColor.xyz * (1.0 - hit.previous.w) * 0.96;
+        if (hit.emissive.w != 0.0) { weight = vec3f(0.0); }
+    }
     var ray = gatherEmptyRay();
-    if (hit.identity.x != 0u && hit.work.z == 0u) {
+    var continues = false;
+    if (hit.identity.x != 0u && hit.work.z == 0u && any(weight > vec3f(0.0))) {
         let direction = gatherDirection(anchor, id.x % gather.settings.z, hit.normal.xyz);
         let geometryNormal = gatherHitGeometry(hit);
         if (dot(direction, geometryNormal) > 0.0) {
             ray = Ray(vec4f(hit.position.xyz + geometryNormal * gather.sampling.x, 0.00001),
                 vec4f(direction, gi.spacing.w), vec4u(0u));
+            continues = true;
         }
     }
     rays[id.x] = ray;
+    throughput[id.x] = vec4f(select(vec3f(0.0), weight, continues), select(0.0, 1.0, continues));
 }
 
 @compute @workgroup_size(64)
@@ -121,7 +133,7 @@ fn generateShadows(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= gather.settings.y * gather.settings.z) { return; }
     let hit = primaryHits[id.x];
     var ray = gatherEmptyRay();
-    if (hit.identity.x != 0u && hit.work.z == 0u && hit.emissive.w == 0.0
+    if (throughput[id.x].w != 0.0 && hit.identity.x != 0u && hit.work.z == 0u && hit.emissive.w == 0.0
         && dot(hit.normal.xyz, gi.sunDirection.xyz) > 0.0
         && dot(gatherHitGeometry(hit), gi.sunDirection.xyz) > 0.0 && any(gi.sunColor.xyz > vec3f(0.0))) {
         ray = Ray(vec4f(hit.position.xyz + gatherHitGeometry(hit) * gather.sampling.x, 0.00001),
@@ -145,11 +157,17 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     var primaryFailures = select(0u, 1u, camera.work.z != 0u || !cameraSnapshotValid);
     var shadowFailures = 0u;
     var irradiance = vec3f(0.0);
+    if (path.x != 0u) {
+        result = anchors[id.x];
+        primaryFailures = result.state.z;
+        shadowFailures = result.state.w;
+        irradiance = result.irradiance.xyz;
+    }
     if (camera.identity.x != 0u && camera.work.z == 0u && cameraSnapshotValid) {
         for (var sample = 0u; sample < gather.settings.z; sample++) {
-            let direction = gatherDirection(id.x, sample, camera.normal.xyz);
-            if (dot(direction, gatherHitGeometry(camera)) <= 0.0) { continue; }
             let index = id.x * gather.settings.z + sample;
+            let weight = throughput[index];
+            if (weight.w == 0.0) { continue; }
             let hit = primaryHits[index];
             let shadow = hits[index];
             primaryFailures += select(0u, 1u, hit.work.z != 0u
@@ -158,7 +176,8 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
                 || shadow.versions.x != gather.state.x || shadow.versions.w != gather.emissive.z);
             var incoming = gi.sky.xyz;
             if (hit.identity.x != 0u) {
-                let includeEmission = gather.emissive.x == 0u || hit.work.w == 0u;
+                // Only the first segment has a separate camera-to-emitter area estimate.
+                let includeEmission = path.x != 0u || gather.emissive.x == 0u || hit.work.w == 0u;
                 incoming = select(vec3f(0.0), hit.emissive.xyz, includeEmission);
                 if (hit.emissive.w != 0.0) {
                     incoming += select(vec3f(0.0), hit.baseColor.xyz, includeEmission);
@@ -167,13 +186,13 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
                     let cosine = select(0.0, max(0.0, dot(hit.normal.xyz, gi.sunDirection.xyz)),
                         dot(gatherHitGeometry(hit), gi.sunDirection.xyz) > 0.0);
                     var hitIrradiance = gi.sunColor.xyz * cosine * visible;
-                    if (gather.state.w != 0u) {
+                    if (gather.state.w != 0u && path.x + 1u == path.y) {
                         hitIrradiance += giSampleSurfaceIrradiance(hit.position.xyz, hit.normal.xyz, gatherHitGeometry(hit), gi.state.x);
                     }
                     incoming += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265359) * hitIrradiance;
                 }
             }
-            irradiance += clamp(incoming, vec3f(0.0), vec3f(65504.0)) * (3.14159265359 / f32(gather.settings.z));
+            irradiance += weight.xyz * clamp(incoming, vec3f(0.0), vec3f(65504.0)) * (3.14159265359 / f32(gather.settings.z));
         }
     }
     result.irradiance = vec4f(clamp(irradiance, vec3f(0.0), vec3f(65504.0)), 1.0);

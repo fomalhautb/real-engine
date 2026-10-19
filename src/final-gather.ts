@@ -3,6 +3,9 @@ export interface FinalGatherOptions {
   pixelSpacing?: number;
   maxAnchors?: number;
   raysPerAnchor?: number;
+  /** Exact diffuse segments before querying the world irradiance cache (1–4).
+   * Single-bounce mode always traces one segment. */
+  pathSegments?: number;
   maxHistory?: number;
   normalBias?: number;
   maxBytes?: number;
@@ -12,6 +15,7 @@ export interface ResolvedFinalGatherOptions {
   readonly pixelSpacing: number;
   readonly maxAnchors: number;
   readonly raysPerAnchor: number;
+  readonly pathSegments: number;
   readonly maxHistory: number;
   readonly normalBias: number;
   readonly maxBytes: number;
@@ -39,6 +43,7 @@ export function resolveFinalGatherOptions(options: FinalGatherOptions = {}): Res
   const pixelSpacing = boundedInteger(options.pixelSpacing === undefined ? 8 : options.pixelSpacing, 1, 128, 'PIXEL_SPACING');
   const maxAnchors = boundedInteger(options.maxAnchors === undefined ? 16_384 : options.maxAnchors, 1, 65_536, 'MAX_ANCHORS');
   const raysPerAnchor = boundedInteger(options.raysPerAnchor === undefined ? 2 : options.raysPerAnchor, 1, 16, 'RAYS_PER_ANCHOR');
+  const pathSegments = boundedInteger(options.pathSegments === undefined ? 1 : options.pathSegments, 1, 4, 'PATH_SEGMENTS');
   const maxHistory = boundedInteger(options.maxHistory === undefined ? 64 : options.maxHistory, 1, 256, 'MAX_HISTORY');
   const normalBias = options.normalBias === undefined ? 0.0001 : options.normalBias;
   if (typeof normalBias !== 'number' || !Number.isFinite(normalBias) || normalBias < 0 || normalBias > 0.01) {
@@ -46,7 +51,7 @@ export function resolveFinalGatherOptions(options: FinalGatherOptions = {}): Res
   }
   const maxBytes = boundedInteger(options.maxBytes === undefined ? 16 * 1024 * 1024 : options.maxBytes,
     1, 64 * 1024 * 1024, 'MAX_BYTES');
-  return Object.freeze({ pixelSpacing, maxAnchors, raysPerAnchor, maxHistory, normalBias, maxBytes });
+  return Object.freeze({ pixelSpacing, maxAnchors, raysPerAnchor, pathSegments, maxHistory, normalBias, maxBytes });
 }
 
 /** Find the finest integer spacing satisfying every per-frame ray and anchor budget. */

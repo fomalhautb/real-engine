@@ -33,6 +33,7 @@ test('recovered virtual PBR geometry preserves combined GI, final gather, reflec
   }
   expect(result.diagnostics.occlusion?.algorithm).toBe('two-phase-current-depth-recovery');
   expect(result.diagnostics.diffuseGi?.finalGather).not.toBeNull();
+  expect(result.diagnostics.diffuseGi?.finalGather?.pathSegmentsPerUpdate).toBe(2);
   expect(result.diagnostics.reflections?.diffuseGi).toBe(true);
   expect(result.diagnostics.reflections?.worldMedia).toBe(true);
   expect(result.diagnostics.volumetricFog).not.toBeNull();

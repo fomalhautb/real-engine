@@ -134,7 +134,7 @@ function cameraSample(world: Vec3, width: number, height: number) {
   return { world, ndc, pixel, ray: { origin: eye,
     direction: unit(plus(plus(forward, right, x), up, y)) } satisfies WorldRay };
 }
-export async function runGiContactReferenceFixture(options: { finalGather?: boolean } = {}) {
+export async function runGiContactReferenceFixture(options: { finalGather?: boolean; pathSegments?: number } = {}) {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = 'position:fixed;left:0;top:0;width:1280px;height:720px;';
   document.body.appendChild(canvas);
@@ -144,7 +144,7 @@ export async function runGiContactReferenceFixture(options: { finalGather?: bool
     renderer = await Renderer.create(canvas, scene.batches, {
       diffuseGi: options.finalGather ? { ...GI_PROBE_GRID, maxBytes: 64 * 1024 * 1024,
         finalGather: { pixelSpacing: 4, raysPerAnchor: 1, maxAnchors: 65536,
-          maxHistory: 256, maxBytes: 64 * 1024 * 1024 } } : GI_PROBE_GRID,
+          pathSegments: options.pathSegments, maxHistory: 256, maxBytes: 64 * 1024 * 1024 } } : GI_PROBE_GRID,
       worldQueries: { maxRays: options.finalGather ? 65536 : 32768 }, antiAliasing: 'fxaa',
       sunShadow: { resolution: 2048,
         focusBounds: { min: [-3.5, -0.25, -4], max: [3.5, 4, 4] },
@@ -164,6 +164,20 @@ export async function runGiContactReferenceFixture(options: { finalGather?: bool
     const floorHits = floor as WorldHit[];
     const samples = floorHits.map(hit => cameraSample(hit.position, renderer!.stats.width, renderer!.stats.height));
     const cameraHits = (await renderer.traceRays(samples.map(sample => sample.ray))).hits;
+    const gatherSpacing = 4, gatherColumns = Math.ceil(renderer.stats.width / gatherSpacing);
+    const gatherRows = Math.ceil(renderer.stats.height / gatherSpacing);
+    const neighborIndices = (pixel: { x: number; y: number }) => {
+      const x = Math.floor((pixel.x + 0.5 - 2.5) / gatherSpacing);
+      const y = Math.floor((pixel.y + 0.5 - 2.5) / gatherSpacing);
+      return [0, 1].flatMap(dy => [0, 1].flatMap(dx => {
+        const column = x + dx, row = y + dy;
+        return column >= 0 && column < gatherColumns && row >= 0 && row < gatherRows
+          ? [column + row * gatherColumns] : [];
+      }));
+    };
+    const gatherNeighborIndices = samples.map((sample, index) => cameraHits[index]?.batch === 'room-neutral'
+      ? neighborIndices(sample.pixel) : []);
+    const gatherUniqueIndices = [...new Set(gatherNeighborIndices.flat())];
     const capture = async (screenshot = false) => {
       renderer!.render(eye, target);
       return { hdr: await renderer!.probeHdr(samples.map(sample => sample.pixel)),
@@ -177,16 +191,47 @@ export async function runGiContactReferenceFixture(options: { finalGather?: bool
     renderer.setDiffuseGiMultiBounce(true);
     let multi = await capture();
     for (let i = 1; i < 12; i++) multi = await capture(i === 11);
-    let gather: { single: Awaited<ReturnType<typeof capture>>; multi: Awaited<ReturnType<typeof capture>> } | null = null;
+    let gather: { single: Awaited<ReturnType<typeof capture>>; multi: Awaited<ReturnType<typeof capture>>;
+      neighborIndices: number[][]; singleAnchors: Awaited<ReturnType<Renderer['probeDiffuseGiFinalGather']>>;
+      multiAnchors: Awaited<ReturnType<Renderer['probeDiffuseGiFinalGather']>> } | null = null;
     if (options.finalGather) {
       renderer.setDiffuseGiFinalGatherEnabled(true);
       renderer.setDiffuseGiMultiBounce(false);
       for (let i = 0; i < 256; i++) renderer.render(eye, target);
       const gatheredSingle = await capture();
+      const singleAnchors = await renderer.probeDiffuseGiFinalGather(gatherUniqueIndices);
       renderer.setDiffuseGiMultiBounce(true);
       for (let i = 0; i < 320; i++) renderer.render(eye, target);
       const gatheredMulti = await capture(true);
-      gather = { single: gatheredSingle, multi: gatheredMulti };
+      const multiAnchors = await renderer.probeDiffuseGiFinalGather(gatherUniqueIndices);
+      gather = { single: gatheredSingle, multi: gatheredMulti,
+        neighborIndices: gatherNeighborIndices, singleAnchors, multiAnchors };
+    }
+    let anchorReferences: { nearSample: number; anchorIndex: number; anchorPosition: Vec3;
+      tracedHit: WorldHit; estimate: Awaited<ReturnType<typeof traceReference>>[number] }[] = [];
+    if (gather) {
+      const candidates = gather.multiAnchors.anchors.filter(anchor => anchor.valid &&
+        Math.abs(anchor.position[1]) < 0.002 && anchor.position[2] > block.frontZ && anchor.normal[1] > 0.9);
+      const chosen: { nearSample: number; anchor: typeof candidates[number] }[] = [];
+      for (const nearSample of [1, 3]) {
+        const targetWorld = cameraHits[nearSample]?.position;
+        if (!targetWorld) throw new Error('GI_CONTACT_ANCHOR_TARGET_MISSING');
+        const nearest = candidates.filter(anchor => !chosen.some(item => item.anchor.index === anchor.index))
+          .sort((a, b) => Math.hypot(...a.position.map((v, axis) => v - targetWorld[axis]))
+            - Math.hypot(...b.position.map((v, axis) => v - targetWorld[axis])))[0];
+        if (!nearest) throw new Error('GI_CONTACT_FLOOR_ANCHOR_MISSING');
+        chosen.push({ nearSample, anchor: nearest });
+      }
+      const rays = chosen.map(({ anchor }) => ({ origin: [anchor.position[0], 0.1, anchor.position[2]] as Vec3,
+        direction: [0, -1, 0] as Vec3, tMin, tMax: 0.2 }));
+      const anchorHits = (await renderer.traceRays(rays)).hits;
+      if (anchorHits.some(hit => !hit || hit.batch !== 'room-neutral' || hit.entityId !== 1 || hit.normal[1] < 0.9)) {
+        throw new Error('GI_CONTACT_ANCHOR_EXPECTED_FLOOR');
+      }
+      const tracedHits = anchorHits as WorldHit[];
+      const estimates = await traceReference(renderer, tracedHits, 100, primaryBias, bounces);
+      anchorReferences = chosen.map(({ nearSample, anchor }, index) => ({ nearSample,
+        anchorIndex: anchor.index, anchorPosition: anchor.position, tracedHit: tracedHits[index], estimate: estimates[index] }));
     }
     const reference: Awaited<ReturnType<typeof traceReference>> = [];
     for (let start = 0; start < floorHits.length; start += 2) reference.push(
@@ -225,7 +270,7 @@ export async function runGiContactReferenceFixture(options: { finalGather?: bool
             value - floorHits[index].position[axis])) : null,
         pixelReference: pixelReferenceByIndex.get(index) ?? null,
         reference: reference[index] })),
-      biasChecks, cases: { off, single, multi }, gather, errors: [...renderer.errors] };
+      biasChecks, cases: { off, single, multi }, gather, anchorReferences, errors: [...renderer.errors] };
     renderer.dispose();
     return { ...result, afterDispose: renderer.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }

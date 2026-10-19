@@ -7,6 +7,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "build:geometry": "node scripts/build-geometry.mjs",
+    "audit:gltf": "node scripts/audit-gltf.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:browser": "playwright test",

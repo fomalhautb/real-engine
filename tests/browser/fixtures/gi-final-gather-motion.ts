@@ -58,7 +58,7 @@ interface MotionResult {
   png: string;
 }
 
-async function run(mode: MotionResult['mode']): Promise<MotionResult> {
+async function run(mode: MotionResult['mode'], pathSegments: number): Promise<MotionResult> {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = `position:fixed;left:0;top:0;width:${width}px;height:${height}px;`;
   document.body.appendChild(canvas);
@@ -67,7 +67,7 @@ async function run(mode: MotionResult['mode']): Promise<MotionResult> {
     renderer = await Renderer.create(canvas, createGiDemoScene().batches, {
       diffuseGi: { ...GI_PROBE_GRID, maxBytes: 64 * 1024 * 1024,
         finalGather: { pixelSpacing: 4, maxAnchors: 32768, raysPerAnchor: 2,
-          maxHistory: 64, maxBytes: 64 * 1024 * 1024 } },
+          pathSegments, maxHistory: 64, maxBytes: 64 * 1024 * 1024 } },
       worldQueries: { maxRays: 65536 }, antiAliasing: 'fxaa',
       sunShadow: { resolution: 2048,
         focusBounds: { min: [-3.5, -0.25, -4], max: [3.5, 4, 4] },
@@ -126,8 +126,8 @@ async function run(mode: MotionResult['mode']): Promise<MotionResult> {
 }
 
 /** Sequential lifetimes keep renderer state, GPU ownership and camera sequence independent. */
-export async function runFinalGatherMotionFixture() {
-  const carried = await run('carried');
-  const baseline = await run('reset');
-  return { carried, baseline };
+export async function runFinalGatherMotionFixture(pathSegments = 1) {
+  const carried = await run('carried', pathSegments);
+  const baseline = await run('reset', pathSegments);
+  return { pathSegments, carried, baseline };
 }

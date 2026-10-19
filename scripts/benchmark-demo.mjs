@@ -12,10 +12,10 @@ const dist = resolve(root, 'dist');
 const artifacts = resolve(root, 'artifacts');
 const stamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
 const defaults = { page: 'gi', channel: 'chrome', warmup: 60, frames: 300, repeat: 1,
-  width: 1280, height: 720, highPerformanceGpu: false, expectVendor: null, parseOnly: false, finalGather: false, camera: 'fixed',
+  width: 1280, height: 720, highPerformanceGpu: false, expectVendor: null, parseOnly: false, finalGather: false, pathSegments: 2, camera: 'fixed',
   out: resolve(artifacts, 'benchmarks', `demo-${stamp}`) };
 const bounds = { warmup: [0, 10_000], frames: [30, 36_000], repeat: [1, 3],
-  width: [320, 3840], height: [240, 2160] };
+  width: [320, 3840], height: [240, 2160], pathSegments: [1, 4] };
 
 function parseArgs(argv) {
   const options = { ...defaults };
@@ -24,16 +24,17 @@ function parseArgs(argv) {
     if (key === '--high-performance-gpu') { options.highPerformanceGpu = true; continue; }
     if (key === '--final-gather') { options.finalGather = true; continue; }
     if (key === '--parse-only') { options.parseOnly = true; continue; }
-    if (!['--page', '--channel', '--warmup', '--frames', '--repeat', '--width', '--height', '--out', '--expect-vendor', '--camera'].includes(key)) {
+    if (!['--page', '--channel', '--warmup', '--frames', '--repeat', '--width', '--height', '--out', '--expect-vendor', '--camera', '--path-segments'].includes(key)) {
       throw new Error(`Unknown benchmark argument: ${key}`);
     }
     const raw = argv[++i];
     if (raw === undefined || raw.startsWith('--')) throw new Error(`Missing value for ${key}`);
-    const name = key === '--expect-vendor' ? 'expectVendor' : key.slice(2);
+    const name = key === '--expect-vendor' ? 'expectVendor' : key === '--path-segments' ? 'pathSegments' : key.slice(2);
     options[name] = name in bounds ? Number(raw) : raw;
   }
   if (!['gi', 'geometry'].includes(options.page)) throw new Error('--page must be gi or geometry');
   if (options.finalGather && options.page !== 'gi') throw new Error('--final-gather requires --page gi');
+  if (argv.includes('--path-segments') && !options.finalGather) throw new Error('--path-segments requires --final-gather');
   if (!['fixed', 'orbit'].includes(options.camera)) throw new Error('--camera must be fixed or orbit');
   if (options.camera === 'orbit' && options.page !== 'gi') throw new Error('--camera orbit requires --page gi');
   if (!['msedge', 'chrome', 'chromium'].includes(options.channel)) throw new Error('--channel must be msedge, chrome, or chromium');
@@ -331,7 +332,7 @@ async function main() {
       });
       page.on('crash', () => pageErrors.push('page crashed'));
       try {
-        await page.goto(`http://127.0.0.1:${server.address().port}/${options.page}.html?benchmark=1${options.finalGather ? '&finalGather=1' : ''}`);
+        await page.goto(`http://127.0.0.1:${server.address().port}/${options.page}.html?benchmark=1${options.finalGather ? '&finalGather=1&pathSegments=' + options.pathSegments : ''}`);
         const harness = options.page === 'gi' ? '__GI_DEMO__' : '__GEOMETRY_DEMO__';
         await page.waitForFunction(name => Boolean(window[name]?.renderer), harness, { timeout: 120_000 });
         const firstSnapshot = await page.evaluate(name => window[name].snapshot(), harness);

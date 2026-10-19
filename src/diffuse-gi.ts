@@ -16,7 +16,7 @@ export interface DiffuseGiOptions {
   /** Smoothly suppress low-confidence visibility weights; 0 disables the curve. */
   visibilityWeightThreshold?: number;
   maxBytes?: number;
-  /** Optional bounded first-segment queries at visible surfaces, ahead of the world probe cache. */
+  /** Optional bounded diffuse path segments at visible surfaces, ahead of the world probe cache. */
   finalGather?: FinalGatherOptions;
 }
 

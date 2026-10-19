@@ -2,6 +2,36 @@
 
 更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 有界多段 Final Gather 与接触区验收
+
+`FinalGatherOptions.pathSegments` 新增 1–4 段精确漫反射追踪，API 默认 1；单反弹模式始终只走一段，开启多反弹时才使用配置段数。每段使用共享世界查询、当前材质和形变，以 `.96 × baseColor × (1-metallic)` 累乘 Lambert 吞吐，只在最后一段的 PBR 命中读取世界 GI。miss 和 Unlit 结束路径，不会把后续空射线当作再次命中天空；注册面积光仅在第一段排除重复发光，后续命中的发光仍计入。它仍是有限路径与探针缓存的混合估计，不是收敛路径追踪或完整 Lumen 实现。
+
+路径复用当前段命中缓冲，新增每条采样射线 16 字节吞吐缓冲和每配置段 16 字节不可变 uniform，全部参与预检、账本与释放；无逐帧 CPU 读回。每次更新查询数为 `anchors + 2 × segments × rays + area`，pass 数为 `1 + 2 × segments + Number(area > 0)`；各次查询仍受共享 work budget 限制，累计上限公开在诊断中。同数量的查询复用不可变参数槽。提前结束的路径提交空射线，仍有剩余 dispatch/reset 开销，尚无活动路径压紧。
+
+在原有 1280×720 房间、4 像素间距、57,600 锚点、每锚点一条方向和原五个实际地面像素下，两段版本对独立 4096 路径/12 次反弹参考的 RGB 平均相对误差为 **4.844%**，最差为 **12.036%**；一段对照仍为 **11.288% / 30.774%**。本轮没有更换参考点、法线偏移或放宽门槛；两段测试已加入原定平均 10% / 单项 20% 的断言。这证明此固定镜头的接触区指标通过，不能推广到整幅图、任意相机、完整漏光或大场景验收。原始与滤波锚点、两个精确锚点位置的独立参考也保存；单段的偏差在滤波前已存在。证据为 `artifacts/gi-path2-native-20261020-v2` 与同名日志，首轮因 WGSL 保留字 `active` 编译失败，修正后 3 项通过。
+
+同配置 Final Gather 查询由每帧 230,400 增为 345,600（增加 50%，不含世界 GI）。GI 演示 `/gi.html?finalGather=1` 采用两段，可用 `pathSegments=1` 对照；`scripts/benchmark-demo.mjs --final-gather --path-segments 1|2|3|4` 将配置记录进基准。960×540、144 个固定蓝墙点、48 帧相机移动的两段测试中，保留历史与每帧重置的 RGB 变化 RMS 分别为 0.002753 与 0.027234，各通道均值差小于 0.54%，应用 GPU 账本稳定于 87,477,192 字节且释放为零。证据为 `artifacts/gi-path-motion-native-20261020`；一段和两段均通过。额外段数增加噪声和追踪成本，整幅图仍可见不均匀；这些数值不是目标场景帧率证明。
+
+多段路径的独立小场景覆盖 2/3/4 段的天空与 Unlit 终止、首段面积采样去重、第二段注册发光保留、材质热更新、共享 Morph/skin 遮挡改变，以及均匀发光封闭房间的解析固定点。封闭房间以 `rho=.48` 对照 `E=πLe/(1-rho)`，原始锚点三种段数的最大相对误差分别约 0.135% / 0.065% / 0.031%；并核对真实非 fallback NVIDIA 适配器。`artifacts/gi-path-contract-native-20261020-v2` 的 9 项通过。CPU 另对吞吐与四个路径 uniform 分配失败逐项注入错误，验证已拥有资源销毁、借入资源保留与账本归零；局部 / 共享预算不足在任何分配前拒绝。本轮完整 `npm run check` 已通过 455 项 CPU 测试（57 文件）、类型检查与构建，日志 `artifacts/gi-path-check-release-20261020.log`。此前遮挡剔除提交 `3cd06e3` 的[远程 CI run 39290480565](https://github.com/fomalhautb/real-engine/actions/runs/39290480565) 已成功，不覆盖本轮未提交改动。
+
+本轮完整 NVIDIA 浏览器回归 97/97 通过（`artifacts/gi-path-browser-release-native-20261020.log`）。随后把已有遮挡恢复＋PBR＋GI＋反射＋雾的联合用例显式切到两段多反弹，NVIDIA 定向通过（`artifacts/gi-path-combined-native-20261020-v2.log`）；首次配置遗漏 `multiBounce: true`，新断言识别实际仍为一段，修正后通过。Intel 非 fallback 核显的新路径与两段联合用例共 10/10 通过（`artifacts/gi-path-target-intel-20261020.log`）。完整回归与随后改变的联合配置分别留存证据，未将局部硬件用例称为全平台性能验收。
+
+SwiftShader 的同组 10 项也通过，实际适配器为 `google / swiftshader / fallback=true`，日志 `artifacts/gi-path-target-software-20261020-v2.log`；首次内置 Chromium 启动报 `spawn UNKNOWN`，未执行 GPU 用例，改用已安装 Edge 后完成。该软件结果只证明功能，不提供硬件性能依据。
+
+性能对照使用 Edge 155.0.4283.62、实际非 fallback NVIDIA Ampere、固定 1920×1080 和同一 orbit 轨迹，每档三轮各预热 300 帧、测量 1800 帧、60 个稀疏 GPU 时间戳。两档源码指纹均为 `2ee9126cefad7dc19cb838a63fdb68522394968994afce204e30c7bbefce972a`，构建/快照指纹均为 `833a34446ac50ae80bb6ac37ce8086e3ae7dd3cc73d36f07d3312259403d7789`。一段的 GPU pass 总和 p95 为 4.588 / 5.308 / 7.340 ms、Final Gather 为 2.038 / 2.232 / 2.753 ms、rAF p95 为 7.0 / 7.1 / 7.1 ms；两段分别为 7.802 / 28.246 / 28.574 ms、3.539 / 20.061 / 20.251 ms、7.1 / 27.7 / 28.01 ms。两段后两轮未通过 16.7 ms 帧预算，不能用首轮代替稳定性能验收。应用 GPU 账本分别恒为 127,040,440 / 127,040,456 字节，结束释放为零且错误为空。日志与逐帧数据在 `artifacts/benchmarks/gi-path1-20261020`、`gi-path2-20261020`；1080p 受锚点预算限制，实际间距为 6，不能把此性能结果直接当作前述 720p/4 像素画质配置的成绩。
+
+针对波动补做同一源码/构建的两段→一段各一轮，并用 `nvidia-smi` 每秒只读记录状态：两段 GPU p95 / Final Gather p95 为 5.977 / 3.215 ms，随后一段为 7.605 / 2.756 ms，rAF p95 分别 7.0 / 7.1 ms，账本稳定、释放归零、错误为空。证据在 `artifacts/benchmarks/gi-path2-observed-20261020`、`gi-path1-observed-20261020` 与 `artifacts/gi-path-telemetry-20261020.csv`。RTX 3070 Laptop GPU 在观察窗口内温度由约 73°C 升至 87°C，负载下频率变化，末段约 975 MHz；这只能说明硬件状态伴随变化，不能确定先前 28 ms 波动的原因，也不能用这一次成功复测覆盖失败轮次。后续继续隔离查询/dispatch、调度与持续负载成本，稳定 60 FPS、大场景和 30 分钟联合性能门槛仍未通过。
+
+## 大型资产的只读审计
+
+新增 `npm run audit:gltf -- path/to/scene.gltf`，也支持 GLB，只读取 JSON 与有限图像头，输出 JSON 清单。独特 POSITION/索引 accessor 计数与每 primitive、每 scene 实例展开量分别记录；检查当前导入器的材质、UV、属性、扩展和默认预算阻碍。场景按每 scene 独立的 visited 集迭代遍历，重复节点明确报告，图像头串行读取。它不是完整 glTF 验证器，也未解码或校验几何载荷，`metadata-compatible-unverified` 不表示资产已成功渲染。
+
+对 Intel 新版 Sponza 的稳定入口 `https://cdrdv2.intel.com/v1/dl/getContent/830833` 进行了实际 Range 读取：ZIP 为 3,987,608,266 字节，中央目录 156 项，三个请求均返回 206，合计读取 127,492 字节。只解出 691,352 字节 glTF 和 15,921 字节许可文本；manifest、范围、条目和 SHA-256 在 `artifacts/sponza-range-audit/manifest.json`。glTF SHA-256 为 `e04c4c540c74bdddcbd3f590a85c14119bfd5839702246a23b3a737c0cce2400`；声明 115 meshes、405 primitives、155 nodes、28 materials，独特 POSITION accessor 共 2,049,137 顶点、索引 11,241,054，primitive 三角形共 3,747,018。它们是声明计数，尚未验证解码后数据和引擎驻留格式，更不能充作几何池 4–8 倍的验收结果。
+
+当前障碍包括 373 个 primitive 的 TEXCOORD_1、59 个 COLOR_0、一个 BLEND 材质、尚未解释的 KHR_lights_punctual，以及导入器顶点/索引预算；声明的单个 BIN 为 139,973,456 字节，也超过默认累计下载预算。几何 BIN、贴图及其余载荷均未下载。包内许可顶部的用途描述与后附 CC BY 4.0 全文存在表述差异，正式发布资产前需核实；本轮没有将资产放入仓库或发行包。后续仍须保真转换、材质与纹理路径、分区流送、室内外完整场景和视觉验收。
+
+进一步按同一 glTF 的实际 textureInfo 检查，所有贴图都使用 UV0，未引用 UV1，因此该固定版本的离线转换可在保留审计记录后移除未使用的 UV1；这不等于引擎普遍支持任意 UV 集。59 个带 COLOR_0 的 primitive 使用 VEC4 float accessor，尚未读取颜色数据，不能假设全白或删除。唯一 BLEND 材质为 `dirt_decal`，alpha 约 0.35、引用基础色贴图，用于 4 个 primitive / 8,140 三角形，需保真处理，不能改作 Mask。24 个灯光节点为 23 point 加 1 directional，强度均为 0；当前包可保存并报告禁用灯的元数据，但通用点光/聚光灯的路线要求仍然保留。下一批接入先验证真实顶点色并贯通共享材质路径，再处理 decal、转换与分区流送。
+
 ## 已实现的运行路径
 
 ### 世界空间反射

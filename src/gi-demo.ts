@@ -316,7 +316,8 @@ async function start(): Promise<void> {
   element('probe-budget').textContent = `${GI_PROBE_GRID.counts.reduce((a, b) => a * b, 1)} 个固定探针，每颗 ${GI_PROBE_GRID.raysPerProbe} 条方向光线＋${GI_PROBE_GRID.emissiveSamplesPerProbe} 个发光面样本`;
   const options: RendererOptions = { diffuseGi: finalGatherPreview ? { ...GI_PROBE_GRID,
     maxBytes: 64 * 1024 * 1024,
-    finalGather: { pixelSpacing: 4, maxAnchors: 65536, raysPerAnchor: 1, maxHistory: 256,
+    finalGather: { pixelSpacing: 4, maxAnchors: 65536, raysPerAnchor: 1,
+      pathSegments: Number(new URLSearchParams(location.search).get('pathSegments') ?? '2'), maxHistory: 256,
       maxBytes: 64 * 1024 * 1024 } } : GI_PROBE_GRID,
     worldQueries: { maxRays: finalGatherPreview ? 65536 : rayBudget }, antiAliasing: 'fxaa',
     sunShadow: { resolution: 2048, focusBounds: { min: [-3.5, -0.25, -4], max: [3.5, 4, 4] },

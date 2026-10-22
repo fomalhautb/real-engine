@@ -13,6 +13,10 @@ const LIMITS = Object.freeze({ jsonBytes: 128 * MiB, inputBytes: 1024 * MiB,
   buffers: 256, primitives: 4096 });
 const PAGE_OPTIONS = Object.freeze({ maxPageBytes: 65536, maxTotalBytes: 256 * MiB });
 const PROXY_OPTIONS = Object.freeze({ maxVertices: 1_048_576, maxTriangles: 262_144, maxBytes: 128 * MiB });
+// Pass every default explicitly so a package remains reproducible if builder defaults change.
+const GEOMETRY_BUILD_OPTIONS = Object.freeze({ maxClusterVertices: 64, maxClusterTriangles: 128,
+  simplifyRatio: 0.5, maxSimplificationError: 1e30, maxLevels: 16, maxVertices: 1_000_000,
+  maxTriangles: 1_000_000, maxOutputTriangles: 3_000_000, maxClusters: 65_536, maxGroups: 65_536 });
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonBytes = value => Buffer.from(JSON.stringify(value, null, 2) + '\n');
 
@@ -22,11 +26,11 @@ function argumentsOf(argv) {
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
     if (key === '--remove-zero-area' && !removeZeroAreaTriangles) { removeZeroAreaTriangles = true; continue; }
-    if (!['--input', '--output', '--query-error', '--max-page-bytes'].includes(key) || values.has(key) || !argv[i + 1]) throw new Error('invalid build arguments');
+    if (!['--input', '--output', '--query-error', '--max-page-bytes', '--group-size'].includes(key) || values.has(key) || !argv[i + 1]) throw new Error('invalid build arguments');
     values.set(key, argv[++i]);
   }
   if (!values.has('--input') || !values.has('--output')) {
-    throw new Error('usage: build-gltf-geometry --input scene.gltf|glb --output new-directory [--remove-zero-area] [--query-error value] [--max-page-bytes value]');
+    throw new Error('usage: build-gltf-geometry --input scene.gltf|glb --output new-directory [--remove-zero-area] [--query-error value] [--max-page-bytes value] [--group-size 2..16]');
   }
   const input = resolve(values.get('--input')), output = resolve(values.get('--output'));
   if (!['.gltf', '.glb'].includes(extname(input).toLowerCase()) || input === output) throw new Error('invalid input/output');
@@ -34,7 +38,9 @@ function argumentsOf(argv) {
   if (!Number.isFinite(maxError) || maxError < 0 || maxError > 1e30) throw new Error('query-error must be finite and in [0, 1e30]');
   const maxPageBytes = values.has('--max-page-bytes') ? Number(values.get('--max-page-bytes')) : LIMITS.pageBytes;
   if (!Number.isSafeInteger(maxPageBytes) || maxPageBytes < 1 || maxPageBytes > 4096 * MiB) throw new Error('max-page-bytes must be an integer in [1, 4294967296]');
-  return { input, output, maxError, maxPageBytes, removeZeroAreaTriangles };
+  const groupSize = values.has('--group-size') ? Number(values.get('--group-size')) : 4;
+  if (!Number.isSafeInteger(groupSize) || groupSize < 2 || groupSize > 16) throw new Error('group-size must be an integer in [2, 16]');
+  return { input, output, maxError, maxPageBytes, groupSize, removeZeroAreaTriangles };
 }
 
 function list(value, label, max = 65536) {
@@ -131,6 +137,7 @@ async function loadSource(input, parseGlb) {
 }
 
 async function buildInto(config, temporary) {
+  const geometryBuildOptions = { ...GEOMETRY_BUILD_OPTIONS, groupSize: config.groupSize };
   const server = await createServer({ root: ROOT, configFile: false,
     server: { middlewareMode: true, watch: null, ws: false },
     optimizeDeps: { noDiscovery: true, include: [] }, appType: 'custom' });
@@ -195,7 +202,7 @@ async function buildInto(config, temporary) {
         // simplification. Its units are local position distance per UV0 unit.
         const textureUvSpan = textureUvSpanOf(clean.mesh);
         const primitiveKey = `gltf:${asset.identity}:mesh:${meshIndex}:primitive:${primitiveIndex}`;
-        const hierarchy = await buildGeometryHierarchy({ primitiveKey, mesh: clean.mesh, coverage: 'opaque' });
+        const hierarchy = await buildGeometryHierarchy({ primitiveKey, mesh: clean.mesh, coverage: 'opaque' }, geometryBuildOptions);
         const encoded = await encodeGeometryPages(hierarchy, PAGE_OPTIONS);
         const directory = await buildGeometryStreamDirectory(hierarchy, encoded);
         const proxy = await buildGeometryQueryProxy(directory, async request => encoded.pages[request.id].bytes,
@@ -237,6 +244,7 @@ async function buildInto(config, temporary) {
     await write('manifest.json', jsonBytes({ version: 1, format: 'real-engine-gltf-geometry', builder: 'meshoptimizer-1.3.0',
       purpose: 'offline geometry package; material compilation, images, scene batching and runtime loading remain separate',
       source: asset.source, assetIdentity: asset.identity, config: { removeZeroAreaTriangles: config.removeZeroAreaTriangles,
+        geometryBuild: geometryBuildOptions,
         page: PAGE_OPTIONS, queryProxy: { ...PROXY_OPTIONS, maxError: config.maxError },
         limits: { ...LIMITS, pageBytes: config.maxPageBytes, primitiveVertices: 1_000_000, primitiveTriangles: 1_000_000 } },
       imageResourcesCopied: false, images: asset.doc.images ?? [],

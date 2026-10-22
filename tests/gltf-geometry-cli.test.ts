@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { basename, dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { validateGeometryStreamDirectory } from '../src/geometry-stream-directory';
+import { decodeGeometryPage } from '../src/geometry-pages';
 
 const script = resolve('scripts/build-gltf-geometry.mjs');
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
@@ -14,12 +15,13 @@ type BuiltPrimitive = {
   textureUvSpan: number | 'unknown';
   sourceTriangleCount: number; triangleCount: number; removedTriangleCount: number;
   directory?: string; streamDirectoryFile?: string; queryProxy?: FileRef;
+  buildOptions?: { groupSize: number };
   pages?: FileRef[]; provenance?: {
     vertices: FileRef; triangles: FileRef; removedTriangles: FileRef;
   };
 };
 
-function fixture(): { json: Buffer; binary: Buffer; opaqueIndices: number[]; blendIndices: number[] } {
+function fixture(gridSize = 0): { json: Buffer; binary: Buffer; opaqueIndices: number[]; blendIndices: number[] } {
   const views: { buffer: number; byteOffset: number; byteLength: number }[] = [];
   const accessors: Record<string, unknown>[] = [];
   const chunks: Buffer[] = [];
@@ -72,6 +74,25 @@ function fixture(): { json: Buffer; binary: Buffer; opaqueIndices: number[]; ble
     COLOR_0: add(Array(4).fill([1, .5, 1, .5]).flat(), 'VEC4', 5126),
   };
   const blendIndexAccessor = add(blendIndices, 'SCALAR', 5123);
+  let gridPrimitive: Record<string, unknown> | undefined;
+  if (gridSize) {
+    const positions: number[] = [], uvs: number[] = [], colors: number[] = [], indices: number[] = [];
+    for (let y = 0; y <= gridSize; y++) for (let x = 0; x <= gridSize; x++) {
+      positions.push(x, y, 2); uvs.push(x / gridSize, y / gridSize);
+      colors.push(x / gridSize, y / gridSize, .5, 1);
+    }
+    for (let y = 0; y < gridSize; y++) for (let x = 0; x < gridSize; x++) {
+      const a = y * (gridSize + 1) + x, b = a + 1, c = a + gridSize + 1, d = c + 1;
+      indices.push(a, b, d, a, d, c);
+    }
+    gridPrimitive = { attributes: {
+      POSITION: add(positions, 'VEC3', 5126, { min: [0, 0, 2], max: [gridSize, gridSize, 2] }),
+      NORMAL: add(Array((gridSize + 1) ** 2).fill([0, 0, 1]).flat(), 'VEC3', 5126),
+      TEXCOORD_0: add(uvs, 'VEC2', 5126),
+      TANGENT: add(Array((gridSize + 1) ** 2).fill([1, 0, 0, 1]).flat(), 'VEC4', 5126),
+      COLOR_0: add(colors, 'VEC4', 5126),
+    }, indices: add(indices, 'SCALAR', 5123), material: 0, mode: 4 };
+  }
   const binary = Buffer.concat(chunks);
   const gltf = {
     asset: { version: '2.0', generator: 'original glTF geometry CLI test' },
@@ -86,6 +107,7 @@ function fixture(): { json: Buffer; binary: Buffer; opaqueIndices: number[]; ble
     meshes: [{ primitives: [
       { attributes: opaque, indices: opaqueIndexAccessor, material: 0, mode: 4 },
       { attributes: blend, indices: blendIndexAccessor, material: 1, mode: 4 },
+      ...(gridPrimitive ? [gridPrimitive] : []),
     ] }],
     nodes: [{ mesh: 0, scale: [10, 2, 1] }], scenes: [{ nodes: [0] }], scene: 0,
   };
@@ -176,11 +198,13 @@ describe('glTF geometry CLI', () => {
 
       const manifest = JSON.parse((await readFile(join(first, 'manifest.json'))).toString('utf8')) as {
         format: string; version: number;
+        config: { geometryBuild: { groupSize: number } };
         source: FileRef & { buffers: FileRef[] };
         images: unknown[]; imageResourcesCopied: boolean; primitives: BuiltPrimitive[];
       };
       expect(manifest.format).toBe('real-engine-gltf-geometry');
       expect(manifest.version).toBe(1);
+      expect(manifest.config.geometryBuild.groupSize).toBe(4);
       expect(manifest.source).toMatchObject({ file: 'source/scene.gltf', bytes: source.json.byteLength,
         sha256: sha256(source.json) });
       expect(await expectFileRef(first, manifest.source)).toEqual(source.json);
@@ -198,6 +222,8 @@ describe('glTF geometry CLI', () => {
         [0, 0, 'opaque', 'paged'], [0, 1, 'blend', 'source'],
       ]);
       expect(opaque).toMatchObject({ sourceTriangleCount: 5, triangleCount: 4, removedTriangleCount: 1 });
+      expect(opaque.buildOptions?.groupSize).toBe(4);
+      expect(manifest.config.geometryBuild).toEqual(opaque.buildOptions);
       expect(blend).toMatchObject({ sourceTriangleCount: 2, triangleCount: 2, removedTriangleCount: 0 });
       // The UV seam on the first surviving triangle dominates. The removed
       // zero-area triangle would make the uncleaned estimator return unknown.
@@ -283,7 +309,56 @@ describe('glTF geometry CLI', () => {
         expect(() => run(input, output, ['--remove-zero-area', '--max-page-bytes', budget])).toThrow();
         expect((await readdir(temporary)).includes(name)).toBe(false);
       }
+      for (const [name, size] of [['low', '1'], ['high', '17'], ['fraction', '4.5'],
+        ['nan', 'NaN'], ['word', 'four']] as const) {
+        const output = join(temporary, name);
+        expect(() => run(input, output, ['--group-size', size])).toThrow();
+        expect((await readdir(temporary)).includes(name)).toBe(false);
+      }
       expect((await readdir(temporary)).sort()).toEqual(['existing', 'mesh.bin', 'scene.gltf', 'unsafe.gltf']);
+    } finally {
+      await removeOwnTestRoot(temporary);
+    }
+  }, 120_000);
+
+  it('records group size and retains full LOD0 provenance and attributes on a simplified grid', async () => {
+    const temporary = await mkdtemp(join(resolve('.'), '.gltf-geometry-test-'));
+    try {
+      const source = fixture(16);
+      const input = join(temporary, 'scene.gltf');
+      await writeFile(input, source.json);
+      await writeFile(join(temporary, 'mesh.bin'), source.binary);
+      const records: { groupSize: number; rootTriangles: number; leafTriangles: number }[] = [];
+      for (const groupSize of [2, 4, 16]) {
+        const output = join(temporary, `group-${groupSize}`);
+        run(input, output, ['--remove-zero-area', '--group-size', String(groupSize)]);
+        const manifest = JSON.parse(await readFile(join(output, 'manifest.json'), 'utf8')) as {
+          config: { geometryBuild: { groupSize: number } }; primitives: BuiltPrimitive[];
+        };
+        expect(manifest.config.geometryBuild.groupSize).toBe(groupSize);
+        const grid = manifest.primitives[2];
+        expect(grid.route).toBe('paged');
+        expect(grid.buildOptions?.groupSize).toBe(groupSize);
+        expect(manifest.config.geometryBuild).toEqual(grid.buildOptions);
+        expect(grid.sourceTriangleCount).toBe(512);
+        expect(grid.triangleCount).toBe(512);
+        expect(u32(await expectFileRef(output, grid.provenance!.triangles)))
+          .toEqual(Array.from({ length: 512 }, (_, index) => index));
+        const directory = JSON.parse(await readFile(join(output, grid.streamDirectoryFile!), 'utf8'));
+        expect(() => validateGeometryStreamDirectory(directory)).not.toThrow();
+        const leafTriangles = directory.clusters.filter((cluster: { level: number }) => cluster.level === 0)
+          .reduce((sum: number, cluster: { triangleCount: number }) => sum + cluster.triangleCount, 0);
+        const rootTriangles = directory.roots.reduce((sum: number, id: number) => sum + directory.clusters[id].triangleCount, 0);
+        expect(leafTriangles).toBe(512);
+        expect(rootTriangles).toBeLessThan(512);
+        const decoded = await decodeGeometryPage(await readFile(join(output, grid.pages![0].file)));
+        expect(decoded.hasUvs).toBe(true);
+        expect(decoded.hasTangents).toBe(true);
+        expect(decoded.hasColors).toBe(true);
+        expect(decoded.clusters.every(cluster => cluster.uvs && cluster.tangents && cluster.colors)).toBe(true);
+        records.push({ groupSize, rootTriangles, leafTriangles });
+      }
+      expect(records[2].rootTriangles).toBeLessThanOrEqual(records[1].rootTriangles);
     } finally {
       await removeOwnTestRoot(temporary);
     }

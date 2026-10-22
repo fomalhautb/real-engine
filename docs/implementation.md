@@ -1,6 +1,20 @@
 # 阶段 1–2 实现状态
 
-更新日期：2026-10-20。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
+更新日期：2026-10-22。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
+
+## 独立 glTF 材质库与预制纹理身份
+
+`createGltfMaterialLibrary(json, options)` 从 glTF 2.0 元数据直接建立材质库，不读取几何、BIN 或下载图片。`materialCount` 给出材料数量，`get(index)` 按需验证并缓存绑定，`get(null)` 返回同一套默认 PBR 材质。调用者须在库和返回绑定的使用期保持输入元数据及图像载荷不可变。完整 `importGltf` 复用此实现，但继续提前验证全部材质及全局 required extensions；材质库只判断实际材质/纹理扩展，不将场景灯光等扩展误当成材质能力。数组仍有 65,536 项上限，非法索引、未知材质扩展、非 UV0、occlusion texture 及 BLEND 仍明确拒绝。
+
+`GltfMaterialOptions.images` 接受解码后的 RGBA8 或 `PreparedTextureAsset`。色彩空间吻合时保留**原对象身份**，使多个 glTF 材质能引用同一个 `TextureStreamSource.fallback`，后续自动替换和新增材质绑定都沿用同一来源。预制图像若色彩空间不符，报 `GLTF_IMAGE_COLOR_SPACE`，不会把已经过滤/压缩的 mip 链重新解释。旧解码 RGBA8 在不同角色需要不同色彩空间时，仍缓存共享像素缓冲的角色视图。所有输入经 `textureStorageLayout` 校验，不复制图像载荷。
+
+可选 `resolveImage(imageIndex, colorSpace)` 独占图像解析，并按图像索引/色彩空间缓存；它应返回所需色彩空间的原始资产对象，返回 undefined 时不会改用 `images`。因此同一源图像兼作基础色和数据贴图时，可以由资产层提供分别构建的 sRGB/linear 包。基础色、金属粗糙度、发光、法线仍分别映射到既有 0–3 槽，保留采样器、顶点色、参数及覆盖语义。网络 `loadGltf` 继续自行下载/解码图片，不暴露预制图像 resolver；预制场景组织使用材质库或直接 `importGltf`。
+
+真实 Sponza 的 CPU 审计读取原 glTF 与 72 份候选纹理包，核对清单 SHA-256 和低清尾链的全部哈希/长度，395,136 字节的 fallback 保持精确身份。原始 28 个材质中 26 个直接通过；材质 12 `light_bulb` 的 `emissiveFactor[2] = 1.00000012` 超出 glTF 合法范围，材质 21 `dirt_decal` 使用尚未支持的 BLEND。审计在独立输入副本中显式把前者改为 1，记录路径、前后值及不超过 `2^-22` 的归一化因子舍入修正界限，之后 27 个可解析/编译。原文件、源 SHA-256 和运行时严格校验均未更改，BLEND 未被转换或丢弃。报告为 `artifacts/sponza-material-audit-20261022.json`；这是接入审计，不是完整场景渲染。BC7 法线包依然未通过最终质量验收。
+
+本轮 `npm run check` 已通过 594 项 CPU 测试（71 文件）、类型与生产构建，日志 `artifacts/gltf-material-check-final-20261022.log`。新增材质库用例验证预制资产身份、角色 resolver、严格校验、完整导入兼容及数值材质求值。首轮检查有一个新增用例误写既有错误码断言，修正后完整检查通过，初轮日志 `artifacts/gltf-material-check-20261022.log` 保留。浏览器新增 glTF＋清单 sRGB 自动流送组合，检查主视图 HDR、深度、世界查询、换材质、升降 mip 和预算；完整 NVIDIA 原生回归 **110/110**，三个流送组合在 Intel 和 SwiftShader 各 **3/3** 通过，图像释放后账本归零且无页面/GPU 验证错误。日志分别为 `artifacts/gltf-material-browser-native-20261022.log`、`artifacts/gltf-material-target-intel-20261022.log` 和 `artifacts/gltf-material-target-software-20261022.log`。GPU 测试串行执行，期间运行时与测试文件冻结；软件适配器只证明所测功能，不证明硬件性能或完整 Sponza 画质。
+
+上一提交 `d3ac87e5` 的 [远程 CI run 39328347855](https://github.com/fomalhautb/real-engine/actions/runs/39328347855) 已完成并成功，不覆盖本轮材质库改动。
 
 ## 完整场景的批次容量与纹理密度
 

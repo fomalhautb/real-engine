@@ -7,6 +7,7 @@ import type { PreparedTextureAsset } from '../../../src/texture-storage';
 import type { TextureStreamSource } from '../../../src/texture-stream-types';
 import { createHttpTextureMipProvider } from '../../../src/texture-stream-source';
 import { loadTextureStreamSource } from '../../../src/texture-stream-manifest';
+import { createGltfMaterialLibrary } from '../../../src/gltf-material';
 
 const COLORS = {
   a: [[192, 32, 16], [32, 192, 16], [16, 32, 192], [128, 64, 32]],
@@ -35,7 +36,7 @@ function payload(name: SourceName, level: number): Uint8Array {
   return data;
 }
 
-async function source(name: SourceName, gate?: Promise<void>, useManifest = false): Promise<TextureStreamSource> {
+async function source(name: SourceName, gate?: Promise<void>, useManifest = false, colorSpace: 'linear' | 'srgb' = 'linear'): Promise<TextureStreamSource> {
   if (useManifest) {
     const loaded = await loadTextureStreamSource(`/__texture-stream/${name}/manifest.json`);
     let first = true;
@@ -52,11 +53,11 @@ async function source(name: SourceName, gate?: Promise<void>, useManifest = fals
       sha256: Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('') };
   }));
   const fallback: PreparedTextureAsset = { kind: 'prepared', width: 8, height: 8, format: 'rgba8',
-    colorSpace: 'linear', baseMipLevel: 2, levels: [2, 3].map(level => ({ width: 8 >> level,
+    colorSpace, baseMipLevel: 2, levels: [2, 3].map(level => ({ width: 8 >> level,
       height: 8 >> level, data: payloads[level].slice() })) };
   let first = true;
   const http = createHttpTextureMipProvider(mips.map(mip => `/__texture-stream/${name}/${mip.level}.bin`));
-  return { id: name, width: 8, height: 8, format: 'rgba8', colorSpace: 'linear', mips, fallback,
+  return { id: name, width: 8, height: 8, format: 'rgba8', colorSpace, mips, fallback,
     provider: async (mip, signal) => {
       if (gate && first) { first = false; await gate; }
       if (signal.aborted) throw signal.reason;
@@ -64,7 +65,17 @@ async function source(name: SourceName, gate?: Promise<void>, useManifest = fals
     } };
 }
 
-function binding(asset: PreparedTextureAsset, tint: readonly [number, number, number, number], repeatU = false): MaterialBinding {
+function binding(asset: PreparedTextureAsset, tint: readonly [number, number, number, number], repeatU = false, useGltf = false): MaterialBinding {
+  if (useGltf) {
+    const library = createGltfMaterialLibrary({ asset: { version: '2.0' }, images: [{}], textures: [{ source: 0, sampler: 0 }],
+      samplers: [{ minFilter: 9984, magFilter: 9728, wrapS: repeatU ? 10497 : 33071, wrapT: 33071 }],
+      materials: [{ extensions: { KHR_materials_unlit: {} }, alphaMode: 'MASK', alphaCutoff: 0.5, doubleSided: true,
+        pbrMetallicRoughness: { baseColorFactor: [...tint], baseColorTexture: { index: 0 } } }] },
+    { images: new Map([[0, asset]]) });
+    const material = library.get(0);
+    if (material.textures?.[0] !== asset) throw new Error('GLTF_STREAM_IDENTITY_CHANGED');
+    return material;
+  }
   return { definition: { ...DEFAULT_MATERIAL_DEFINITION, shading: 'unlit', alphaMode: 'mask',
     doubleSided: true, alphaCutoff: 0.5, baseColor: m.multiply(m.texture(0), m.parameter(0)) },
     parameters: new Float32Array(tint), textures: [asset],
@@ -80,17 +91,18 @@ function batch(name: string, x: number, material: MaterialBinding, entityId: num
       color: [1, 1, 1, 1], metalness: 0, roughness: 1, historyVersion: 0 }] };
 }
 
-export async function runTextureStreamingFixture(useManifest = false) {
+export async function runTextureStreamingFixture(useManifest = false, useGltf = false) {
   const canvas = document.createElement('canvas');
   canvas.width = 128; canvas.height = 128;
   canvas.style.cssText = 'position:fixed;left:0;top:0;width:128px;height:128px;z-index:10000';
   document.body.append(canvas);
   let releaseFirstA!: () => void;
   const gate = new Promise<void>(resolve => { releaseFirstA = resolve; });
-  const [a, b] = await Promise.all([source('a', gate, useManifest), source('b', undefined, useManifest)]);
-  const scene = [batch('a-left', -4.5, binding(a.fallback, [1, 1, 1, 1]), 1),
-    batch('a-right', -3.5, binding(a.fallback, [1, 0.5, 1, 1], true), 2),
-    batch('b', 4, binding(b.fallback, [1, 1, 1, 1]), 3)];
+  const colorSpace = useGltf ? 'srgb' : 'linear';
+  const [a, b] = await Promise.all([source('a', gate, useManifest, colorSpace), source('b', undefined, useManifest, colorSpace)]);
+  const scene = [batch('a-left', -4.5, binding(a.fallback, [1, 1, 1, 1], false, useGltf), 1),
+    batch('a-right', -3.5, binding(a.fallback, [1, 0.5, 1, 1], true, useGltf), 2),
+    batch('b', 4, binding(b.fallback, [1, 1, 1, 1], false, useGltf), 3)];
   let renderer: Renderer | undefined;
   try {
     renderer = await Renderer.create(canvas, scene, { antiAliasing: 'none', textureBudgetBytes: 400,
@@ -141,13 +153,13 @@ export async function runTextureStreamingFixture(useManifest = false) {
       try { active.replaceTexture(a.fallback, b.fallback); return ''; }
       catch (error) { return String(error); }
     })();
-    await active.setMaterial('a-right', binding(a.fallback, [0.5, 1, 1, 1]));
+    await active.setMaterial('a-right', binding(a.fallback, [0.5, 1, 1, 1], false, useGltf));
     render('a');
     const aLateMaterial = await sample('a-late-material', 'a');
 
     await pump('b', 2, 0);
     const bFine = await sample('b-fine', 'b');
-    await active.setMaterial('b', binding(b.fallback, [1, 1, 1, 1]));
+    await active.setMaterial('b', binding(b.fallback, [1, 1, 1, 1], false, useGltf));
     render('b');
     const bLateMaterial = await sample('b-late-material', 'b');
     await pump('a', 0, 2);

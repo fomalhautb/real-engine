@@ -41,6 +41,8 @@
 
 `npm run build:texture -- --input image.dds --output new-package` 将完整 DX10 RGBA8/BC7 mip 链打包为独立层文件与哈希清单；PNG 可显式配置外部 texconv、格式和色彩空间。浏览器调用 `loadTextureStreamSource('/new-package/manifest.json')` 取得已校验的低清来源，再将它交给自动流送。真实 Sponza 72 张贴图的候选包已构建，石墙材质已有实际浏览器预览；法线压缩质量与整个场景仍需验收。命令、约束和证据见[纹理包构建](docs/implementation.md#纹理包构建清单加载与真实-sponza-贴图)。
 
+`createGltfMaterialLibrary(json, { images })` 可以独立于几何读取 glTF 材质，以 `get(index)` 或 `get(null)` 取得实际/默认绑定。将清单来源的 `fallback` 原对象放进按 glTF image 索引组织的 Map，即可保持自动纹理流送关联；预制图像必须匹配材质角色的色彩空间。需要同一图像的不同角色包时提供 `resolveImage(index, colorSpace)`。支持范围、严格校验和真实资产限制见[独立 glTF 材质库](docs/implementation.md#独立-gltf-材质库与预制纹理身份)。
+
 需要 Node.js 24 与支持 WebGPU 的浏览器。使用 localhost 或 HTTPS。
 
 ```sh

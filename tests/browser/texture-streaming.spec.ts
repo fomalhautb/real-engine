@@ -5,8 +5,9 @@ import type { runTextureStreamingFixture } from './fixtures/texture-streaming';
 
 test.use({ deviceScaleFactor: 1 });
 
-for (const useManifest of [false, true]) {
-test(useManifest
+for (const [useManifest, useGltf] of [[false, false], [true, false], [true, true]]) {
+test(useGltf ? 'glTF materials preserve manifest texture identity, sRGB sampling, and automatic mip publication'
+  : useManifest
   ? 'manifest texture streaming preserves coarse images, budgets, and shared material publication'
   : 'automatic texture streaming preserves coarse images, budgets, and shared material publication', async ({ page }, info) => {
   test.setTimeout(180_000);
@@ -33,7 +34,7 @@ test(useManifest
           sha256: createHash('sha256').update(bytes).digest('hex'), file: `${level}.bin` };
       });
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
-        version: 1, id: source, width: 8, height: 8, colorSpace: 'linear', format: 'rgba8',
+        version: 1, id: source, width: 8, height: 8, colorSpace: useGltf ? 'srgb' : 'linear', format: 'rgba8',
         fallbackMip: 2, mips,
       }) });
       return;
@@ -46,12 +47,12 @@ test(useManifest
   await page.goto('/?trees=1');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
-  const result = await page.evaluate(async (manifest) => {
+  const result = await page.evaluate(async ({ manifest, gltf }) => {
     window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose();
     const module = await import('/tests/browser/fixtures/' + 'texture-streaming.ts') as {
       runTextureStreamingFixture: typeof runTextureStreamingFixture };
-    return module.runTextureStreamingFixture(manifest);
-  }, useManifest);
+    return module.runTextureStreamingFixture(manifest, gltf);
+  }, { manifest: useManifest, gltf: useGltf });
   const samples = [result.coarse, result.partial, result.aFine, result.aLateMaterial,
     result.bFine, result.bLateMaterial, result.aReturn];
   await writeFile(info.outputPath('texture-streaming.json'), JSON.stringify({ ...result, httpRequests,
@@ -69,7 +70,10 @@ test(useManifest
     expected.forEach((value, channel) => expect(Math.abs(actual[channel] - value), `${label}/${channel}`).toBeLessThan(0.004));
   };
   const expected = (source: 'a' | 'b', mip: number, tint: readonly number[] = [1, 1, 1]) =>
-    colors[source][mip].map((value, channel) => value / 255 * tint[channel]);
+    colors[source][mip].map((value, channel) => {
+      const c = value / 255;
+      return (useGltf ? (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4) : c) * tint[channel];
+    });
   for (const sample of samples) {
     const current = Object.fromEntries(sample.streaming.sources.map(source => [source.id, source.currentMip]));
     const rightTint = sample === result.coarse || sample === result.partial || sample === result.aFine

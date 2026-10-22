@@ -2,7 +2,7 @@ import { parseGlb } from './gltf-binary';
 import { importGltf, prepareGltfTangents, type GltfAsset, type GltfImportOptions } from './gltf-import';
 import { decodeTexture, type TextureAsset } from './texture-assets';
 
-export interface GltfLoadOptions extends Omit<GltfImportOptions, 'images'> {
+export interface GltfLoadOptions extends Omit<GltfImportOptions, 'images' | 'resolveImage'> {
   signal?: AbortSignal;
   /** Cumulative compressed/downloaded bytes, including JSON, buffers and images. */
   maxBytes?: number;

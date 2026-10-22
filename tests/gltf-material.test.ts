@@ -4,6 +4,8 @@ import { importGltf, prepareGltfTangents } from '../src/gltf-import';
 import { compileMaterial, evaluateMaterial } from '../src/material';
 import type { TextureAsset } from '../src/texture-assets';
 import type { GltfBinaryDocument } from '../src/gltf-binary';
+import { createGltfMaterialLibrary } from '../src/gltf-material';
+import type { PreparedTextureAsset } from '../src/texture-storage';
 
 const directory = new URL('../public/assets/gltf/AnimatedMorphCube/glTF/', import.meta.url);
 const source = readFileSync(new URL('AnimatedMorphCube.gltf', directory), 'utf8');
@@ -181,5 +183,172 @@ describe('glTF material import', () => {
     for (const target of json.meshes[0].primitives[0].targets ?? []) delete target.TANGENT;
     expect(() => importGltf(json, buffers, { images: new Map([[0, image]]), maxTangentBytes: 1 }))
       .toThrow(/GLTF_TANGENT_WORK_BUDGET/);
+  });
+});
+
+const prepared = (colorSpace: 'srgb' | 'linear'): PreparedTextureAsset => ({
+  kind: 'prepared', width: 2, height: 2, colorSpace, format: 'rgba8', baseMipLevel: 0,
+  levels: [{ width: 2, height: 2, data: new Uint8Array(16) },
+    { width: 1, height: 1, data: new Uint8Array(4) }],
+});
+
+const materialDocument = () => ({
+  asset: { version: '2.0' }, images: [{ uri: 'shared.png' }],
+  samplers: [
+    { wrapS: 33071, wrapT: 33648, minFilter: 9728, magFilter: 9728 },
+    { wrapS: 10497, wrapT: 10497, minFilter: 9987, magFilter: 9729 },
+  ],
+  textures: [{ source: 0, sampler: 0 }, { source: 0, sampler: 1 }],
+  materials: [
+    { pbrMetallicRoughness: { baseColorTexture: { index: 0 } } },
+    { pbrMetallicRoughness: { baseColorTexture: { index: 1 }, metallicRoughnessTexture: { index: 0 } },
+      normalTexture: { index: 0 } },
+    { emissiveTexture: { index: 1 } },
+  ],
+});
+
+describe('glTF material library without geometry', () => {
+  it('shares an exact stream-fallback identity across materials while keeping samplers per texture', () => {
+    const doc = materialDocument();
+    const snapshot = JSON.stringify(doc);
+    const srgb = prepared('srgb');
+    const linear = prepared('linear');
+    const library = createGltfMaterialLibrary(doc, { resolveImage: (_imageIndex, role) => role === 'srgb' ? srgb : linear });
+    expect(library.materialCount).toBe(3);
+    const first = library.get(0), second = library.get(1), third = library.get(2);
+    expect(library.get(0)).toBe(first);
+    expect(first.textures?.[0]).toBe(srgb);
+    expect(second.textures?.[0]).toBe(srgb);
+    expect(third.textures?.[2]).toBe(srgb);
+    expect(second.textures?.[1]).toBe(linear);
+    expect(second.textures?.[3]).toBe(linear);
+    expect(first.samplers?.[0]).toMatchObject({ addressModeU: 'clamp-to-edge',
+      addressModeV: 'mirror-repeat', minFilter: 'nearest', magFilter: 'nearest', lodMaxClamp: 0 });
+    expect(second.samplers?.[0]).toMatchObject({ addressModeU: 'repeat',
+      addressModeV: 'repeat', minFilter: 'linear', mipmapFilter: 'linear' });
+    expect(JSON.stringify(doc)).toBe(snapshot);
+    expect(srgb.levels[0].data).toHaveLength(16);
+    expect(linear.levels[0].data).toHaveLength(16);
+  });
+
+  it('calls a resolver once per image and color role and preserves each returned asset exactly', () => {
+    const doc = materialDocument();
+    const srgb = prepared('srgb'), linear = prepared('linear');
+    const calls: string[] = [];
+    const library = createGltfMaterialLibrary(doc, { resolveImage: (index, role) => {
+      calls.push(`${index}:${role}`);
+      return role === 'srgb' ? srgb : linear;
+    } });
+    library.get(2);
+    library.get(1);
+    library.get(0);
+    library.get(1);
+    expect(calls).toEqual(['0:srgb', '0:linear']);
+    expect(library.get(1).textures?.[1]).toBe(linear);
+    expect(library.get(0).textures?.[0]).toBe(srgb);
+  });
+
+  it('passes prepared image resolution through the ordinary glTF importer', () => {
+    const srgb = prepared('srgb'), linear = prepared('linear');
+    const calls: string[] = [];
+    const asset = importGltf(texturedFixture(), [binary], { resolveImage: (index, role) => {
+      calls.push(`${index}:${role}`);
+      return role === 'srgb' ? srgb : linear;
+    } });
+    const binding = asset.meshes[0].primitives[0].material;
+    expect(binding.textures?.[0]).toBe(srgb);
+    expect(binding.textures?.[1]).toBe(linear);
+    expect(binding.textures?.[2]).toBe(srgb);
+    expect(calls).toEqual(['0:srgb', '0:linear']);
+  });
+
+  it('validates prepared storage and color role without cloning or repairing it', () => {
+    const doc = materialDocument();
+    const mismatched = prepared('linear');
+    expect(() => createGltfMaterialLibrary(doc, { images: new Map([[0, mismatched]]) }).get(0))
+      .toThrow(/GLTF_IMAGE_COLOR_SPACE/);
+    const malformed = prepared('srgb');
+    (malformed.levels[1] as { width: number; height: number; data: Uint8Array }).data = new Uint8Array(3);
+    expect(() => createGltfMaterialLibrary(doc, { images: new Map([[0, malformed]]) }).get(0))
+      .toThrow(/TEXTURE_STORAGE/);
+    expect(() => createGltfMaterialLibrary(doc).get(0)).toThrow(/GLTF_IMAGE_NOT_DECODED/);
+  });
+
+  it('does not fall back to the image map or reinterpret a resolver result with the wrong color space', () => {
+    const doc = materialDocument();
+    expect(() => createGltfMaterialLibrary(doc, { images: new Map([[0, image]]), resolveImage: () => undefined }).get(0))
+      .toThrow(/GLTF_IMAGE_NOT_DECODED/);
+    const decodedLinear: TextureAsset = { ...image, colorSpace: 'linear' };
+    expect(() => createGltfMaterialLibrary(doc, { resolveImage: () => decodedLinear }).get(0))
+      .toThrow(/GLTF_IMAGE_COLOR_SPACE/);
+    expect(() => createGltfMaterialLibrary(doc, { resolveImage: () => prepared('linear') }).get(0))
+      .toThrow(/GLTF_IMAGE_COLOR_SPACE/);
+  });
+
+  it('bounds metadata and leaves scene-only extension validation to the full importer', () => {
+    expect(() => createGltfMaterialLibrary({ asset: { version: '1.0' } })).toThrow(/GLTF_VERSION/);
+    expect(() => createGltfMaterialLibrary({ asset: { version: '2.0' }, images: new Array(65537) }))
+      .toThrow(/GLTF_ARRAY_LIMIT/);
+    const doc = { ...materialDocument(), extensionsRequired: ['KHR_lights_punctual'] };
+    expect(createGltfMaterialLibrary(doc, { images: new Map([[0, image]]) }).get(0).definition.shading).toBe('pbr');
+    const full = { ...texturedFixture(), extensionsRequired: ['KHR_lights_punctual'] };
+    expect(() => importGltf(full, [binary], { images: new Map([[0, image]]) })).toThrow(/GLTF_REQUIRED_EXTENSION/);
+    const invalidUnused = texturedFixture();
+    invalidUnused.materials.push({ alphaMode: 'BLEND' });
+    expect(() => importGltf(invalidUnused, [binary], { images: new Map([[0, image]]) })).toThrow(/GLTF_UNSUPPORTED_ALPHA_MODE/);
+  });
+
+  it('keeps decoded legacy pixels shared across roles and evaluates factors, normal scale, vertex color, and mask coverage', () => {
+    const doc = materialDocument() as any;
+    doc.materials[0] = {
+      ...doc.materials[0], alphaMode: 'MASK', alphaCutoff: 0.3, doubleSided: true,
+      pbrMetallicRoughness: { ...doc.materials[0].pbrMetallicRoughness,
+        baseColorFactor: [0.5, 0.25, 1, 0.8], roughnessFactor: 0.5, metallicFactor: 0.6 },
+      emissiveFactor: [0.2, 0.4, 0.6], emissiveTexture: { index: 1 },
+      normalTexture: { index: 0, scale: -0.5 },
+    };
+    const decoded: TextureAsset = { width: 1, height: 1, colorSpace: 'srgb', pixels: new Uint8Array([255, 128, 64, 255]) };
+    const library = createGltfMaterialLibrary(doc, { images: new Map([[0, decoded]]) });
+    const material = library.get(0), other = library.get(1);
+    expect(material.textures?.[0]).toBe(decoded);
+    expect(material.textures?.[2]).toBe(decoded);
+    expect(material.textures?.[3]).toBe(other.textures?.[1]);
+    expect(material.textures?.[3]).not.toBe(decoded);
+    expect((material.textures?.[3] as TextureAsset).pixels).toBe(decoded.pixels);
+    expect(decoded.colorSpace).toBe('srgb');
+    const program = compileMaterial(material.definition);
+    expect(program).toMatchObject({ shading: 'pbr', alphaMode: 'mask', doubleSided: true, normalMapped: true });
+    const inputs = { parameters: material.parameters,
+      textures: (slot: number): [number, number, number, number] => slot === 0 ? [0.8, 0.4, 0.2, 0.5]
+        : slot === 3 ? [0.75, 0.5, 1, 1] : [1, 1, 1, 1],
+      instanceColor: [1, 1, 1, 1] as [number, number, number, number],
+      instanceMetalRough: [1, 1] as [number, number] };
+    const evaluated = evaluateMaterial(program, inputs);
+    expect(evaluated.baseColor[0]).toBeCloseTo(0.4);
+    expect(evaluated.roughness).toBeCloseTo(0.5);
+    expect(evaluated.metallic).toBeCloseTo(0.6);
+    evaluated.emissive.forEach((value, index) => expect(value).toBeCloseTo([0.2, 0.4, 0.6][index]));
+    expect(evaluated.covered).toBe(true);
+    expect(evaluated.tangentNormal[0]).toBeLessThan(0);
+    expect(evaluateMaterial(program, { ...inputs, vertexColor: [1, 1, 1, 0.5] }).covered).toBe(false);
+  });
+
+  it('uses a null default and validates requested material, texture, and image indices lazily', () => {
+    const doc = materialDocument();
+    const library = createGltfMaterialLibrary(doc, { images: new Map([[0, image]]) });
+    expect(library.get(null).definition).toMatchObject({ shading: 'pbr', alphaMode: 'opaque' });
+    expect(library.get(null)).toBe(library.get(null));
+    for (const index of [-1, 3, 0.5, NaN]) expect(() => library.get(index)).toThrow();
+    const badTexture = materialDocument();
+    badTexture.materials[0] = { pbrMetallicRoughness: { baseColorTexture: { index: 99 } } };
+    expect(() => createGltfMaterialLibrary(badTexture, { images: new Map([[0, image]]) }).get(0)).toThrow();
+    const badImage = materialDocument();
+    badImage.textures[0].source = 99;
+    expect(() => createGltfMaterialLibrary(badImage, { images: new Map([[0, image]]) }).get(0)).toThrow();
+    const blendDoc = materialDocument();
+    const blend = { ...blendDoc, materials: [...blendDoc.materials.slice(0, 2), { alphaMode: 'BLEND' }] };
+    const lazy = createGltfMaterialLibrary(blend, { images: new Map([[0, image]]) });
+    expect(lazy.get(0).definition.alphaMode).toBe('opaque');
+    expect(() => lazy.get(2)).toThrow(/GLTF_UNSUPPORTED_ALPHA_MODE/);
   });
 });

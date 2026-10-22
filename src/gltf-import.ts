@@ -3,10 +3,9 @@ import { AnimationRig, type AnimationNode, type AnimationTrack, type AnimationCl
 import type { MeshData } from './geometry';
 import type { MorphTarget } from './deformation';
 import type { MaterialBinding } from './contracts';
-import { m, type Vec4Expr } from './material';
+import { createGltfMaterialLibrary, type GltfMaterialOptions } from './gltf-material';
 import { identity, inverseAffine, type Mat4 } from './math';
 import { buildMorphTarget } from './morph-assets';
-import type { TextureAsset } from './texture-assets';
 import { generateGltfTangents } from './gltf-tangents';
 
 export { prepareGltfTangents } from './gltf-tangents';
@@ -21,9 +20,7 @@ export interface GltfAsset {
   scenes: { name: string; roots: number[] }[]; scene: number;
   warnings: string[];
 }
-export interface GltfImportOptions {
-  /** A decoded image has a separate sRGB/linear view when required by different texture roles. */
-  images?: ReadonlyMap<number, TextureAsset>;
+export interface GltfImportOptions extends GltfMaterialOptions {
   maxVertices?: number; maxIndices?: number;
   /** Conservative tangent preparation-work estimate per primitive, not a runtime RSS ceiling (default 256 MiB, hard limit 512 MiB). */
   maxTangentBytes?: number;
@@ -73,72 +70,16 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
   const nodeJson = array(doc.nodes ?? [], 'nodes', 4096).map((node, i) => object(node, 'node' + i));
   const meshJson = array(doc.meshes ?? [], 'meshes').map((mesh, i) => object(mesh, 'mesh' + i));
   const skinJson = array(doc.skins ?? [], 'skins').map((skin, i) => object(skin, 'skin' + i));
-  const materialJson = array(doc.materials ?? [], 'materials').map((value, i) => object(value, 'material' + i));
-  const textures = array(doc.textures ?? [], 'textures').map(value => object(value, 'texture'));
-  const images = array(doc.images ?? [], 'images');
-  const samplers = array(doc.samplers ?? [], 'samplers').map(value => object(value, 'sampler'));
+  array(doc.materials ?? [], 'materials').forEach((value, i) => object(value, 'material' + i));
+  array(doc.textures ?? [], 'textures').forEach(value => object(value, 'texture'));
+  array(doc.samplers ?? [], 'samplers').forEach(value => object(value, 'sampler'));
+  const materialLibrary = createGltfMaterialLibrary(json, options);
+  for (let i = 0; i < materialLibrary.materialCount; i++) materialLibrary.get(i);
+  const defaultMaterial = materialLibrary.get(null);
   const accessorDefinitions = array(doc.accessors ?? [], 'accessors');
   const accessorCount = accessorDefinitions.length;
   const warnings: string[] = [];
   if (doc.cameras !== undefined) warnings.push('glTF cameras are asset metadata; the application supplies the render camera.');
-  const textureViews = new Map<string, TextureAsset>();
-  const material = (source: Json): MaterialBinding => {
-    const pbr = object(source.pbrMetallicRoughness ?? {}, 'pbrMetallicRoughness');
-    if (source.occlusionTexture !== undefined) throw new Error('GLTF_UNSUPPORTED_MATERIAL: occlusion texture');
-    const extensions = object(source.extensions ?? {}, 'material.extensions');
-    for (const name of Object.keys(extensions)) if (!supportedExtensions.has(name)) throw new Error('GLTF_UNSUPPORTED_MATERIAL_EXTENSION: ' + name);
-    const alphaMode = source.alphaMode ?? 'OPAQUE';
-    if (alphaMode !== 'OPAQUE' && alphaMode !== 'MASK') throw new Error('GLTF_UNSUPPORTED_ALPHA_MODE: ' + String(alphaMode));
-    if (source.doubleSided !== undefined && typeof source.doubleSided !== 'boolean') throw new Error('GLTF_DOUBLE_SIDED');
-    const baseColor = vector(pbr.baseColorFactor, [1, 1, 1, 1], 'baseColorFactor');
-    const emissive = vector(source.emissiveFactor, [0, 0, 0], 'emissiveFactor');
-    if ([...baseColor, ...emissive].some(v => v < 0 || v > 1)) throw new Error('GLTF_MATERIAL_FACTOR_RANGE');
-    const slots: (TextureAsset | undefined)[] = [];
-    const samplerSlots: NonNullable<MaterialBinding['samplers']>[number][] = [];
-    const withTexture = (input: Vec4Expr, infoValue: unknown, slot: number, colorSpace: 'srgb' | 'linear') => {
-      if (infoValue === undefined) return input;
-      const info = object(infoValue, 'textureInfo');
-      if ((info.texCoord ?? 0) !== 0 || info.extensions !== undefined) throw new Error('GLTF_UNSUPPORTED_TEXTURE_COORDINATES');
-      const texture = textures[index(info.index, textures.length, 'textureInfo.index')];
-      if (texture.extensions !== undefined) throw new Error('GLTF_UNSUPPORTED_TEXTURE_EXTENSION');
-      const imageIndex = index(texture.source, images.length, 'texture.source');
-      const original = options.images?.get(imageIndex);
-      if (!original) throw new Error('GLTF_IMAGE_NOT_DECODED: ' + imageIndex);
-      const key = imageIndex + ':' + colorSpace;
-      let view = textureViews.get(key);
-      if (!view) { view = { ...original, colorSpace }; textureViews.set(key, view); }
-      slots[slot] = view;
-      if (texture.sampler !== undefined) {
-        const sampler = samplers[index(texture.sampler, samplers.length, 'texture.sampler')];
-        const wrap = (value: unknown): GPUAddressMode => {
-          switch (value ?? 10497) { case 10497: return 'repeat'; case 33071: return 'clamp-to-edge'; case 33648: return 'mirror-repeat'; default: throw new Error('GLTF_SAMPLER_WRAP'); }
-        };
-        const min = sampler.minFilter ?? 9987, mag = sampler.magFilter ?? 9729;
-        if (![9728, 9729, 9984, 9985, 9986, 9987].includes(min as number) || (mag !== 9728 && mag !== 9729)) throw new Error('GLTF_SAMPLER_FILTER');
-        samplerSlots[slot] = { addressModeU: wrap(sampler.wrapS), addressModeV: wrap(sampler.wrapT),
-          magFilter: mag === 9728 ? 'nearest' : 'linear', minFilter: [9728, 9984, 9986].includes(min as number) ? 'nearest' : 'linear',
-          mipmapFilter: [9986, 9987].includes(min as number) ? 'linear' : 'nearest',
-          ...([9728, 9729].includes(min as number) ? { lodMaxClamp: 0 } : {}) };
-      }
-      return m.multiply(input, m.texture(slot));
-    };
-    const color = m.multiply(withTexture(m.parameter(0), pbr.baseColorTexture, 0, 'srgb'), m.vertexColor);
-    const mr = withTexture(m.parameter(1), pbr.metallicRoughnessTexture, 1, 'linear');
-    const emission = withTexture(m.parameter(2), source.emissiveTexture, 2, 'srgb');
-    const normalInfo = source.normalTexture === undefined ? undefined : object(source.normalTexture, 'normalTexture');
-    const normal = normalInfo === undefined ? undefined : withTexture(m.constant([1, 1, 1, 1]), normalInfo, 3, 'linear');
-    const normalScale = normalInfo === undefined ? undefined : number(normalInfo.scale, 1, 'normalTexture.scale');
-    return { definition: { shading: extensions.KHR_materials_unlit !== undefined ? 'unlit' : 'pbr',
-      alphaMode: alphaMode === 'MASK' ? 'mask' : 'opaque', doubleSided: source.doubleSided === true,
-      baseColor: color, metallic: m.component(mr, 2), roughness: m.component(mr, 1), emissive: emission,
-      alphaCutoff: m.component(m.parameter(1), 3),
-      ...(normal === undefined ? {} : { normal, normalScale: m.component(m.parameter(3), 0) }) },
-      parameters: new Float32Array([...baseColor, 0, number(pbr.roughnessFactor, 1, 'roughnessFactor', 0, 1),
-        number(pbr.metallicFactor, 1, 'metallicFactor', 0, 1), number(source.alphaCutoff, 0.5, 'alphaCutoff', 0), ...emissive, 0,
-        ...(normalScale === undefined ? [] : [normalScale, 0, 0, 0])]),
-      textures: slots, samplers: samplerSlots };
-  };
-  const materials = materialJson.map(material), defaultMaterial = material({});
   let vertexTotal = 0, indexTotal = 0;
   const maxVertices = number(options.maxVertices, 1_000_000, 'maxVertices', 1, 10_000_000);
   const maxIndices = number(options.maxIndices, 3_000_000, 'maxIndices', 3, 30_000_000);
@@ -154,7 +95,7 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       const primitive = object(primitiveValue, 'primitive');
       if ((primitive.mode ?? 4) !== 4) throw new Error('GLTF_UNSUPPORTED_PRIMITIVE: triangles required');
       if (primitive.extensions !== undefined) throw new Error('GLTF_UNSUPPORTED_PRIMITIVE_EXTENSION');
-      const binding = primitive.material === undefined ? defaultMaterial : materials[index(primitive.material, materials.length, 'primitive.material')];
+      const binding = primitive.material === undefined ? defaultMaterial : materialLibrary.get(index(primitive.material, materialLibrary.materialCount, 'primitive.material'));
       const attrs = object(primitive.attributes, 'attributes');
       for (const attribute of Object.keys(attrs)) if (!['POSITION', 'NORMAL', 'TANGENT', 'TEXCOORD_0', 'COLOR_0', 'JOINTS_0', 'WEIGHTS_0'].includes(attribute)) throw new Error('GLTF_UNSUPPORTED_ATTRIBUTE: ' + attribute);
       const position = access(attrs.POSITION, 'VEC3', 'POSITION');

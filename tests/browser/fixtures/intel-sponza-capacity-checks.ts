@@ -16,13 +16,31 @@ export function interpolateCapacityCamera(a: CapacityCamera, b: CapacityCamera, 
 }
 
 export function assertCapacityLedger(state: { liveBytes: number; reservedBytes: number; accountedBytes: number;
-  peakBytes: number; error: string | null; limits: { maxResidentBytes: number; maxPeakBytes: number } }) {
+  peakBytes: number; error: string | null; limits: { maxResidentBytes: number; maxPeakBytes: number };
+  // Historical single-transaction reports omit all of these. A new report must
+  // supply the complete group so missing accounting cannot silently pass.
+  pendingGrowthBytes?: number; projectedLiveBytes?: number; inFlightMigrations?: number;
+  copyReservations?: { bytes: number; pages: number };
+  scheduling?: { maxConcurrentMigrations: number; maxCopyBytes: number; maxCopyPages: number; intervalFrames: number } }) {
   const values = [state.liveBytes, state.reservedBytes, state.accountedBytes, state.peakBytes];
   if (state.error || values.some(n => !Number.isSafeInteger(n) || n < 0)
     || state.accountedBytes !== state.liveBytes + state.reservedBytes
     || state.liveBytes > state.limits.maxResidentBytes || state.accountedBytes > state.limits.maxPeakBytes
     || state.peakBytes > state.limits.maxPeakBytes || state.peakBytes < state.accountedBytes) {
     throw Error('SPONZA_CAPACITY_LEDGER: ' + JSON.stringify(state));
+  }
+  if ([state.pendingGrowthBytes, state.projectedLiveBytes, state.inFlightMigrations, state.copyReservations, state.scheduling].some(value => value !== undefined)) {
+    const copies = state.copyReservations, limits = state.scheduling;
+    const extended = [state.pendingGrowthBytes, state.projectedLiveBytes, state.inFlightMigrations, copies?.bytes, copies?.pages];
+    if (!limits || !copies || extended.some(value => value === undefined || !Number.isSafeInteger(value) || value < 0)
+      || [limits.maxConcurrentMigrations, limits.maxCopyBytes, limits.maxCopyPages, limits.intervalFrames].some(value => !Number.isSafeInteger(value) || value < 1)
+      || state.projectedLiveBytes !== state.liveBytes + state.pendingGrowthBytes!
+      || state.projectedLiveBytes! > state.limits.maxResidentBytes || state.inFlightMigrations! > limits.maxConcurrentMigrations
+      || copies.bytes > limits.maxCopyBytes || copies.pages > limits.maxCopyPages
+      || limits.maxConcurrentMigrations > 16 || limits.maxCopyBytes > 256 * 1024 ** 2 || limits.maxCopyPages > 4096 || limits.intervalFrames > 600
+      || state.inFlightMigrations === 0 && (copies.bytes !== 0 || copies.pages !== 0 || state.pendingGrowthBytes !== 0 || state.reservedBytes !== 0)) {
+      throw Error('SPONZA_CAPACITY_PARALLEL_LEDGER: ' + JSON.stringify(state));
+    }
   }
 }
 

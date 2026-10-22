@@ -9,15 +9,15 @@ const options = { geometryRoot: '/artifacts/sponza-group16-pages-20261022/',
   textureReferenceRoot: '/artifacts/sponza-textures-reference-20261020/',
   uvAuditUrl: '/artifacts/sponza-uv-demand-20261020.json', anisotropy: 8,
   output: 'artifacts/sponza-capacity-capture', settleFrames: 1200, travelFrames: 48, stableFrames: 24,
-  intervalFrames: 2, maxErrorPixels: 2, exposureEV: 3, timeoutMs: 1800000 };
+  intervalFrames: 2, maxConcurrentMigrations: 4, maxErrorPixels: 2, exposureEV: 3, timeoutMs: 1800000 };
 const flags = new Map([['--geometry-root', 'geometryRoot'], ['--query-root', 'queryRoot'], ['--output', 'output'],
   ['--texture-gpu-root', 'textureGpuRoot'], ['--texture-reference-root', 'textureReferenceRoot'], ['--uv-audit', 'uvAuditUrl'],
   ['--resident-mib', 'residentMiB'], ['--peak-mib', 'peakMiB'], ['--settle-frames', 'settleFrames'],
-  ['--travel-frames', 'travelFrames'], ['--stable-frames', 'stableFrames'], ['--interval-frames', 'intervalFrames'],
+  ['--travel-frames', 'travelFrames'], ['--stable-frames', 'stableFrames'], ['--interval-frames', 'intervalFrames'], ['--concurrent-migrations', 'maxConcurrentMigrations'],
   ['--lod-error', 'maxErrorPixels'], ['--anisotropy', 'anisotropy'], ['--exposure', 'exposureEV'], ['--timeout-ms', 'timeoutMs']]);
 if (process.argv.includes('--help')) {
   console.log('Usage: node scripts/capture-sponza-capacity.mjs [--output artifacts/name] [--resident-mib N --peak-mib N]\n'
-    + '  --settle-frames 1200 --travel-frames 48 --stable-frames 24 --interval-frames 2 --lod-error 2\n'
+    + '  --settle-frames 1200 --travel-frames 48 --stable-frames 24 --interval-frames 2 --concurrent-migrations 4 --lod-error 2\n'
     + '  --geometry-root /local/path/ --texture-gpu-root /local/path/ --texture-reference-root /local/path/ --uv-audit /local/file.json\n'
     + 'Requires an existing Vite server at http://127.0.0.1:5173. Runs Edge with the high-performance hardware adapter.\n'
     + 'Default live budget equals original quarter-page pools plus ALL selection and current/previous output allocations.\n'
@@ -34,6 +34,7 @@ for (const key of ['geometryRoot', 'queryRoot', 'textureGpuRoot', 'textureRefere
 if (!options.uvAuditUrl.startsWith('/') || options.uvAuditUrl.startsWith('//')) throw Error('SPONZA_CAPACITY_LOCAL_UV_AUDIT');
 for (const [key, minimum, maximum, integral] of [['residentMiB', 0.000001, 8192, false], ['peakMiB', 0.000001, 8192, false],
   ['settleFrames', 90, 3600, true], ['travelFrames', 1, 240, true], ['stableFrames', 12, 120, true], ['intervalFrames', 1, 60, true],
+  ['maxConcurrentMigrations', 1, 16, true],
   ['maxErrorPixels', 0, 16, false], ['anisotropy', 1, 16, true], ['exposureEV', -10, 10, false], ['timeoutMs', 60000, 3600000, true]]) {
   if (options[key] === undefined) continue;
   options[key] = Number(options[key]);
@@ -76,7 +77,8 @@ try {
   console.log(JSON.stringify({ passed: true, adapter: result.info.adapterInfo, limits: result.limits,
     endpoints: result.endpoints.map(endpoint => ({ label: endpoint.label, triangles: endpoint.actualTriangles,
       clusters: endpoint.visibleClusters, framesToSettle: endpoint.framesToSettle, exchange: endpoint.exchange })),
-    migrations: result.migrations.length, recovery: result.recovery, ownedAfterDispose: result.ownedAfterDispose }));
+    migrationBatches: result.migrationBatches, migrations: result.auditedMigrations,
+    diagnosticMigrations: result.afterDispose.migrations, recovery: result.recovery, ownedAfterDispose: result.ownedAfterDispose }));
 } catch (error) {
   await writeFile(join(options.output, 'failure.json'), JSON.stringify({ error: String(error), options, pageErrors, savedCaptures, progress }, null, 2));
   throw error;

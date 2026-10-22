@@ -19,6 +19,17 @@ describe('real Sponza capacity acceptance oracles', () => {
       expect(() => assertCapacityLedger({ ...ledger, ...mutation })).toThrow('SPONZA_CAPACITY_LEDGER');
     }
   });
+  it('checks pending growth, aggregate copy budgets and concurrency, while allowing historical ledgers', () => {
+    const parallel = { ...ledger, pendingGrowthBytes: 20, projectedLiveBytes: 100, inFlightMigrations: 2,
+      copyReservations: { bytes: 30, pages: 4 }, scheduling: { maxCopyBytes: 32, maxCopyPages: 4, maxConcurrentMigrations: 4, intervalFrames: 1 } };
+    expect(() => assertCapacityLedger(ledger)).not.toThrow();
+    expect(() => assertCapacityLedger(parallel)).not.toThrow();
+    for (const mutation of [{ projectedLiveBytes: 80 }, { pendingGrowthBytes: 21, projectedLiveBytes: 101 },
+      { inFlightMigrations: 5 }, { copyReservations: { bytes: 33, pages: 4 } }, { copyReservations: { bytes: 30, pages: 5 } },
+      { pendingGrowthBytes: -1 }, { pendingGrowthBytes: undefined }, { scheduling: undefined }, { inFlightMigrations: 0 }]) {
+      expect(() => assertCapacityLedger({ ...parallel, ...mutation })).toThrow('PARALLEL_LEDGER');
+    }
+  });
   it('accepts a complete resident cut including culled members and counts only actually drawn triangles', () => {
     expect(assertCapacityCut(directory, new Set([0, 1, 2]), [[0, 1], [2]], feedback))
       .toEqual({ completeClusters: 3, visibleClusters: 2, triangles: 3, indices: 9 });

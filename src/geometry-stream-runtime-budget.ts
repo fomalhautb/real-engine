@@ -30,7 +30,7 @@ function budget(value: number | undefined, fallback: number, maximum: number, na
   return result;
 }
 
-/** Stateful cross-stream admission and one-at-a-time migration choice. The
+/** Stateful cross-stream admission and bounded migration choice. The
  * Renderer owns preparation/commit/retirement; this scheduler accounts for all
  * their declared GPU dependents rather than just moving logical page quotas. */
 export class GeometryStreamRuntimeBudget {
@@ -99,15 +99,24 @@ export class GeometryStreamRuntimeBudget {
   /** Choose one migration. Shrinks free space before growth. A smaller temporary
    * root-only target is allowed when the desired shrink cannot fit in overlap.
    * A null action reports headroom pressure without overcommitting or stalling
-   * rendering. Caller must wait for retirement before releasing its reservation. */
-  next(plan: ReturnType<GeometryStreamRuntimeBudget['plan']>, currentSlots: readonly number[], retiringBytes = 0) {
+   * rendering. reservedBytes includes all candidates and retiring owners. Growth
+   * already admitted but not committed must also reserve its positive live delta:
+   * asynchronous preparation/commit order cannot borrow an uncommitted shrink. */
+  next(plan: ReturnType<GeometryStreamRuntimeBudget['plan']>, currentSlots: readonly number[], reservedBytes = 0,
+    pending: { excluded?: readonly number[]; growthBytes?: number } = {}) {
+    const growthBytes = pending.growthBytes ?? 0;
     if (!Array.isArray(currentSlots) || currentSlots.length !== this.inputs.length
-      || !Number.isSafeInteger(retiringBytes) || retiringBytes < 0
+      || !Number.isSafeInteger(reservedBytes) || reservedBytes < 0
+      || !Number.isSafeInteger(growthBytes) || growthBytes < 0
+      || pending.excluded !== undefined && (!Array.isArray(pending.excluded) || pending.excluded.length > this.inputs.length)
       || !Array.isArray(plan?.streams) || plan.streams.length !== this.inputs.length) throw new RangeError('GEOMETRY_STREAM_RUNTIME_STATE');
+    const excluded = new Set(pending.excluded ?? []);
+    if ([...excluded].some(index => !Number.isSafeInteger(index) || index < 0 || index >= this.inputs.length)) throw new RangeError('GEOMETRY_STREAM_RUNTIME_STATE');
     const current = currentSlots.map((slots, index) => this.state(index, slots));
     const liveBytes = current.reduce((sum, state) => sum + state.totalBytes, 0);
-    const ownedBytes = liveBytes + retiringBytes;
+    const ownedBytes = liveBytes + reservedBytes;
     if (ownedBytes > this.options.maxPeakBytes) throw new RangeError('GEOMETRY_STREAM_RUNTIME_EXISTING_PEAK');
+    if (liveBytes + growthBytes > this.options.maxResidentBytes) throw new RangeError('GEOMETRY_STREAM_RUNTIME_EXISTING_LIVE');
     const targets = plan.streams.map((stream, index) => {
       const state = this.state(index, stream.slots);
       if (stream.index !== index || stream.totalBytes !== state.totalBytes || stream.poolBytes !== state.poolBytes
@@ -117,7 +126,7 @@ export class GeometryStreamRuntimeBudget {
       return { ...state, pages: stream.pages };
     });
     if (targets.reduce((sum, state) => sum + state.totalBytes, 0) > this.options.maxResidentBytes) throw new RangeError('GEOMETRY_STREAM_RUNTIME_PLAN');
-    const candidates = targets.filter(target => target.slots !== current[target.index].slots).sort((a, b) => {
+    const candidates = targets.filter(target => !excluded.has(target.index) && target.slots !== current[target.index].slots).sort((a, b) => {
       const da = current[a.index].totalBytes - a.totalBytes, db = current[b.index].totalBytes - b.totalBytes;
       return Number(db > 0) - Number(da > 0) || db - da || a.index - b.index;
     });
@@ -129,10 +138,11 @@ export class GeometryStreamRuntimeBudget {
         temporary = desired.slots !== target.slots;
       }
       if (ownedBytes + desired.totalBytes > this.options.maxPeakBytes) continue;
-      return { liveBytes, retiringBytes, action: { ...desired, pages: [...desired.pages], temporary,
+      if (liveBytes + growthBytes + Math.max(0, desired.totalBytes - current[desired.index].totalBytes) > this.options.maxResidentBytes) continue;
+      return { liveBytes, retiringBytes: reservedBytes, action: { ...desired, pages: [...desired.pages], temporary,
         expectedSlots: current[desired.index].slots, poolPeakBytes: current[desired.index].poolBytes + desired.poolBytes,
         peakBytes: ownedBytes + desired.totalBytes }, deferred: false };
     }
-    return { liveBytes, retiringBytes, action: null, deferred: candidates.length > 0 };
+    return { liveBytes, retiringBytes: reservedBytes, action: null, deferred: candidates.length > 0 };
   }
 }

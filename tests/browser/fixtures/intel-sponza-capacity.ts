@@ -28,6 +28,7 @@ export interface IntelSponzaCapacityOptions extends Omit<IntelSponzaAssetOptions
   travelFrames?: number;
   stableFrames?: number;
   intervalFrames?: number;
+  maxConcurrentMigrations?: number;
   exposureEV?: number;
 }
 
@@ -41,9 +42,10 @@ type PrivateRenderer = { device: GPUDevice; geometryCapacity: { dispose(): Promi
 export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOptions = {},
   onCapture?: (capture: CapacityCapture) => Promise<void>) {
   const settleFrames = options.settleFrames ?? 1200, travelFrames = options.travelFrames ?? 48,
-    stableFrames = options.stableFrames ?? 24, intervalFrames = options.intervalFrames ?? 2;
+    stableFrames = options.stableFrames ?? 24, intervalFrames = options.intervalFrames ?? 2,
+    maxConcurrentMigrations = options.maxConcurrentMigrations ?? 4;
   for (const [value, minimum, maximum, name] of [[settleFrames, 90, 3600, 'SETTLE'], [travelFrames, 1, 240, 'TRAVEL'],
-    [stableFrames, 12, 120, 'STABLE'], [intervalFrames, 1, 60, 'INTERVAL']] as const) {
+    [stableFrames, 12, 120, 'STABLE'], [intervalFrames, 1, 60, 'INTERVAL'], [maxConcurrentMigrations, 1, 16, 'CONCURRENT']] as const) {
     if (!Number.isSafeInteger(value) || value < minimum || value > maximum) throw Error('SPONZA_CAPACITY_' + name);
   }
   if (stableFrames < intervalFrames * 2 || settleFrames < stableFrames) throw Error('SPONZA_CAPACITY_SETTLE_WINDOW');
@@ -89,7 +91,7 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
     renderer = await Renderer.create(canvas, batches, { maxBatches: 512, antiAliasing: 'fxaa', textureBudgetBytes: 512 * MiB,
       textureStreaming: { sources, maxCpuBytes: 256 * MiB, maxInFlightBytes: 128 * MiB, maxUploadBytesPerFrame: 2 * MiB },
       sunShadow: { resolution: 2048, focusBounds: bounds as { min: [number, number, number]; max: [number, number, number] } },
-      geometryRuntimeBudget: { maxResidentBytes, maxPeakBytes, intervalFrames, maxCopyPages: 4096, maxCopyBytes: 64 * MiB } });
+      geometryRuntimeBudget: { maxResidentBytes, maxPeakBytes, intervalFrames, maxConcurrentMigrations, maxCopyPages: 4096, maxCopyBytes: 64 * MiB } });
     renderer.setSun({ direction: [0.35, 0.8, 0.4], color: [4, 3.8, 3.5] });
     renderer.setExposure(options.exposureEV ?? 3);
     renderer.setGeometryLod({ maxErrorPixels, frustumCulling: true, debug: 'material' });
@@ -98,7 +100,8 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
     const seenMissing = inputs.map(() => new Set<number>()), pendingRecovery = inputs.map(() => new Set<number>());
     let recoveredPages = 0, maximumMissingAllocatedPages = 0;
     let epochs = inputs.map(() => 0);
-    const frames: Record<string, unknown>[] = [], migrations: Record<string, unknown>[] = [];
+    const frames: Record<string, unknown>[] = [], migrations: { frame: number; stage: string;
+      streams: Awaited<ReturnType<typeof auditCuts>>; slots: number[] }[] = [];
     const historyChecks: { frame: number; streams: number[]; samples: number; currentError: number; previousError: number }[] = [];
 
     const checkDiagnostics = () => {
@@ -208,6 +211,8 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
       }
       const row = { frame, stage, renderFrame: active.stats.frames, liveBytes: state.budget.liveBytes, reservedBytes: state.budget.reservedBytes,
         accountedBytes: state.budget.accountedBytes, phase: state.budget.phase, migrations: state.budget.migrations,
+        inFlightMigrations: state.budget.inFlightMigrations, pendingGrowthBytes: state.budget.pendingGrowthBytes,
+        projectedLiveBytes: state.budget.projectedLiveBytes, copyReservations: state.budget.copyReservations,
         missingAllocatedPages: state.missingAllocatedPages, desiredGroups: state.desiredGroups, actualTriangles: state.actualTriangles,
         residentPages: state.diagnostics.geometryStreams.reduce((n, stream) => n + stream.pool.residentPages.length, 0) };
       frames.push(row); if (frame % 30 === 0) progress('frames', row);
@@ -283,6 +288,8 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
     await new Promise<void>(resolve => setTimeout(resolve, 0));
     const afterDispose = active.diagnostics().geometryRuntimeBudget, ownedAfterDispose = active.stats.ownedGpuBytes;
     if (!afterDispose.enabled || afterDispose.liveBytes || afterDispose.reservedBytes || afterDispose.accountedBytes || ownedAfterDispose !== 0) failures.push('DISPOSE_NOT_ZERO');
+    const auditedMigrations = migrations.reduce((sum, batch) => sum + batch.streams.length, 0);
+    if (!afterDispose.enabled || auditedMigrations !== afterDispose.migrations) failures.push('MIGRATION_EPOCH_COUNT_MISMATCH');
     if (active.errors.length) failures.push('RENDERER_ERRORS');
     return { schemaVersion: 1, fixture: 'intel-sponza-runtime-capacity', passed: failures.length === 0, failures,
       info, errors: [...new Set([...errors, ...active.errors])], elapsedMs: performance.now() - started,
@@ -292,9 +299,9 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
         lighting: 'PBR direct lighting and fixed coarse shadow proxies; no GI in this geometry acceptance run',
         history: 'static world transforms, moving cameras; sampled current/previous world positions after every committed migration',
         performance: 'diagnostic readbacks and serial waits; elapsed time and FPS are not hardware benchmark results' },
-      limits: { maxResidentBytes, maxPeakBytes, intervalFrames, maxErrorPixels, settleFrames, travelFrames, stableFrames },
+      limits: { maxResidentBytes, maxPeakBytes, intervalFrames, maxConcurrentMigrations, maxErrorPixels, settleFrames, travelFrames, stableFrames },
       preflight: { rootBytes: sizing.rootBytes, initialBytes: initialPlan.allocatedBytes, initialSlots: initialPlan.streams.map(s => s.slots) },
-      peakAccountedBytes, maximumOwnedGpuBytes, frames, migrations, historyChecks, endpoints, captures,
+      peakAccountedBytes, maximumOwnedGpuBytes, frames, migrations, migrationBatches: migrations.length, auditedMigrations, historyChecks, endpoints, captures,
       recovery: { uniqueMissingPages: seenMissing.reduce((n, pages) => n + pages.size, 0), recoveredPages, maximumMissingAllocatedPages,
         finalMissingAllocatedPages: finalState.missingAllocatedPages, pendingOrNoLongerDemanded: pendingRecovery.reduce((n, pages) => n + pages.size, 0) },
       exchangeAB, exchangeBA, exchangeTurn, exchangeTurnBack, pendingDispose, afterDispose, ownedAfterDispose };

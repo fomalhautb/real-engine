@@ -85,4 +85,16 @@ describe('runtime scene geometry budgets including rendered dependents', () => {
     expect(() => scheduler.next({ ...plan, streams: plan.streams.map(stream => ({ ...stream, poolBytes: 1 })) }, [2, 2])).toThrow('PLAN');
     expect(() => scheduler.next({ ...plan, streams: plan.streams.map(stream => ({ ...stream, pages: [4, 4] })) }, [2, 2])).toThrow('PLAN');
   });
+
+  it('does not spend a pending shrink or overbook positive growth reserved by another candidate', () => {
+    const sizing = generous(), resident = sizing.state(0, 4).totalBytes + sizing.state(1, 2).totalBytes;
+    const scheduler = new GeometryStreamRuntimeBudget(inputs, { maxResidentBytes: resident, maxPeakBytes: resident * 3 }, limits);
+    const plan = scheduler.plan([[], [demand(2, 100), demand(0, 50)]]);
+    expect(scheduler.next(plan, [4, 2], scheduler.state(0, 2).totalBytes, { excluded: [0] })).toMatchObject({ action: null, deferred: true });
+    const delta = scheduler.state(1, 4).totalBytes - scheduler.state(1, 2).totalBytes;
+    expect(scheduler.next(plan, [2, 2], 0, { growthBytes: delta })).toMatchObject({ action: null, deferred: true });
+    expect(scheduler.next(plan, [2, 2], 0).action).toMatchObject({ index: 1, slots: 4 });
+    expect(() => scheduler.next(plan, [4, 2], 0, { growthBytes: 1 })).toThrow('EXISTING_LIVE');
+    expect(() => scheduler.next(plan, [2, 2], 0, { excluded: [2] })).toThrow('STATE');
+  });
 });

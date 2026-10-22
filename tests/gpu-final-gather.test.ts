@@ -82,6 +82,10 @@ describe('final gather path resource ownership', () => {
     [6, 'surface final gather immutable path segment 1'],
     [7, 'surface final gather immutable path segment 2'],
     [8, 'surface final gather immutable path segment 3'],
+    [14, 'final gather surface candidates'],
+    [15, 'final gather coverage prefix sums'],
+    [16, 'final gather coverage map 0'],
+    [17, 'final gather coverage map 1'],
   ] as const;
 
   it.each(failedAllocations)(

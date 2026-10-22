@@ -125,6 +125,7 @@ export class GpuDiffuseGi {
       ...(options.finalGather ? [
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' as const } },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' as const } },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' as const } },
       ] : []),
     ];
     const surfaceLayout = device.createBindGroupLayout({ entries: this.surfaceLayoutEntries });
@@ -159,10 +160,11 @@ export class GpuDiffuseGi {
       this.checkMemoryBudget();
     }
     const gatherBuffers = this.finalGather?.outputBuffers ?? [undefined];
-    this.surfaceVariants = this.probeBuffers.flatMap(buffer => gatherBuffers.map(anchors => [
+    this.surfaceVariants = this.probeBuffers.flatMap(buffer => gatherBuffers.map((anchors, gatherIndex) => [
         { binding: 0, resource: { buffer: this.parameters } }, { binding: 1, resource: { buffer } },
         ...(anchors ? [{ binding: 2, resource: { buffer: this.finalGather!.surfaceParameters } },
-          { binding: 3, resource: { buffer: anchors } }] : []),
+          { binding: 3, resource: { buffer: anchors } },
+          { binding: 6, resource: { buffer: this.finalGather!.coverageMapBuffers[gatherIndex] } }] : []),
       ]));
     this.surfaceGroups = this.probeBuffers.map((_, probeIndex) => gatherBuffers.map((_, gatherIndex) =>
       this.device.createBindGroup({ layout: this.surfaceLayout,
@@ -202,6 +204,11 @@ export class GpuDiffuseGi {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
     if (!this.finalGather) throw new Error('FINAL_GATHER_UNCONFIGURED');
     return this.finalGather.probe(indices);
+  }
+  async probeFinalGatherCoverageTiles(tiles: readonly number[]) {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    if (!this.finalGather) throw new Error('FINAL_GATHER_UNCONFIGURED');
+    return this.finalGather.probeCoverageTiles(tiles);
   }
   setEnabled(enabled: boolean): void {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');

@@ -226,7 +226,7 @@ export async function runGiFilterBoundaryDenoiseFixture() {
   const gridColumns = 64, gridRows = 5, count = gridColumns * gridRows;
   const gridStep = 0.01, h = 0.01, wallSeparation = 0.004;
   const anchorWords = FINAL_GATHER_ANCHOR_BYTES / Float32Array.BYTES_PER_ELEMENT;
-  if (anchorWords !== 28) throw new Error('GI_FILTER_BOUNDARY_MOMENT_LAYOUT');
+  if (anchorWords !== 28 || FINAL_GATHER_PARAMETER_BYTES !== 320) throw new Error('GI_FILTER_BOUNDARY_LAYOUT');
   // moments.x stores population variance of individual frame estimates. For
   // N=16, v=(N-1)*0.08^2 gives a known standard error of the mean of 0.08.
   const noiseAmplitude = 0.08, noiseHistory = 16;
@@ -236,6 +236,9 @@ export async function runGiFilterBoundaryDenoiseFixture() {
     const parameters = allocate(FINAL_GATHER_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const raw = allocate(count * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const filtered = allocate(count * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    // Every anchor is primary; the production denoise layout still includes
+    // the supplemental map binding, although this fixture never reads it.
+    const historyCoverageMap = allocate(Uint32Array.BYTES_PER_ELEMENT, GPUBufferUsage.STORAGE);
     const readback = allocate(count * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     const common = commonSource.replace('// GI_DISTANCE_CONSTANTS',
       `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`);
@@ -246,7 +249,7 @@ export async function runGiFilterBoundaryDenoiseFixture() {
     const pipeline = await device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'denoise' } });
     const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: parameters } }, { binding: 6, resource: { buffer: filtered } },
-      { binding: 7, resource: { buffer: raw } },
+      { binding: 7, resource: { buffer: raw } }, { binding: 23, resource: { buffer: historyCoverageMap } },
     ] });
     const params = new Uint32Array(FINAL_GATHER_PARAMETER_BYTES / Uint32Array.BYTES_PER_ELEMENT);
     params.set([gridColumns * 4, gridRows * 4, gridColumns, gridRows], 36);

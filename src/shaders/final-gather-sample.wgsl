@@ -12,6 +12,7 @@ struct FinalGatherParameters {
     rasterDy: vec4f,
     rasterDz: vec4f,
     raster: vec4u,
+    coverage: vec4u,
 }
 struct FinalGatherAnchor {
     position: vec4f,
@@ -24,6 +25,7 @@ struct FinalGatherAnchor {
 }
 @group(3) @binding(2) var<uniform> gather: FinalGatherParameters;
 @group(3) @binding(3) var<storage, read> finalGatherAnchors: array<FinalGatherAnchor>;
+@group(3) @binding(6) var<storage, read> finalGatherCoverage: array<u32>;
 
 struct FinalGatherReconstruction {
     irradiance: vec3f,
@@ -136,14 +138,18 @@ fn finalGatherReconstruct(pixel: vec2f, position: vec3f, normal: vec3f, geometri
         for (var y = -1; y <= 1; y++) { for (var x = -1; x <= 1; x++) {
             let coordinate = cell + vec2i(x, y);
             if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(shape))) { continue; }
-            let index = gather.viewport.z * gather.viewport.w + u32(coordinate.x) + u32(coordinate.y) * shape.x;
-            let anchor = finalGatherAnchors[index];
+            let tile = u32(coordinate.x) + u32(coordinate.y) * shape.x;
+            for (var rank = 0u; rank < 8u; rank++) {
+            let mapped = finalGatherCoverage[tile * 8u + rank];
+            if (mapped == 0u) { continue; }
+            let anchor = finalGatherAnchors[mapped - 1u];
             if (!finalGatherCompatible(anchor, position, normal, geometricNormal, expectedIdentity)) { continue; }
             let delta = position - anchor.position.xyz;
             let weight = 1.0 / (dot(delta, delta) + 0.000001);
             extraSum += anchor.irradiance.xyz * weight;
             extraTotal += weight;
             result.supplementalAccepted++;
+            }
         } }
         if (extraTotal > 0.0) {
             result.branch = 6u;

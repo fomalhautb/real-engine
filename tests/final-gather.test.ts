@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { finalGatherRasterRayBasis, invertFinalGatherProjection, planFinalGatherGrid, planFinalGatherSupplemental, resolveFinalGatherOptions } from '../src/final-gather';
 import { lookAt, multiply, perspective } from '../src/math';
+import { decodeFinalGatherDiagnostics } from '../src/final-gather-diagnostics';
 
 describe('final gather CPU contract', () => {
   it('resolves immutable defaults and independent normal bias', () => {
@@ -15,16 +16,45 @@ describe('final gather CPU contract', () => {
 
   it('fits optional coverage receivers in spare capacity without an unbounded tile scan', () => {
     expect(planFinalGatherSupplemental(1280, 720, 7936, 8192))
-      .toEqual({ spacing: 11, columns: 117, rows: 66, anchorCount: 7722 });
-    expect(planFinalGatherSupplemental(1280, 720, 0, 8192).anchorCount).toBe(0);
-    expect(planFinalGatherSupplemental(1280, 720, 7936, 0).anchorCount).toBe(0);
-    expect(planFinalGatherSupplemental(32768, 32768, 65536, 16384).anchorCount).toBe(0);
-    expect(planFinalGatherSupplemental(1, 1, 1, 1).anchorCount).toBe(1);
+      .toEqual({ spacing: 11, columns: 117, rows: 66, anchorCount: 7936, tileCount: 7722, permutationStride: 521 });
+    const disabled = { spacing: 0, columns: 0, rows: 0, anchorCount: 0, tileCount: 0, permutationStride: 1 };
+    expect(planFinalGatherSupplemental(1280, 720, 0, 8192)).toEqual(disabled);
+    expect(planFinalGatherSupplemental(1280, 720, 7936, 0)).toEqual(disabled);
+    expect(planFinalGatherSupplemental(32768, 32768, 65536, 16384)).toEqual(disabled);
+    expect(planFinalGatherSupplemental(1, 1, 1, 1))
+      .toEqual({ spacing: 1, columns: 1, rows: 1, anchorCount: 1, tileCount: 1, permutationStride: 521 });
     expect(() => resolveFinalGatherOptions({ maxSupplementalAnchors: 1 })).toThrow(/REQUIRES_RASTER/);
     expect(() => resolveFinalGatherOptions({ receiver: 'raster', maxSupplementalAnchors: 1 })).toThrow(/WORK_REQUIRED/);
     for (const requested of [-1, 16385, 0.5, NaN]) {
       expect(() => planFinalGatherSupplemental(128, 128, 100, requested)).toThrow();
       expect(() => resolveFinalGatherOptions({ receiver: 'raster', maxSupplementalAnchors: requested })).toThrow();
+    }
+  });
+
+  it('uses all spare slots independently of tile count and permutes each tile exactly once', () => {
+    const spare = planFinalGatherSupplemental(1280, 720, 7936, 8192);
+    expect(spare.anchorCount).toBeGreaterThan(spare.tileCount);
+    expect(spare.anchorCount).toBe(Math.min(7936, 8192));
+    for (const count of [1, 2, 521, 1042, 5210, 15_630, 523, 1046, 16_384]) {
+      const plan = planFinalGatherSupplemental(count, 1, count, count);
+      expect(plan.tileCount).toBe(count);
+      expect(plan.permutationStride).toBe(count % 521 ? 521 : 523);
+      const visited = new Set(Array.from({ length: count }, (_, index) => (index * plan.permutationStride) % count));
+      expect(visited.size).toBe(count);
+      expect([...visited].every(tile => tile >= 0 && tile < count)).toBe(true);
+    }
+  });
+
+  it('decodes up to eight supplemental ranks in all nine neighboring tiles', () => {
+    const words = new Uint32Array(8), floats = new Float32Array(words.buffer), pixel = [{ x: 0, y: 0 }];
+    words.fill(0x80808080, 4); floats.set([1, 0.2, 0.3], 1);
+    for (const count of [1, 8, 9, 10, 71, 72]) {
+      words[0] = 6 | (count << 24);
+      expect(decodeFinalGatherDiagnostics(words, pixel)[0]).toMatchObject({ branch: 'supplemental', supplementalAccepted: count });
+    }
+    for (const header of [6, 6 | (73 << 24), 6 | (255 << 24), 1 | (72 << 24)]) {
+      words[0] = header;
+      expect(() => decodeFinalGatherDiagnostics(words, pixel)).toThrow('FINAL_GATHER_DIAGNOSTIC_HEADER');
     }
   });
 

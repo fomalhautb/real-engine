@@ -3,7 +3,7 @@ import { GeometryDemoScene } from '../src/geometry-demo-scene';
 import { encodeGeometryPages } from '../src/geometry-pages';
 import { buildGeometryStreamDirectory } from '../src/geometry-stream-directory';
 import type { GeometryStreamDirectory } from '../src/geometry-stream-types';
-import type { GpuGeometryPagePool } from '../src/gpu-geometry-page-pool';
+import { GpuGeometryPagePool } from '../src/gpu-geometry-page-pool';
 import { GpuGeometryStreamSelection } from '../src/gpu-geometry-stream-selection';
 import { identity } from '../src/math';
 import type { GpuOcclusion } from '../src/gpu-occlusion';
@@ -94,6 +94,42 @@ afterEach(() => {
 });
 
 describe('GPU streamed selection ownership and failure lifecycle', () => {
+  it('shares one loss observer with page pools and detaches disposed owners before device loss', async () => {
+    const device = new FakeDevice(), observed = vi.spyOn(device.lost, 'then');
+    const pool = await GpuGeometryPagePool.create(device as unknown as GPUDevice, directory);
+    const retired = await selection(device), active = await selection(device);
+    pool.dispose(); retired.dispose();
+    expect(observed).toHaveBeenCalledOnce();
+    device.loseDevice(); await Promise.resolve();
+    expect(pool.diagnostics().error).toBeNull(); expect(retired.diagnostics().error).toBeNull();
+    expect(active.diagnostics()).toMatchObject({ disposed: true, gpuBytes: 0, error: 'GEOMETRY_STREAM_DEVICE_LOST' });
+  });
+
+  it('reuses compiled pipelines during capacity changes and closes allocation scopes before awaiting', async () => {
+    const device = new FakeDevice(), current = await selection(device);
+    const compiled = device.pipelines, allocated = device.buffers.length;
+    const replacement = GpuGeometryStreamSelection.create(device as unknown as GPUDevice,
+      { ...fakePool(), slotCount: directory.rootPages.length } as GpuGeometryPagePool,
+      buffer('instances', 224) as unknown as GPUBuffer, 1, () => {}, {}, undefined, current);
+    expect(device.pushes).toBe(device.pops); expect(device.pipelines).toBe(compiled);
+    const next = await replacement; selections.push(next);
+    expect(next.physicalVertexCount).toBe(directory.rootPages.length * 1024);
+    expect(device.buffers.length - allocated).toBe(7);
+    current.dispose();
+    next.update(1, 1, identity(), [0, 0, 4], 400);
+    expect(() => next.encode(device.createCommandEncoder() as unknown as GPUCommandEncoder)).not.toThrow();
+    expect(device.buffers.slice(allocated).every(entry => !entry.destroyed)).toBe(true);
+  });
+
+  it('cleans partial reused selection allocations while keeping the old owner usable', async () => {
+    const device = new FakeDevice(), current = await selection(device), allocated = device.buffers.length;
+    device.failBufferAt = allocated + 2;
+    await expect(GpuGeometryStreamSelection.create(device as unknown as GPUDevice, fakePool(),
+      buffer('instances', 224) as unknown as GPUBuffer, 1, () => {}, {}, undefined, current)).rejects.toThrow('FAKE_ALLOCATION_FAILURE');
+    expect(device.buffers.slice(allocated).every(entry => entry.destroyed)).toBe(true);
+    expect(current.diagnostics().disposed).toBe(false); expect(device.pushes).toBe(device.pops);
+  });
+
   it('destroys partial allocations and balances both scopes while retaining the allocation error', async () => {
     const device = new FakeDevice(); device.failBufferAt = 3;
     await expect(selection(device, bytes => {

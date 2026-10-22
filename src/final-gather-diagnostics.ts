@@ -139,7 +139,7 @@ export function decodeFinalGatherDiagnostics(
     const branchId = packed & 0xff, primaryAccepted = (packed >>> 8) & 0xff;
     const ringAccepted = (packed >>> 16) & 0xff;
     const supplementalAccepted = packed >>> 24;
-    if (supplementalAccepted > 9 || (branchId !== 6 && supplementalAccepted !== 0)
+    if (supplementalAccepted > 72 || (branchId !== 6 && supplementalAccepted !== 0)
       || (branchId === 6 && supplementalAccepted === 0) || branchId >= BRANCHES.length || primaryAccepted > 4 || ringAccepted > 12) {
       throw new RangeError('FINAL_GATHER_DIAGNOSTIC_HEADER');
     }

@@ -15,7 +15,10 @@ struct Params {
     offsets: vec4u, // triangle IDs, indices, UVs, colors (0 = white)
     limits: vec4u, // ray count, work limit, frame, topology version
     material: vec4u, // material revision, GI area-sampling source flag, candidates enabled, words per ray
-    textureLod: vec4f,
+    textureLod: f32,
+    budgetBlock: u32, // zero = uniform quota; otherwise repeating source-major block size
+    budgetPrimary: u32, // primary prefix length within each block
+    budgetSupplemental: u32, // work quota for each suffix ray
     instanceTree: vec4u, // node offset, order offset, bounds offset, node count (0 = linear)
 }
 @group(0) @binding(0) var<uniform> params: Params;
@@ -83,12 +86,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // GPU consumers use an empty interval for inactive work (e.g. sky rays
     // needing no sun-visibility query). Preserve the reset miss at zero cost.
     if (ray.direction.w < ray.origin.w) { return; }
+    var workLimit = params.limits.y;
+    if (params.budgetBlock != 0u) {
+        var localRay = id.x;
+        if (localRay >= params.budgetBlock) { localRay %= params.budgetBlock; }
+        if (localRay >= params.budgetPrimary) { workLimit = params.budgetSupplemental; }
+    }
     var instanceCursor = 0u;
     var winningInstance = 0xffffffffu;
     loop {
         let accelerated = params.instanceTree.w != 0u;
         if (instanceCursor >= select(params.shape.z, params.instanceTree.w, accelerated)) { break; }
-        if (hit.work.x >= params.limits.y) { hit.work.z = 1u; break; }
+        if (hit.work.x >= workLimit) { hit.work.z = 1u; break; }
         hit.work.x++;
         var instance = instanceCursor;
         if (accelerated) {
@@ -107,7 +116,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         var node = 0u;
         loop {
             if (node >= params.shape.x) { break; }
-            if (hit.work.x >= params.limits.y) { hit.work.z = 1u; break; }
+            if (hit.work.x >= workLimit) { hit.work.z = 1u; break; }
             hit.work.x++;
             if (!intersectsBox(ray, bounds[instance * params.shape.x + node], hit.metric.x)) {
                 node = source[node * 4u + 2u]; continue;
@@ -116,7 +125,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             let first = source[node * 4u];
             let count = source[node * 4u + 1u];
             for (var i = 0u; i < count; i++) {
-                if (hit.work.x >= params.limits.y) { hit.work.z = 1u; break; }
+                if (hit.work.x >= workLimit) { hit.work.z = 1u; break; }
                 hit.work.x++; hit.work.y++;
                 let triangle = source[params.offsets.x + first + i];
                 let v0 = source[params.offsets.y + triangle * 3u];
@@ -147,8 +156,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 let uv = uvAt(v0) * weights.x + uvAt(v1) * weights.y + uvAt(v2) * weights.z;
                 let color = colorAt(v0) * weights.x + colorAt(v1) * weights.y + colorAt(v2) * weights.z;
                 let inst = instances[instance];
-                if (!evaluateCoverage(uv, params.textureLod.x, inst.color, inst.material.xy, color)) { continue; }
-                let surface = evaluateMaterial(uv, params.textureLod.x, inst.color, inst.material.xy, color);
+                if (!evaluateCoverage(uv, params.textureLod, inst.color, inst.material.xy, color)) { continue; }
+                let surface = evaluateMaterial(uv, params.textureLod, inst.color, inst.material.xy, color);
                 let geometricNormal = surfaceUnit(cross(edge1, edge2), vec3f(0.0, 1.0, 0.0)) * select(-1.0, 1.0, determinant > 0.0);
                 let vertexNormal = a.normal.xyz * weights.x + b.normal.xyz * weights.y + c.normal.xyz * weights.z;
                 var normal = surfaceUnit(vertexNormal, geometricNormal);
@@ -167,7 +176,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 hit.baseColor = vec4f(surface.baseColor, surface.opacity);
                 hit.emissive = vec4f(surface.emissive, select(0.0, 1.0, MATERIAL_UNLIT));
                 hit.versions = vec4u(params.limits.z, identity.z, params.limits.w, params.material.x);
-                hit.uvInfo = vec4f(uv, params.textureLod.x, encodedGeometry.y);
+                hit.uvInfo = vec4f(uv, params.textureLod, encodedGeometry.y);
                 hit.work.w = params.material.y;
                 winningInstance = instance;
             }

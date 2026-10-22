@@ -13,6 +13,7 @@ struct FinalGatherParameters {
     rasterDy: vec4f,
     rasterDz: vec4f,
     raster: vec4u, // receiver mode, metadata rows, supplemental tile pitch, supplemental count
+    coverage: vec4u, // map tile capacity, actual tiles, scan permutation stride, reserved
 }
 struct FinalGatherAnchor {
     position: vec4f,
@@ -60,6 +61,10 @@ struct FinalGatherAreaSample {
 @group(0) @binding(17) var receiverIdentityNormals: texture_2d<u32>;
 @group(0) @binding(18) var<storage, read> receiverMetadata: array<ReceiverMetadata>;
 @group(0) @binding(19) var<storage, read_write> rasterCameraHits: array<Hit>;
+@group(0) @binding(20) var<storage, read_write> coverageCandidates: array<Hit>;
+@group(0) @binding(21) var<storage, read_write> coveragePrefix: array<u32>;
+@group(0) @binding(22) var<storage, read_write> coverageMap: array<u32>;
+@group(0) @binding(23) var<storage, read> historyCoverageMap: array<u32>;
 
 struct ReceiverMetadata {
     identity: vec4u, // source, entity, generation, flags
@@ -185,22 +190,20 @@ fn gatherPrimaryCovers(pixel: vec2f, receiver: Hit) -> bool {
 
 @compute @workgroup_size(64)
 fn loadSupplementalReceivers(@builtin(global_invocation_id) id: vec3u) {
-    if (id.x >= gather.raster.w || gather.raster.z == 0u) { return; }
+    if (id.x >= gather.coverage.y || gather.raster.z == 0u) { return; }
     let pitch = gather.raster.z;
     let columns = (gather.viewport.x + pitch - 1u) / pitch;
     let begin = vec2u(id.x % columns, id.x / columns) * pitch;
     let end = min(begin + vec2u(pitch), gather.viewport.xy);
-    var selected: Hit;
-    selected.versions = vec4u(gather.state.x, 0u, 0u, gather.emissive.z);
-    var candidates: array<Hit, 4>;
-    var support = vec4u(0u);
+    var candidates: array<Hit, 8>;
+    var support: array<u32, 8>;
     for (var y = begin.y; y < end.y; y++) {
         for (var x = begin.x; x < end.x; x++) {
             let pixel = vec2f(f32(x) + 0.5, f32(y) + 0.5);
             let hit = gatherRasterHit(pixel);
             if (hit.identity.x != 0u && hit.emissive.w == 0.0 && !gatherPrimaryCovers(pixel, hit)) {
                 var matched = false;
-                for (var i = 0u; i < 4u; i++) {
+                for (var i = 0u; i < 8u; i++) {
                     if (support[i] != 0u && gatherReceiverCompatible(candidates[i], hit)) {
                         support[i]++;
                         matched = true;
@@ -211,17 +214,20 @@ fn loadSupplementalReceivers(@builtin(global_invocation_id) id: vec3u) {
                     // the least-supported candidate; ties are deterministic.
                     // Counts measure retained matches, not an optimal cover.
                     var slot = 0u;
-                    for (var i = 1u; i < 4u; i++) { if (support[i] < support[slot]) { slot = i; } }
+                    for (var i = 1u; i < 8u; i++) { if (support[i] < support[slot]) { slot = i; } }
                     candidates[slot] = hit;
                     support[slot] = 1u;
                 }
             }
         }
     }
-    var best = 0u;
-    for (var i = 1u; i < 4u; i++) { if (support[i] > support[best]) { best = i; } }
-    if (support[best] != 0u) { selected = candidates[best]; }
-    rasterCameraHits[gather.viewport.z * gather.viewport.w + id.x] = selected;
+    for (var rank = 0u; rank < 8u; rank++) {
+        var best = 0u;
+        for (var i = 1u; i < 8u; i++) { if (support[i] > support[best]) { best = i; } }
+        var selected: Hit;
+        if (support[best] != 0u) { selected = candidates[best]; support[best] = 0u; }
+        coverageCandidates[id.x * 8u + rank] = selected;
+    }
 }
 
 @compute @workgroup_size(64)
@@ -413,6 +419,14 @@ fn integrateArea(@builtin(global_invocation_id) id: vec3u) {
     if (failures != 0u) { anchors[id.x].state.x = 0u; }
 }
 
+fn gatherStationaryHistoryMatches(current: FinalGatherAnchor, previous: FinalGatherAnchor) -> bool {
+    return gather.state.z == 0u && current.state.x != 0u && previous.state.x != 0u
+        && previous.state.y + 1u == gather.state.x && all(current.identity == previous.identity)
+        && all(current.versions.yzw == previous.versions.yzw)
+        && dot(current.normal.xyz, previous.normal.xyz) > 0.9999
+        && distance(current.position.xyz, previous.position.xyz) < 0.0001;
+}
+
 @compute @workgroup_size(64)
 fn accumulate(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= gather.settings.y) { return; }
@@ -424,12 +438,28 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
     if (gather.emissive.w == 0u) {
         // Preserve the stationary estimator exactly, including its strict
         // triangle identity and 0.1 mm positional checks.
-        let previous = oldAnchors[id.x];
-        let historyMatches = gather.state.z == 0u && current.state.x != 0u && previous.state.x != 0u
-            && previous.state.y + 1u == gather.state.x && all(current.identity == previous.identity)
-            && all(current.versions.yzw == previous.versions.yzw)
-            && dot(current.normal.xyz, previous.normal.xyz) > 0.9999
-            && distance(current.position.xyz, previous.position.xyz) < 0.0001;
+        var previous = oldAnchors[id.x];
+        var historyMatches = gatherStationaryHistoryMatches(current, previous);
+        // Compaction changes storage addresses when another tile changes.
+        // Recover the exact stationary receiver through the previous map;
+        // physical slots are not surface identities.
+        if (!historyMatches && gather.state.z == 0u && current.state.x != 0u
+            && id.x >= gather.viewport.z * gather.viewport.w) {
+            let clip = gather.previousViewProjection * vec4f(current.position.xyz, 1.0);
+            let pixel = vec2f(clip.x, -clip.y) / clip.w * vec2f(gather.viewport.xy) * 0.5 + vec2f(gather.viewport.xy) * 0.5;
+            let shape = (gather.viewport.xy + vec2u(gather.raster.z - 1u)) / gather.raster.z;
+            let cell = vec2i(floor(pixel / f32(gather.raster.z)));
+            for (var candidate = 0u; candidate < 72u && !historyMatches; candidate++) {
+                let tileOffset = candidate / 8u;
+                let coordinate = cell + vec2i(i32(tileOffset % 3u) - 1, i32(tileOffset / 3u) - 1);
+                if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(shape))) { continue; }
+                let tile = u32(coordinate.x) + u32(coordinate.y) * shape.x;
+                let mapped = historyCoverageMap[tile * 8u + candidate % 8u];
+                if (mapped == 0u) { continue; }
+                let value = oldAnchors[mapped - 1u];
+                if (gatherStationaryHistoryMatches(current, value)) { previous = value; historyMatches = true; }
+            }
+        }
         if (historyMatches) {
             let count = min(previous.irradiance.w + 1.0, f32(gather.settings.w));
             let alpha = 1.0 / count;
@@ -462,13 +492,19 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
     var history = 0.0;
     var mixtureMean = 0.0;
     var varianceMass = 0.0;
-    for (var corner = 0u; corner < select(4u, 9u, supplemental); corner++) {
+    for (var corner = 0u; corner < select(4u, 72u, supplemental); corner++) {
         let offset = vec2i(i32(corner & 1u), i32((corner >> 1u) & 1u));
-        let coordinate = select(lower + offset, extraCell + vec2i(i32(corner % 3u) - 1, i32(corner / 3u) - 1), supplemental);
+        let tileOffset = corner / 8u;
+        let coordinate = select(lower + offset, extraCell + vec2i(i32(tileOffset % 3u) - 1, i32(tileOffset / 3u) - 1), supplemental);
         let shape = select(gather.viewport.zw, extraShape, supplemental);
         if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(shape))) { continue; }
-        let previous = oldAnchors[u32(coordinate.x) + u32(coordinate.y) * shape.x
-            + select(0u, gather.viewport.z * gather.viewport.w, supplemental)];
+        var index = u32(coordinate.x) + u32(coordinate.y) * shape.x;
+        if (supplemental) {
+            let mapped = historyCoverageMap[index * 8u + corner % 8u];
+            if (mapped == 0u) { continue; }
+            index = mapped - 1u;
+        }
+        let previous = oldAnchors[index];
         if (previous.state.x == 0u || previous.state.y + 1u != gather.state.x
             || !all(previous.identity.xyz == current.identity.xyz)
             || !all(previous.versions.yzw == current.versions.yzw)
@@ -514,16 +550,25 @@ fn denoise(@builtin(global_invocation_id) id: vec3u) {
     let extraPitch = max(gather.raster.z, 1u);
     let shape = select(gather.viewport.zw, (gather.viewport.xy + vec2u(extraPitch - 1u)) / extraPitch, supplemental);
     let indexBase = select(0u, gather.viewport.z * gather.viewport.w, supplemental);
-    let coordinate = vec2i(i32((id.x - indexBase) % shape.x), i32((id.x - indexBase) / shape.x));
+    var tile = id.x;
+    if (supplemental) { tile = historyCoverageMap[gather.coverage.x * 8u + id.x - indexBase]; }
+    let coordinate = vec2i(i32(tile % shape.x), i32(tile / shape.x));
     let centerLuminance = gatherLuminance(center.irradiance.xyz);
     let centerMeanVariance = center.moments.x / max(center.irradiance.w - 1.0, 1.0);
     var sum = vec3f(0.0);
     var total = 0.0;
-    for (var y = -2; y <= 2; y++) {
-        for (var x = -2; x <= 2; x++) {
+    let radius = select(2, 1, supplemental);
+    for (var y = -radius; y <= radius; y++) {
+        for (var x = -radius; x <= radius; x++) {
             let neighborCoordinate = coordinate + vec2i(x, y);
             if (any(neighborCoordinate < vec2i(0)) || any(neighborCoordinate >= vec2i(shape))) { continue; }
-            let index = indexBase + u32(neighborCoordinate.x) + u32(neighborCoordinate.y) * shape.x;
+            for (var rank = 0u; rank < select(1u, 8u, supplemental); rank++) {
+            var index = u32(neighborCoordinate.x) + u32(neighborCoordinate.y) * shape.x;
+            if (supplemental) {
+                let mapped = historyCoverageMap[index * 8u + rank];
+                if (mapped == 0u) { continue; }
+                index = mapped - 1u;
+            }
             let neighbor = oldAnchors[index];
             if (neighbor.state.x == 0u || neighbor.state.y != gather.state.x
                 || !all(neighbor.identity.xyz == center.identity.xyz)
@@ -544,6 +589,7 @@ fn denoise(@builtin(global_invocation_id) id: vec3u) {
             let weight = spatial * mix(1.0, range, reliability);
             sum += neighbor.irradiance.xyz * weight;
             total += weight;
+            }
         }
     }
     // The valid center is always an eligible, positive-weight neighbor.

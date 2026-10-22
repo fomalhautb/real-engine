@@ -14,6 +14,56 @@ import { decodeWorldHits, packWorldRays, resolveWorldQueryOptions, WORLD_HIT_BYT
 
 type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
+/** Every source-major block contains a primary prefix and a supplemental suffix.
+ * The primary budget remains the encodeTrace maxWorkUnits argument. */
+export interface WorldQueryWorkPartition {
+  readonly raysPerBlock: number;
+  readonly primaryRaysPerBlock: number;
+  readonly supplementalMaxWorkUnits: number;
+}
+
+export interface WorldQueryTraceBudgetPlan {
+  readonly raysPerBlock: number;
+  readonly primaryRaysPerBlock: number;
+  readonly primaryWorkPerRay: number;
+  readonly supplementalWorkPerRay: number;
+  readonly primaryRayCount: number;
+  readonly supplementalRayCount: number;
+  readonly allocatedWorkUnits: number;
+  readonly maxTotalWorkUnits: number;
+}
+
+/** Integer quotas bound aggregate traversal work independently of dispatch order. */
+export function planWorldQueryTraceBudget(count: number,
+  options: Pick<Required<WorldQueryOptions>, 'maxRays' | 'maxNodeVisits' | 'maxTotalWorkUnits'>,
+  maxWorkUnits = options.maxTotalWorkUnits, partition?: WorldQueryWorkPartition): WorldQueryTraceBudgetPlan {
+  if (!Number.isSafeInteger(count) || count < 0 || count > options.maxRays) throw new Error('WORLD_QUERY_RAY_BUDGET');
+  const validBudget = (value: number): boolean => Number.isSafeInteger(value) && value >= 1 && value <= options.maxTotalWorkUnits;
+  if (!validBudget(maxWorkUnits)) throw new Error('WORLD_QUERY_TRACE_WORK_BUDGET');
+  let raysPerBlock = 0, primaryRaysPerBlock = 0, primaryRayCount = count, supplementalRayCount = 0;
+  let supplementalBudget = 0;
+  if (partition !== undefined) {
+    if (!partition || typeof partition !== 'object') throw new Error('WORLD_QUERY_WORK_PARTITION');
+    raysPerBlock = partition.raysPerBlock; primaryRaysPerBlock = partition.primaryRaysPerBlock;
+    if (!Number.isSafeInteger(raysPerBlock) || raysPerBlock < 2 || raysPerBlock > count
+      || count % raysPerBlock !== 0 || !Number.isSafeInteger(primaryRaysPerBlock)
+      || primaryRaysPerBlock < 1 || primaryRaysPerBlock >= raysPerBlock) throw new Error('WORLD_QUERY_WORK_PARTITION');
+    supplementalBudget = partition.supplementalMaxWorkUnits;
+    if (!validBudget(supplementalBudget)) throw new Error('WORLD_QUERY_TRACE_WORK_BUDGET');
+    primaryRayCount = (count / raysPerBlock) * primaryRaysPerBlock;
+    supplementalRayCount = count - primaryRayCount;
+  }
+  const primaryWorkPerRay = primaryRayCount ? Math.min(options.maxNodeVisits, Math.floor(maxWorkUnits / primaryRayCount)) : 0;
+  const supplementalWorkPerRay = supplementalRayCount ? Math.min(options.maxNodeVisits, Math.floor(supplementalBudget / supplementalRayCount)) : 0;
+  if ((primaryRayCount && primaryWorkPerRay < 1) || (supplementalRayCount && supplementalWorkPerRay < 1)) {
+    throw new Error('WORLD_QUERY_WORK_BUDGET: total budget cannot cover every ray');
+  }
+  return Object.freeze({ raysPerBlock, primaryRaysPerBlock, primaryWorkPerRay, supplementalWorkPerRay,
+    primaryRayCount, supplementalRayCount,
+    allocatedWorkUnits: primaryRayCount * primaryWorkPerRay + supplementalRayCount * supplementalWorkPerRay,
+    maxTotalWorkUnits: maxWorkUnits + supplementalBudget });
+}
+
 interface QuerySource {
   scene: RenderBatch;
   output: GPUBuffer;
@@ -411,28 +461,26 @@ export class GpuWorldQuery {
    * Submit it before encoding another encoder with different parameters: GPU
    * snapshots and uniform buffers assume serial encode/submit. Callers own ray
    * generation and inspect hit.work.z for an explicit overflow. An optional
-   * maxWorkUnits limits this trace independently; callers account for the sum
-   * of budgets when splitting one logical query into multiple traces. Returns the
+   * maxWorkUnits limits this trace. An explicit partition adds a separate bounded
+   * supplemental budget without changing primary quotas or ray/hit indices. Returns the
    * number of uniform bytes actually queued for upload. */
   encodeTrace(encoder: GPUCommandEncoder, count: number, textureLod: number, materialRevision: number,
-    maxWorkUnits = this.options.maxTotalWorkUnits): number {
+    maxWorkUnits = this.options.maxTotalWorkUnits, partition?: WorldQueryWorkPartition): number {
     if (this.disposed || !this.frame) throw new Error('WORLD_QUERY_NO_RENDERED_FRAME');
     this.validateTopology();
     if (!Number.isSafeInteger(count) || count < 0 || count > this.options.maxRays) throw new Error('WORLD_QUERY_RAY_BUDGET');
     if (!Number.isFinite(textureLod) || textureLod < 0 || textureLod > 32) throw new Error('WORLD_QUERY_TEXTURE_LOD');
     u32(materialRevision, 'MATERIAL_REVISION');
-    if (!Number.isSafeInteger(maxWorkUnits) || maxWorkUnits < 1 || maxWorkUnits > this.options.maxTotalWorkUnits) {
-      throw new Error('WORLD_QUERY_TRACE_WORK_BUDGET');
-    }
+    const budget = planWorldQueryTraceBudget(count, this.options, maxWorkUnits, partition);
     if (!count) return 0;
-    const workPerRay = Math.min(this.options.maxNodeVisits, Math.floor(maxWorkUnits / count));
-    if (workPerRay < 1) throw new Error('WORLD_QUERY_WORK_BUDGET: total budget cannot cover every ray');
+    const workPerRay = budget.primaryWorkPerRay;
     const snapshot = JSON.stringify([this.frame, materialRevision,
       this.batches.map((batch, index) => [index + 1, batch.nodeCount, batch.mesh.vertexCount, batch.count,
         ...batch.offsets, batch.topologyVersion])]);
     let state = this.traceParameters.get(encoder);
     if (state && state.snapshot !== snapshot) throw new Error('WORLD_QUERY_ENCODER_SNAPSHOT_CHANGED');
-    const key = JSON.stringify([count, Math.fround(textureLod), workPerRay]);
+    const key = JSON.stringify([count, Math.fround(textureLod), workPerRay,
+      budget.raysPerBlock, budget.primaryRaysPerBlock, budget.supplementalWorkPerRay]);
     let slot = state?.slots.get(key);
     const upload = slot === undefined;
     if (upload) {
@@ -453,7 +501,8 @@ export class GpuWorldQuery {
     reset.setPipeline(this.resetPipeline); reset.setBindGroup(0, this.resetGroups[parameterSlot]);
     reset.dispatchWorkgroups(Math.ceil(count / 64)); reset.end();
     if (this.sceneEnabled) {
-      uploadedBytes += this.sceneBvh!.encodeCandidates(encoder, parameterSlot, count, workPerRay, upload);
+      uploadedBytes += this.sceneBvh!.encodeCandidates(encoder, parameterSlot, count, workPerRay, upload,
+        partition ? budget : undefined);
     }
     for (let index = 0; index < this.batches.length; index++) {
       const batch = this.batches[index];
@@ -464,6 +513,7 @@ export class GpuWorldQuery {
           ...batch.offsets, batch.colorOffset, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
           batch.emissiveSampling === 'triangle-area' ? 1 : 0, this.sceneEnabled ? 1 : 0, this.sceneBvh?.maskWords ?? 0]);
         new Float32Array(params)[16] = textureLod;
+        new Uint32Array(params).set([budget.raysPerBlock, budget.primaryRaysPerBlock, budget.supplementalWorkPerRay], 17);
         new Uint32Array(params).set(batch.instanceTree, 20);
         this.device.queue.writeBuffer(batch.params, parameterSlot * this.traceUniformStride, params);
         uploadedBytes += 96;

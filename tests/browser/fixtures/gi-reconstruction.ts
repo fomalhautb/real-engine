@@ -11,7 +11,8 @@ interface Field { radiance: Vec3; blocked: (index: number) => boolean;
   blockedMoments?: [number, number]; }
 interface Anchor { position: Vec3; normal: Vec3; geometry?: [number, number]; irradiance: Vec3; frame?: number;
   identity?: [number, number]; }
-interface Diagnostic { total: number; branch: number; primaryAccepted: number; ringAccepted: number; rejections: number[]; }
+interface Diagnostic { total: number; branch: number; primaryAccepted: number; ringAccepted: number;
+  supplementalAccepted: number; rejections: number[]; }
 
 /** Known inputs are supplied directly to the production reconstruction shaders.
  * This isolates interpolation from triangle traversal, ray sampling and textures. */
@@ -34,6 +35,7 @@ export async function runGiReconstructionFixture() {
     const probes = allocate(8 * DIFFUSE_GI_PROBE_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const gatherParameters = allocate(FINAL_GATHER_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const anchors = allocate(20 * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const coverageMap = allocate(4 * 9 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const input = allocate(64, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const outputBytes = 112;
     const output = allocate(outputBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
@@ -57,7 +59,7 @@ fn reconstruct() {
       vec2u(1u, 1u));
     answer.irradiance = vec4f(result.irradiance, 1.0);
     answer.measures.x = result.total;
-    answer.state = vec4u(result.branch, result.primaryAccepted, result.ringAccepted, 0u);
+    answer.state = vec4u(result.branch, result.primaryAccepted, result.ringAccepted, result.supplementalAccepted);
     for (var slot = 0u; slot < 16u; slot++) { answer.rejections[slot] = result.rejections[slot]; }
   }
 }`;
@@ -75,6 +77,7 @@ fn reconstruct() {
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ] });
     const pipeline = await device.createComputePipelineAsync({
       layout: device.createPipelineLayout({ bindGroupLayouts: [ioLayout, emptyLayout, emptyLayout, lightingLayout] }),
@@ -87,13 +90,15 @@ fn reconstruct() {
     const lightingGroup = device.createBindGroup({ layout: lightingLayout, entries: [
       { binding: 0, resource: { buffer: giParameters } }, { binding: 1, resource: { buffer: probes } },
       { binding: 2, resource: { buffer: gatherParameters } }, { binding: 3, resource: { buffer: anchors } },
+      { binding: 6, resource: { buffer: coverageMap } },
     ] });
     const gi = new Float32Array(28), giIntegers = new Uint32Array(gi.buffer);
     gi.set([-0.5, -0.5, -0.5, 1], 0); gi.set([1, 1, 1, 10], 4);
     giIntegers.set([2, 2, 2, 64], 8); gi[23] = 0.2; giIntegers[24] = 1;
     device.queue.writeBuffer(giParameters, 0, gi);
 
-    const dispatch = async (field: Field, query: Query, anchorData?: Anchor[], viewport = 16, extra?: Anchor[]): Promise<number[]> => {
+    const dispatch = async (field: Field, query: Query, anchorData?: Anchor[], viewport = 16, extra?: Anchor[],
+      mappedIndices?: readonly number[]): Promise<number[]> => {
       const records = new Float32Array(8 * DIFFUSE_GI_PROBE_FLOATS), words = new Uint32Array(records.buffer);
       for (let index = 0; index < 8; index++) {
         const base = index * DIFFUSE_GI_PROBE_FLOATS;
@@ -110,10 +115,17 @@ fn reconstruct() {
       }
       device.queue.writeBuffer(probes, 0, records);
       const parameters = new Float32Array(FINAL_GATHER_PARAMETER_BYTES / 4), integers = new Uint32Array(parameters.buffer);
-      integers.set([viewport, viewport, 4, 4], 36); integers.set([4, 16, 1, 64], 40);
+      integers.set([viewport, viewport, 4, 4], 36); integers.set([4, 16 + (extra?.length ?? 0), 1, 64], 40);
       integers.set([1, 1, 0, 0], 44); parameters.set([0.0001, 0, 0.001, 0.25], 48);
-      if (extra) integers.set([1, 0, 8, 4], 72);
+      if (extra) {
+        integers.set([1, 0, 8, extra.length], 72);
+        integers.set([4, 4, 1, 0], 76);
+      }
       device.queue.writeBuffer(gatherParameters, 0, parameters);
+      const map = new Uint32Array(4 * 9);
+      if (mappedIndices) map.set(mappedIndices);
+      else extra?.forEach((_, tile) => { map[tile * 8] = 16 + tile + 1; });
+      device.queue.writeBuffer(coverageMap, 0, map);
       const anchorFloats = FINAL_GATHER_ANCHOR_BYTES / Float32Array.BYTES_PER_ELEMENT;
       const packedAnchors = new Float32Array(20 * anchorFloats), anchorWords = new Uint32Array(packedAnchors.buffer);
       [...(anchorData ?? []), ...(extra ?? [])].forEach((anchor, index) => {
@@ -138,7 +150,7 @@ fn reconstruct() {
       try {
         const raw = readback.getMappedRange();
         const floats = new Float32Array(raw), words = new Uint32Array(raw);
-        diagnostics.push({ total: floats[4], branch: words[8], primaryAccepted: words[9], ringAccepted: words[10],
+        diagnostics.push({ total: floats[4], branch: words[8], primaryAccepted: words[9], ringAccepted: words[10], supplementalAccepted: words[11],
           rejections: Array.from(words.slice(12, 28)) });
         return Array.from(floats.slice(0, 3));
       }
@@ -206,6 +218,14 @@ fn reconstruct() {
     const extra = makeAnchors().slice(0, 4);
     extra[3] = { position: [0, 0, 0], normal: [0, 1, 0], irradiance: recovered };
     results.push({ label: 'supplemental-compatible', actual: await dispatch(open, gatherQuery, makeAnchors(), 16, extra), expected: recovered });
+    const lastRank = Array<number>(32).fill(0); lastRank[3 * 8 + 7] = 20;
+    results.push({ label: 'supplemental-last-rank', actual: await dispatch(open, gatherQuery, makeAnchors(), 16, extra, lastRank), expected: recovered });
+    results.push({ label: 'supplemental-unmapped-ignored', actual: await dispatch(open, gatherQuery, makeAnchors(), 16, extra, []), expected });
+    const paired = extra.map(anchor => ({ ...anchor }));
+    paired[0] = { position: [0, 0, 0], normal: [0, 1, 0], irradiance: [0.6, 0.2, 0] };
+    const sameTile = [...lastRank]; sameTile[3 * 8] = 17;
+    results.push({ label: 'supplemental-two-ranks-same-tile', actual: await dispatch(open, gatherQuery, makeAnchors(), 16, paired, sameTile),
+      expected: [0.4, 0.3, 0.3] });
     for (const [label, change] of [
       ['supplemental-four-mm-wall', { position: [0, 0.004, 0] }],
       ['supplemental-other-entity', { identity: [1, 2] }],

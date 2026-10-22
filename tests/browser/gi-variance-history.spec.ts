@@ -60,4 +60,24 @@ test('production final gather accumulates raw luminance population variance with
   expect(Number.isFinite(result.moved.variance)).toBe(true);
   expect(Math.abs(result.moved.mean - expectedMovingMean)).toBeLessThan(2e-5);
   expect(Math.abs(result.moved.variance - expectedMovingVariance)).toBeLessThan(2e-4);
+  const compacted = result.compacted;
+  expect(compacted.sourceSlot).toBe(1);
+  expect(compacted.targetSlot).toBe(3);
+  expect(compacted.mapRank).toBe(7);
+  // Four prior observations [1,1,3,3] have mean 2 and variance 1. The
+  // stationary map lookup must preserve them after the receiver changes slot.
+  const expectedCompacted = population([1, 1, 3, 3, 10], [0.2, 0.2, 0.2, 0.2, 0.2]);
+  expect(compacted.recovered.count).toBe(5);
+  expect(Math.abs(compacted.recovered.mean - expectedCompacted.mean)).toBeLessThan(2e-5);
+  expect(Math.abs(compacted.recovered.variance - expectedCompacted.variance)).toBeLessThan(2e-4);
+  expect(compacted.withoutMap).toEqual({ mean: 10, count: 1, variance: 0 });
+  expect(compacted.rejected.map(sample => sample.label)).toEqual([
+    'reset', 'source', 'entity', 'generation', 'representation-token',
+    'history-version', 'topology-version', 'material-revision', 'position', 'stale-frame',
+  ]);
+  for (const sample of compacted.rejected) {
+    expect(sample.count, `compacted ${sample.label}`).toBe(1);
+    expect(sample.mean, `compacted ${sample.label}`).toBeCloseTo(10, 5);
+    expect(sample.variance, `compacted ${sample.label}`).toBe(0);
+  }
 });

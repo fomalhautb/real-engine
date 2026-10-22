@@ -84,6 +84,10 @@ export class GpuGeometryStream {
   get pool() { return this.activePool; }
   get selection() { return this.activeSelection; }
   get capacityEpoch() { return this.epoch; }
+  /** Bounded GPU demand, independent of residency. Null until this epoch has feedback. */
+  get capacityDemand(): readonly GeometryStreamSelectionFeedback['desiredGroups'][number][] | null {
+    return this.lastFeedback?.desiredGroups ?? null;
+  }
   static async create(device: GPUDevice, scene: RenderBatch, instances: GPUBuffer, track: (bytes: number) => void,
     decoder?: GeometryPageDecodeService, occlusion?: GpuOcclusion) {
     const source = scene.geometryStream;
@@ -139,7 +143,7 @@ export class GpuGeometryStream {
         this.validateSources();
         if (this.epoch !== sourceEpoch || this.pool !== sourcePool) throw new Error('GEOMETRY_STREAM_CAPACITY_STALE');
         selection = await GpuGeometryStreamSelection.create(this.device, pool, this.instances, this.scene.capacity,
-          this.track, this.source.selection, this.occlusion);
+          this.track, this.source.selection, this.occlusion, this.selection);
         this.validateSources();
         if (this.epoch !== sourceEpoch || this.pool !== sourcePool) throw new Error('GEOMETRY_STREAM_CAPACITY_STALE');
         selection.copyViewStateFrom(this.selection);

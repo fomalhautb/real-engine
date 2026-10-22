@@ -77,9 +77,9 @@ export function resolveFinalGatherOptions(options: FinalGatherOptions = {}): Res
     maxReceiverBytes, maxSupplementalAnchors, maxSupplementalWorkUnits });
 }
 
-/** One deterministic candidate per tile. At most 1,024 receiver pixels are
- * inspected per candidate; insufficient spare capacity disables this optional
- * path rather than coarsening the primary grid or exceeding its ray budget. */
+export const FINAL_GATHER_COVERAGE_CANDIDATES = 8;
+/** Bounded tile scan with globally shared supplementary slots. Empty tiles
+ * consume no selected slot; the primary grid and its ray quota are unchanged. */
 export function planFinalGatherSupplemental(width: number, height: number, spareCapacity: number, requested: number) {
   boundedInteger(width, 1, 32_768, 'WIDTH'); boundedInteger(height, 1, 32_768, 'HEIGHT');
   boundedInteger(spareCapacity, 0, 65_536, 'SPARE_CAPACITY');
@@ -87,9 +87,13 @@ export function planFinalGatherSupplemental(width: number, height: number, spare
   const budget = Math.min(spareCapacity, requested);
   for (let spacing = 1; spacing <= 32 && budget; spacing++) {
     const columns = Math.ceil(width / spacing), rows = Math.ceil(height / spacing);
-    if (columns * rows <= budget) return { spacing, columns, rows, anchorCount: columns * rows };
+    const tileCount = columns * rows;
+    if (tileCount <= budget) return { spacing, columns, rows, anchorCount: budget, tileCount,
+      // A stable permutation distributes partial allocation rounds spatially.
+      // At most 16,384 tiles cannot be divisible by both primes.
+      permutationStride: tileCount % 521 ? 521 : 523 };
   }
-  return { spacing: 0, columns: 0, rows: 0, anchorCount: 0 };
+  return { spacing: 0, columns: 0, rows: 0, anchorCount: 0, tileCount: 0, permutationStride: 1 };
 }
 
 /** Bounded double-precision inversion. Keep doubles until camera-relative ray

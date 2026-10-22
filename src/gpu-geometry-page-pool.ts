@@ -3,6 +3,7 @@ import { validateGeometryStreamDirectory } from './geometry-stream-directory';
 import type { GeometryStreamDirectory } from './geometry-stream-types';
 import { GEOMETRY_GPU_VERTEX_BYTES, packGeometryGpuPage, type PackedGeometryGpuPage } from './geometry-gpu-page';
 import { geometryGpuPoolLayout, GEOMETRY_GPU_LOCATION_BYTES as LOCATION_BYTES } from './geometry-gpu-pool-layout';
+import { subscribeGpuDeviceLoss } from './gpu-device-loss';
 
 export interface GeometryGpuPoolOptions {
   /** Actual allocated buffers, including fixed-slot padding and metadata. */
@@ -84,6 +85,7 @@ export class GpuGeometryPagePool {
   private uploads = 0;
   private evictions = 0;
   private migrating = false;
+  private unsubscribeLoss?: () => void;
 
   static async create(device: GPUDevice, directory: GeometryStreamDirectory, options: GeometryGpuPoolOptions = {},
     track: (bytes: number) => void = () => {}): Promise<GpuGeometryPagePool> {
@@ -139,7 +141,7 @@ export class GpuGeometryPagePool {
       this.clusterLocations = this.buffer('paged geometry: cluster locations', sizes[2], usage);
       this.pageResidency = this.buffer('paged geometry: publication flags', sizes[3], usage);
     } catch (error) { try { this.dispose(); } catch { /* Preserve the allocation failure. */ } throw error; }
-    void device.lost.then(info => { if (!this.disposed) {
+    this.unsubscribeLoss = subscribeGpuDeviceLoss(device, info => { if (!this.disposed) {
       this.error = 'GEOMETRY_GPU_POOL_DEVICE_LOST: ' + info.message;
       try { this.dispose(); } catch (error) { this.error += '; tracker: ' + String(error); }
     } });
@@ -452,6 +454,7 @@ export class GpuGeometryPagePool {
   }
   dispose(): void {
     if (this.disposed) return; this.disposed = true;
+    this.unsubscribeLoss?.(); this.unsubscribeLoss = undefined;
     for (const buffer of this.buffers) buffer.destroy(); this.buffers.length = 0;
     const released = this.allocatedBytes; this.allocatedBytes = 0; this.stagingBytes = 0;
     this.pending.clear(); this.resident.clear(); this.frames.clear(); this.leased.clear(); this.pinned.clear(); this.activePage = undefined;

@@ -14,7 +14,7 @@ interface FakeBuffer {
   unmap(): void;
 }
 
-async function setup(maxNodeVisits = 1000) {
+async function setup(maxNodeVisits = 1000, sceneBvh = false) {
   const buffers: FakeBuffer[] = [];
   const writeBuffer = vi.fn((buffer: FakeBuffer, offset: number, data: ArrayBuffer | ArrayBufferView,
     dataOffset = 0, size?: number) => {
@@ -40,13 +40,15 @@ async function setup(maxNodeVisits = 1000) {
     createComputePipelineAsync: async () => pipeline,
   } as unknown as GPUDevice;
   const query = await GpuWorldQuery.create(device, {} as GPUBindGroupLayout, () => {}, {
-    maxRays: 8, maxTotalWorkUnits: 100, maxNodeVisits, sceneAcceleration: 'linear',
+    maxRays: 8, maxBatches: 8, maxTotalWorkUnits: 100, maxNodeVisits, sceneAcceleration: sceneBvh ? 'bvh' : 'linear',
   });
   const scene: SceneBatch = { name: 'budget-plane', mesh: createPlane(), capacity: 1,
     deformation: { jointCount: 0, nodes: [] }, morphTargets: [],
     instances: [{ entityId: 1, model: identity(), normalMatrix: identity(), bones: [], deformScalars: [],
       color: [1, 1, 1, 1], metalness: 0, roughness: 1, historyVersion: 0 }] };
-  query.addBatch({ scene, output: {} as GPUBuffer, instances: {} as GPUBuffer,
+  for (let index = 0; index < (sceneBvh ? 8 : 1); index++) query.addBatch({
+    scene: { ...scene, name: `budget-plane-${index}`, instances: index ? [] : scene.instances },
+    output: {} as GPUBuffer, instances: {} as GPUBuffer,
     getPipeline: () => pipeline as unknown as GPUComputePipeline,
     getMaterial: () => ({ bindGroup: {} }) as ReturnType<Parameters<typeof query.addBatch>[0]['getMaterial']> });
   query.updateSnapshot(1, 2);
@@ -65,6 +67,32 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('world query per-trace work budget', () => {
+  it('records matching scene/triangle partitions once and isolates different block layouts in immutable slots', async () => {
+    const { query, writeBuffer, encoder } = await setup(1000, true);
+    try {
+      const gpuEncoder = encoder as unknown as GPUCommandEncoder;
+      const partition = { raysPerBlock: 4, primaryRaysPerBlock: 2, supplementalMaxWorkUnits: 40 };
+      query.encodeTrace(gpuEncoder, 8, 0, 2, 100, partition);
+      const writes = () => writeBuffer.mock.calls.filter(([buffer]) =>
+        ['world batch parameter slots', 'world query scene candidate parameter slots'].includes(buffer.label))
+        .map(([buffer, offset, data]) => ({ label: buffer.label, words: Array.from(new Uint32Array(buffer.bytes, offset, data.byteLength / 4)) }));
+      const first = writes();
+      expect(first).toHaveLength(2);
+      expect(first[0].words.slice(0, 2)).toEqual([8, 25]);
+      expect(first[0].words.slice(8, 12)).toEqual([4, 2, 10, 0]);
+      expect(first[1].words[9]).toBe(25);
+      expect(first[1].words.slice(17, 20)).toEqual([4, 2, 10]);
+      // One reset, one scene candidate pass, one active mesh pass: no second trace.
+      expect(encoder.beginComputePass).toHaveBeenCalledTimes(3);
+      expect(query.encodeTrace(gpuEncoder, 8, 0, 2, 100, { ...partition, supplementalMaxWorkUnits: 43 })).toBe(0);
+      query.encodeTrace(gpuEncoder, 8, 0, 2, 100, { ...partition, raysPerBlock: 8, primaryRaysPerBlock: 4 });
+      expect(writes()).toHaveLength(4);
+      expect(writes()[0]).toEqual(first[0]); expect(writes()[1]).toEqual(first[1]);
+      expect(writes()[2].words.slice(8, 12)).toEqual([8, 4, 10, 0]);
+      query.encodeTrace(gpuEncoder, 8, 0, 2);
+      expect(writes().at(-1)!.words.slice(17, 20)).toEqual([0, 0, 0]);
+    } finally { query.dispose(); }
+  });
   it('keeps default and supplemental quotas in separate immutable slots and reuses equivalent quotas', async () => {
     const { query, quotas, encoder } = await setup();
     try {

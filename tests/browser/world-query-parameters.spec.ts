@@ -66,13 +66,13 @@ test('linear and scene-BVH world queries retain encoder parameters, masks and sl
     expect(result.cleanup).toEqual({ firstOwnedBytesAfterDispose: 0, secondOwnedBytesAfterDispose: 0 });
     expect(result.validation).toEqual([]);
   }
-  // Candidate selection adds one 32-byte dispatch/layout snapshot per distinct slot.
+  // Candidate selection adds one 48-byte dispatch/layout/work-partition snapshot per distinct slot.
   for (const index of [0, 1, 2]) {
-    expect(variants.accelerated.uploads[index] - variants.linear.uploads[index]).toBe(32);
+    expect(variants.accelerated.uploads[index] - variants.linear.uploads[index]).toBe(48);
   }
   for (const index of [0, 1]) {
-    expect(variants.accelerated.budgetUploads[index] - variants.linear.budgetUploads[index]).toBe(32);
+    expect(variants.accelerated.budgetUploads[index] - variants.linear.budgetUploads[index]).toBe(48);
   }
-  expect(variants.accelerated.freshUpload - variants.linear.freshUpload).toBe(32);
+  expect(variants.accelerated.freshUpload - variants.linear.freshUpload).toBe(48);
   expect(pageErrors).toEqual([]);
 });

@@ -60,3 +60,49 @@ export async function runGiSupplementalFixture() {
     return { sky, pixels, runs };
   } finally { canvas.remove(); }
 }
+
+/** Three separate subpixel strips share one 8px coverage tile. Rank compaction
+ * must give all three a real receiver; a single representative cannot do so. */
+export async function runGiMultiSurfaceFixture() {
+  const canvas = document.createElement('canvas'); canvas.style.cssText = 'width:128px;height:128px'; document.body.appendChild(canvas);
+  const sky: Vec3 = [0.1, 0.2, 0.3], pixels = [64, 65, 66].map(x => ({ x, y: 64 }));
+  const eye: Vec3 = [0, 0, 3], target: Vec3 = [0, 0, 0], runs = [];
+  try {
+    for (const repair of [false, true]) {
+      const wall = batch('multisurface-wall', state(1, 2, 2, 0));
+      const worldPerPixel = 2 * 2.98 * Math.tan(Math.PI / 6.4) / 128;
+      const strips = pixels.map((pixel, i) => {
+        const instance = state(i + 2, worldPerPixel * 0.8, 1.6, 0.02);
+        instance.model[12] = (pixel.x + 0.5 - 64) * worldPerPixel;
+        return batch('multisurface-strip-' + i, instance);
+      });
+      const renderer = await Renderer.create(canvas, [wall, ...strips], {
+        worldQueries: { maxRays: 2048 },
+        diffuseGi: { origin: [-2, -2, -2], spacing: [4, 4, 4], counts: [2, 2, 2], skyRadiance: sky,
+          maxDistance: 12, multiBounce: false, finalGather: { receiver: 'raster', pixelSpacing: 8,
+            maxAnchors: 512, maxSupplementalAnchors: repair ? 256 : 0, maxSupplementalWorkUnits: repair ? 1_048_576 : 0,
+            raysPerAnchor: 2, maxHistory: 16 } },
+      });
+      try {
+        renderer.setSun({ direction: [0, 1, 0], color: [0, 0, 0] });
+        const capture = async () => {
+          const diagnostic = renderer.diagnostics().diffuseGi!.finalGather!;
+          const map = repair ? await renderer.probeDiffuseGiFinalGatherCoverageTiles([8 + 8 * 16]) : null;
+          const indices = map?.tiles.flatMap(t => t.indices) ?? [];
+          return { reconstruction: await renderer.probeDiffuseGiReconstruction(pixels), diagnostic, map,
+            anchors: indices.length ? await renderer.probeDiffuseGiFinalGather(indices) : null };
+        };
+        for (let i = 0; i < 16; i++) renderer.render(eye, target);
+        const stationary = await capture();
+        renderer.render([0.0005, 0, 3], [0.0005, 0, 0]);
+        const moving = await capture();
+        strips[0].instances.length = 0;
+        renderer.render([0.0005, 0, 3], [0.0005, 0, 0]);
+        const removed = await capture();
+        const errors = [...renderer.errors]; renderer.dispose();
+        runs.push({ repair, stationary, moving, removed, errors, afterDispose: renderer.stats.ownedGpuBytes });
+      } finally { renderer.dispose(); }
+    }
+    return { sky, runs };
+  } finally { canvas.remove(); }
+}

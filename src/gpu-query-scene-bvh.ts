@@ -1,6 +1,7 @@
 import shaderSource from './shaders/query-scene-bvh.wgsl?raw';
 import { buildInstanceBvhTopology, orderInstanceBounds } from './instance-bvh';
 import type { Bounds3 } from './deformation';
+import type { WorldQueryTraceBudgetPlan } from './gpu-world-query';
 
 export type QueryBufferAllocator = (label: string, size: number, usage: GPUBufferUsageFlags,
   data?: ArrayBuffer) => GPUBuffer;
@@ -10,7 +11,7 @@ type RefitLevel = { count: number; bindGroup: GPUBindGroup };
 const MAX_CAPACITY = 4096;
 const MAX_RAYS = 65_536;
 const MAX_PARAMETER_SLOTS = 32;
-const PARAM_BYTES = 32;
+const PARAM_BYTES = 48;
 
 function integer(value: number, low: number, high: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < low || value > high) {
@@ -125,7 +126,7 @@ export class GpuQuerySceneBvh {
     ] });
     const refitLevels = topology.levels.map((level, depth) => {
       const params = allocate('world query scene BVH depth parameters', PARAM_BYTES,
-        GPUBufferUsage.UNIFORM, new Uint32Array([levelOffsets[depth], level.length, 0, 0, ...sceneLayout]).buffer);
+        GPUBufferUsage.UNIFORM, new Uint32Array([levelOffsets[depth], level.length, 0, 0, ...sceneLayout, 0, 0, 0, 0]).buffer);
       return { count: level.length, bindGroup: bindGroup(params) };
     });
     const candidateGroups = Array.from({ length: parameterSlots }, (_, slot) =>
@@ -163,13 +164,21 @@ export class GpuQuerySceneBvh {
 
   /** Clears ceil(capacity/32) mask words per ray, then bounds-tests the tree. */
   encodeCandidates(encoder: GPUCommandEncoder, slot: number, count: number, workPerRay: number,
-    upload: boolean): number {
+    upload: boolean, partition?: Pick<WorldQueryTraceBudgetPlan, 'raysPerBlock' | 'primaryRaysPerBlock' | 'supplementalWorkPerRay'>): number {
     integer(slot, 0, this.candidateGroups.length - 1, 'slot');
     integer(count, 0, this.maxRays, 'count');
     integer(workPerRay, 1, 1_048_576, 'workPerRay');
+    if (partition !== undefined) {
+      if (!partition || typeof partition !== 'object') throw new RangeError('scene BVH work partition');
+      integer(partition.raysPerBlock, 2, count, 'raysPerBlock');
+      integer(partition.primaryRaysPerBlock, 1, partition.raysPerBlock - 1, 'primaryRaysPerBlock');
+      integer(partition.supplementalWorkPerRay, 1, 1_048_576, 'supplementalWorkPerRay');
+      if (count % partition.raysPerBlock !== 0) throw new RangeError('scene BVH work partition');
+    }
     if (count === 0) return 0;
     if (upload) this.device.queue.writeBuffer(this.candidateParams, slot * this.parameterStride,
-      new Uint32Array([count, workPerRay, 0, 0, this.capacity, this.nodeCount, this.nodeCount * 4, this.maskWords]));
+      new Uint32Array([count, workPerRay, 0, 0, this.capacity, this.nodeCount, this.nodeCount * 4, this.maskWords,
+        partition?.raysPerBlock ?? 0, partition?.primaryRaysPerBlock ?? 0, partition?.supplementalWorkPerRay ?? 0, 0]));
     const pass = encoder.beginComputePass({ label: 'world scene BVH candidates' });
     pass.setPipeline(this.candidatePipeline);
     pass.setBindGroup(0, this.candidateGroups[slot]);

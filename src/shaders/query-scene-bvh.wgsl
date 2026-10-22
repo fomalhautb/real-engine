@@ -9,7 +9,11 @@ struct Hit {
 // Refit: [depthNodeOffset, nodeCount, 0, 0].
 // Candidate selection: [rayCount, perRayWorkLimit, 0, 0].
 // Layout: [batch capacity, tree nodes, order word offset, mask words per ray].
-struct Params { dispatch: vec4u, scene: vec4u }
+struct Params {
+    dispatch: vec4u,
+    scene: vec4u,
+    budget: vec4u, // repeating block size (0 = uniform), primary prefix, supplemental quota, reserved
+}
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> data: array<u32>;
 @group(0) @binding(2) var<storage, read_write> bounds: array<Bounds>;
@@ -68,11 +72,17 @@ fn selectBatches(@builtin(global_invocation_id) id: vec3u) {
     for (var word = 0u; word < params.scene.w; word++) { masks[maskBase + word] = 0u; }
     let ray = rays[id.x];
     if (ray.direction.w < ray.origin.w) { return; }
+    var workLimit = params.dispatch.y;
+    if (params.budget.x != 0u) {
+        var localRay = id.x;
+        if (localRay >= params.budget.x) { localRay %= params.budget.x; }
+        if (localRay >= params.budget.y) { workLimit = params.budget.z; }
+    }
     var hit = hits[id.x];
     var node = 0u;
     loop {
         if (node >= params.scene.y) { break; }
-        if (hit.work.x >= params.dispatch.y) { hit.work.z = 1u; break; }
+        if (hit.work.x >= workLimit) { hit.work.z = 1u; break; }
         hit.work.x++;
         let start = node * 4u;
         let box = bounds[params.scene.x + node];

@@ -37,7 +37,7 @@ test('supplemental raster receivers fill a thin surface gap and reject removed o
   expect(recycled.every(a => a.identity[2] === 2 && a.historyUpdates === 1)).toBe(true);
 });
 
-test('supplemental split queries preserve two area sources and multi-segment transport', async ({ page }, testInfo) => {
+test('supplemental partitioned queries preserve two area sources and multi-segment transport', async ({ page }, testInfo) => {
   test.setTimeout(180_000);
   await page.goto('/?trees=1'); await page.waitForFunction(() => window.__REAL_ENGINE__);
   const result = await page.evaluate(async () => {
@@ -48,7 +48,10 @@ test('supplemental split queries preserve two area sources and multi-segment tra
   await testInfo.attach('gi-supplemental-area.json', { body: JSON.stringify(result), contentType: 'application/json' });
   expect(result.errors).toEqual([]); expect(result.afterDispose).toBe(0);
   expect(result.unlitMulti.diagnostics.activeEmitters).toBe(2);
-  expect(result.unlitMulti.diagnostics.supplementalQueryPassesPerUpdate).toBe(5);
+  expect(result.unlitMulti.diagnostics.supplementalQueryPassesPerUpdate).toBe(0);
+  expect(result.unlitMulti.diagnostics.partitionedQueryPassesPerUpdate).toBe(5);
+  expect(result.unlitMulti.diagnostics.queryPassesPerUpdate).toBe(5);
+  expect(result.unlitMulti.diagnostics.supplementalQueryScratchBytes).toBe(0);
   expect(result.missSingle.supplementalAnchors.some(a => a.valid)).toBe(true);
   expect(result.supplementalAreaChecks).toHaveLength(9);
   for (const check of result.supplementalAreaChecks) {

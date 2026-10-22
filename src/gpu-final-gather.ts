@@ -1,6 +1,7 @@
 import commonSource from './shaders/diffuse-gi-common.wgsl?raw';
 import interpolateSource from './shaders/diffuse-gi-interpolate.wgsl?raw';
 import updateSource from './shaders/final-gather-update.wgsl?raw';
+import coverageSource from './shaders/final-gather-coverage.wgsl?raw';
 import sampleSource from './shaders/final-gather-sample.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
@@ -17,14 +18,15 @@ type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
 export const finalGatherSampleSource = sampleSource;
 export const FINAL_GATHER_ANCHOR_BYTES = 112;
-export const FINAL_GATHER_PARAMETER_BYTES = 304;
+export const FINAL_GATHER_PARAMETER_BYTES = 320;
 const PARAMETER_BYTES = FINAL_GATHER_PARAMETER_BYTES;
 const AREA_SAMPLE_BYTES = 48;
 const AREA_PARAMETER_BYTES = 32;
 const MAX_PROBE_ANCHORS = 1_024;
 const READBACK_BYTES = MAX_PROBE_ANCHORS * FINAL_GATHER_ANCHOR_BYTES * 2;
 type EntryPoint = 'generateCamera' | 'generateHemisphere' | 'generateShadows' | 'integrate'
-  | 'clearArea' | 'generateArea' | 'integrateArea' | 'accumulate' | 'denoise' | 'loadRasterReceivers' | 'loadSupplementalReceivers';
+  | 'clearArea' | 'generateArea' | 'integrateArea' | 'accumulate' | 'denoise' | 'loadRasterReceivers' | 'loadSupplementalReceivers'
+  | 'clearSupplementalReceivers' | 'scanSupplementalTiles' | 'scanSupplementalBlocks' | 'scatterSupplementalReceivers';
 export interface FinalGatherUpdate {
   frame: number;
   width: number;
@@ -117,7 +119,7 @@ export class GpuFinalGather {
   private areaRayCount = 0;
   private pathSegments = 1;
   private grid: FinalGatherGridPlan = { spacing: 1, columns: 0, rows: 0, anchorCount: 0, rayCount: 0 };
-  private supplemental = { spacing: 0, columns: 0, rows: 0, anchorCount: 0 };
+  private supplemental = { spacing: 0, columns: 0, rows: 0, anchorCount: 0, tileCount: 0, permutationStride: 1 };
   private get activeAnchorCount(): number { return this.grid.anchorCount + this.supplemental.anchorCount; }
   private historyUpdates = 0;
   private historyResetReason = 'initial';
@@ -133,10 +135,14 @@ export class GpuFinalGather {
   private filteredAnchors!: GPUBuffer;
   private readback!: GPUBuffer;
   private areaSamples!: GPUBuffer;
-  private splitRays?: GPUBuffer;
-  private splitHits?: GPUBuffer;
+  private coverageCandidates!: GPUBuffer;
+  private coveragePrefix!: GPUBuffer;
+  private coverageMaps!: [GPUBuffer, GPUBuffer];
+  private coverageGroups!: Record<'clear' | 'tiles' | 'blocks', GPUBindGroup>;
+  private coverageScatterGroups!: GPUBindGroup[];
+  private get coverageCapacity(): number { return Math.min(this.options.maxSupplementalAnchors, this.anchorCapacity); }
   private pipelines!: Record<EntryPoint, GPUComputePipeline>;
-  private groups!: Record<Exclude<EntryPoint, 'generateHemisphere' | 'integrate' | 'generateArea' | 'integrateArea' | 'accumulate' | 'denoise' | 'loadRasterReceivers' | 'loadSupplementalReceivers'>, GPUBindGroup>;
+  private groups!: Record<'generateCamera' | 'generateShadows' | 'clearArea', GPUBindGroup>;
   private rasterReceivers?: RasterReceiverBindings;
   private rasterReceiverGroup?: GPUBindGroup;
   private hemisphereGroups!: GPUBindGroup[];
@@ -149,6 +155,7 @@ export class GpuFinalGather {
   get surfaceBuffer(): GPUBuffer { return this.filteredAnchors; }
   /** A stable filtered output is separate from both raw temporal history fields. */
   get outputBuffers(): [GPUBuffer, GPUBuffer] { return [this.filteredAnchors, this.filteredAnchors]; }
+  get coverageMapBuffers(): readonly [GPUBuffer, GPUBuffer] { return this.coverageMaps; }
   get currentIndex(): number { return this.outputIndex; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, giParameterBuffer: GPUBuffer,
@@ -158,7 +165,7 @@ export class GpuFinalGather {
     const capacity = Math.min(resolved.maxAnchors, Math.floor(queries.options.maxRays / resolved.raysPerAnchor),
       Math.floor(queries.options.maxTotalWorkUnits / resolved.raysPerAnchor));
     if (capacity < 1) throw new Error('FINAL_GATHER_QUERY_RAY_BUDGET');
-    if (queries.options.maxTraceParameterSetsPerEncoder < (resolved.maxSupplementalAnchors ? 6 : 4)) throw new Error('FINAL_GATHER_QUERY_PARAMETER_BUDGET');
+    if (queries.options.maxTraceParameterSetsPerEncoder < 4) throw new Error('FINAL_GATHER_QUERY_PARAMETER_BUDGET');
     if (resolved.maxSupplementalWorkUnits > queries.options.maxTotalWorkUnits) throw new Error('FINAL_GATHER_SUPPLEMENTAL_WORK_BUDGET');
     if (device.limits.maxStorageBuffersPerShaderStage < 6) throw new Error('FINAL_GATHER_STORAGE_BINDING_LIMIT');
     if (!Number.isSafeInteger(maxBytesRemaining) || maxBytesRemaining < 1) throw new Error('FINAL_GATHER_MEMORY_BUDGET');
@@ -199,12 +206,14 @@ export class GpuFinalGather {
   }
   private async initialize(): Promise<void> {
     const cap = this.anchorCapacity, rayCapacity = cap * this.options.raysPerAnchor;
+    const coverageCapacity = this.coverageCapacity;
+    const candidateBytes = Math.max(WORLD_HIT_BYTES, coverageCapacity * 8 * WORLD_HIT_BYTES);
+    const prefixBytes = Math.max(4, (coverageCapacity + Math.ceil(coverageCapacity / 128) + 1) * 32);
+    const mapBytes = Math.max(4, coverageCapacity * 9 * 4);
     this.preflight([PARAMETER_BYTES, cap * WORLD_HIT_BYTES, rayCapacity * WORLD_HIT_BYTES,
       cap * FINAL_GATHER_ANCHOR_BYTES, cap * FINAL_GATHER_ANCHOR_BYTES, cap * FINAL_GATHER_ANCHOR_BYTES,
       this.queries.options.maxRays * AREA_SAMPLE_BYTES, READBACK_BYTES, rayCapacity * 16,
-      ...(this.options.maxSupplementalAnchors ? [this.queries.options.maxRays * WORLD_RAY_BYTES,
-        this.queries.options.maxRays * WORLD_HIT_BYTES] : []),
-      ...Array<number>(this.options.pathSegments).fill(16)]);
+      ...Array<number>(this.options.pathSegments).fill(16), candidateBytes, prefixBytes, mapBytes, mapBytes]);
     if (Math.ceil(this.queries.options.maxRays / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) {
       throw new Error('FINAL_GATHER_DISPATCH_LIMIT');
     }
@@ -223,26 +232,26 @@ export class GpuFinalGather {
     this.readback = this.buffer('surface final gather explicit anchor diagnostics', READBACK_BYTES,
       GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
     this.areaSamples = this.buffer('surface final gather emission samples', this.queries.options.maxRays * AREA_SAMPLE_BYTES, GPUBufferUsage.STORAGE);
-    if (this.options.maxSupplementalAnchors) {
-      this.splitRays = this.buffer('final gather split-query rays', this.queries.options.maxRays * WORLD_RAY_BYTES,
-        GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
-      this.splitHits = this.buffer('final gather split-query combined hits', this.queries.options.maxRays * WORLD_HIT_BYTES,
-        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
-    }
+    this.coverageCandidates = this.buffer('final gather surface candidates', candidateBytes, GPUBufferUsage.STORAGE);
+    this.coveragePrefix = this.buffer('final gather coverage prefix sums', prefixBytes, GPUBufferUsage.STORAGE);
+    this.coverageMaps = [0, 1].map(i => this.buffer('final gather coverage map ' + i, mapBytes,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC)) as [GPUBuffer, GPUBuffer];
     const common = commonSource.replace('// GI_DISTANCE_CONSTANTS',
       `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`);
     const module = this.device.createShaderModule({ label: 'surface final gather',
-      code: surfaceFrameSource + '\n' + updateSource.replace('// GI_COMMON', common).replace('// GI_INTERPOLATE', interpolateSource) });
+      code: surfaceFrameSource + '\n' + updateSource.replace('// GI_COMMON', common).replace('// GI_INTERPOLATE', interpolateSource) + '\n' + coverageSource });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `final gather:${error.lineNum}: ${error.message}`).join('\n'));
     const names: EntryPoint[] = ['generateCamera', 'generateHemisphere', 'generateShadows', 'integrate',
-      'clearArea', 'generateArea', 'integrateArea', 'accumulate', 'denoise', 'loadRasterReceivers', 'loadSupplementalReceivers'];
+      'clearArea', 'generateArea', 'integrateArea', 'accumulate', 'denoise', 'loadRasterReceivers', 'loadSupplementalReceivers',
+      'clearSupplementalReceivers', 'scanSupplementalTiles', 'scanSupplementalBlocks', 'scatterSupplementalReceivers'];
     const receiverLayout = this.device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       { binding: 19, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 16, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
       { binding: 17, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'uint' } },
       { binding: 18, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 20, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ] });
     const results = await Promise.all(names.map(entryPoint => this.device.createComputePipelineAsync({
       label: 'surface final gather ' + entryPoint,
@@ -261,14 +270,21 @@ export class GpuFinalGather {
       [[0, this.parameters], [1, this.giParameterBuffer], [2, q.rayBuffer], [4, this.cameraHits],
         [5, this.primaryHits], [14, path], [15, this.throughput]]));
     this.integrateGroups = this.anchors.map(output => this.giProbeBuffers.map(probes => this.pathParameters.map(path => this.bind(p.integrate,
-      [[0, this.parameters], [1, this.giParameterBuffer], [3, this.splitHits ?? q.hitBuffer], [4, this.cameraHits],
+      [[0, this.parameters], [1, this.giParameterBuffer], [3, q.hitBuffer], [4, this.cameraHits],
         [5, this.primaryHits], [6, output], [8, probes], [14, path], [15, this.throughput]]))));
     this.areaIntegrateGroups = this.anchors.map(output => this.bind(p.integrateArea,
-      [[0, this.parameters], [3, this.splitHits ?? q.hitBuffer], [6, output], [13, this.areaSamples]]));
+      [[0, this.parameters], [3, q.hitBuffer], [6, output], [13, this.areaSamples]]));
     this.accumulateGroups = this.anchors.map((output, index) => this.bind(p.accumulate,
-      [[0, this.parameters], [4, this.cameraHits], [6, output], [7, this.anchors[1 - index]]]));
-    this.denoiseGroups = this.anchors.map(input => this.bind(p.denoise,
-      [[0, this.parameters], [6, this.filteredAnchors], [7, input]]));
+      [[0, this.parameters], [4, this.cameraHits], [6, output], [7, this.anchors[1 - index]], [23, this.coverageMaps[1 - index]]]));
+    this.denoiseGroups = this.anchors.map((input, index) => this.bind(p.denoise,
+      [[0, this.parameters], [6, this.filteredAnchors], [7, input], [23, this.coverageMaps[index]]]));
+    this.coverageGroups = {
+      clear: this.bind(p.clearSupplementalReceivers, [[0, this.parameters], [19, this.cameraHits]]),
+      tiles: this.bind(p.scanSupplementalTiles, [[0, this.parameters], [20, this.coverageCandidates], [21, this.coveragePrefix]]),
+      blocks: this.bind(p.scanSupplementalBlocks, [[0, this.parameters], [21, this.coveragePrefix]]),
+    };
+    this.coverageScatterGroups = this.coverageMaps.map(map => this.bind(p.scatterSupplementalReceivers,
+      [[0, this.parameters], [19, this.cameraHits], [20, this.coverageCandidates], [21, this.coveragePrefix], [22, map]]));
   }
 
   /** Borrow completed full-resolution receiver surfaces; their owner retains
@@ -292,6 +308,7 @@ export class GpuFinalGather {
       { binding: 0, resource: { buffer: this.parameters } }, { binding: 19, resource: { buffer: this.cameraHits } },
       { binding: 16, resource: input.motionDepth.createView() }, { binding: 17, resource: input.identityNormals.createView() },
       { binding: 18, resource: { buffer: input.metadata } },
+      { binding: 20, resource: { buffer: this.coverageCandidates } },
     ] });
     this.rasterReceivers = { ...input }; this.rasterReceiverGroup = group;
   }
@@ -419,6 +436,7 @@ export class GpuFinalGather {
     }
     integers.set([Number(this.options.receiver === 'raster'), this.rasterReceivers?.metadataRows ?? 0,
       supplemental.spacing, supplemental.anchorCount], 72);
+    integers.set([this.coverageCapacity, supplemental.tileCount, supplemental.permutationStride, 0], 76);
     this.device.queue.writeBuffer(this.parameters, 0, data);
     let uploaded = data.byteLength;
     if (input.enabled) this.batches.forEach((batch, index) => {
@@ -457,18 +475,26 @@ export class GpuFinalGather {
       const output = 1 - this.outputIndex, grid = this.grid;
       const anchors = this.activeAnchorCount, rayCount = anchors * this.options.raysPerAnchor;
       const dispatch = (name: EntryPoint, count: number, group: GPUBindGroup,
-        timestampWrites?: GPUComputePassTimestampWrites): void => {
+        timestampWrites?: GPUComputePassTimestampWrites, workgroupSize = 64): void => {
         if (!count) return;
         const pass = encoder.beginComputePass({ label: 'surface final gather ' + name, timestampWrites });
         pass.setPipeline(this.pipelines[name]); pass.setBindGroup(0, group);
-        pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
+        pass.dispatchWorkgroups(Math.ceil(count / workgroupSize)); pass.end();
       };
       const begin = timing && { querySet: timing.querySet, beginningOfPassWriteIndex: timing.beginningOfPassWriteIndex };
       let uploaded = 0;
       if (this.options.receiver === 'raster') {
         if (!this.rasterReceiverGroup) throw new Error('FINAL_GATHER_RASTER_BINDINGS');
         dispatch('loadRasterReceivers', grid.anchorCount, this.rasterReceiverGroup, begin);
-        if (this.supplemental.anchorCount) dispatch('loadSupplementalReceivers', this.supplemental.anchorCount, this.rasterReceiverGroup, coverageTiming);
+        if (this.supplemental.anchorCount) {
+          dispatch('clearSupplementalReceivers', this.supplemental.anchorCount, this.coverageGroups.clear,
+            coverageTiming && { querySet: coverageTiming.querySet, beginningOfPassWriteIndex: coverageTiming.beginningOfPassWriteIndex });
+          dispatch('loadSupplementalReceivers', this.supplemental.tileCount, this.rasterReceiverGroup);
+          dispatch('scanSupplementalTiles', this.supplemental.tileCount, this.coverageGroups.tiles, undefined, 128);
+          dispatch('scanSupplementalBlocks', 128, this.coverageGroups.blocks, undefined, 128);
+          dispatch('scatterSupplementalReceivers', this.supplemental.tileCount, this.coverageScatterGroups[output],
+            coverageTiming && { querySet: coverageTiming.querySet, endOfPassWriteIndex: coverageTiming.endOfPassWriteIndex });
+        }
         else if (coverageTiming) encoder.beginComputePass({ label: 'empty supplemental receivers', timestampWrites: coverageTiming }).end();
       } else {
         dispatch('generateCamera', grid.anchorCount, this.groups.generateCamera, begin);
@@ -478,7 +504,7 @@ export class GpuFinalGather {
       for (let segment = 0; segment < this.pathSegments; segment++) {
         dispatch('generateHemisphere', rayCount, this.hemisphereGroups[segment]);
         uploaded += this.traceReceivers(encoder, this.options.raysPerAnchor, 1, materialRevision);
-        encoder.copyBufferToBuffer(this.splitHits ?? this.queries.hitBuffer, 0, this.primaryHits, 0, rayCount * WORLD_HIT_BYTES);
+        encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.primaryHits, 0, rayCount * WORLD_HIT_BYTES);
         dispatch('generateShadows', rayCount, this.groups.generateShadows);
         uploaded += this.traceReceivers(encoder, this.options.raysPerAnchor, 1, materialRevision);
         dispatch('integrate', anchors, this.integrateGroups[output][giIndex][segment]);
@@ -498,33 +524,54 @@ export class GpuFinalGather {
     } finally { this.encoding = false; }
   }
 
-  /** Preserve the primary traversal quota. Pack source-major area blocks as
-   * well as hemisphere rays, then scatter both results back to their original
-   * indices. All movement stays on the GPU; added work has an explicit budget. */
+  /** One query retains source-major ray/hit indices and assigns independent
+   * primary/supplemental quotas within each block, without copying either set. */
   private traceReceivers(encoder: GPUCommandEncoder, raysPerAnchor: number, blocks: number, materialRevision: number): number {
     const q = this.queries, base = this.grid.anchorCount * raysPerAnchor;
     const extra = this.supplemental.anchorCount * raysPerAnchor, stride = base + extra;
-    if (!extra) {
-      const uploaded = q.encodeTrace(encoder, blocks * base, 0, materialRevision);
-      if (this.splitHits) encoder.copyBufferToBuffer(q.hitBuffer, 0, this.splitHits, 0, blocks * base * WORLD_HIT_BYTES);
-      return uploaded;
-    }
-    encoder.copyBufferToBuffer(q.rayBuffer, 0, this.splitRays!, 0, blocks * stride * WORLD_RAY_BYTES);
-    let uploaded = 0;
-    for (const supplemental of [false, true]) {
-      const count = supplemental ? extra : base, start = supplemental ? base : 0;
-      for (let block = 0; block < blocks; block++) encoder.copyBufferToBuffer(this.splitRays!,
-        (block * stride + start) * WORLD_RAY_BYTES, q.rayBuffer, block * count * WORLD_RAY_BYTES, count * WORLD_RAY_BYTES);
-      uploaded += q.encodeTrace(encoder, blocks * count, 0, materialRevision,
-        supplemental ? this.options.maxSupplementalWorkUnits : undefined);
-      for (let block = 0; block < blocks; block++) encoder.copyBufferToBuffer(q.hitBuffer,
-        block * count * WORLD_HIT_BYTES, this.splitHits!, (block * stride + start) * WORLD_HIT_BYTES, count * WORLD_HIT_BYTES);
-    }
-    return uploaded;
+    return q.encodeTrace(encoder, blocks * stride, 0, materialRevision, undefined,
+      extra ? { raysPerBlock: stride, primaryRaysPerBlock: base,
+        supplementalMaxWorkUnits: this.options.maxSupplementalWorkUnits } : undefined);
   }
 
   /** Explicit, bounded diagnostics only. Call after submitting the rendered
    * frame; no per-frame geometry or anchor readback occurs in the runtime. */
+  async probeCoverageTiles(tiles: readonly number[]): Promise<{ frame: number; tiles: { tile: number; indices: number[] }[] }> {
+    this.assertAlive();
+    if (!this.encodedFrame) throw new Error('FINAL_GATHER_NO_FRAME');
+    if (!this.enabled) throw new Error('FINAL_GATHER_DISABLED');
+    if (this.encoding || this.encodedFrame !== this.frame) throw new Error('FINAL_GATHER_FRAME_NOT_ENCODED');
+    if (this.readbackPending) throw new Error('FINAL_GATHER_READBACK_PENDING');
+    if (!Array.isArray(tiles) || tiles.length > 256) throw new Error('FINAL_GATHER_TILE_BUDGET');
+    if (tiles.some(tile => !Number.isSafeInteger(tile) || tile < 0 || tile >= this.supplemental.tileCount)
+      || new Set(tiles).size !== tiles.length) throw new Error('FINAL_GATHER_TILE_INDICES');
+    const frame = this.encodedFrame, requested = [...tiles], primaryCount = this.grid.anchorCount,
+      activeCount = this.activeAnchorCount;
+    if (!requested.length) return { frame, tiles: [] };
+    this.readbackPending = true;
+    try {
+      const encoder = this.device.createCommandEncoder({ label: 'explicit final gather coverage diagnostics' });
+      for (let i = 0; i < requested.length; i++) encoder.copyBufferToBuffer(this.coverageMaps[this.outputIndex],
+        requested[i] * 32, this.readback, i * 32, 32);
+      this.device.queue.submit([encoder.finish()]);
+      await this.readback.mapAsync(GPUMapMode.READ, 0, requested.length * 32);
+      this.assertAlive();
+      const data = new Uint32Array(this.readback.getMappedRange(0, requested.length * 32));
+      return { frame, tiles: requested.map((tile, i) => {
+        const mapped = Array.from(data.subarray(i * 8, i * 8 + 8)).filter(value => value !== 0);
+        if (new Set(mapped).size !== mapped.length || mapped.some(value => value <= primaryCount
+          || value > activeCount)) throw new Error('FINAL_GATHER_INVALID_COVERAGE_MAP');
+        return { tile, indices: mapped.map(value => value - 1) };
+      }) };
+    } catch (error) {
+      if (this.disposed) throw new Error('FINAL_GATHER_DISPOSED');
+      throw error;
+    } finally {
+      if (this.readback.mapState === 'mapped') this.readback.unmap();
+      this.readbackPending = false;
+    }
+  }
+
   async probe(indices: readonly number[]): Promise<FinalGatherProbeResult> {
     this.assertAlive();
     if (!this.encodedFrame) throw new Error('FINAL_GATHER_NO_FRAME');
@@ -598,7 +645,7 @@ export class GpuFinalGather {
     const hemisphere = anchors * this.options.raysPerAnchor * this.pathSegments;
     const area = this.enabled ? this.areaRayCount : 0;
     const transportPasses = this.enabled ? 2 * this.pathSegments + Number(area > 0) : 0;
-    const extraPasses = this.supplemental.anchorCount ? transportPasses : 0;
+    const partitionedPasses = this.supplemental.anchorCount ? transportPasses : 0;
     const primaryPasses = this.enabled ? Number(this.options.receiver !== 'raster') + transportPasses : 0;
     return { enabled: this.enabled, frame: this.encodedFrame, options: this.options, ownedGpuBytes: this.bytes,
       representation: this.options.receiver === 'raster' ? 'actual-raster-camera-receiver-screen-grid-irradiance'
@@ -617,8 +664,10 @@ export class GpuFinalGather {
       supplementalAnchorsPerUpdate: this.enabled ? this.supplemental.anchorCount : 0,
       supplementalTileSpacing: this.supplemental.spacing,
       supplementalMaxReceiverPixelsInspected: this.enabled && this.supplemental.anchorCount ? this.previous!.width * this.previous!.height : 0,
-      supplementalMaxCompatibilityChecks: this.enabled && this.supplemental.anchorCount ? this.previous!.width * this.previous!.height * 20 : 0,
-      supplementalSurfaceCandidatesPerTile: 4,
+      supplementalMaxCompatibilityChecks: this.enabled && this.supplemental.anchorCount ? this.previous!.width * this.previous!.height * 24 : 0,
+      supplementalSurfaceCandidatesPerTile: 8,
+      supplementalTileCount: this.supplemental.tileCount,
+      supplementalCoverageBytes: this.coverageCandidates.size + this.coveragePrefix.size + this.coverageMaps[0].size * 2,
       supplementalStatus: !this.options.maxSupplementalAnchors ? 'not-requested'
         : this.supplemental.anchorCount ? 'active' : 'insufficient-spare-capacity-for-bounded-tiles',
       pathSegmentsPerUpdate: this.enabled ? this.pathSegments : 0,
@@ -628,16 +677,18 @@ export class GpuFinalGather {
       activeEmitters: this.activeEmitters, registeredEmitters: this.batches.length,
       inactiveEmitterBlockRaysPerUpdate: this.enabled ? (this.sourceBlocks - this.activeEmitters) * anchors : 0,
       queryRaysPerUpdate: (this.options.receiver === 'raster' ? 0 : anchors) + hemisphere * 2 + area,
-      queryPassesPerUpdate: primaryPasses + extraPasses,
-      supplementalQueryPassesPerUpdate: extraPasses,
-      supplementalQueryScratchBytes: (this.splitRays?.size ?? 0) + (this.splitHits?.size ?? 0),
+      queryPassesPerUpdate: primaryPasses,
+      supplementalQueryPassesPerUpdate: 0,
+      partitionedQueryPassesPerUpdate: partitionedPasses,
+      supplementalQueryScratchBytes: 0,
       primaryTraversalQuotaPreserved: true,
-      maxWorkUnitsPerUpdate: this.queries.options.maxTotalWorkUnits * primaryPasses + this.options.maxSupplementalWorkUnits * extraPasses,
+      maxWorkUnitsPerUpdate: this.queries.options.maxTotalWorkUnits * primaryPasses + this.options.maxSupplementalWorkUnits * partitionedPasses,
       historyUpdates: this.historyUpdates, nominalHistoryUpdates: this.historyUpdates,
       historyUpdatesMeaning: 'nominal-completed-updates-since-global-reset', historyResetReason: this.historyResetReason,
       temporalAccumulation: 'surface-validated-raw-camera-reprojection', cameraReprojection: true,
       cameraMoving: this.cameraMoving, cameraMotionHistoryCap: Math.min(this.options.maxHistory, 8),
       cameraReprojectionCandidates: 4, cameraReprojectionMaxWorldDistance: 0.10,
+      supplementalHistoryMaxCandidates: 72,
       cameraReprojectionPlaneTolerance: 0.001, cameraReprojectionNormalThreshold: 0.98,
       cameraReprojectionInput: this.options.receiver === 'raster'
         ? 'previous-rendered-raster-position-and-exact-previous-view-projection'
@@ -649,16 +700,18 @@ export class GpuFinalGather {
       diagnosticReadbackPending: this.readbackPending,
       spatialDenoise: 'variance-guided-irradiance-with-surface-identity-plane-normal-rejection',
       spatialDenoiseRadius: 2, spatialDenoiseMaxNeighbors: 25, spatialDenoiseMaxWorldDistance: 0.10,
+      supplementalDenoiseTileRadius: 1, supplementalDenoiseMaxNeighbors: 72,
       spatialDenoiseNormalThreshold: 0.98, spatialDenoisePlaneTolerance: 0.001,
       historyBootstrapFrames: 4, spatialDenoiseStandardDeviationScale: 4,
       filteredOutputFeedsHistory: false,
       spatialFilter: 'four-anchor-bilinear-with-bounded-compatible-ring-recovery', maxSpatialFilterDistance: 0.25,
       spatialFilterPrimaryCandidates: 4, spatialFilterRecoveryCandidates: 12,
+      spatialFilterSupplementalCandidates: 72,
       spatialFilterNormalThreshold: 0.95, spatialFilterPlaneTolerance: Math.max(0.001, this.options.normalBias * 4),
       uncoveredFallback: 'completed-world-GI', firstSegment: 'full-configured-GI-range',
       normalBias: this.options.normalBias, emissionSampling: 'one-area-sample-per-source-per-anchor-per-update',
       feedbackToWorldField: false, automaticAdaptiveContactAnchors: this.supplemental.anchorCount > 0,
-      supplementalAllocation: 'one-supported-uncovered-raster-receiver-from-four-candidates-per-bounded-tile' };
+      supplementalAllocation: 'eight-surface-candidates-per-tile-with-bounded-global-rank-compaction' };
   }
   dispose(): void {
     if (this.disposed) return;

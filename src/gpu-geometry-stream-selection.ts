@@ -6,6 +6,7 @@ import type { Mat4 } from './math';
 import type { GeometryGroupDemand } from './geometry-stream-working-set';
 import { occlusionTestSource, type GpuOcclusion } from './gpu-occlusion';
 import type { GeometryStreamDirectory } from './geometry-stream-types';
+import { subscribeGpuDeviceLoss } from './gpu-device-loss';
 
 /** Includes persistent buffers and the maximum one-at-a-time feedback buffer. */
 export interface GeometryStreamSelectionOptions { maxGpuBytes?: number }
@@ -72,10 +73,31 @@ export class GpuGeometryStreamSelection {
   private error: string | null = null;
   private readonly feedbackBudget: number;
   private readonly maxGpuBytes: number;
+  private unsubscribeLoss?: () => void;
 
   static async create(device: GPUDevice, pool: GpuGeometryPagePool, instances: GPUBuffer, capacity: number,
-    track: (bytes: number) => void = () => {}, options: GeometryStreamSelectionOptions = {}, occlusion?: GpuOcclusion) {
+    track: (bytes: number) => void = () => {}, options: GeometryStreamSelectionOptions = {}, occlusion?: GpuOcclusion,
+    reuse?: GpuGeometryStreamSelection) {
     let result: GpuGeometryStreamSelection | undefined;
+    if (reuse) {
+      reuse.live();
+      if (reuse.device !== device || reuse.occlusion !== occlusion) throw new Error('GEOMETRY_STREAM_PIPELINE_REUSE');
+      device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
+      let failure: unknown;
+      try {
+        result = new GpuGeometryStreamSelection(device, pool, instances, capacity, track, options, occlusion, reuse);
+        result.pipelines = reuse.pipelines;
+      } catch (error) { failure = error; }
+      // Runtime migration only replaces buffers/bindings. Close scopes before
+      // the first await so rendering or material updates can run concurrently.
+      const checks = await Promise.allSettled([device.popErrorScope(), device.popErrorScope()]);
+      for (const check of checks) if (check.status === 'rejected') failure ??= check.reason;
+      else if (check.value) failure ??= new Error('GEOMETRY_STREAM_INITIALIZATION: ' + check.value.message);
+      try {
+        if (failure) throw failure;
+        result!.live(); return result!;
+      } catch (error) { try { result?.dispose(); } catch { /* preserve preparation failure */ } throw error; }
+    }
     device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
     try {
       result = new GpuGeometryStreamSelection(device, pool, instances, capacity, track, options, occlusion);
@@ -108,7 +130,7 @@ export class GpuGeometryStreamSelection {
 
   private constructor(private readonly device: GPUDevice, readonly pool: GpuGeometryPagePool, instances: GPUBuffer,
     readonly capacity: number, private readonly track: (bytes: number) => void,
-    options: GeometryStreamSelectionOptions, private readonly occlusion?: GpuOcclusion) {
+    options: GeometryStreamSelectionOptions, private readonly occlusion?: GpuOcclusion, reuse?: GpuGeometryStreamSelection) {
     const allocation = geometryStreamSelectionResources(pool.directory, capacity, device.limits.minUniformBufferOffsetAlignment);
     this.packed = allocation.packed;
     const directory = this.packed.directory, pairs = allocation.pairs;
@@ -144,8 +166,8 @@ export class GpuGeometryStreamSelection {
       const layouts = (bindings: number[]) => device.createBindGroupLayout({ entries: bindings.map(binding => ({ binding,
         visibility: GPUShaderStage.COMPUTE, buffer: { type: binding < 2 ? 'uniform' : [5, 6, 9, 10].includes(binding) ? 'storage' : 'read-only-storage',
           ...(binding === 1 ? { hasDynamicOffset: true, minBindingSize: 48 } : {}) } })) });
-      this.selectLayout = layouts([0, 1, 2, 3, 4, 5, 6]);
-      this.compactLayout = layouts([0, 1, 2, 3, 4, 5, 7, 8, 9, 10]);
+      this.selectLayout = reuse?.selectLayout ?? layouts([0, 1, 2, 3, 4, 5, 6]);
+      this.compactLayout = reuse?.compactLayout ?? layouts([0, 1, 2, 3, 4, 5, 7, 8, 9, 10]);
       const buffers = [this.view, this.params, metadata, instances, pool.pageResidency, this.selected,
         this.requests, pool.clusterLocations, pool.indices, this.indices, this.arguments];
       const group = (layout: GPUBindGroupLayout, bindings: number[]) => device.createBindGroup({ layout,
@@ -153,7 +175,7 @@ export class GpuGeometryStreamSelection {
       this.selectGroup = group(this.selectLayout, [0, 1, 2, 3, 4, 5, 6]);
       this.compactGroup = group(this.compactLayout, [0, 1, 2, 3, 4, 5, 7, 8, 9, 10]);
     } catch (error) { try { this.dispose(); } catch { /* preserve allocation failure */ } throw error; }
-    void device.lost.then(() => {
+    this.unsubscribeLoss = subscribeGpuDeviceLoss(device, () => {
       this.error = 'GEOMETRY_STREAM_DEVICE_LOST';
       try { this.dispose(); } catch (error) { this.error += '; cleanup: ' + String(error); }
     });
@@ -268,6 +290,7 @@ export class GpuGeometryStreamSelection {
       recoveredFrame: this.recoveredFrame }, settings: { ...this.settings } }; }
   dispose() {
     if (this.disposed) return; this.disposed = true;
+    this.unsubscribeLoss?.(); this.unsubscribeLoss = undefined;
     for (const buffer of this.buffers) buffer.destroy(); this.buffers.length = 0;
     let released = this.bytes; this.bytes = 0;
     if (this.reading) { released += this.reading.size; this.reading.destroy(); this.reading = undefined; }

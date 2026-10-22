@@ -283,20 +283,35 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
               (dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1 ? primary : recovery).push(x + dx + (y + dy) * grid.columns);
             }
           }
-          const supplemental: number[] = [];
+          const supplemental: number[] = [], supplementalTiles: number[] = [];
           if (grid.supplementalTileSpacing) {
             const pitch = grid.supplementalTileSpacing, columns = Math.ceil(canvas.width / pitch), rows = Math.ceil(canvas.height / pitch);
             const sx = Math.floor(pixel.x / pitch), sy = Math.floor(pixel.y / pitch);
             for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
               if (sx + dx >= 0 && sy + dy >= 0 && sx + dx < columns && sy + dy < rows) {
-                supplemental.push(grid.primaryAnchorsPerUpdate + sx + dx + (sy + dy) * columns);
+                supplementalTiles.push(sx + dx + (sy + dy) * columns);
               }
             }
           }
-          return { pixel, primary, recovery, supplemental, indices: [...primary, ...recovery, ...supplemental] };
+          return { pixel, primary, recovery, supplemental, supplementalTiles, indices: [...primary, ...recovery] };
         }) : [];
+        const tiles = [...new Set(candidates.flatMap(row => row.supplementalTiles))];
+        const tileIndices = new Map<number, number[]>();
+        for (let offset = 0; offset < tiles.length; offset += 256) {
+          const map = await renderer!.probeDiffuseGiFinalGatherCoverageTiles(tiles.slice(offset, offset + 256));
+          for (const entry of map.tiles) tileIndices.set(entry.tile, entry.indices);
+        }
+        for (const candidate of candidates) {
+          candidate.supplemental = candidate.supplementalTiles.flatMap(tile => tileIndices.get(tile) ?? []);
+          candidate.indices.push(...candidate.supplemental);
+        }
+        const indices = [...new Set(candidates.flatMap(row => row.indices))];
+        const anchorProbes = [];
+        for (let offset = 0; offset < indices.length; offset += 1024) {
+          anchorProbes.push(await renderer!.probeDiffuseGiFinalGather(indices.slice(offset, offset + 1024)));
+        }
         const finalGather = candidates.length ? { candidates,
-          probe: await renderer!.probeDiffuseGiFinalGather([...new Set(candidates.flatMap(row => row.indices))]),
+          probe: { frame: anchorProbes[0]?.frame, anchors: anchorProbes.flatMap(probe => probe.anchors) },
           note: 'Candidate anchors only; inclusion does not prove surface compatibility or acceptance by reconstruction.' } : null;
         const diagnostic = settings.reconstructionDiagnostics ? await renderer!.probeDiffuseGiReconstruction(points,
           { coverage: settings.coverageDiagnostics }) : null;

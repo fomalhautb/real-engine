@@ -1,5 +1,5 @@
 import type { InstanceState, MaterialBinding, SceneBatch } from '../../../src/contracts';
-import { giRayDirection, type GiVisibilityDirection } from '../../../src/diffuse-gi';
+import { giRayDirection, type GiVisibilityDirection, type GiVisibilityFilter } from '../../../src/diffuse-gi';
 import { createPlane, type MeshData } from '../../../src/geometry';
 import { buildGiDistanceWeights, GI_DISTANCE_CELLS } from '../../../src/gi-visibility';
 import { identity, normalMatrix, translation } from '../../../src/math';
@@ -37,8 +37,11 @@ function door(): SceneBatch {
     queryIdentity: { assetId: 'gi-support/door', primitiveId: 0, topologyVersion: 1 },
     deformation: { jointCount: 0, nodes: [] }, morphTargets: [], material: material(), emissiveSampling: 'triangle-area' };
 }
-function expectedMoments(direction: GiVisibilityDirection, x = 0, doubleSided = false, present = true) {
-  const rays = Array.from({ length: 64 }, (_, i) => giRayDirection(i, 64)), weights = buildGiDistanceWeights(rays);
+function expectedMoments(rays: readonly Vec3[], direction: GiVisibilityDirection, x = 0, doubleSided = false, present = true) {
+  // Capture weights are uploaded from CPU directions in production. Plane
+  // intersections use the actual GPU-generated rays, whose trig arithmetic
+  // can differ from JS doubles (especially on a software adapter).
+  const weights = buildGiDistanceWeights(Array.from({ length: 64 }, (_, i) => giRayDirection(i, 64)));
   return Array.from({ length: 8 }, (_, p) => {
     const px = grid.origin[0] + (p & 1) * grid.spacing[0];
     const distances = rays.map(d => {
@@ -56,17 +59,42 @@ function expectedMoments(direction: GiVisibilityDirection, x = 0, doubleSided = 
     });
   });
 }
-export async function runGiSupportFixture(lowBudget = false) {
+
+async function generatedDirections(renderer: Renderer): Promise<Vec3[]> {
+  // Exercise the actual production generator, without reading hit distances
+  // or moment results into the plane-equation oracle. Only query scratch is
+  // overwritten, after a completed render; the next render regenerates it.
+  const gpu = renderer as unknown as { device: GPUDevice; worldQueries: { rayBuffer: GPUBuffer };
+    diffuseGi: { generate: GPUComputePipeline; computeGroups: GPUBindGroup[]; currentIndex: number } };
+  const bytes = 64 * 48;
+  const readback = gpu.device.createBuffer({ label: 'test GI generated directions', size: bytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  try {
+    const encoder = gpu.device.createCommandEncoder(), pass = encoder.beginComputePass();
+    pass.setPipeline(gpu.diffuseGi.generate); pass.setBindGroup(0, gpu.diffuseGi.computeGroups[gpu.diffuseGi.currentIndex]);
+    pass.dispatchWorkgroups(1); pass.end();
+    encoder.copyBufferToBuffer(gpu.worldQueries.rayBuffer, 0, readback, 0, bytes);
+    gpu.device.queue.submit([encoder.finish()]);
+    await readback.mapAsync(GPUMapMode.READ);
+    try {
+      const values = new Float32Array(readback.getMappedRange());
+      return Array.from({ length: 64 }, (_, i) => [values[i * 12 + 4], values[i * 12 + 5], values[i * 12 + 6]]);
+    } finally { readback.unmap(); }
+  } finally { readback.destroy(); }
+}
+export async function runGiSupportFixture(lowBudget = false, visibilityFilter: GiVisibilityFilter = 'moment-bilinear') {
   const element = canvas(), batch = door(); let renderer: Renderer | undefined;
   try {
     renderer = await Renderer.create(element, [batch], {
       worldQueries: { maxRays: 512, maxTotalWorkUnits: 65536, maxTraceParameterSetsPerEncoder: 3 },
-      diffuseGi: { ...grid, emissiveSamplesPerProbe: 4, maxVisibilityWorkUnits: lowBudget ? 512 : 65536 },
+      diffuseGi: { ...grid, visibilityFilter, emissiveSamplesPerProbe: 4, maxVisibilityWorkUnits: lowBudget ? 512 : 65536 },
     });
     renderer.setSun({ direction: [1, 0, 0], color: [3, 2, 1] });
+    let rayDirections: Vec3[] | undefined;
     const capture = async (direction: GiVisibilityDirection, x = 0, doubleSided = false, present = true) => {
       renderer!.setDiffuseGiVisibilityDirection(direction); renderer!.render(eye, target);
-      return { direction, actual: await renderer!.probeDiffuseGi(), expected: expectedMoments(direction, x, doubleSided, present),
+      rayDirections ??= await generatedDirections(renderer!);
+      return { direction, actual: await renderer!.probeDiffuseGi(), expected: expectedMoments(rayDirections, direction, x, doubleSided, present),
         diagnostics: renderer!.diagnostics().diffuseGi, bytes: renderer!.stats.ownedGpuBytes };
     };
     const ordinaryBefore = await capture('probe-to-receiver');
@@ -93,7 +121,7 @@ export async function runGiSupportFixture(lowBudget = false) {
       renderer.setDiffuseGiEnabled(true); sequence.push(await capture('receiver-to-probe', -0.25));
     }
     const errors = [...renderer.errors]; renderer.dispose();
-    return { lowBudget, ordinaryBefore, reversed, ordinaryAfter, sequence, queryBefore, queryAfter,
+    return { lowBudget, rayDirections: rayDirections!, ordinaryBefore, reversed, ordinaryAfter, sequence, queryBefore, queryAfter,
       errors, afterDispose: renderer.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); element.remove(); }
 }

@@ -4,7 +4,7 @@ struct GiParameters {
     spacing: vec4f, // xyz spacing, w maximum ray distance
     counts: vec4u, // xyz grid dimensions, w rays per probe
     sunDirection: vec4f, // xyz unit vector, w world-space normal bias
-    sunColor: vec4f, // xyz radiance, w receiver-directed support enabled
+    sunColor: vec4f, // xyz radiance; w exact integer flags: bit 0 receiver-directed support, bit 1 per-tap Chebyshev
     sky: vec4f, // xyz radiance, w low-confidence visibility weight threshold
     state: vec4u, // rendered frame, usable history frame, feedback enabled, emissive area sampling enabled
 }

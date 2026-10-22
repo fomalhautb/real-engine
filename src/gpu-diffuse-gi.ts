@@ -246,7 +246,10 @@ export class GpuDiffuseGi {
     data.set([...o.origin, this.enabled ? 1 : 0]); data.set([...o.spacing, o.maxDistance], 4);
     integers.set([...o.counts, o.raysPerProbe], 8);
     data.set([...direction, o.normalBias], 12); data.set(color, 16); data.set(o.skyRadiance, 20);
-    data[19] = this.visibilityDirection === 'receiver-to-probe' ? 1 : 0;
+    // Exactly represented integer flags in the existing f32 lane: direction
+    // switches replace bit 0 while preserving the immutable filter in bit 1.
+    data[19] = Number(this.visibilityDirection === 'receiver-to-probe')
+      | (Number(o.visibilityFilter === 'per-tap-chebyshev-bilinear') << 1);
     data[23] = o.visibilityWeightThreshold;
     integers[24] = frame;
     integers[25] = this.lastHistoryFrame;
@@ -332,6 +335,7 @@ export class GpuDiffuseGi {
       capture: 'diffuse-and-emissive', update: 'full-grid-every-frame', representation: 'radiance-SH9',
       visibility: 'octahedral-distance-moments', visibilityResolution: GI_DISTANCE_RESOLUTION,
       visibilityCapture: 'normalized-cosine-power-32', distanceCaptureSamplesPerUpdate: GI_DISTANCE_CELLS * this.options.rayCount,
+      visibilityFilter: this.options.visibilityFilter,
       visibilityDirection: this.visibilityDirection,
       visibilityQueriesPerUpdate: this.enabled ? supportRays : 0,
       visibilityMaxWorkUnitsPerUpdate: this.enabled && supportRays ? this.options.maxVisibilityWorkUnits : 0,

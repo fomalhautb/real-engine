@@ -93,9 +93,20 @@ function bilinearMoment(moments: number[][], direction: Vec3): [number, number] 
     sum + moments[tap][channel] * weights[index], 0)) as [number, number];
 }
 
+function expectedVisibility(moments: number[][], direction: Vec3, distance: number): number {
+  // Evaluate the per-cell probabilities on the CPU, then reuse only the
+  // independently tested octahedral interpolation reference.
+  const probabilities = moments.map(([mean, square]) => {
+    const variance = Math.max(square - mean * mean, 0.0001);
+    const value = variance / (variance + Math.max(0, distance - mean) ** 2);
+    return [value, value];
+  });
+  return bilinearMoment(probabilities, direction)[0];
+}
+
 /** Dispatches the production giDistanceMoments helper with a separately owned
  * probe record. The 8x8 moments come from the actual Renderer readback. */
-async function sampleProductionHelper(moments: number[][]) {
+async function sampleProductionHelper(moments: number[][], visibilityFlags = 2) {
   const adapter = await navigator.gpu?.requestAdapter();
   if (!adapter) throw new Error('GI_VISIBILITY_NO_ADAPTER');
   const device = await adapter.requestDevice();
@@ -110,7 +121,8 @@ async function sampleProductionHelper(moments: number[][]) {
   device.addEventListener('uncapturederror', event => uncaptured.push(event.error.message));
   device.pushErrorScope('validation');
   let validationError = '';
-  let samples: { uv: [number, number]; direction: Vec3; actual: number[]; expected: [number, number] }[] = [];
+  let samples: { uv: [number, number]; direction: Vec3; actual: number[]; expected: [number, number];
+    actualVisibility: number; expectedVisibility: number }[] = [];
   try {
     const record = new Float32Array(DIFFUSE_GI_PROBE_FLOATS);
     for (let cell = 0; cell < GI_DISTANCE_CELLS; cell++) {
@@ -124,6 +136,7 @@ async function sampleProductionHelper(moments: number[][]) {
     const uniform = allocate(112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const parameters = new Float32Array(28);
     parameters[3] = 1;
+    parameters[19] = visibilityFlags;
     new Uint32Array(parameters.buffer).set([2, 2, 2, 64], 8);
     device.queue.writeBuffer(uniform, 0, parameters);
     const directions = seamUv.map(uv => octaDecode(uv));
@@ -140,7 +153,8 @@ async function sampleProductionHelper(moments: number[][]) {
 fn testDistanceMoments(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= ${directions.length}u) { return; }
   let sample = testDirections[id.x];
-  testMoments[id.x] = vec4f(giDistanceMoments(u32(sample.w), normalize(sample.xyz)), 0.0, 0.0);
+  testMoments[id.x] = vec4f(giDistanceMoments(u32(sample.w), normalize(sample.xyz)),
+    giVisibility(u32(sample.w), normalize(sample.xyz), 3.0), 0.0);
 }`;
     const shader = device.createShaderModule({ code: source });
     const compilation = await shader.getCompilationInfo();
@@ -179,7 +193,12 @@ fn testDistanceMoments(@builtin(global_invocation_id) id: vec3u) {
     finally { readback.unmap(); }
     samples = directions.map((direction, index) => ({ uv: seamUv[index], direction,
       actual: [values[index * 4], values[index * 4 + 1]],
-      expected: bilinearMoment(moments, direction) }));
+      expected: bilinearMoment(moments, direction), actualVisibility: values[index * 4 + 2],
+      expectedVisibility: (visibilityFlags & 2) !== 0 ? expectedVisibility(moments, direction, 3) : (() => {
+        const [mean, square] = bilinearMoment(moments, direction);
+        const variance = Math.max(square - mean * mean, 0.0001);
+        return variance / (variance + Math.max(0, 3 - mean) ** 2);
+      })() }));
   } finally {
     try { validationError = String((await device.popErrorScope())?.message ?? ''); }
     finally {
@@ -188,6 +207,21 @@ fn testDistanceMoments(@builtin(global_invocation_id) id: vec3u) {
     }
   }
   return { samples, seamPairs, uncaptured, validationError, ownedBytes };
+}
+
+export async function runGiVisibilityFilterFixture() {
+  // Two angular regions terminate at distinct deterministic distances. A
+  // receiver at distance 3 is behind the near region and before the far one.
+  const make = (distance: (x: number) => number) => Array.from({ length: GI_DISTANCE_CELLS }, (_, cell) => {
+    const d = distance(cell % GI_DISTANCE_RESOLUTION); return [d, d * d, 1];
+  });
+  const split = make(x => x < 4 ? 1 : 5);
+  return { split: await sampleProductionHelper(split),
+    splitReverse: await sampleProductionHelper(split, 3),
+    legacySplit: await sampleProductionHelper(split, 0),
+    legacyReverse: await sampleProductionHelper(split, 1),
+    clear: await sampleProductionHelper(make(() => 5)),
+    blocked: await sampleProductionHelper(make(() => 1)) };
 }
 
 /** A separate, constant-radiance field checks the production eight-probe

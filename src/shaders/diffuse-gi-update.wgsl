@@ -122,7 +122,7 @@ fn integrateVisibility(@builtin(global_invocation_id) id: vec3u) {
     for (var i = 0u; i < gi.counts.w; i++) {
         let index = probeIndex * gi.counts.w + i;
         var distance = gi.spacing.w;
-        if (gi.sunColor.w != 0.0) {
+        if ((u32(gi.sunColor.w) & 1u) != 0u) {
             if (shadows[index].identity.x != 0u) { distance = shadows[index].metric.x; }
         } else if (primary[index].identity.x != 0u) { distance = primary[index].metric.x; }
         let weight = distanceWeights[cell * gi.counts.w + i];

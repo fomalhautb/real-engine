@@ -6,7 +6,7 @@ import type { SceneBatch } from '../../../src/contracts';
 import { intelSponzaReference } from './intel-sponza-reference';
 import { loadIntelSponzaAssets } from './intel-sponza-assets';
 import { FINAL_GATHER_DIAGNOSTIC_MAX_POINTS } from '../../../src/final-gather-diagnostics';
-import type { GiVisibilityDirection } from '../../../src/diffuse-gi';
+import type { GiVisibilityDirection, GiVisibilityFilter } from '../../../src/diffuse-gi';
 
 const MiB = 1024 ** 2;
 
@@ -41,6 +41,7 @@ export interface IntelSponzaGiOptions {
   anisotropy?: number;
   sceneBudget?: boolean;
   visibilityDirection?: GiVisibilityDirection;
+  visibilityFilter?: GiVisibilityFilter;
   /** Exact rendered warmup frame count; residency must be settled at its end. */
   warmupFrames?: number;
 }
@@ -49,6 +50,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
   const warmupFrames = settings.warmupFrames ?? 600;
   if (settings.visibilityDirection !== undefined && settings.visibilityDirection !== 'probe-to-receiver'
     && settings.visibilityDirection !== 'receiver-to-probe') throw Error('SPONZA_VISIBILITY_DIRECTION');
+  if (settings.visibilityFilter !== undefined && settings.visibilityFilter !== 'moment-bilinear'
+    && settings.visibilityFilter !== 'per-tap-chebyshev-bilinear') throw Error('SPONZA_VISIBILITY_FILTER');
   if (!Number.isSafeInteger(warmupFrames) || warmupFrames < 90 || warmupFrames > 3600) throw Error('SPONZA_WARMUP_FRAMES');
   if (settings.rasterReceiver && !settings.finalGather) throw Error('SPONZA_RASTER_RECEIVER_REQUIRES_FINAL_GATHER');
   if (settings.reconstructionDiagnostics && !settings.finalGather) throw Error('SPONZA_RECONSTRUCTION_REQUIRES_FINAL_GATHER');
@@ -110,6 +113,7 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
       spacing: giSpacing, counts: giCounts, raysPerProbe: settings.fineGather ? 128 : 64, maxDistance: 80, normalBias: 0.03,
       skyRadiance: [0.2, 0.25, 0.35] as [number, number, number], multiBounce: false, maxBytes: 128 * MiB,
       visibilityDirection: settings.visibilityDirection ?? 'probe-to-receiver',
+      visibilityFilter: settings.visibilityFilter ?? 'moment-bilinear',
       maxVisibilityWorkUnits: settings.visibilityDirection === 'receiver-to-probe' ? 67_108_864 : 0,
       ...(settings.finalGather ? { finalGather: { pixelSpacing: settings.gatherPixelSpacing ?? (settings.fineGather ? 4 : 8),
         maxAnchors: settings.gatherCapacity ?? (settings.fineGather ? 65536 : 32768), raysPerAnchor: 1,

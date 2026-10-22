@@ -3,6 +3,7 @@ import { GI_DISTANCE_CELLS } from './gi-visibility';
 import { resolveFinalGatherOptions, type FinalGatherOptions, type ResolvedFinalGatherOptions } from './final-gather';
 import type { WorldQueryOptions } from './world-query';
 export type GiVisibilityDirection = 'probe-to-receiver' | 'receiver-to-probe';
+export type GiVisibilityFilter = 'moment-bilinear' | 'per-tap-chebyshev-bilinear';
 export interface DiffuseGiOptions {
   origin: readonly [number, number, number];
   spacing: readonly [number, number, number];
@@ -20,6 +21,9 @@ export interface DiffuseGiOptions {
   visibilityWeightThreshold?: number;
   /** Direction of material-sidedness used by the cache support estimate. */
   visibilityDirection?: GiVisibilityDirection;
+  /** Default: interpolate moments before evaluating confidence. Per-tap
+   * confidence filtering is opt-in and does not add capture rays or storage. */
+  visibilityFilter?: GiVisibilityFilter;
   /** Additional traversal allowance for receiver-directed support. Zero (default)
    * disables that capture and rejects switching to it at runtime. */
   maxVisibilityWorkUnits?: number;
@@ -40,6 +44,7 @@ export interface ResolvedDiffuseGiOptions {
   readonly emissiveSamplesPerProbe: number;
   readonly visibilityWeightThreshold: number;
   readonly visibilityDirection: GiVisibilityDirection;
+  readonly visibilityFilter: GiVisibilityFilter;
   readonly maxVisibilityWorkUnits: number;
   readonly maxBytes: number;
   readonly probeCount: number;
@@ -118,6 +123,10 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   if (visibilityDirection !== 'probe-to-receiver' && visibilityDirection !== 'receiver-to-probe') {
     throw new RangeError('DIFFUSE_GI_VISIBILITY_DIRECTION');
   }
+  const visibilityFilter = options.visibilityFilter === undefined ? 'moment-bilinear' : options.visibilityFilter;
+  if (visibilityFilter !== 'moment-bilinear' && visibilityFilter !== 'per-tap-chebyshev-bilinear') {
+    throw new RangeError('DIFFUSE_GI_VISIBILITY_FILTER');
+  }
   const maxVisibilityWorkUnits = options.maxVisibilityWorkUnits === undefined ? 0 : options.maxVisibilityWorkUnits;
   if (!Number.isSafeInteger(maxVisibilityWorkUnits) || maxVisibilityWorkUnits < 0 || maxVisibilityWorkUnits > 67_108_864
     || (maxVisibilityWorkUnits > 0 && maxVisibilityWorkUnits < rayCount)
@@ -136,7 +145,7 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   if (probeCount * DIFFUSE_GI_PROBE_BYTES > maxBytes) throw new RangeError('DIFFUSE_GI_MEMORY_BUDGET');
   const finalGather = options.finalGather === undefined ? undefined : resolveFinalGatherOptions(options.finalGather);
   return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias,
-    skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, visibilityDirection,
+    skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, visibilityDirection, visibilityFilter,
     maxVisibilityWorkUnits, maxBytes, probeCount, rayCount, finalGather });
 }
 

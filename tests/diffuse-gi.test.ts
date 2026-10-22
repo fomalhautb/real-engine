@@ -28,6 +28,7 @@ describe('diffuse GI probe contract', () => {
     expect(value.multiBounce).toBe(false);
     expect(value.emissiveSamplesPerProbe).toBe(0);
     expect(value.visibilityWeightThreshold).toBe(0.2);
+    expect(value.visibilityFilter).toBe('moment-bilinear');
     expect(value.maxBytes).toBe(32 * 1024 * 1024);
     expect(DIFFUSE_GI_PROBE_BYTES).toBe((9 + GI_DISTANCE_CELLS + 1) * 16);
     expect(DIFFUSE_GI_PROBE_FLOATS).toBe(DIFFUSE_GI_PROBE_BYTES / 4);
@@ -77,6 +78,33 @@ describe('diffuse GI probe contract', () => {
     for (const invalid of [-0.001, 1.001, NaN, Infinity, null, '0.2']) {
       expect(() => resolveDiffuseGiOptions({ ...grid, visibilityWeightThreshold: invalid as unknown as number }))
         .toThrow('DIFFUSE_GI_VISIBILITY_WEIGHT_THRESHOLD');
+    }
+  });
+
+  it('keeps legacy visibility filtering by default and makes per-tap filtering an immutable independent choice', () => {
+    const legacy = resolveDiffuseGiOptions(grid);
+    for (const visibilityDirection of ['probe-to-receiver', 'receiver-to-probe'] as const) {
+      for (const visibilityFilter of ['moment-bilinear', 'per-tap-chebyshev-bilinear'] as const) {
+        const input: DiffuseGiOptions = { ...grid, visibilityDirection, visibilityFilter,
+          maxVisibilityWorkUnits: visibilityDirection === 'receiver-to-probe' ? 512 : 0 };
+        const resolved = resolveDiffuseGiOptions(input);
+        input.visibilityFilter = visibilityFilter === 'moment-bilinear' ? 'per-tap-chebyshev-bilinear' : 'moment-bilinear';
+        expect(resolved.visibilityFilter).toBe(visibilityFilter);
+        expect(resolved.visibilityDirection).toBe(visibilityDirection);
+        expect(Object.isFrozen(resolved)).toBe(true);
+        expect(resolved.rayCount).toBe(legacy.rayCount);
+        expect(resolved.probeCount).toBe(legacy.probeCount);
+        expect(resolved.maxBytes).toBe(legacy.maxBytes);
+        expect(diffuseGiQueryParameterSlots(resolved)).toBe(visibilityDirection === 'receiver-to-probe' ? 2 : 1);
+        expect(() => validateDiffuseGiQueryBudget(resolved,
+          { maxRays: 512, maxTotalWorkUnits: 512, maxTraceParameterSetsPerEncoder: 2 })).not.toThrow();
+      }
+    }
+    expect(() => resolveDiffuseGiOptions({ ...grid, visibilityDirection: 'receiver-to-probe',
+      visibilityFilter: 'per-tap-chebyshev-bilinear' })).toThrow('DIFFUSE_GI_VISIBILITY_WORK_BUDGET');
+    for (const value of [null, '', 'per-tap', 'moment', 0, 1, true, NaN, {}]) {
+      expect(() => resolveDiffuseGiOptions({ ...grid, visibilityFilter: value as never }))
+        .toThrow('DIFFUSE_GI_VISIBILITY_FILTER');
     }
   });
 

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { giRayDirection } from '../../src/diffuse-gi';
 import type { runGiSupportFixture, runGiSupportHistoryFixture } from './fixtures/gi-support';
 
 async function setup(page: Page) {
@@ -17,11 +18,17 @@ function moments(capture: Capture) {
     }));
   });
 }
-test('receiver-directed GI moments match analytic sided planes without changing sun or emissive SH', async ({ page }) => {
+for (const filter of ['moment-bilinear', 'per-tap-chebyshev-bilinear'] as const)
+test(`receiver-directed GI moments match analytic sided planes with ${filter} without changing sun or emissive SH`, async ({ page }) => {
   const errors = await setup(page);
-  const r = await page.evaluate(async () => {
+  const r = await page.evaluate(async filter => {
     const f = await import('/tests/browser/fixtures/' + 'gi-support.ts') as { runGiSupportFixture: typeof runGiSupportFixture };
-    return f.runGiSupportFixture();
+    return f.runGiSupportFixture(false, filter);
+  }, filter);
+  r.rayDirections.forEach((direction, i) => {
+    const expected = giRayDirection(i, 64);
+    direction.forEach((v, axis) => expect(Math.abs(v - expected[axis]), `ray ${i}, axis ${axis}`).toBeLessThan(0.001));
+    expect(Math.abs(Math.hypot(...direction) - 1), `ray ${i} length`).toBeLessThan(0.001);
   });
   for (const c of [r.ordinaryBefore, r.reversed, r.ordinaryAfter, ...r.sequence]) moments(c);
   for (let p = 0; p < 8; p++) {
@@ -35,6 +42,9 @@ test('receiver-directed GI moments match analytic sided planes without changing 
   expect(r.reversed.diagnostics!.queriesPerUpdate - r.ordinaryBefore.diagnostics!.queriesPerUpdate).toBe(512);
   expect(r.reversed.diagnostics!.maxWorkUnitsPerUpdate - r.ordinaryBefore.diagnostics!.maxWorkUnitsPerUpdate).toBe(65536);
   expect(r.reversed.diagnostics!.visibilityQueriesPerUpdate).toBe(512);
+  for (const capture of [r.ordinaryBefore, r.reversed, r.ordinaryAfter, ...r.sequence]) {
+    expect(capture.diagnostics!.visibilityFilter).toBe(filter);
+  }
   expect(errors).toEqual([]); expect(r.errors).toEqual([]); expect(r.afterDispose).toBe(0);
 });
 

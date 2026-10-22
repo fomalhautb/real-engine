@@ -10,6 +10,36 @@ fn giDistanceMoments(index: u32, direction: vec3f) -> vec2f {
     return mix(bottom, top, fraction.y);
 }
 
+fn giMomentVisibility(moment: vec2f, distance: f32) -> f32 {
+    let variance = max(moment.y - moment.x * moment.x, 0.0001);
+    let beyond = max(0.0, distance - moment.x);
+    return variance / (variance + beyond * beyond);
+}
+
+fn giPerTapVisibility(index: u32, direction: vec3f, distance: f32) -> f32 {
+    let pixel = giOctaEncode(direction) * f32(GI_DISTANCE_RESOLUTION) - 0.5;
+    let lower = vec2i(floor(pixel));
+    let fraction = fract(pixel);
+    // Evaluate each directional distribution before interpolating confidence.
+    // Mixing its moments first adds variance between unrelated near/far faces
+    // and can turn a partially blocked footprint into full visibility.
+    let bottom = mix(
+        giMomentVisibility(giProbes[index].moments[giDistanceTexel(lower)].xy, distance),
+        giMomentVisibility(giProbes[index].moments[giDistanceTexel(lower + vec2i(1, 0))].xy, distance), fraction.x);
+    let top = mix(
+        giMomentVisibility(giProbes[index].moments[giDistanceTexel(lower + vec2i(0, 1))].xy, distance),
+        giMomentVisibility(giProbes[index].moments[giDistanceTexel(lower + vec2i(1, 1))].xy, distance), fraction.x);
+    return mix(bottom, top, fraction.y);
+}
+
+fn giVisibility(index: u32, direction: vec3f, distance: f32) -> f32 {
+    // Filter and single-sided support direction are independent options.
+    if ((u32(gi.sunColor.w) & 2u) != 0u) {
+        return giPerTapVisibility(index, direction, distance);
+    }
+    return giMomentVisibility(giDistanceMoments(index, direction), distance);
+}
+
 fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: vec3f, expectedFrame: u32) -> vec3f {
     if (gi.origin.w == 0.0) { return vec3f(0.0); }
     let biased = position + geometricNormal * gi.sunDirection.w;
@@ -36,10 +66,7 @@ fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: ve
         let delta = biased - probePosition;
         let distance = length(delta);
         let direction = delta / max(distance, 0.00001);
-        let moment = giDistanceMoments(index, direction);
-        let variance = max(moment.y - moment.x * moment.x, 0.0001);
-        let beyond = max(0.0, distance - moment.x);
-        let visibility = variance / (variance + beyond * beyond);
+        let visibility = giVisibility(index, direction, distance);
         let facing = max(0.05, (1.0 - dot(direction, geometricNormal)) * 0.5);
         var confidence = facing * facing * visibility * visibility * visibility;
         // A continuous curve suppresses weak occluded contributors before

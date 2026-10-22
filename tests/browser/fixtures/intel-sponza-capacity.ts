@@ -1,5 +1,5 @@
 import { Renderer } from '../../../src/renderer';
-import { GeometryStreamRuntimeBudget } from '../../../src/geometry-stream-runtime-budget';
+import { GeometryStreamRuntimeBudget, type GeometryStreamRuntimeBudgetOptions } from '../../../src/geometry-stream-runtime-budget';
 import { GeometryStreamCut } from '../../../src/geometry-stream-cut';
 import { geometryGpuPoolLayout } from '../../../src/geometry-gpu-pool-layout';
 import type { GpuGeometryStream } from '../../../src/gpu-geometry-stream';
@@ -29,11 +29,14 @@ export interface IntelSponzaCapacityOptions extends Omit<IntelSponzaAssetOptions
   stableFrames?: number;
   intervalFrames?: number;
   maxConcurrentMigrations?: number;
+  growthOrder?: GeometryStreamRuntimeBudgetOptions['growthOrder'];
   exposureEV?: number;
 }
 
 type Diagnostics = ReturnType<Renderer['diagnostics']>;
-type CapacityCapture = { label: string; png: string; frame: number; debug: 'material' | 'clusters'; exposureEV: number };
+type CapacityCapture = { label: string; png: string; frame: number; debug: 'material' | 'clusters'; exposureEV: number;
+  transition?: { stage: string; settleFrame: number; phase: string; migrations: number; actualTriangles: number;
+    missingAllocatedPages: number; trianglesSource: 'latest-completed-feedback'; feedbackFrameRange: [number, number] | null } };
 type PrivateRenderer = { device: GPUDevice; geometryCapacity: { dispose(): Promise<void> };
   batches: { instanceData: Float32Array; stream: { runtime: GpuGeometryStream; bindings: { output: GPUBuffer } } }[] };
 
@@ -44,6 +47,8 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
   const settleFrames = options.settleFrames ?? 1200, travelFrames = options.travelFrames ?? 48,
     stableFrames = options.stableFrames ?? 24, intervalFrames = options.intervalFrames ?? 2,
     maxConcurrentMigrations = options.maxConcurrentMigrations ?? 4;
+  const growthOrder = options.growthOrder === undefined ? 'large-first' : options.growthOrder;
+  if (growthOrder !== 'large-first' && growthOrder !== 'small-first') throw Error('SPONZA_CAPACITY_GROWTH_ORDER');
   for (const [value, minimum, maximum, name] of [[settleFrames, 90, 3600, 'SETTLE'], [travelFrames, 1, 240, 'TRAVEL'],
     [stableFrames, 12, 120, 'STABLE'], [intervalFrames, 1, 60, 'INTERVAL'], [maxConcurrentMigrations, 1, 16, 'CONCURRENT']] as const) {
     if (!Number.isSafeInteger(value) || value < minimum || value > maximum) throw Error('SPONZA_CAPACITY_' + name);
@@ -91,7 +96,8 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
     renderer = await Renderer.create(canvas, batches, { maxBatches: 512, antiAliasing: 'fxaa', textureBudgetBytes: 512 * MiB,
       textureStreaming: { sources, maxCpuBytes: 256 * MiB, maxInFlightBytes: 128 * MiB, maxUploadBytesPerFrame: 2 * MiB },
       sunShadow: { resolution: 2048, focusBounds: bounds as { min: [number, number, number]; max: [number, number, number] } },
-      geometryRuntimeBudget: { maxResidentBytes, maxPeakBytes, intervalFrames, maxConcurrentMigrations, maxCopyPages: 4096, maxCopyBytes: 64 * MiB } });
+      geometryRuntimeBudget: { maxResidentBytes, maxPeakBytes, intervalFrames, maxConcurrentMigrations, growthOrder,
+        maxCopyPages: 4096, maxCopyBytes: 64 * MiB } });
     renderer.setSun({ direction: [0.35, 0.8, 0.4], color: [4, 3.8, 3.5] });
     renderer.setExposure(options.exposureEV ?? 3);
     renderer.setGeometryLod({ maxErrorPixels, frustumCulling: true, debug: 'material' });
@@ -232,14 +238,26 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
       selected: Awaited<ReturnType<typeof auditCuts>>; actualTriangles: number; visibleClusters: number; rootsReady: boolean;
       missingAllocatedPages: number };
     const captures: CapacityCapture[] = [], endpoints: Endpoint[] = [];
+    const transitionFrames = new Set([16, 32, 64, 128, 256]);
     for (const [stageIndex, stage] of trajectory.entries()) {
       if (stageIndex) for (let step = 1; step <= travelFrames; step++) {
         await tick(interpolateCapacityCamera(trajectory[stageIndex - 1].camera, stage.camera, step / travelFrames), stage.label + '-travel');
       }
       let stable = 0, prior = '', didSettle = false, framesToSettle = 0;
       for (let step = 1; step <= settleFrames; step++) {
-        const state = await tick(stage.camera, stage.label), next = signature(state.diagnostics);
+        // Save the already-rendered material frame. No debug switch, additional
+        // render or extra contribution to the stability counter is introduced.
+        const state = await tick(stage.camera, stage.label, transitionFrames.has(step)), next = signature(state.diagnostics);
         stable = settled(state.diagnostics) && next === prior ? stable + 1 : 0; prior = next;
+        if (state.png) {
+          const feedbackFrames = state.diagnostics.geometryStreams.flatMap(stream => stream.feedback ? [stream.feedback.frame] : []);
+          const image: CapacityCapture = { label: `${stage.label}-step-${step}-material`, png: state.png, frame, debug: 'material',
+            exposureEV: options.exposureEV ?? 3, transition: { stage: stage.label, settleFrame: step,
+              phase: state.budget.phase, migrations: state.budget.migrations, actualTriangles: state.actualTriangles,
+              missingAllocatedPages: state.missingAllocatedPages, trianglesSource: 'latest-completed-feedback',
+              feedbackFrameRange: feedbackFrames.length ? [Math.min(...feedbackFrames), Math.max(...feedbackFrames)] : null } };
+          captures.push(image); await onCapture?.(image);
+        }
         if (stable >= stableFrames) { didSettle = true; framesToSettle = step; break; }
       }
       if (!didSettle) throw Error('SPONZA_CAPACITY_DID_NOT_SETTLE: ' + JSON.stringify({ stage: stage.label, state: frames.at(-1), budget: active.diagnostics().geometryRuntimeBudget }));
@@ -299,7 +317,8 @@ export async function captureIntelSponzaCapacity(options: IntelSponzaCapacityOpt
         lighting: 'PBR direct lighting and fixed coarse shadow proxies; no GI in this geometry acceptance run',
         history: 'static world transforms, moving cameras; sampled current/previous world positions after every committed migration',
         performance: 'diagnostic readbacks and serial waits; elapsed time and FPS are not hardware benchmark results' },
-      limits: { maxResidentBytes, maxPeakBytes, intervalFrames, maxConcurrentMigrations, maxErrorPixels, settleFrames, travelFrames, stableFrames },
+      limits: { maxResidentBytes, maxPeakBytes, intervalFrames, maxConcurrentMigrations, growthOrder,
+        maxErrorPixels, settleFrames, travelFrames, stableFrames },
       preflight: { rootBytes: sizing.rootBytes, initialBytes: initialPlan.allocatedBytes, initialSlots: initialPlan.streams.map(s => s.slots) },
       peakAccountedBytes, maximumOwnedGpuBytes, frames, migrations, migrationBatches: migrations.length, auditedMigrations, historyChecks, endpoints, captures,
       recovery: { uniqueMissingPages: seenMissing.reduce((n, pages) => n + pages.size, 0), recoveredPages, maximumMissingAllocatedPages,

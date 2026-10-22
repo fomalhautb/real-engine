@@ -20,6 +20,9 @@ export interface GeometryStreamRuntimeBudgetOptions {
   /** Same resources including other streams, candidate and retiring owners.
    * Does not include source/query proxies, textures, CPU caches or driver memory. */
   readonly maxPeakBytes: number;
+  /** Growth order only; shrinks still release the most bytes first. Default
+   * large-first overlaps long page refills; small-first preserves the baseline. */
+  readonly growthOrder?: 'large-first' | 'small-first';
 }
 export type GeometryStreamRuntimeLimits = Pick<GPUSupportedLimits, 'maxBufferSize' | 'maxStorageBufferBindingSize'
   | 'maxComputeWorkgroupsPerDimension' | 'minUniformBufferOffsetAlignment'>;
@@ -44,6 +47,8 @@ export class GeometryStreamRuntimeBudget {
     const maxResidentBytes = budget(options?.maxResidentBytes, 0, 8 * 1024 ** 3, 'RESIDENT_BUDGET');
     const maxPeakBytes = budget(options?.maxPeakBytes, 0, 8 * 1024 ** 3, 'PEAK_BUDGET');
     if (maxPeakBytes < maxResidentBytes) throw new RangeError('GEOMETRY_STREAM_RUNTIME_PEAK_BUDGET');
+    const growthOrder = options.growthOrder === undefined ? 'large-first' : options.growthOrder;
+    if (growthOrder !== 'large-first' && growthOrder !== 'small-first') throw new RangeError('GEOMETRY_STREAM_RUNTIME_GROWTH_ORDER');
     if (!Array.isArray(inputs) || !inputs.length || inputs.length > 4096) throw new RangeError('GEOMETRY_STREAM_RUNTIME_INPUTS');
     for (const name of ['maxBufferSize', 'maxStorageBufferBindingSize', 'maxComputeWorkgroupsPerDimension', 'minUniformBufferOffsetAlignment'] as const) {
       const value = limits?.[name];
@@ -75,7 +80,7 @@ export class GeometryStreamRuntimeBudget {
     });
     this.rootBytes = this.inputs.reduce((sum, input) => sum + input.fixedBytes + input.pageBytes * input.directory.rootPages.length, 0);
     if (this.rootBytes > maxResidentBytes) throw new RangeError('GEOMETRY_STREAM_RUNTIME_ROOT_BUDGET');
-    this.options = Object.freeze({ maxResidentBytes, maxPeakBytes });
+    this.options = Object.freeze({ maxResidentBytes, maxPeakBytes, growthOrder });
     this.previous = this.inputs.map(() => new Set());
   }
   /** Actual dependent allocations at this slot count, with maximum feedback
@@ -96,8 +101,9 @@ export class GeometryStreamRuntimeBudget {
     this.previous = admitted.map(plan => new Set(plan.admittedGroups));
     return { streams, allocatedBytes: streams.reduce((sum, stream) => sum + stream.totalBytes, 0), rootBytes: this.rootBytes };
   }
-  /** Choose one migration. Shrinks free space before growth. A smaller temporary
-   * root-only target is allowed when the desired shrink cannot fit in overlap.
+  /** Choose one migration. Shrinks free space before growth; by default larger
+   * slot growth starts first so page refill can overlap later migrations.
+   * A smaller temporary root-only target is allowed when the desired shrink cannot fit in overlap.
    * A null action reports headroom pressure without overcommitting or stalling
    * rendering. reservedBytes includes all candidates and retiring owners. Growth
    * already admitted but not committed must also reserve its positive live delta:
@@ -128,7 +134,10 @@ export class GeometryStreamRuntimeBudget {
     if (targets.reduce((sum, state) => sum + state.totalBytes, 0) > this.options.maxResidentBytes) throw new RangeError('GEOMETRY_STREAM_RUNTIME_PLAN');
     const candidates = targets.filter(target => !excluded.has(target.index) && target.slots !== current[target.index].slots).sort((a, b) => {
       const da = current[a.index].totalBytes - a.totalBytes, db = current[b.index].totalBytes - b.totalBytes;
-      return Number(db > 0) - Number(da > 0) || db - da || a.index - b.index;
+      const shrinkOrder = Number(db > 0) - Number(da > 0);
+      if (shrinkOrder || da > 0 || this.options.growthOrder === 'small-first') return shrinkOrder || db - da || a.index - b.index;
+      return (b.slots - current[b.index].slots) - (a.slots - current[a.index].slots)
+        || da - db || a.index - b.index;
     });
     for (const target of candidates) {
       let desired = target, temporary = false;

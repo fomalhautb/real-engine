@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
-import { GI_DISTANCE_CELLS } from '../../src/gi-visibility';
+import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from '../../src/gi-visibility';
 import type { runGiUniformIrradianceFixture, runGiVisibilityLeakFixture,
-  runGiVisibilityMomentsFixture } from './fixtures/gi-visibility';
+  runGiVisibilityMomentsFixture, runGiVisibilityFilterFixture } from './fixtures/gi-visibility';
 
 type MomentsResult = Awaited<ReturnType<typeof runGiVisibilityMomentsFixture>>;
 type LeakResult = Awaited<ReturnType<typeof runGiVisibilityLeakFixture>>;
@@ -45,6 +45,7 @@ test('closed box GPU distance moments match analytic ray exits and production fo
   for (const [index, sample] of result.helper.samples.entries()) {
     expect(Math.abs(sample.actual[0] - sample.expected[0]), `sample ${index} mean`).toBeLessThanOrEqual(0.005);
     expect(Math.abs(sample.actual[1] - sample.expected[1]), `sample ${index} mean squared`).toBeLessThanOrEqual(0.015);
+    expect(Math.abs(sample.actualVisibility - sample.expectedVisibility), `sample ${index} visibility`).toBeLessThanOrEqual(0.001);
   }
   for (const [left, right] of result.helper.seamPairs) {
     const a = result.helper.samples[left].actual, b = result.helper.samples[right].actual;
@@ -56,6 +57,46 @@ test('closed box GPU distance moments match analytic ray exits and production fo
   expect(result.helper.ownedBytes).toBe(0);
   expect(result.errors).toEqual([]);
   expect(result.afterDispose).toBe(0);
+  expect(pageErrors).toEqual([]);
+});
+
+test('GI visibility filters near and far directional confidence without inventing a fully clear footprint', async ({ page }) => {
+  const pageErrors = await fixturePage(page);
+  const result = await page.evaluate(async () => {
+    const fixture = await import('/tests/browser/fixtures/' + 'gi-visibility.ts') as {
+      runGiVisibilityFilterFixture: typeof runGiVisibilityFilterFixture;
+    };
+    return fixture.runGiVisibilityFilterFixture();
+  });
+  const blocked = 0.0001 / (0.0001 + 4);
+  for (const [name, field] of Object.entries(result)) {
+    for (const sample of field.samples) {
+      expect(sample.actualVisibility).toBeGreaterThanOrEqual(0);
+      expect(sample.actualVisibility).toBeLessThanOrEqual(1);
+      expect(Math.abs(sample.actualVisibility - sample.expectedVisibility), name).toBeLessThan(1e-5);
+      if (name === 'clear') expect(sample.actualVisibility).toBeCloseTo(1, 6);
+      if (name === 'blocked') expect(sample.actualVisibility).toBeCloseTo(blocked, 6);
+    }
+    for (const [a, b] of field.seamPairs) {
+      if (name.startsWith('legacy')) continue;
+      // The directions approach the fold from epsilon=1/4096 on either
+      // side; they are not identical directions. A full-contrast bilinear
+      // step has slope at most the map resolution in this UV interval.
+      const maximumStep = 2 / 4096 * GI_DISTANCE_RESOLUTION * (1 - blocked);
+      expect(Math.abs(field.samples[a].actualVisibility - field.samples[b].actualVisibility)).toBeLessThan(maximumStep + 1e-6);
+    }
+    expect(field.uncaptured).toEqual([]); expect(field.validationError).toBe(''); expect(field.ownedBytes).toBe(0);
+  }
+  const center = result.split.samples.find(s => s.uv[0] === 0.5 && s.uv[1] === 0.5)!;
+  expect(center.actualVisibility).toBeCloseTo((1 + blocked) / 2, 6);
+  // Interpolating the old moments instead gives mean 3 and visibility 1.
+  expect(center.actual[0]).toBeCloseTo(3, 6);
+  expect(center.actualVisibility).toBeLessThan(0.501);
+  for (const field of [result.legacySplit, result.legacyReverse]) {
+    expect(field.samples.find(s => s.uv[0] === 0.5 && s.uv[1] === 0.5)!.actualVisibility).toBeCloseTo(1, 6);
+  }
+  expect(result.splitReverse.samples.map(s => s.actualVisibility)).toEqual(result.split.samples.map(s => s.actualVisibility));
+  expect(result.legacyReverse.samples.map(s => s.actualVisibility)).toEqual(result.legacySplit.samples.map(s => s.actualVisibility));
   expect(pageErrors).toEqual([]);
 });
 

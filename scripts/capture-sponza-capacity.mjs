@@ -9,15 +9,17 @@ const options = { geometryRoot: '/artifacts/sponza-group16-pages-20261022/',
   textureReferenceRoot: '/artifacts/sponza-textures-reference-20261020/',
   uvAuditUrl: '/artifacts/sponza-uv-demand-20261020.json', anisotropy: 8,
   output: 'artifacts/sponza-capacity-capture', settleFrames: 1200, travelFrames: 48, stableFrames: 24,
-  intervalFrames: 2, maxConcurrentMigrations: 4, maxErrorPixels: 2, exposureEV: 3, timeoutMs: 1800000 };
+  intervalFrames: 2, maxConcurrentMigrations: 4, growthOrder: 'large-first', maxErrorPixels: 2, exposureEV: 3, timeoutMs: 1800000 };
 const flags = new Map([['--geometry-root', 'geometryRoot'], ['--query-root', 'queryRoot'], ['--output', 'output'],
   ['--texture-gpu-root', 'textureGpuRoot'], ['--texture-reference-root', 'textureReferenceRoot'], ['--uv-audit', 'uvAuditUrl'],
   ['--resident-mib', 'residentMiB'], ['--peak-mib', 'peakMiB'], ['--settle-frames', 'settleFrames'],
   ['--travel-frames', 'travelFrames'], ['--stable-frames', 'stableFrames'], ['--interval-frames', 'intervalFrames'], ['--concurrent-migrations', 'maxConcurrentMigrations'],
+  ['--growth-order', 'growthOrder'],
   ['--lod-error', 'maxErrorPixels'], ['--anisotropy', 'anisotropy'], ['--exposure', 'exposureEV'], ['--timeout-ms', 'timeoutMs']]);
 if (process.argv.includes('--help')) {
   console.log('Usage: node scripts/capture-sponza-capacity.mjs [--output artifacts/name] [--resident-mib N --peak-mib N]\n'
     + '  --settle-frames 1200 --travel-frames 48 --stable-frames 24 --interval-frames 2 --concurrent-migrations 4 --lod-error 2\n'
+    + '  --growth-order large-first|small-first (same-code ordering comparison; default large-first)\n'
     + '  --geometry-root /local/path/ --texture-gpu-root /local/path/ --texture-reference-root /local/path/ --uv-audit /local/file.json\n'
     + 'Requires an existing Vite server at http://127.0.0.1:5173. Runs Edge with the high-performance hardware adapter.\n'
     + 'Default live budget equals original quarter-page pools plus ALL selection and current/previous output allocations.\n'
@@ -32,6 +34,7 @@ for (let i = 2; i < process.argv.length; i++) {
 for (const key of ['geometryRoot', 'queryRoot', 'textureGpuRoot', 'textureReferenceRoot']) if (options[key] !== undefined
   && (!options[key].startsWith('/') || options[key].startsWith('//') || !options[key].endsWith('/'))) throw Error('SPONZA_CAPACITY_LOCAL_ROOT: ' + key);
 if (!options.uvAuditUrl.startsWith('/') || options.uvAuditUrl.startsWith('//')) throw Error('SPONZA_CAPACITY_LOCAL_UV_AUDIT');
+if (!['large-first', 'small-first'].includes(options.growthOrder)) throw Error('SPONZA_CAPACITY_ARGUMENT: growthOrder');
 for (const [key, minimum, maximum, integral] of [['residentMiB', 0.000001, 8192, false], ['peakMiB', 0.000001, 8192, false],
   ['settleFrames', 90, 3600, true], ['travelFrames', 1, 240, true], ['stableFrames', 12, 120, true], ['intervalFrames', 1, 60, true],
   ['maxConcurrentMigrations', 1, 16, true],
@@ -61,7 +64,8 @@ try {
     if (!/^[a-z0-9-]+$/.test(capture.label) || !capture.png.startsWith('data:image/png;base64,')) throw Error('SPONZA_CAPACITY_CAPTURE_FORMAT');
     const file = capture.label + '.png';
     await writeFile(join(options.output, file), Buffer.from(capture.png.split(',')[1], 'base64'));
-    savedCaptures.push({ label: capture.label, frame: capture.frame, debug: capture.debug, exposureEV: capture.exposureEV, file });
+    const { png, ...metadata } = capture;
+    savedCaptures.push({ ...metadata, file });
   });
   await page.goto('http://127.0.0.1:5173/');
   await page.waitForFunction(() => window.__REAL_ENGINE__);

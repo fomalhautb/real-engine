@@ -2,6 +2,7 @@ import type { DecodedGeometryPage } from './geometry-pages';
 import { validateGeometryStreamDirectory } from './geometry-stream-directory';
 import type { GeometryStreamDirectory } from './geometry-stream-types';
 import { GEOMETRY_GPU_VERTEX_BYTES, packGeometryGpuPage, type PackedGeometryGpuPage } from './geometry-gpu-page';
+import { geometryGpuPoolLayout, GEOMETRY_GPU_LOCATION_BYTES as LOCATION_BYTES } from './geometry-gpu-pool-layout';
 
 export interface GeometryGpuPoolOptions {
   /** Actual allocated buffers, including fixed-slot padding and metadata. */
@@ -27,7 +28,6 @@ type Pending = { packed: PackedGeometryGpuPage; bytes: number; priority: number;
   slot?: number; locations?: Uint32Array<ArrayBuffer>; phase: number; offset: number };
 type Frame = { pages: Set<number>; submitted: boolean };
 const MiB = 1024 * 1024;
-const LOCATION_BYTES = 32;
 
 function option(value: number | undefined, fallback: number, minimum: number, maximum: number, name: string): number {
   const result = value ?? fallback;
@@ -102,15 +102,14 @@ export class GpuGeometryPagePool {
       maxFramesInFlight: option(options.maxFramesInFlight, 3, 1, 8, 'maxFramesInFlight'),
     });
     if (this.options.maxUploadBytesPerFrame % 4) throw new Error('GEOMETRY_GPU_POOL_UPLOAD_ALIGNMENT');
-    this.verticesPerSlot = this.directory.pages.reduce((max, page) => Math.max(max,
-      page.clusterIds.reduce((sum, id) => sum + this.directory.clusters[id].vertexCount, 0)), 0);
-    this.indicesPerSlot = this.directory.pages.reduce((max, page) => Math.max(max,
-      page.clusterIds.reduce((sum, id) => sum + this.directory.clusters[id].triangleCount * 3, 0)), 0);
+    const layout = geometryGpuPoolLayout(this.directory);
+    this.verticesPerSlot = layout.verticesPerSlot;
+    this.indicesPerSlot = layout.indicesPerSlot;
     if (this.directory.pages.some(page => this.pagePayloadBytes(page.id) > this.options.maxStagingBytes)) {
       throw new Error('GEOMETRY_GPU_POOL_PAGE_STAGING_BUDGET');
     }
-    this.bytesPerSlot = this.verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES + this.indicesPerSlot * 4;
-    const metadataBytes = this.directory.clusters.length * LOCATION_BYTES + this.directory.pages.length * 4;
+    this.bytesPerSlot = layout.bytesPerSlot;
+    const metadataBytes = layout.metadataBytes;
     this.slotCount = Math.min(this.directory.pages.length, Math.floor((this.options.maxResidentBytes - metadataBytes) / this.bytesPerSlot));
     if (this.slotCount < this.directory.rootPages.length) throw new Error('GEOMETRY_GPU_POOL_ROOT_BUDGET');
     const sizes = [this.slotCount * this.verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES,

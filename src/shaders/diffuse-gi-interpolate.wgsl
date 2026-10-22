@@ -22,10 +22,15 @@ fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: ve
     let basis = giBasis(normal);
     var sum = vec3f(0.0);
     var total = 0.0;
+    var visibleSupport = 0.0;
+    var peakSpatialWeight = 0.0;
     for (var corner = 0u; corner < 8u; corner++) {
         let offset = vec3u(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
         let coordinate = lower + offset;
         let index = coordinate.x + gi.counts.x * (coordinate.y + gi.counts.y * coordinate.z);
+        let trilinear = select(vec3f(1.0) - fraction, fraction, offset == vec3u(1u));
+        let spatialWeight = trilinear.x * trilinear.y * trilinear.z;
+        peakSpatialWeight = max(peakSpatialWeight, spatialWeight);
         if (giProbes[index].state.x == 0u || giProbes[index].state.y != expectedFrame) { continue; }
         let probePosition = gi.origin.xyz + vec3f(coordinate) * gi.spacing.xyz;
         let delta = biased - probePosition;
@@ -35,7 +40,6 @@ fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: ve
         let variance = max(moment.y - moment.x * moment.x, 0.0001);
         let beyond = max(0.0, distance - moment.x);
         let visibility = variance / (variance + beyond * beyond);
-        let trilinear = select(vec3f(1.0) - fraction, fraction, offset == vec3u(1u));
         let facing = max(0.05, (1.0 - dot(direction, geometricNormal)) * 0.5);
         var confidence = facing * facing * visibility * visibility * visibility;
         // A continuous curve suppresses weak occluded contributors before
@@ -44,7 +48,15 @@ fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: ve
             let fractionOfThreshold = confidence / gi.sky.w;
             confidence *= fractionOfThreshold * fractionOfThreshold;
         }
-        let weight = trilinear.x * trilinear.y * trilinear.z * confidence;
+        let weight = spatialWeight * confidence;
+        // Normalization must not turn a set of occluded probes into an
+        // unoccluded field. Keep the best participating visibility separately
+        // from facing: a visible probe with a grazing normal is still valid.
+        // Spatial support vanishes continuously at cell boundaries; merely
+        // entering a cell must not let a zero-weight corner restore full light.
+        if (weight > 0.0) {
+            visibleSupport = max(visibleSupport, spatialWeight * visibility * visibility * visibility);
+        }
         var irradiance = vec3f(0.0);
         for (var coefficient = 0u; coefficient < 9u; coefficient++) {
             var convolution = 0.785398163;
@@ -58,9 +70,18 @@ fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: ve
         sum += clamp(irradiance, vec3f(0.0), maximum * 3.14159265) * weight;
         total += weight;
     }
-    // Visible probes can legitimately have very small facing weights. Preserve
-    // a uniform field instead of darkening it with a large normalization floor.
-    return sum / max(total, 0.000000000001);
+    // Distance moments provide interpolation confidence, not physical
+    // transmittance. Do not attenuate a well-supported field: this would lose
+    // energy repeatedly in an otherwise uniform diffuse enclosure. Retain the
+    // existing low-confidence curve only where every spatial contributor is
+    // weak, so normalization cannot restore an unsupported bright field.
+    let support = visibleSupport / peakSpatialWeight;
+    var supportWeight = 1.0;
+    if (support < gi.sky.w) {
+        let fractionOfThreshold = support / gi.sky.w;
+        supportWeight = fractionOfThreshold * fractionOfThreshold;
+    }
+    return sum / max(total, 0.000000000001) * supportWeight;
 }
 
 // Compatibility for diagnostics that intentionally use one surface direction.

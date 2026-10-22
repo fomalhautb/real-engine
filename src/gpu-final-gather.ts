@@ -5,7 +5,7 @@ import sampleSource from './shaders/final-gather-sample.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
 import { DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
-import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
+import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, octaDecode } from './gi-visibility';
 import { planFinalGatherGrid, resolveFinalGatherOptions, type FinalGatherGridPlan, type ResolvedFinalGatherOptions } from './final-gather';
 import type { GpuWorldQuery } from './gpu-world-query';
 import { WORLD_HIT_BYTES, WORLD_RAY_BYTES } from './world-query';
@@ -40,6 +40,8 @@ export interface FinalGatherProbeResult {
     index: number;
     position: [number, number, number];
     normal: [number, number, number];
+    /** Geometric plane normal, separate from the material normal used for sampling. */
+    geometricNormal: [number, number, number];
     identity: [number, number, number, number];
     versions: [number, number, number, number];
     /** Raw irradiance, before the separate spatial denoise pass. */
@@ -488,7 +490,8 @@ export class GpuFinalGather {
           || [...irradiance, ...filteredIrradiance].some(value => value < 0 || value > 65504)) {
           throw new Error('FINAL_GATHER_INVALID_ANCHOR');
         }
-        return { index, position, normal, identity, versions, irradiance, historyUpdates,
+        const geometricNormal = octaDecode([(data[base + 3] + 1) * 0.5, (data[base + 7] + 1) * 0.5]);
+        return { index, position, normal, geometricNormal, identity, versions, irradiance, historyUpdates,
           valid: state[0] === 1, state, filteredIrradiance };
       });
       return { frame, anchors };
@@ -543,7 +546,9 @@ export class GpuFinalGather {
       spatialDenoiseRadius: 2, spatialDenoiseMaxNeighbors: 25, spatialDenoiseMaxWorldDistance: 0.10,
       spatialDenoiseNormalThreshold: 0.98, spatialDenoisePlaneTolerance: 0.001,
       filteredOutputFeedsHistory: false,
-      spatialFilter: 'four-anchor-bilinear-plane-normal-distance-rejection', maxSpatialFilterDistance: 0.25,
+      spatialFilter: 'four-anchor-bilinear-with-bounded-compatible-ring-recovery', maxSpatialFilterDistance: 0.25,
+      spatialFilterPrimaryCandidates: 4, spatialFilterRecoveryCandidates: 12,
+      spatialFilterNormalThreshold: 0.95, spatialFilterPlaneTolerance: Math.max(0.001, this.options.normalBias * 4),
       uncoveredFallback: 'completed-world-GI', firstSegment: 'full-configured-GI-range',
       normalBias: this.options.normalBias, emissionSampling: 'one-area-sample-per-source-per-anchor-per-update',
       feedbackToWorldField: false, automaticAdaptiveContactAnchors: false };

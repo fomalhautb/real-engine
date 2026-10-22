@@ -116,6 +116,27 @@ async function frames(stream: TextureStreaming, demands: readonly TextureStreamD
 }
 
 describe('TextureStreaming', () => {
+  it('shares constrained detail across equally visible images instead of starving later materials', async () => {
+    for (const reverse of [false, true]) {
+      const sources = ['a', 'b', 'c', 'd'].map(id => fixture(id));
+      const backend = new Backend(440);
+      const stream = await TextureStreaming.create({ sources: reverse ? [...sources].reverse() : sources,
+        maxCpuBytes: 400, maxInFlightBytes: 512, maxUploadBytesPerFrame: 32 }, backend);
+      const demands = sources.map(source => demand(source));
+      await frames(stream, demands, 60);
+      // Four mip-1 tails fit; greedy whole-tail allocation used to give the
+      // first image mip 0 and leave the other three at their 2x2 fallback.
+      expect(sources.map(source => current(stream, source.id))).toEqual([1, 1, 1, 1]);
+      expect(stream.diagnostics().cpuBytes).toBe(336);
+      expect(backend.imageBytes()).toBe(336);
+      const publications = stream.diagnostics().publications;
+      await frames(stream, demands, 10);
+      expect(stream.diagnostics().publications).toBe(publications);
+      await stream.dispose();
+      expect(backend.imageBytes()).toBe(0);
+    }
+  });
+
   it('uploads bounded rows, retains old bindings until completion, and publishes all shared slots', async () => {
     const source = fixture('wall');
     const backend = new Backend(400);

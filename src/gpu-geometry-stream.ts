@@ -3,7 +3,7 @@ import { GpuGeometryPagePool, type GeometryGpuPoolOptions } from './gpu-geometry
 import { GpuGeometryStreamSelection, type GeometryStreamSelectionFeedback, type GeometryStreamSelectionOptions } from './gpu-geometry-stream-selection';
 import type { GeometryPageProvider, GeometryStreamDirectory } from './geometry-stream-types';
 import { residentMesh, type RenderBatch } from './contracts';
-import { validateGeometryQueryProxy, type GeometryQueryProxy } from './geometry-query-proxy';
+import { validateGeometryQueryProxy, type GeometryQueryProxy, type GeometryQueryProxyOptions } from './geometry-query-proxy';
 import type { Mat4 } from './math';
 import { GeometryStreamWorkingSet } from './geometry-stream-working-set';
 import type { GeometryPageDecodeService } from './geometry-decode-worker-pool';
@@ -14,6 +14,8 @@ import { GEOMETRY_GPU_VERTEX_BYTES } from './geometry-gpu-page';
 export interface GeometryStreamSource {
   /** Explicit fixed representation for a source-free StreamedSceneBatch. */
   readonly queryProxy?: GeometryQueryProxy;
+  /** Optional retained-proxy budgets; defaults and hard ceilings remain those of validateGeometryQueryProxy. */
+  readonly queryProxyLimits?: Pick<GeometryQueryProxyOptions, 'maxVertices' | 'maxTriangles' | 'maxBytes'>;
   readonly directory: GeometryStreamDirectory;
   readonly provider: GeometryPageProvider;
   readonly cpuCache?: GeometryPageCacheOptions;
@@ -72,9 +74,10 @@ export class GpuGeometryStream {
     }
     const visits = source.maxRequestsPerFrame ?? 16;
     if (!Number.isSafeInteger(visits) || visits < 1 || visits > 256) throw new Error('GEOMETRY_STREAM_REQUEST_VISIT_BUDGET');
+    if (!source.queryProxy && source.queryProxyLimits !== undefined) throw new Error('GEOMETRY_STREAM_QUERY_PROXY_LIMITS_WITHOUT_PROXY');
     if (source.queryProxy && scene.mesh) throw new Error('GEOMETRY_STREAM_AMBIGUOUS_REPRESENTATION');
     const mesh = residentMesh(scene);
-    if (source.queryProxy) await validateGeometryQueryProxy(source.directory, source.queryProxy);
+    if (source.queryProxy) await validateGeometryQueryProxy(source.directory, source.queryProxy, source.queryProxyLimits);
     else if (source.directory.sourceVertexCount !== mesh.vertexCount || source.directory.sourceTriangleCount * 3 !== mesh.indices.length
       || !!source.directory.hasColors !== !!mesh.colors
       || source.directory.vertexStride !== 80 + (mesh.uvs ? 8 : 0) + (mesh.tangents ? 16 : 0) + (mesh.colors ? 16 : 0)) {

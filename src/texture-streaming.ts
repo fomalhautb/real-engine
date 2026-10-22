@@ -145,12 +145,43 @@ export class TextureStreaming {
     let available = Math.min(this.backend.budgetBytes - unmanaged - this.scratchBytes, this.maxCpuBytes) - this.rootBytes;
     this.budgetBlocked = available < 0;
     available = Math.max(0, available);
-    for (const entry of [...this.entries].sort((a, b) => b.priority - a.priority || a.source.id.localeCompare(b.source.id))) {
-      const root = entry.bytes[entry.source.fallback.baseMipLevel];
-      for (const mip of entry.allowed) {
-        if (mip < entry.wanted || entry.bytes[mip] - root > available) continue;
-        entry.planned = mip; available -= entry.bytes[mip] - root; break;
+    // Allocate incremental mip improvements globally. Giving one image its
+    // entire requested tail first can leave equally visible materials at their
+    // tiny fallback, even when modest detail for all of them would fit.
+    type Upgrade = { entry: Entry; index: number; bytes: number; score: number };
+    const heap: Upgrade[] = [];
+    const precedes = (a: Upgrade, b: Upgrade): boolean => a.score > b.score ||
+      a.score === b.score && (a.bytes < b.bytes || a.bytes === b.bytes && a.entry.source.id < b.entry.source.id);
+    const push = (entry: Entry, index: number): void => {
+      if (index < 0 || entry.allowed[index] < entry.wanted) return;
+      const mip = entry.allowed[index], bytes = entry.bytes[mip] - entry.bytes[entry.planned];
+      const upgrade = { entry, index, bytes, score: entry.priority / bytes * (entry.planned - mip) };
+      let at = heap.length; heap.push(upgrade);
+      while (at > 0) {
+        const parent = (at - 1) >>> 1;
+        if (!precedes(upgrade, heap[parent])) break;
+        heap[at] = heap[parent]; at = parent;
       }
+      heap[at] = upgrade;
+    };
+    for (const entry of this.entries) push(entry, entry.allowed.indexOf(entry.planned) - 1);
+    // At most one candidate per source and one pop per legal source mip;
+    // storage is bounded by 1024 sources, work by their validated mip chains.
+    while (heap.length) {
+      const next = heap[0], last = heap.pop()!;
+      if (heap.length) {
+        let at = 0;
+        while (at * 2 + 1 < heap.length) {
+          let child = at * 2 + 1;
+          if (child + 1 < heap.length && precedes(heap[child + 1], heap[child])) child++;
+          if (!precedes(heap[child], last)) break;
+          heap[at] = heap[child]; at = child;
+        }
+        heap[at] = last;
+      }
+      if (next.bytes > available) continue;
+      next.entry.planned = next.entry.allowed[next.index]; available -= next.bytes;
+      push(next.entry, next.index - 1);
     }
   }
 

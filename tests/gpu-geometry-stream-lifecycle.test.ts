@@ -1,16 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SceneBatch } from '../src/contracts';
+import type { RenderBatch, SceneBatch } from '../src/contracts';
 import { GpuGeometryStream } from '../src/gpu-geometry-stream';
 import type { GeometryStreamSelectionFeedback } from '../src/gpu-geometry-stream-selection';
 
 const mocks = vi.hoisted(() => ({
-  cacheCreate: vi.fn(), poolCreate: vi.fn(), selectionCreate: vi.fn(),
+  cacheCreate: vi.fn(), poolCreate: vi.fn(), selectionCreate: vi.fn(), validateProxy: vi.fn(),
 }));
 const zeroOcclusion = { deferredClusters: 0, culledClusters: 0, recoveredClusters: 0 };
 
 vi.mock('../src/geometry-stream-cache', () => ({ GeometryPageCache: { create: mocks.cacheCreate } }));
 vi.mock('../src/gpu-geometry-page-pool', () => ({ GpuGeometryPagePool: { create: mocks.poolCreate } }));
 vi.mock('../src/gpu-geometry-stream-selection', () => ({ GpuGeometryStreamSelection: { create: mocks.selectionCreate } }));
+vi.mock('../src/geometry-query-proxy', () => ({ validateGeometryQueryProxy: mocks.validateProxy }));
 vi.mock('../src/geometry-stream-working-set', () => ({ GeometryStreamWorkingSet: class {
   plan(demands: { groupId: number; projectedError: number }[]) {
     return { pages: [0, ...demands.map(d => d.groupId)], admittedGroups: [], budgetDeferredGroups: [], dependencyDeferredGroups: [],
@@ -61,9 +62,34 @@ async function feedbackSettled(stream: GpuGeometryStream): Promise<void> {
   await (stream as unknown as { feedbackTask: Promise<void> }).feedbackTask;
 }
 
-beforeEach(() => { vi.resetAllMocks(); });
+beforeEach(() => { vi.resetAllMocks(); mocks.validateProxy.mockResolvedValue(undefined); });
 
 describe('GPU geometry stream bridge lifecycle', () => {
+  it('rejects proxy budgets without a proxy before GPU allocation', async () => {
+    const { scene, device } = setup();
+    const invalid = { ...scene, geometryStream: { ...scene.geometryStream!, queryProxyLimits: { maxTriangles: 1 } } };
+    await expect(GpuGeometryStream.create(device, invalid, {} as GPUBuffer, () => {}))
+      .rejects.toThrow('GEOMETRY_STREAM_QUERY_PROXY_LIMITS_WITHOUT_PROXY');
+    expect(mocks.poolCreate).not.toHaveBeenCalled();
+  });
+
+  it('forwards explicit proxy budgets and propagates validation failure before GPU allocation', async () => {
+    const { scene, device } = setup();
+    const proxy = { mesh: scene.mesh } as NonNullable<typeof scene.geometryStream>['queryProxy'];
+    const limits = { maxVertices: 4, maxTriangles: 2, maxBytes: 1024 };
+    const paged = { ...scene, mesh: undefined, geometryStream: { ...scene.geometryStream!, queryProxy: proxy,
+      queryProxyLimits: limits } } as unknown as RenderBatch;
+    mocks.validateProxy.mockRejectedValueOnce(new RangeError('GEOMETRY_QUERY_PROXY_TRIANGLE_BUDGET'));
+    await expect(GpuGeometryStream.create(device, paged, {} as GPUBuffer, () => {}))
+      .rejects.toThrow('GEOMETRY_QUERY_PROXY_TRIANGLE_BUDGET');
+    expect(mocks.validateProxy).toHaveBeenCalledWith(paged.geometryStream!.directory, proxy, limits);
+    expect(mocks.poolCreate).not.toHaveBeenCalled();
+
+    const stream = await GpuGeometryStream.create(device, paged, {} as GPUBuffer, () => {});
+    expect(mocks.validateProxy).toHaveBeenLastCalledWith(paged.geometryStream!.directory, proxy, limits);
+    await stream.dispose();
+  });
+
   it('preserves initialization failure and cleans every owner when selection disposal throws', async () => {
     const { scene, device, cache, pool, selection } = setup();
     const initial = new Error('FAKE_ROOT_ENQUEUE_FAILURE');

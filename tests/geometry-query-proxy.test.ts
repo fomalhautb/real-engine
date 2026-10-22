@@ -130,11 +130,22 @@ describe('offline geometry query proxy', () => {
 
   it('rejects budgets before fetching pages and malformed authenticated payloads', async () => {
     const provider = vi.fn(data.provider);
+    await expect(buildGeometryQueryProxy(data.directory, provider, { maxVertices: 1_048_577 }))
+      .rejects.toThrow('VERTEX_BUDGET');
+    await expect(buildGeometryQueryProxy(data.directory, provider, { maxTriangles: 262_145 }))
+      .rejects.toThrow('TRIANGLE_BUDGET');
+    await expect(buildGeometryQueryProxy(data.directory, provider, { maxBytes: 128 * 1024 * 1024 + 1 }))
+      .rejects.toThrow('BYTE_BUDGET');
+    expect(provider).not.toHaveBeenCalled();
     await expect(buildGeometryQueryProxy(data.directory, provider, { maxTriangles: 1 })).rejects.toThrow('TRIANGLE_BUDGET');
     expect(provider).not.toHaveBeenCalled();
     await expect(buildGeometryQueryProxy(data.directory, data.provider, { maxVertices: 2 })).rejects.toThrow('VERTEX_BUDGET');
     await expect(buildGeometryQueryProxy(data.directory, data.provider, { maxBytes: 100 })).rejects.toThrow('BYTE_BUDGET');
     const proxy = await buildGeometryQueryProxy(data.directory, data.provider);
+    await expect(validateGeometryQueryProxy(data.directory, proxy, { maxTriangles: 1 }))
+      .rejects.toThrow('TRIANGLE_BUDGET');
+    await expect(validateGeometryQueryProxy(data.directory, proxy, { maxVertices: 1_048_577 }))
+      .rejects.toThrow('VERTEX_BUDGET');
     await expect(validateGeometryQueryProxy(data.directory, { ...proxy, selectedClusters: [proxy.selectedClusters[0]] }))
       .rejects.toThrow('CUT');
     const malformed = encodeGeometryQueryProxy(proxy).slice();

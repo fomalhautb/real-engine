@@ -13,7 +13,8 @@ export interface DiffuseGiOptions {
   multiBounce?: boolean;
   /** Bounded area samples for emissive geometry at each probe; zero disables them. */
   emissiveSamplesPerProbe?: number;
-  /** Smoothly suppress low-confidence visibility weights; 0 disables the curve. */
+  /** Smoothly suppress low-confidence visibility weights and unsupported probe
+   * interpolation; 0 disables the curve. Moment confidence is not transmittance. */
   visibilityWeightThreshold?: number;
   maxBytes?: number;
   /** Optional bounded diffuse path segments at visible surfaces, ahead of the world probe cache. */

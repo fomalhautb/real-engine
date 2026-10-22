@@ -1,6 +1,7 @@
 import type { Mat4 } from './math';
 import { validateGeometryStreamDirectory } from './geometry-stream-directory';
 import type { GeometryStreamDirectory, GeometryStreamGroup } from './geometry-stream-types';
+import type { GeometryGroupDemand } from './geometry-stream-working-set';
 
 export interface GeometryStreamView {
   eye: readonly [number, number, number];
@@ -9,6 +10,9 @@ export interface GeometryStreamView {
   maxErrorPixels: number;
   /** Column-major affine object transform; omitted means identity. */
   model?: Mat4;
+  /** Optional frustum for capacity demand only. plan() still returns a complete
+   * cut, including culled clusters, just like the GPU refinement passes. */
+  viewProjection?: Mat4;
 }
 export interface GeometryStreamPlan {
   selectedClusters: number[];
@@ -31,6 +35,9 @@ function checkView(view: GeometryStreamView): void {
     || model[3] !== 0 || model[7] !== 0 || model[11] !== 0 || model[15] !== 1)) {
     throw new RangeError('GEOMETRY_STREAM_MODEL');
   }
+  if (view.viewProjection && (view.viewProjection.length !== 16 || !Array.from(view.viewProjection).every(finite32))) {
+    throw new RangeError('GEOMETRY_STREAM_VIEW');
+  }
 }
 
 /** CPU reference for a complete resident cut; page availability must mean GPU-uploaded residency. */
@@ -42,6 +49,42 @@ export class GeometryStreamCut {
     this.directory = validateGeometryStreamDirectory(directory);
     this.descendingGroups = this.directory.groups.map((_, id) => id)
       .sort((a, b) => this.directory.groups[b].level - this.directory.groups[a].level || a - b);
+  }
+
+  /** Pre-creation counterpart of GPU group demand: no page decode or geometry
+   * readback. Merge multiple instances/viewpoints by maximum projected error.
+   * Without viewProjection this deliberately includes off-screen demand. */
+  demands(views: readonly GeometryStreamView[]): GeometryGroupDemand[] {
+    if (!Array.isArray(views) || views.length > 256 || views.length * this.directory.groups.length > 262144) {
+      throw new RangeError('GEOMETRY_STREAM_DEMAND_WORK_BUDGET');
+    }
+    for (const view of views) checkView(view);
+    const result: GeometryGroupDemand[] = [];
+    for (let groupId = 0; groupId < this.directory.groups.length; groupId++) {
+      const group = this.directory.groups[groupId]; if (group.terminal) continue;
+      let projectedError = 0;
+      for (const view of views) {
+        const measured = this.measure(group, view);
+        if (measured.pixels <= view.maxErrorPixels) continue;
+        const vp = view.viewProjection;
+        if (vp) {
+          const center = [0, 0, 0, 0], radius = [0, 0, 0, 0];
+          for (let axis = 0; axis < 4; axis++) {
+            center[axis] = vp[12 + axis];
+            for (let col = 0; col < 3; col++) {
+              center[axis] += vp[col * 4 + axis] * measured.center[col];
+              radius[axis] += Math.abs(vp[col * 4 + axis]) * measured.extent[col];
+            }
+          }
+          if (center[0] + center[3] + radius[0] + radius[3] < 0 || center[3] - center[0] + radius[3] + radius[0] < 0
+            || center[1] + center[3] + radius[1] + radius[3] < 0 || center[3] - center[1] + radius[3] + radius[1] < 0
+            || center[2] + radius[2] < 0 || center[3] - center[2] + radius[3] + radius[2] < 0) continue;
+        }
+        projectedError = Math.max(projectedError, Math.min(measured.pixels, 1e30));
+      }
+      if (projectedError > 0) result.push({ groupId, projectedError });
+    }
+    return result;
   }
 
   plan(residentPages: ReadonlySet<number>, view: GeometryStreamView): GeometryStreamPlan {
@@ -79,6 +122,10 @@ export class GeometryStreamCut {
   }
 
   private needsRefinement(group: GeometryStreamGroup, view: GeometryStreamView): boolean {
+    return this.measure(group, view).pixels > view.maxErrorPixels;
+  }
+
+  private measure(group: GeometryStreamGroup, view: GeometryStreamView) {
     const { min, max } = group.bounds;
     const model = view.model;
     let center = [0, 0, 0], extent = [0, 0, 0], scale = 1;
@@ -107,6 +154,6 @@ export class GeometryStreamCut {
     }
     const distance = Math.hypot(...center.map((value, axis) => Math.max(Math.abs(view.eye[axis] - value) - extent[axis], 0)));
     const pixels = group.error * scale * view.projectionScale / Math.max(view.near, distance);
-    return pixels > view.maxErrorPixels;
+    return { center, extent, pixels };
   }
 }

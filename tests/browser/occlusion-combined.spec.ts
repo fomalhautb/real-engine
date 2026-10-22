@@ -9,21 +9,21 @@ const energy = (values: readonly number[]) => values[0] + values[1] + values[2];
 const distance = (left: readonly number[], right: readonly number[]) =>
   Math.max(...[0, 1, 2].map(channel => Math.abs(left[channel] - right[channel])));
 
-test('recovered virtual PBR geometry preserves combined GI, final gather, reflections and fog', async ({ page }, testInfo) => {
+for (const receiver of ['world-query', 'raster'] as const) test(`recovered virtual PBR geometry preserves combined GI, final gather, reflections and fog (${receiver})`, async ({ page }, testInfo) => {
   test.setTimeout(180_000);
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto('/?trees=1');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async (receiver) => {
     window.__REAL_ENGINE__!.pause(true);
     window.__REAL_ENGINE__!.dispose();
     const fixture = await import('/tests/browser/fixtures/' + 'occlusion-combined.ts') as {
       runOcclusionCombinedFixture: typeof runOcclusionCombinedFixture;
     };
-    return fixture.runOcclusionCombinedFixture();
-  }) as Result;
+    return fixture.runOcclusionCombinedFixture(receiver);
+  }, receiver) as Result;
   await testInfo.attach('occlusion-combined.json', {
     body: JSON.stringify(result, null, 2), contentType: 'application/json',
   });

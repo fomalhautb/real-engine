@@ -11,6 +11,7 @@ import type { GpuWorldQuery } from './gpu-world-query';
 import type { RenderBatch } from './contracts';
 import { GpuGiEmissiveSampler } from './gpu-gi-emissive';
 import { GpuFinalGather, finalGatherSampleSource, type FinalGatherProbeResult } from './gpu-final-gather';
+import type { RasterReceiverBindings } from './surface-receivers';
 import type { Mat4 } from './math';
 
 const constants = `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`;
@@ -174,6 +175,11 @@ export class GpuDiffuseGi {
     this.emissiveSampler?.addBatch(scene, output, sourceId);
     this.finalGather?.registerBatch(scene, output, sourceId);
     this.checkMemoryBudget();
+  }
+  setRasterReceivers(input: RasterReceiverBindings): void {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    if (!this.finalGather) throw new Error('FINAL_GATHER_UNCONFIGURED');
+    this.finalGather.setRasterReceivers(input);
   }
   updateFinalGather(frame: number, width: number, height: number, eye: readonly [number, number, number],
     viewProjection: Mat4, previousViewProjection: Mat4 | undefined, geometryChanged: boolean,

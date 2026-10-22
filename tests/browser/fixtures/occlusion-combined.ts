@@ -96,7 +96,7 @@ function energy(values: readonly number[]): number {
 
 /** Two equivalent scenes exercise both virtual-geometry passes while GI,
  * final gather, reflections and fog all consume the recovered PBR surface. */
-export async function runOcclusionCombinedFixture() {
+export async function runOcclusionCombinedFixture(receiver: 'world-query' | 'raster' = 'world-query') {
   const mesh = backboardMesh();
   const hierarchy = await buildGeometryHierarchy({ primitiveKey: 'occlusion-combined-pbr-v1', mesh,
     coverage: 'opaque' }, { maxClusterTriangles: 24, maxClusterVertices: 48,
@@ -112,7 +112,7 @@ export async function runOcclusionCombinedFixture() {
     worldQueries: { maxRays: 4096, maxTotalWorkUnits: 16_777_216 },
     diffuseGi: { origin: [-2, -2, -1], spacing: [4, 4, 4], counts: [2, 2, 2],
       raysPerProbe: 16, maxDistance: 20, skyRadiance: [0.7, 0.5, 0.3], multiBounce: true,
-      finalGather: { pixelSpacing: 8, maxAnchors: 64, raysPerAnchor: 2, pathSegments: 2, maxHistory: 8 } },
+      finalGather: { receiver, pixelSpacing: 8, maxAnchors: 64, raysPerAnchor: 2, pathSegments: 2, maxHistory: 8 } },
     reflections: { pixelSpacing: 2, maxAnchors: 1024, samplesPerAnchor: 4,
       maxDistance: 20, maxBytes: 16 * 1024 * 1024, skyRadiance: [0, 0, 0] },
     volumetricFog: { pixelSize: 4, slices: 24, maxViewDepth: 12,

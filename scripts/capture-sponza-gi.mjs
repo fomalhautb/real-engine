@@ -14,16 +14,19 @@ const defaults = {
   output: 'artifacts/sponza-gi-capture',
   exposureEV: 3,
   anisotropy: 8,
+  warmupFrames: 600,
 };
 const valueFlags = new Map([
   ['--geometry-root', 'geometryRoot'], ['--query-root', 'queryRoot'], ['--output', 'output'],
   ['--texture-gpu-root', 'textureGpuRoot'], ['--texture-reference-root', 'textureReferenceRoot'],
   ['--uv-audit', 'uvAuditUrl'],
   ['--anisotropy', 'anisotropy'],
+  ['--warmup-frames', 'warmupFrames'],
 ]);
 const switches = new Map([
   ['--source-raster', 'sourceRaster'], ['--fine-gather', 'fineGather'],
   ['--reference', 'reference'], ['--final-gather', 'finalGather'],
+  ['--raster-receiver', 'rasterReceiver'],
   ['--scene-budget', 'sceneBudget'],
 ]);
 const options = { ...defaults };
@@ -44,10 +47,14 @@ if (!options.uvAuditUrl.startsWith('/') || options.uvAuditUrl.startsWith('//')) 
 if (options.sourceRaster && !options.queryRoot) throw Error('SPONZA_GI_SOURCE_RASTER_REQUIRES_FINE_QUERY');
 if (options.sourceRaster && options.sceneBudget) throw Error('SPONZA_GI_SOURCE_RASTER_HAS_NO_PAGE_POOLS');
 if (options.fineGather) options.finalGather = true;
+if (options.rasterReceiver && !options.finalGather) throw Error('SPONZA_GI_RASTER_RECEIVER_REQUIRES_FINAL_GATHER');
 if (options.anisotropy !== undefined) {
   options.anisotropy = Number(options.anisotropy);
   if (!Number.isInteger(options.anisotropy) || options.anisotropy < 1 || options.anisotropy > 16) throw Error('SPONZA_GI_ANISOTROPY');
 }
+options.warmupFrames = Number(options.warmupFrames);
+if (!Number.isSafeInteger(options.warmupFrames) || options.warmupFrames < 90 || options.warmupFrames > 3600)
+  throw Error('SPONZA_GI_WARMUP_FRAMES');
 
 await mkdir(options.output, { recursive: true });
 const browser = await chromium.launch({ channel: 'msedge', headless: true, args: ['--force-high-performance-gpu'] });

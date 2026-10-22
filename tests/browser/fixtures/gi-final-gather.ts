@@ -19,7 +19,7 @@ function batch(name: string, id: number, instance: InstanceState): SceneBatch {
     deformation: { jointCount: 0, nodes: [] }, morphTargets: [] };
 }
 
-export async function runFinalGatherSkyFixture() {
+export async function runFinalGatherSkyFixture(receiverMode: 'world-query' | 'raster' = 'world-query') {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = 'position:fixed;left:0;top:0;width:256px;height:256px;';
   document.body.appendChild(canvas);
@@ -35,7 +35,7 @@ export async function runFinalGatherSkyFixture() {
     renderer = await Renderer.create(canvas, [receiver, blocker], {
       worldQueries: { maxRays: 8192 },
       diffuseGi: { origin: [-1, 0.3, -1], spacing: [2, 1, 2], counts: [2, 2, 2],
-        maxDistance: 12, skyRadiance: sky, finalGather: { pixelSpacing: 4, maxAnchors: 4096 } },
+        maxDistance: 12, skyRadiance: sky, finalGather: { pixelSpacing: 4, maxAnchors: 4096, receiver: receiverMode } },
     });
     renderer.setSun({ direction: [0, 1, 0], color: [0, 0, 0] });
     const point = { x: 128, y: 128 };

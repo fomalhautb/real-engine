@@ -16,7 +16,7 @@ struct Instance {
     surfaceIdentity: vec2u,
 }
 struct Deformed { position: vec4f, normal: vec4f, previous: vec4f, tangent: vec4f }
-struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, padding: u32 }
+struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, scalarCount: u32, receiver: vec4u }
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var shadowMap: texture_depth_2d;
 @group(0) @binding(2) var shadowSampler: sampler_comparison;
@@ -69,6 +69,9 @@ struct Varyings {
     @location(9) tangent: vec4f,
     @location(10) @interpolate(flat) surfaceIdentity: vec2u,
     @location(11) vertexColor: vec4f,
+    @location(12) previousWorld: vec3f,
+    @location(13) @interpolate(flat) receiverRow: u32,
+    @location(14) @interpolate(flat) representationToken: u32,
 }
 fn surfaceUvAt(index: u32) -> vec2f {
     return vec2f(attributes[index * 2u], attributes[index * 2u + 1u]);
@@ -84,6 +87,9 @@ fn geometryVaryings(vertex: Deformed, instanceIndex: u32, uv: vec2f, color: vec4
     result.position = frame.viewProjection * vertex.position;
     result.current = result.position;
     result.previous = frame.previousViewProjection * vertex.previous;
+    result.previousWorld = vertex.previous.xyz;
+    result.receiverRow = params.receiver.x + instanceIndex;
+    result.representationToken = 0u;
     result.world = vertex.position.xyz;
     result.normal = vertex.normal.xyz;
     result.tangent = vertex.tangent;
@@ -109,6 +115,7 @@ fn clusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
     let identity = clusterVertices[index % count];
     var result = makeVaryings(identity.x, index / count);
     result.clusterDebug = vec3u(identity.w, identity.z, 1u);
+    result.representationToken = identity.y + 1u;
     return result;
 }
 @vertex
@@ -120,6 +127,7 @@ fn pagedClusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
     let color = bitcast<vec4f>(clusterVertices[physical * 9u + 8u]);
     var result = geometryVaryings(vertices[index], index / params.vertexCount, uv, color);
     result.clusterDebug = vec3u(identity.w, identity.z, 1u);
+    result.representationToken = identity.y + 1u;
     return result;
 }
 fn debugColor(seed: u32) -> vec3f {
@@ -201,10 +209,10 @@ fn visibility(light: vec4f) -> f32 {
     return sum / 9.0;
 }
 // REFLECTION_PROGRAM
-struct FragmentOutput { @location(0) color: vec4f, @location(1) velocity: vec2f }
-@fragment
-fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> FragmentOutput {
-    let shadowVisibility = visibility(input.light);
+struct RasterSurface { material: MaterialSurface, geometryNormal: vec3f, shadingNormal: vec3f, covered: bool }
+// Both the receiver pass and PBR evaluate exactly the same coverage, derivatives,
+// tangent frame and material mip filtering on the selected raster geometry.
+fn rasterSurface(input: Varyings, front: bool) -> RasterSurface {
     let edge1 = dpdx(input.world);
     let edge2 = dpdy(input.world);
     let uv1 = dpdx(input.uv);
@@ -212,12 +220,32 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     let geometricNormal = surfaceUnit(cross(edge2, edge1), surfaceUnit(input.normal, vec3f(0.0, 1.0, 0.0)) * select(-1.0, 1.0, front));
     let surface = evaluateMaterial(input.uv, 0.0, input.color, input.material, input.vertexColor);
     let covered = evaluateCoverage(input.uv, 0.0, input.color, input.material, input.vertexColor);
-    if (!covered) { discard; }
     var n = surfaceUnit(input.normal, geometricNormal);
     n *= select(-1.0, 1.0, dot(n, geometricNormal) >= 0.0);
     if (MATERIAL_NORMAL_MAPPED) {
         n = surfaceMappedNormal(input.normal, geometricNormal, input.tangent, edge1, edge2, uv1, uv2, surface.tangentNormal);
     }
+    return RasterSurface(surface, geometricNormal, n, covered);
+}
+struct ReceiverOutput { @location(0) motionDepth: vec4f, @location(1) identityNormals: vec4u }
+@fragment
+fn receiverFragment(input: Varyings, @builtin(front_facing) front: bool) -> ReceiverOutput {
+    let sample = rasterSurface(input, front);
+    if (!sample.covered) { discard; }
+    // Fragment position.w is 1/clip.w, not interpolated device depth.
+    return ReceiverOutput(vec4f(input.previousWorld, 1.0 / input.position.w),
+        vec4u(input.receiverRow + 1u, input.representationToken,
+            pack2x16snorm(surfaceOctEncode(sample.shadingNormal)), pack2x16snorm(surfaceOctEncode(sample.geometryNormal))));
+}
+struct FragmentOutput { @location(0) color: vec4f, @location(1) velocity: vec2f }
+@fragment
+fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> FragmentOutput {
+    let shadowVisibility = visibility(input.light);
+    let sample = rasterSurface(input, front);
+    if (!sample.covered) { discard; }
+    let surface = sample.material;
+    let geometricNormal = sample.geometryNormal;
+    let n = sample.shadingNormal;
     let v = normalize(frame.camera.xyz - input.world);
     let l = normalize(frame.sunDirection.xyz);
     let metalness = surface.metallic;

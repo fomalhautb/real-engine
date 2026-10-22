@@ -8,6 +8,11 @@ struct FinalGatherParameters {
     state: vec4u, // frame, enabled, reset history, multiple diffuse bounces
     sampling: vec4f, // independent normal bias, reserved, plane tolerance, maximum filter distance
     emissive: vec4u, // active source prefix, area query count, material revision, camera moving
+    rasterOrigin: vec4f,
+    rasterDx: vec4f,
+    rasterDy: vec4f,
+    rasterDz: vec4f,
+    raster: vec4u, // receiver mode, metadata row count, reserved
 }
 struct FinalGatherAnchor {
     position: vec4f,
@@ -50,6 +55,15 @@ struct FinalGatherAreaSample {
 // Immutable per-dispatch path parameters; no queue overwrite between encoded segments.
 @group(0) @binding(14) var<uniform> path: vec4u; // segment index, configured segment count, reserved
 @group(0) @binding(15) var<storage, read_write> throughput: array<vec4f>;
+@group(0) @binding(16) var receiverMotionDepth: texture_2d<f32>;
+@group(0) @binding(17) var receiverIdentityNormals: texture_2d<u32>;
+@group(0) @binding(18) var<storage, read> receiverMetadata: array<ReceiverMetadata>;
+@group(0) @binding(19) var<storage, read_write> rasterCameraHits: array<Hit>;
+
+struct ReceiverMetadata {
+    identity: vec4u, // source, entity, generation, flags
+    versions: vec4u, // frame, history, topology, material
+}
 
 // GI_INTERPOLATE
 
@@ -83,6 +97,40 @@ fn gatherDirection(anchor: u32, sample: u32, normal: vec3f) -> vec3f {
 }
 fn gatherEmptyRay() -> Ray {
     return Ray(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(0.0), vec4u(0u));
+}
+
+@compute @workgroup_size(64)
+fn loadRasterReceivers(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= gather.settings.y) { return; }
+    let coordinate = vec2u(id.x % gather.viewport.z, id.x / gather.viewport.z);
+    let pixelOffset = f32(gather.settings.x / 2u) + 0.5;
+    let pixel = min(vec2f(coordinate) * f32(gather.settings.x) + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
+    let texel = vec2i(floor(pixel));
+    let packed = textureLoad(receiverIdentityNormals, texel, 0);
+    let motionDepth = textureLoad(receiverMotionDepth, texel, 0);
+    var hit: Hit;
+    hit.versions = vec4u(gather.state.x, 0u, 0u, gather.emissive.z);
+    if (packed.x != 0u && packed.x <= gather.raster.y && motionDepth.w > 0.0 && motionDepth.w < 1e30
+        && all(abs(motionDepth.xyz) < vec3f(1e30))) {
+        let metadata = receiverMetadata[packed.x - 1u];
+        let clip = vec2f(pixel.x / f32(gather.viewport.x) * 2.0 - 1.0,
+            1.0 - pixel.y / f32(gather.viewport.y) * 2.0);
+        let position = gather.rasterOrigin.xyz + motionDepth.w *
+            (gather.rasterDx.xyz * clip.x + gather.rasterDy.xyz * clip.y + gather.rasterDz.xyz);
+        let encodedNormal = unpack2x16snorm(packed.z);
+        let encodedGeometry = unpack2x16snorm(packed.w);
+        if (metadata.identity.x != 0u && metadata.versions.x == gather.state.x
+            && metadata.versions.w == gather.emissive.z && all(abs(position) < vec3f(1e30))) {
+            hit.identity = vec4u(metadata.identity.xyz, packed.y);
+            hit.position = vec4f(position, encodedGeometry.x);
+            hit.normal = vec4f(surfaceOctDecode(encodedNormal), 0.0);
+            hit.previous = vec4f(motionDepth.xyz, 0.0);
+            hit.uvInfo.w = encodedGeometry.y;
+            hit.emissive.w = select(0.0, 1.0, (metadata.identity.w & 1u) != 0u);
+            hit.versions = metadata.versions;
+        }
+    }
+    rasterCameraHits[id.x] = hit;
 }
 
 @compute @workgroup_size(64)

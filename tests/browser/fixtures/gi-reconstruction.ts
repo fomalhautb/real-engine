@@ -1,7 +1,7 @@
 import { DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET } from '../../../src/diffuse-gi';
 import { GI_DISTANCE_CELLS } from '../../../src/gi-visibility';
 import { diffuseGiSampleSource } from '../../../src/gpu-diffuse-gi';
-import { FINAL_GATHER_ANCHOR_BYTES, finalGatherSampleSource } from '../../../src/gpu-final-gather';
+import { FINAL_GATHER_ANCHOR_BYTES, FINAL_GATHER_PARAMETER_BYTES, finalGatherSampleSource } from '../../../src/gpu-final-gather';
 import surfaceFrameSource from '../../../src/shaders/surface-frame.wgsl?raw';
 
 type Vec3 = [number, number, number];
@@ -29,7 +29,7 @@ export async function runGiReconstructionFixture() {
   try {
     const giParameters = allocate(112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const probes = allocate(8 * DIFFUSE_GI_PROBE_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    const gatherParameters = allocate(224, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const gatherParameters = allocate(FINAL_GATHER_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const anchors = allocate(16 * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const input = allocate(64, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const output = allocate(16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
@@ -43,7 +43,8 @@ fn reconstruct() {
   if (query.pixel.z == 0.0) {
     answer = vec4f(diffuseGiSurfaceIrradiance(query.position.xyz, query.normal.xyz, query.geometry.xyz), 1.0);
   } else {
-    answer = vec4f(finalGatherIrradiance(query.pixel.xy, query.position.xyz, query.normal.xyz, query.geometry.xyz), 1.0);
+    answer = vec4f(finalGatherIrradiance(query.pixel.xy, query.position.xyz, query.normal.xyz, query.geometry.xyz,
+      vec2u(1u, 1u)), 1.0);
   }
 }`;
     const shader = device.createShaderModule({ code: source });
@@ -94,7 +95,7 @@ fn reconstruct() {
         words[base + DIFFUSE_GI_STATE_FLOAT_OFFSET + 1] = field.stale?.(index) ? 0 : 1;
       }
       device.queue.writeBuffer(probes, 0, records);
-      const parameters = new Float32Array(56), integers = new Uint32Array(parameters.buffer);
+      const parameters = new Float32Array(FINAL_GATHER_PARAMETER_BYTES / 4), integers = new Uint32Array(parameters.buffer);
       integers.set([viewport, viewport, 4, 4], 36); integers.set([4, 16, 1, 64], 40);
       integers.set([1, 1, 0, 0], 44); parameters.set([0.0001, 0, 0.001, 0.25], 48);
       device.queue.writeBuffer(gatherParameters, 0, parameters);

@@ -7,6 +7,11 @@ struct FinalGatherParameters {
     state: vec4u,
     sampling: vec4f,
     emissive: vec4u,
+    rasterOrigin: vec4f,
+    rasterDx: vec4f,
+    rasterDy: vec4f,
+    rasterDz: vec4f,
+    raster: vec4u,
 }
 struct FinalGatherAnchor {
     position: vec4f,
@@ -20,8 +25,9 @@ struct FinalGatherAnchor {
 @group(3) @binding(3) var<storage, read> finalGatherAnchors: array<FinalGatherAnchor>;
 
 fn finalGatherCompatible(anchor: FinalGatherAnchor, position: vec3f,
-    normal: vec3f, geometricNormal: vec3f) -> bool {
+    normal: vec3f, geometricNormal: vec3f, expectedIdentity: vec2u) -> bool {
     if (anchor.state.x == 0u || anchor.state.y != gather.state.x || anchor.versions.w != gather.emissive.z) { return false; }
+    if (expectedIdentity.x != 0u && !all(anchor.identity.xy == expectedIdentity)) { return false; }
     let delta = position - anchor.position.xyz;
     let anchorGeometry = surfaceOctDecode(vec2f(anchor.position.w, anchor.normal.w));
     return dot(normal, anchor.normal.xyz) >= 0.95
@@ -32,7 +38,8 @@ fn finalGatherCompatible(anchor: FinalGatherAnchor, position: vec3f,
 
 // Irradiance is filtered independently of the receiver's albedo. Uncovered,
 // incomplete or incompatible geometry explicitly uses the completed world field.
-fn finalGatherIrradiance(pixel: vec2f, position: vec3f, normal: vec3f, geometricNormal: vec3f) -> vec3f {
+fn finalGatherIrradiance(pixel: vec2f, position: vec3f, normal: vec3f, geometricNormal: vec3f,
+    expectedIdentity: vec2u) -> vec3f {
     if (gather.state.y == 0u || gather.state.x != gi.state.x) {
         return diffuseGiSurfaceIrradiance(position, normal, geometricNormal);
     }
@@ -52,7 +59,7 @@ fn finalGatherIrradiance(pixel: vec2f, position: vec3f, normal: vec3f, geometric
         if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(gather.viewport.zw))) { continue; }
         let index = u32(coordinate.x) + u32(coordinate.y) * gather.viewport.z;
         let anchor = finalGatherAnchors[index];
-        if (!finalGatherCompatible(anchor, position, normal, geometricNormal)) { continue; }
+        if (!finalGatherCompatible(anchor, position, normal, geometricNormal, expectedIdentity)) { continue; }
         let axisWeights = select(vec2f(1.0) - fraction, fraction, offset == vec2i(1));
         let weight = axisWeights.x * axisWeights.y;
         sum += anchor.irradiance.xyz * weight;
@@ -69,7 +76,7 @@ fn finalGatherIrradiance(pixel: vec2f, position: vec3f, normal: vec3f, geometric
                 let coordinate = lower + vec2i(x, y);
                 if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(gather.viewport.zw))) { continue; }
                 let anchor = finalGatherAnchors[u32(coordinate.x) + u32(coordinate.y) * gather.viewport.z];
-                if (!finalGatherCompatible(anchor, position, normal, geometricNormal)) { continue; }
+                if (!finalGatherCompatible(anchor, position, normal, geometricNormal, expectedIdentity)) { continue; }
                 let anchorPixel = min(vec2f(coordinate) * f32(gather.settings.x) + pixelOffset,
                     vec2f(gather.viewport.xy) - 0.5);
                 let screenDistance = (pixel - anchorPixel) / f32(gather.settings.x);

@@ -43,6 +43,7 @@ describe('BenchmarkRecorder', () => {
     expect(result.gpuMs.occlusion?.max).toBe(0);
     expect(result.gpuMs.diffuseGi?.max).toBe(0);
     expect(result.gpuMs.finalGather?.max).toBe(0);
+    expect(result.gpuMs.surfaceReceivers?.max).toBe(0);
     expect(result.gpuMs.reflections?.max).toBe(0);
     expect(result.gpuMs.volumetricFog?.max).toBe(0);
     expect(result.uploadedBytesTotal).toBe(5050);
@@ -73,6 +74,7 @@ describe('BenchmarkRecorder', () => {
     expect(empty.gpuMs.occlusion).toBeNull();
     expect(empty.gpuMs.diffuseGi).toBeNull();
     expect(empty.gpuMs.finalGather).toBeNull();
+    expect(empty.gpuMs.surfaceReceivers).toBeNull();
     expect(empty.gpuMs.reflections).toBeNull();
     expect(empty.gpuMs.volumetricFog).toBeNull();
     expect(empty.ownedGpuBytes).toBeNull();
@@ -83,9 +85,9 @@ describe('BenchmarkRecorder', () => {
     recorder.recordGpu({ frame: 2, deformation: 0, shadow: 1, surface: 2 });
     expect(recorder.summary().frameIntervalMs?.p50).toBe(0);
     expect(recorder.toCsv()).toBe(
-      'frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuTotalMs\n'
-      + '1,0,0,0,0,0,0,0,0,0,0,,,,,,,,,,,,\n'
-      + '2,32,2,1,0.5,0.25,20,2,200,4,2,0,1,2,0,0,0,0,0,0,0,0,3\n',
+      'frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuSurfaceReceiversMs,gpuTotalMs\n'
+      + '1,0,0,0,0,0,0,0,0,0,0,,,,,,,,,,,,,\n'
+      + '2,32,2,1,0.5,0.25,20,2,200,4,2,0,1,2,0,0,0,0,0,0,0,0,0,3\n',
     );
   });
 
@@ -103,10 +105,10 @@ describe('BenchmarkRecorder', () => {
     expect(gpuMs.diffuseGi).toEqual({ count: 2, mean: 4.5, p50: 2, p95: 7, p99: 7, max: 7 });
     expect(gpuMs.total).toEqual({ count: 2, mean: 20, p50: 12, p95: 28, p99: 28, max: 28 });
     const rows = recorder.toCsv().trimEnd().split('\n');
-    expect(rows[0]).toContain('gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuTotalMs');
-    expect(rows[1]).toMatch(/,1,2,3,4,5,6,0,7,0,0,0,28$/);
-    expect(rows[2].split(',').slice(11)).toEqual(Array(12).fill('')); // No GPU sample on frame 2.
-    expect(rows[3]).toMatch(/,0,0,1,2,3,4,0,2,0,0,0,12$/);
+    expect(rows[0]).toContain('gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuSurfaceReceiversMs,gpuTotalMs');
+    expect(rows[1]).toMatch(/,1,2,3,4,5,6,0,7,0,0,0,0,28$/);
+    expect(rows[2].split(',').slice(11)).toEqual(Array(13).fill('')); // No GPU sample on frame 2.
+    expect(rows[3]).toMatch(/,0,0,1,2,3,4,0,2,0,0,0,0,12$/);
   });
 
   it('includes final gather in the measured GPU total and CSV', () => {
@@ -120,6 +122,21 @@ describe('BenchmarkRecorder', () => {
     const values = sample.split(',');
     expect(values[columns.indexOf('gpuFinalGatherMs')]).toBe('5');
     expect(values[columns.indexOf('gpuTotalMs')]).toBe('8');
+  });
+
+  it('adds optional raster receiver timing exactly once and preserves older samples', () => {
+    const recorder = new BenchmarkRecorder(2, 16);
+    recorder.record(frame(1)); recorder.record(frame(2));
+    recorder.recordGpu({ frame: 1, deformation: 1, shadow: 2, surface: 3, finalGather: 4, surfaceReceivers: 5 });
+    recorder.recordGpu({ frame: 2, deformation: 1, shadow: 2, surface: 3, finalGather: 4 });
+    expect(recorder.summary().gpuMs.surfaceReceivers).toEqual({ count: 2, mean: 2.5,
+      p50: 0, p95: 5, p99: 5, max: 5 });
+    expect(recorder.summary().gpuMs.total).toEqual({ count: 2, mean: 12.5,
+      p50: 10, p95: 15, p99: 15, max: 15 });
+    const [header, first, second] = recorder.toCsv().trimEnd().split('\n');
+    const column = header.split(',').indexOf('gpuSurfaceReceiversMs');
+    expect(first.split(',')[column]).toBe('5');
+    expect(second.split(',')[column]).toBe('0');
   });
 
   it('includes volumetric fog in GPU totals and preserves zero for older samples', () => {
@@ -192,6 +209,7 @@ describe('BenchmarkRecorder', () => {
     expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, diffuseGi: -1 })).toThrow(/GPU diffuseGi/);
     expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, diffuseGi: Infinity })).toThrow(/GPU diffuseGi/);
     expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, finalGather: -1 })).toThrow(/GPU finalGather/);
+    expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, surfaceReceivers: -1 })).toThrow(/GPU surfaceReceivers/);
     expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, reflections: -1 })).toThrow(/GPU reflections/);
     expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, reflections: Infinity })).toThrow(/GPU reflections/);
     expect(() => recorder.recordGpu({ frame: 1, deformation: 1, shadow: 1, surface: 1, volumetricFog: -1 })).toThrow(/GPU volumetricFog/);

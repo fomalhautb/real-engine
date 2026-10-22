@@ -48,6 +48,20 @@ Final Gather 保留原四锚点插值；无足够兼容支持时最多检查外�
 
 最终集成检查：`npm run check` 通过类型、构建与 **612 项/73 文件**单元测试；`npm run test:browser` 在非 fallback NVIDIA Ampere/Edge 上 **112/112** 通过，日志分别为 `artifacts/sponza-parallel-final-check-20261022.log` 和 `artifacts/sponza-parallel-full-native-20261022.log`。两次新 Sponza 捕获均达到计划纹理 mip、准入几何页全部驻留，错误为空、释放归零。上述是功能回归与画质诊断，不是性能、最终画质或阶段完成验收。
 
+### 实际光栅接收面与受控边界测试
+
+Final Gather 新增可选 `receiver: 'raster'`，默认仍为 `world-query`。接收面预渲染与 PBR 共用完整网格、驻留 LOD 和分页几何的绘制列表，以及材质覆盖、导数贴图采样、切线空间法线和当前/前帧形变。使用两张全分辨率 16 字节附件保存前帧世界位置、线性视深度、身份行、稳定簇 ID、材质法线和几何法线；每个实例身份行另占 32 字节。接收面预算独立于 Final Gather 锚点预算，默认 128 MiB、硬上限 512 MiB，包含 resize 新旧附件的短暂重叠；分配失败清理新资源并保留旧接收面，释放计入 Renderer 账本。`surfaceReceivers` GPU 耗时独立记录并计入 benchmark 总耗时。
+
+启用遮挡剔除时，次序为接收面预渲染 → 当前深度 Hi-Z → 可见性补回 → 补回接收面 → Final Gather → 最终 PBR；同一帧不会重新选择另一组 LOD。身份保留精确整数 source/entity/generation/history/topology/material，静止镜头切换簇表示时拒绝旧历史；表面插值也检查 source/entity。GPU 测试验证曲面细/粗 LOD 的锚点深度与实际画面一致、稳定簇身份、透明裁剪、实例代次变化、均匀天空能量以及 GI/反射/雾联合遮挡恢复。该路径不再为相机接收点执行世界查询，但后续光线仍使用原世界查询几何；它没有解决粗光栅与精细查询代理之间的自相交，也没有实现自适应曲面采样或遮挡感知滤波。
+
+新增解析半屋顶测试将原始光传输与空间降噪分开验收。NVIDIA 实测 180 个接收点、每点 4,096 样本，归一化原始 RMSE 为 0.00512，滤波后为 0.01509；10–90% 过渡宽度解析值 0.08065 m、原始 0.08030 m、滤波后 0.09860 m。另以无噪声解析场输入生产降噪器，过渡由 0.02833 m 扩至 0.04433 m，证明即使无随机噪声也存在边界扩散；均匀能量、非负值、对称性与 4 mm 平行面隔离通过。测试报告这些偏差，不把当前扩散值设为画质通过门槛。
+
+Sponza 采集增加 `--warmup-frames`（默认 600），固定渲染次数后才检查最终连续 12 帧驻留稳定，并记录每个采集段的起止帧；不再因 IO 提早完成而改变采样种子。`--raster-receiver` 配合 `--fine-gather` 或 `--final-gather` 启用新路径。修订后的 CPU 检查为 617 项/74 文件通过，定向 NVIDIA GPU 回归 10/10 通过；日志分别为 `artifacts/raster-receivers-check-complete-20261022.log` 与 `artifacts/raster-receivers-focused-native-20261022.log`。
+
+同配置分页 Sponza 的两次采集保存在 `artifacts/sponza-query-receiver-fixed-20261022/` 与 `artifacts/sponza-raster-receiver-fixed-20261022/`，均固定预热 600 帧、4 像素 Final Gather、8× 各向异性、相同预算及镜头，各采集段起止帧完全一致。直接光全部像素相同，世界场单/多反弹各仅有 2 个像素不同；Final Gather 上层双拱内的大片异常三角亮块明显减少，但门框亮边仍在。多反弹图左门 ROI 的显示 RGB 均值由 7.989 降至 5.188，地面由 25.718 变为 25.784；这只是局部画面变化，没有对应真值，不能把变暗量解释为准确率。新路径接收面账本为 29,504,032 字节，另增加 32 字节时间戳读回/解析缓冲；每帧节省 57,600 条相机查询射线，但多一个预渲染步骤，不能据此宣称性能提高。两组均无页面/GPU 错误、无无效探针，释放归零。审计见 `artifacts/sponza-raster-receiver-comparison-20261022.json`。
+
+最终集成检查 `npm run check` 为 **617 项/74 文件**通过（`artifacts/raster-receivers-release-check-20261022.log`）；完整 `npm run test:browser` 在 NVIDIA Ampere/Edge 上 **117/117** 通过（`artifacts/raster-receivers-full-native-20261022.log`）。联合画质与性能验收仍未通过。
+
 ## Sponza 远近 LOD 的实际限制
 
 用户指出分簇预览中远处仍有大量细小簇，本轮针对实际场景做了诊断。关闭视锥剔除以排除对象消失的影响，LOD 误差保持 2 像素；显示镜头固定在 `[9,1.8,0]`，分别用 `[9,1.8,0]`、`[40,1.8,0]`、`[120,1.8,0]` 的选择视点，通过现有冻结选择功能显示不同距离的切分。401 个批次的实际 GPU 簇 ID 都与各帧实际驻留集合下的独立 CPU 切分逐项一致，没有 GPU/页面错误，释放账本归零。

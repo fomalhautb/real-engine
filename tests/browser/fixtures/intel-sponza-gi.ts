@@ -47,13 +47,19 @@ export interface IntelSponzaGiOptions {
   exposureEV?: number;
   reference?: boolean;
   finalGather?: boolean;
+  rasterReceiver?: boolean;
   sourceRaster?: boolean;
   fineGather?: boolean;
   anisotropy?: number;
   sceneBudget?: boolean;
+  /** Exact rendered warmup frame count; residency must be settled at its end. */
+  warmupFrames?: number;
 }
 
 export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) {
+  const warmupFrames = settings.warmupFrames ?? 600;
+  if (!Number.isSafeInteger(warmupFrames) || warmupFrames < 90 || warmupFrames > 3600) throw Error('SPONZA_WARMUP_FRAMES');
+  if (settings.rasterReceiver && !settings.finalGather) throw Error('SPONZA_RASTER_RECEIVER_REQUIRES_FINAL_GATHER');
   const root = settings.geometryRoot ?? '/artifacts/sponza-group16-pages-20261022/';
   const textureGpuRoot = settings.textureGpuRoot ?? '/artifacts/sponza-textures-gpu-20261020/';
   const textureReferenceRoot = settings.textureReferenceRoot ?? '/artifacts/sponza-textures-reference-20261020/';
@@ -185,7 +191,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
       spacing: giSpacing, counts: giCounts, raysPerProbe: settings.fineGather ? 128 : 64, maxDistance: 80, normalBias: 0.03,
       skyRadiance: [0.2, 0.25, 0.35] as [number, number, number], multiBounce: false, maxBytes: 128 * MiB,
       ...(settings.finalGather ? { finalGather: { pixelSpacing: settings.fineGather ? 4 : 8, maxAnchors: settings.fineGather ? 65536 : 32768, raysPerAnchor: 1,
-        pathSegments: 2, maxHistory: settings.fineGather ? 256 : 64, maxBytes: 64 * MiB } } : {}) };
+        pathSegments: 2, maxHistory: settings.fineGather ? 256 : 64, maxBytes: 64 * MiB,
+        receiver: settings.rasterReceiver ? 'raster' as const : 'world-query' as const } } : {}) };
     const renderBatches = settings.sourceRaster ? batches.map(({ geometryStream, ...batch }): SceneBatch => ({ ...batch, mesh: geometryStream.queryProxy.mesh })) : batches;
     renderer = await Renderer.create(canvas, renderBatches, { maxBatches: 512, antiAliasing: 'fxaa', textureBudgetBytes: 512 * MiB,
       worldQueries: { maxRays: settings.fineGather ? 65536 : 32768, maxBatches: 512, maxTrianglesPerMesh: 262144,
@@ -199,7 +206,7 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
     if (!settings.sourceRaster) renderer.setGeometryLod({ maxErrorPixels: 2, frustumCulling: true, debug: 'material' });
     progress('renderer-ready', { ownedGpuBytes: renderer.stats.ownedGpuBytes });
     const frames = [];
-    let stableFrames = 0, priorSignature = '';
+    let stableFrames = 0, firstSettledFrame: number | null = null, priorSignature = '', renderedFrame = 0;
     const residencySignature = () => {
       const d = renderer!.diagnostics();
       return JSON.stringify({ textures: d.textureStreaming?.sources.map(s => [s.id, s.currentMip]),
@@ -216,21 +223,23 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
         && d.geometryStreams.every(s => !s.pool.pendingPages.length && !s.cache.activeRequests && !s.cache.queuedRequests
           && s.allocation.pages.every(page => s.pool.residentPages.includes(page)));
     };
-    for (let frame = 0; frame < 600; frame++) {
+    for (let frame = 0; frame < warmupFrames; frame++) {
       renderer.render(eye, target);
+      renderedFrame++;
       await renderer.probeHdr([{ x: 640, y: 360 }]);
       await new Promise(requestAnimationFrame);
       if (renderer.errors.length) throw Error('SPONZA_RENDER: ' + renderer.errors.join('; '));
       const d = renderer.diagnostics();
-      frames.push({ frame, imageBytes: d.materials.imageBytes, ownedGpuBytes: renderer.stats.ownedGpuBytes,
+      frames.push({ frame, renderFrame: renderedFrame, imageBytes: d.materials.imageBytes, ownedGpuBytes: renderer.stats.ownedGpuBytes,
         textureActive: d.textureStreaming?.active, geometryResidentPages: d.geometryStreams.reduce((n, stream) => n + stream.pool.residentPages.length, 0) });
       if (frame % 15 === 0) progress('warmup', frames.at(-1));
       const signature = residencySignature();
       const idle = residencySettled(d);
       stableFrames = idle && signature === priorSignature ? stableFrames + 1 : 0; priorSignature = signature;
-      if (frame >= 89 && stableFrames >= 12) break;
+      if (stableFrames >= 12 && firstSettledFrame === null) firstSettledFrame = renderedFrame;
     }
     if (stableFrames < 12) throw Error('SPONZA_RESIDENCY_NOT_SETTLED');
+    const warmup = { requestedFrames: warmupFrames, renderedFrames: renderedFrame, firstSettledFrame, stableFramesAtEnd: stableFrames };
     let giAudit;
     {
       const points = [{x:640,y:620},{x:480,y:560},{x:260,y:400},{x:1020,y:400},{x:640,y:300},{x:900,y:140},
@@ -238,7 +247,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
       const captures: any[] = [];
       const capture = async (label: string, count: number) => {
         const signatureBefore = residencySignature(), hdrFrames = [];
-        for (let i = 0; i < count; i++) { renderer!.render(eye, target); hdrFrames.push(await renderer!.probeHdr(points)); }
+        const firstFrame = renderedFrame + 1;
+        for (let i = 0; i < count; i++) { renderer!.render(eye, target); renderedFrame++; hdrFrames.push(await renderer!.probeHdr(points)); }
         const probe = label === 'direct-only' ? null : await renderer!.probeDiffuseGi();
         const diagnostics = renderer!.diagnostics();
         if (!residencySettled(diagnostics)) throw Error('SPONZA_CAPTURE_RESIDENCY_NOT_SETTLED');
@@ -258,7 +268,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
           probe: await renderer!.probeDiffuseGiFinalGather([...new Set(candidates.flatMap(row => row.indices))]),
           note: 'Candidate anchors only; inclusion does not prove surface compatibility or acceptance by reconstruction.' } : null;
         const signatureAfter = residencySignature();
-        const result = { label, png: canvas.toDataURL(), points, hdrFrames, probe, finalGather,
+        const result = { label, firstFrame, lastFrame: renderedFrame, renderedFrames: count,
+          png: canvas.toDataURL(), points, hdrFrames, probe, finalGather,
           residencyUnchanged: signatureBefore === signatureAfter, diagnostics };
         captures.push(result);
         progress('gi-capture', { label, invalidProbes: probe?.invalidProbes, residencyUnchanged: result.residencyUnchanged, hdr: hdrFrames.at(-1) });
@@ -274,14 +285,15 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
         await capture('gather-single-bounce', settings.fineGather ? 256 : 64);
         renderer.setDiffuseGiMultiBounce(true); await capture('gather-multi-bounce', settings.fineGather ? 256 : 64);
       }
-      giAudit = { options: giOptions, exposureEV: settings.exposureEV ?? 3, queryRoot: settings.queryRoot, sourceRaster: settings.sourceRaster ?? false, anisotropy: settings.anisotropy ?? 1, stableFrames, captures, reference,
+      giAudit = { options: giOptions, exposureEV: settings.exposureEV ?? 3, queryRoot: settings.queryRoot, sourceRaster: settings.sourceRaster ?? false,
+        anisotropy: settings.anisotropy ?? 1, receiver: settings.rasterReceiver ? 'raster' : 'world-query', warmup, captures, reference,
         limitations: ['Fixed regular probe grid has no automatic relocation.', 'Coarse query proxies are not a visibility-error reference; zero-error proxies retain the cleaned LOD0 topology.',
           'Direct-only uses zero indirect term; the older unconfigured-GI capture included a constant ambient fill.',
           'Sky radiance is an explicit constant environment; no HDRI, reflection or volumetric fog.'] };
     }
     const diagnostics = renderer.diagnostics();
     const report = { root, buildConfig: manifest.config, info: renderer.info, bounds, sourceInstances, batches: batches.length, sourceTriangles,
-      baselineAccounting: accounting, appliedAccounting, capacityPlan, frames, conversion, omitted, giAudit, errors: [...renderer.errors], diagnostics,
+      baselineAccounting: accounting, appliedAccounting, capacityPlan, frames, warmup, conversion, omitted, giAudit, errors: [...renderer.errors], diagnostics,
       limitations: ['Partial integration preview: four BLEND source primitives explicitly excluded.',
         'World diffuse GI preview; reflections and fog are not enabled.',
         'Fixed query proxies cast shadows; proxy quality remains unaccepted.',

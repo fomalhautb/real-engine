@@ -3,7 +3,7 @@ import type { runFinalGatherSkyFixture } from './fixtures/gi-final-gather';
 import type { runGiContactReferenceFixture } from './fixtures/gi-contact-reference';
 import { writeFile } from 'node:fs/promises';
 
-test('surface final gather preserves sky energy and responds to offscreen occluder removal', async ({ page }) => {
+for (const receiverMode of ['world-query', 'raster'] as const) test(`surface final gather ${receiverMode} preserves sky energy and responds to offscreen occluder removal`, async ({ page }) => {
   test.setTimeout(180_000);
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -11,12 +11,12 @@ test('surface final gather preserves sky energy and responds to offscreen occlud
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
   await page.evaluate(() => { window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose(); });
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async (receiverMode) => {
     const module = await import('/tests/browser/fixtures/' + 'gi-final-gather.ts') as {
       runFinalGatherSkyFixture: typeof runFinalGatherSkyFixture;
     };
-    return module.runFinalGatherSkyFixture();
-  });
+    return module.runFinalGatherSkyFixture(receiverMode);
+  }, receiverMode);
   console.log('FINAL_GATHER_SKY ' + JSON.stringify({ initial: result.initial.hdr,
     blocked: result.blocked.hdr, restored: result.restoredImmediate.hdr,
     history: result.stable.gi?.finalGather?.historyUpdates,

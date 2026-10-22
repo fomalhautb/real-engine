@@ -1,5 +1,7 @@
 import { GeometryDemoScene } from '../../../src/geometry-demo-scene';
-import { encodeGeometryPages } from '../../../src/geometry-pages';
+import { createCube } from '../../../src/geometry';
+import { buildGeometryHierarchy } from '../../../src/geometry-hierarchy';
+import { decodeGeometryPage, encodeGeometryPages } from '../../../src/geometry-pages';
 import { buildGeometryStreamDirectory } from '../../../src/geometry-stream-directory';
 import { GeometryPageCache } from '../../../src/geometry-stream-cache';
 import { GeometryStreamCut, type GeometryStreamView } from '../../../src/geometry-stream-cut';
@@ -112,6 +114,100 @@ function compareDemand(actual: readonly Demand[], expected: readonly Demand[], l
       throw new Error(`${label}: DEMAND_ERROR:${expectedSorted[i].groupId}: ${JSON.stringify({ observed, wanted, tolerance })}`);
     }
   }
+}
+
+/** A real 12-triangle cube is one cluster, unlike count=1 in the multi-cluster
+ * demo. Capacity=2 also checks switching between single-pair and scan paths. */
+async function singlePairCases(device: GPUDevice, occlusion: GpuOcclusion,
+  planes: (mode: 'first' | 'recover' | 'reject') => void,
+  readWords: (source: GPUBuffer, byteCount: number) => Promise<Uint32Array>) {
+  const hierarchy = await buildGeometryHierarchy({ primitiveKey: 'selection-single-pair-cube', mesh: createCube(), coverage: 'opaque' });
+  const encoded = await encodeGeometryPages(hierarchy);
+  const directory = await buildGeometryStreamDirectory(hierarchy, encoded);
+  same([directory.clusters.length, directory.pages.length, directory.sourceTriangleCount], [1, 1, 12], 'SINGLE_PAIR_ASSET');
+  const decoded = await decodeGeometryPage(encoded.pages[0].bytes);
+  let pool: GpuGeometryPagePool | undefined, plain: GpuGeometryStreamSelection | undefined;
+  let hiz: GpuGeometryStreamSelection | undefined, input: GPUBuffer | undefined;
+  let poolOwned = 0, selectionOwned = 0;
+  try {
+    pool = await GpuGeometryPagePool.create(device, directory, {}, bytes => { poolOwned += bytes; });
+    pool.enqueue(0, decoded); pool.uploadFrame(1);
+    same(pool.diagnostics().rootsReady, true, 'SINGLE_PAIR_ROOT_READY');
+    input = device.createBuffer({ size: 2 * 224, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    plain = await GpuGeometryStreamSelection.create(device, pool, input, 2, bytes => { selectionOwned += bytes; });
+    hiz = await GpuGeometryStreamSelection.create(device, pool, input, 2, bytes => { selectionOwned += bytes; }, {}, occlusion);
+    const physicalCount = plain.physicalVertexCount, location = pool.clusterLocation(0)!;
+    const expectedInstance = [...decoded.clusters[0].localTriangles].map(value => value + location.baseVertex + location.firstVertex);
+    const savedLocation = await readWords(pool.clusterLocations, 32);
+    const savedIndex = await readWords(pool.indices, 4);
+    const rows = [], faults = [];
+    let frame = 0;
+    const submit = async (selection: GpuGeometryStreamSelection, count: number, offscreen = false) => {
+      device.queue.writeBuffer(input!, 0, instances([offscreen ? translation(1000, 0, 0) : identity(), identity()]));
+      selection.setSettings({ maxErrorPixels: 0, frustumCulling: true });
+      selection.update(++frame, count, vp, eye, projectionScale);
+      const lease = pool!.acquireFrame([0]), encoder = device.createCommandEncoder();
+      let submitted = false;
+      try {
+        selection.encode(encoder); selection.encodeRecovery(encoder);
+        const completion = pool!.submitFrame(lease, [encoder.finish()]); submitted = true;
+        const done = await completion; if (done.error) throw new Error(done.error);
+      } finally { if (!submitted) pool!.cancelFrame(lease); }
+      const feedback = await selection.feedback(true);
+      const args = await readWords(selection.arguments, 64);
+      const indices = await readWords(selection.indices, feedback.indices * 4);
+      return { feedback, args, indices };
+    };
+    // All visible cases emit the full nonempty cube. Zero and two-active cases
+    // ensure the optimization uses current count, not allocated owner capacity.
+    for (const mode of ['plain', 'first', 'recover', 'reject', 'frustum'] as const) {
+      if (mode !== 'plain' && mode !== 'frustum') planes(mode);
+      const selection = mode === 'plain' || mode === 'frustum' ? plain : hiz;
+      for (const count of mode === 'frustum' ? [1] : [0, 1, 0, 1, 2, 1]) {
+        const { feedback, args, indices } = await submit(selection, count, mode === 'frustum');
+        const visible = mode !== 'reject' && mode !== 'frustum';
+        const expected = visible ? Array.from({ length: count }, (_, instance) => expectedInstance.map(value => value + instance * physicalCount)).flat() : [];
+        same([...indices], expected, 'SINGLE_PAIR_EXACT_INDICES_' + mode);
+        same(feedback.overflow, false, 'SINGLE_PAIR_VALID_OVERFLOW');
+        const recovered = mode === 'recover', deferred = mode === 'recover' || mode === 'reject';
+        const firstCount = recovered ? 0 : expected.length, recoveryCount = recovered ? expected.length : 0;
+        same([args[0], args[8], args[10]], [firstCount, recoveryCount, firstCount], 'SINGLE_PAIR_INDIRECT');
+        same(feedback.occlusion, { deferredClusters: deferred ? count : 0,
+          culledClusters: mode === 'reject' ? count : 0, recoveredClusters: recovered ? count : 0 }, 'SINGLE_PAIR_HIZ');
+        same(feedback.selectedClusters?.map(entry => entry.visible), Array(count).fill(visible), 'SINGLE_PAIR_FLAGS');
+        rows.push({ mode, count, indices: feedback.indices, firstIndices: firstCount, recoveredIndices: recoveryCount });
+      }
+    }
+    for (const mode of ['first', 'recover'] as const) for (const defect of ['count', 'output', 'input-range', 'vertex-range', 'index'] as const) {
+      planes(mode);
+      const broken = savedLocation.slice();
+      if (defect === 'count') broken[4] = 1539;
+      if (defect === 'output') broken[4] = directory.sourceTriangleCount * 3 * 2 + 3;
+      if (defect === 'input-range') broken[3] = 0xffffffff;
+      if (defect === 'vertex-range') broken[0] = physicalCount + 1;
+      device.queue.writeBuffer(pool.clusterLocations, 0, broken);
+      if (defect === 'index') device.queue.writeBuffer(pool.indices, 0, new Uint32Array([0xffffffff]));
+      try {
+        const { feedback, args, indices } = await submit(hiz, 1);
+        same({ indices: feedback.indices, overflow: feedback.overflow }, { indices: 0, overflow: true }, 'SINGLE_PAIR_FAIL_CLOSED_' + mode + '_' + defect);
+        same([args[0], args[8], args[6], args[14]], mode === 'first' ? [0, 0, 1, 0] : [0, 0, 0, 1], 'SINGLE_PAIR_FAILURE_PHASE');
+        same(indices.length, 0, 'SINGLE_PAIR_FAILURE_DRAW');
+        faults.push({ mode, defect, indices: feedback.indices, overflow: feedback.overflow });
+      } finally {
+        device.queue.writeBuffer(pool.clusterLocations, 0, savedLocation);
+        device.queue.writeBuffer(pool.indices, 0, savedIndex);
+      }
+    }
+    // A failed phase must not poison the next frame after valid input returns.
+    planes('recover');
+    const restored = await submit(hiz, 1);
+    same([...restored.indices], expectedInstance, 'SINGLE_PAIR_RESTORED_INDICES');
+    same(restored.feedback.overflow, false, 'SINGLE_PAIR_RESTORED_OVERFLOW');
+    same([plain.diagnostics().compaction.scratchBytes, hiz.diagnostics().compaction.scratchBytes], [0, 0], 'SINGLE_PAIR_NO_SCRATCH');
+    plain.dispose(); hiz.dispose(); pool.dispose(); await device.queue.onSubmittedWorkDone();
+    return { clusters: directory.clusters.length, capacity: 2, trianglesPerInstance: directory.sourceTriangleCount,
+      rows, faults, restoredIndices: restored.feedback.indices, poolOwned, selectionOwned };
+  } finally { plain?.dispose(); hiz?.dispose(); pool?.dispose(); input?.destroy(); }
 }
 
 /** Native GPU numeric cut comparison; its only readbacks are test diagnostics. */
@@ -380,11 +476,15 @@ export async function runGeometryStreamSelectionCases() {
       device.queue.writeBuffer(currentPool.clusterLocations, firstCluster * 32, savedLocation);
     }
     recoverySelection.dispose();
+    const singlePair = await singlePairCases(device, occlusion, mode => {
+      device.queue.writeTexture({ texture: previous.texture }, new Float32Array([mode === 'first' ? 1 : 0]), { bytesPerRow: 4 }, [1, 1]);
+      device.queue.writeTexture({ texture: current.texture }, new Float32Array([mode === 'reject' ? 0 : 1]), { bytesPerRow: 4 }, [1, 1]);
+    }, readWords);
     selection.dispose(); currentPool.dispose(); await cache.dispose(); await device.queue.onSubmittedWorkDone();
     return { adapter: { vendor: adapter.info.vendor, isFallbackAdapter: adapter.info.isFallbackAdapter },
       pages: directory.pages.length, sourceTriangles: directory.sourceTriangleCount,
       rootOnly, fine, middle, frozen, farCount, coarse, culled, zero, allOffscreen, swapped, poolOwned, selectionOwned,
-      stableSmall, stableLarge, boundaryBelow, boundaryZero, boundaryRegrow, recoveryCases, overflowCases,
+      stableSmall, stableLarge, boundaryBelow, boundaryZero, boundaryRegrow, recoveryCases, overflowCases, singlePair,
       pool: currentPool.diagnostics(), selection: selection.diagnostics(), errors };
   } finally {
     recoverySelection?.dispose(); selection?.dispose(); pool?.dispose();

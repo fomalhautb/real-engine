@@ -52,6 +52,17 @@ test('native GPU stream cuts agree with per-instance CPU plans across residency,
   for (const entry of result.recoveryCases) expect(new Set(entry.hashes).size).toBe(1);
   expect(result.overflowCases).toHaveLength(4);
   expect(result.overflowCases.every(entry => entry.overflow && entry.indices === 0)).toBe(true);
+  expect(result.singlePair).toMatchObject({ clusters: 1, capacity: 2, trianglesPerInstance: 12,
+    restoredIndices: 36, poolOwned: 0, selectionOwned: 0 });
+  expect(result.singlePair.rows).toHaveLength(25);
+  for (const entry of result.singlePair.rows) {
+    const visible = entry.mode !== 'reject' && entry.mode !== 'frustum';
+    expect(entry.indices).toBe(visible ? entry.count * 36 : 0);
+    expect(entry.firstIndices).toBe(visible && entry.mode !== 'recover' ? entry.count * 36 : 0);
+    expect(entry.recoveredIndices).toBe(entry.mode === 'recover' ? entry.count * 36 : 0);
+  }
+  expect(result.singlePair.faults).toHaveLength(10);
+  expect(result.singlePair.faults.every(entry => entry.overflow && entry.indices === 0)).toBe(true);
   expect(result.poolOwned).toBe(0);
   expect(result.selectionOwned).toBe(0);
   expect(result.pool).toMatchObject({ disposed: true, allocatedGpuBytes: 0, framesInFlight: 0 });

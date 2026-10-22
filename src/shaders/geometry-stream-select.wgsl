@@ -192,6 +192,12 @@ fn writeCluster(index:u32,offset:u32,recovery:bool) {
     else {atomicAdd(&args.first.selectedCount,1u);}
 }
 fn fused(lane:u32,recovery:bool) {
+    // Uniform active-pair count: every lane skips every scan barrier together.
+    // One pair has the unique prefix zero, even when owner capacity is larger.
+    if(params.clusterCount*params.instanceCount==1u){
+        if(lane==0u){let count=weight(0u,recovery);publish(count,recovery);writeCluster(0u,0u,recovery);}
+        return;
+    }
     scanValues[lane]=weight(lane,recovery);scanValues[lane+256u]=weight(lane+256u,recovery);
     scan(lane);
     if(lane==0u){publish(scanTotal,recovery);}

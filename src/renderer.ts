@@ -1,5 +1,6 @@
 import deformationSource from './shaders/deform.wgsl?raw';
 import surfaceSource from './shaders/surface.wgsl?raw';
+import gatherDiagnosticSource from './shaders/final-gather-diagnostic.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import surfaceBrdfSource from './shaders/surface-brdf.wgsl?raw';
 import resolveSource from './shaders/resolve.wgsl?raw';
@@ -32,6 +33,7 @@ import { TextureStreaming } from './texture-streaming';
 import { meshWorldUnitsPerUv, modelStretch, textureViewDemand } from './texture-stream-demand';
 import type { TextureStreamDemand, TextureStreamingOptions } from './texture-stream-types';
 import { GpuSurfaceReceivers } from './gpu-surface-receivers';
+import { decodeFinalGatherDiagnostics, decodeFinalGatherDiagnosticSurfaces, validateFinalGatherDiagnosticPoints } from './final-gather-diagnostics';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 0, length = values.length): boolean {
@@ -40,7 +42,8 @@ function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 
 }
 type MaterialPipelines = { surface: GPURenderPipeline; surfaceLod?: GPURenderPipeline; surfaceStream?: GPURenderPipeline;
   receiver?: GPURenderPipeline; receiverLod?: GPURenderPipeline; receiverStream?: GPURenderPipeline;
-  shadow: GPURenderPipeline; query?: GPUComputePipeline };
+  shadow: GPURenderPipeline; query?: GPUComputePipeline;
+  gatherDiagnostic?: (surface?: boolean) => Promise<MaterialPipelines> };
 type Batch = {
   sourceId: number; receiverBase: number; scene: RenderBatch; mesh: MeshData; rest: GPUBuffer; indices: GPUBuffer; params: GPUBuffer;
   instances: GPUBuffer; palettes: GPUBuffer; output: GPUBuffer; scalars: GPUBuffer;
@@ -143,6 +146,7 @@ export class Renderer {
   private readonly timestampCount: number;
   private timingPending = false;
   private disposed = false;
+  private gatherDiagnosticPending = false;
   private readonly deformationPipelines = new Map<string, GPUComputePipeline>();
   private graph!: ReturnType<typeof compileRenderGraph<GPUCommandEncoder>>;
   private readonly materialResources: MaterialResources;
@@ -170,6 +174,7 @@ export class Renderer {
   private lightingGroups: GPUBindGroup[] = [];
   private defaultClusterVertices!: GPUBuffer;
   private materialRevision = 0;
+  private lastRenderedMaterialRevision = -1;
   private format!: GPUTextureFormat;
   private computeLayout!: GPUBindGroupLayout;
   private geometryLayout!: GPUBindGroupLayout;
@@ -562,7 +567,8 @@ export class Renderer {
         }
         this.compilingMaterials.add(program.key);
         pending = (async () => {
-          const module = await this.shader((surfaceFrameSource + '\n' + surfaceBrdfSource + '\n' + surfaceSource)
+          const module = await this.shader((surfaceFrameSource + '\n' + surfaceBrdfSource + '\n' + surfaceSource
+            + (this.diffuseGiOptions?.finalGather ? '\n' + gatherDiagnosticSource : ''))
             .replace('// REFLECTION_PROGRAM', this.reflections ? reflectionSurfaceSource : '')
             .replace('// REFLECTED_LIGHTING', this.reflections
               ? 'let reflected = reflectionRadiance(input.position.xy, input.world, n, geometricNormal, base, metalness, roughness, input.surfaceIdentity);'
@@ -611,7 +617,25 @@ export class Renderer {
           const receiver = this.surfaceReceivers ? await receiverPipeline('vertexMain') : undefined;
           const receiverLod = this.surfaceReceivers && this.hasGeometryLod ? await receiverPipeline('clusterVertexMain') : undefined;
           const receiverStream = this.surfaceReceivers && this.hasGeometryStream ? await receiverPipeline('pagedClusterVertexMain') : undefined;
-          return { surface, surfaceLod, surfaceStream, receiver, receiverLod, receiverStream, shadow, query };
+          const result: MaterialPipelines = { surface, surfaceLod, surfaceStream, receiver, receiverLod, receiverStream, shadow, query };
+          if (this.diffuseGiOptions?.finalGather) {
+            const diagnostics: (Promise<MaterialPipelines> | undefined)[] = [];
+            const create = (entryPoint: string, fragment: string) => this.device.createRenderPipelineAsync({ label: 'explicit GI diagnostic ' + entryPoint,
+              layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.frameLayout, this.geometryLayout,
+                this.materialResources.layout, this.lightingLayout!] }),
+              vertex: { module, entryPoint }, fragment: { module, entryPoint: fragment,
+                targets: [{ format: 'rgba32uint' }, { format: 'rgba32uint' }] },
+              primitive, depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' } });
+            result.gatherDiagnostic = (surface = false) => {
+              const index = Number(surface), fragment = surface ? 'gatherDiagnosticSurfaceFragment' : 'gatherDiagnosticFragment';
+              return diagnostics[index] ??= Promise.all([create('vertexMain', fragment),
+                this.hasGeometryLod ? create('clusterVertexMain', fragment) : undefined,
+                this.hasGeometryStream ? create('pagedClusterVertexMain', fragment) : undefined])
+                .then(([surface, surfaceLod, surfaceStream]) => ({ ...result, surface, surfaceLod, surfaceStream }))
+                .catch(error => { diagnostics[index] = undefined; throw error; });
+            };
+          }
+          return result;
         })();
         this.materialPipelines.set(program.key, pending);
         // Permit a corrected retry after compilation/device errors; do not cache rejected work.
@@ -1192,6 +1216,7 @@ export class Renderer {
     this.volumetricFog?.afterSubmit();
     if (readTiming) void this.readTiming(this.stats.frames + 1);
     this.stats.frames++;
+    this.lastRenderedMaterialRevision = this.materialRevision;
     this.stats.drawCalls = this.batches.filter(batch => batch.scene.instances.length).length * 2 + 1 + (this.volumetricFog ? 1 : 0)
       + (this.surfaceReceivers ? this.batches.filter(batch => batch.scene.instances.length).length : 0)
       + (this.occlusion ? this.batches.filter(batch => batch.scene.instances.length && batch.material.program.alphaMode === 'opaque'
@@ -1314,25 +1339,28 @@ export class Renderer {
       weights: floats(48, 4) as [number, number, number, number],
       ...(tangents?.[vertex * 4 + 3] ? { tangent: Array.from(tangents.subarray(vertex * 4, vertex * 4 + 4)) as [number, number, number, number] } : {}) };
   }
-  private draw(pass: GPURenderPassEncoder, kind: 'surface' | 'shadow' | 'receiver', recovery = false): void {
+  private draw(pass: GPURenderPassEncoder, kind: 'surface' | 'shadow' | 'receiver', recovery = false,
+    overrides?: ReadonlyMap<MaterialPipelines, MaterialPipelines>): void {
     for (const batch of this.batches) {
-      if (!batch.scene.instances.length) continue;
+      const instanceCount = overrides ? batch.lastInstances.length : batch.scene.instances.length;
+      if (!instanceCount) continue;
+      const pipelines = overrides?.get(batch.materialPipelines) ?? batch.materialPipelines;
       if (kind !== 'shadow' && batch.stream && batch.material.program.alphaMode === 'opaque') {
-        pass.setPipeline(kind === 'receiver' ? batch.materialPipelines.receiverStream! : batch.materialPipelines.surfaceStream!); pass.setBindGroup(2, batch.material.bindGroup);
+        pass.setPipeline(kind === 'receiver' ? pipelines.receiverStream! : pipelines.surfaceStream!); pass.setBindGroup(2, batch.material.bindGroup);
         pass.setBindGroup(1, batch.stream.render); pass.setIndexBuffer(batch.stream.runtime.selection.indices, 'uint32');
         pass.drawIndexedIndirect(batch.stream.runtime.selection.arguments, recovery ? 32 : 0); continue;
       }
       const lod = kind !== 'shadow' && batch.material.program.alphaMode === 'opaque' ? batch.geometryLod : undefined;
       if (recovery && !lod) continue;
-      pass.setPipeline(lod ? (kind === 'receiver' ? batch.materialPipelines.receiverLod! : batch.materialPipelines.surfaceLod!)
-        : batch.materialPipelines[kind]!); pass.setBindGroup(2, batch.material.bindGroup);
+      pass.setPipeline(lod ? (kind === 'receiver' ? pipelines.receiverLod! : pipelines.surfaceLod!)
+        : pipelines[kind]!); pass.setBindGroup(2, batch.material.bindGroup);
       if (lod) {
         pass.setBindGroup(1, batch.render); pass.setIndexBuffer(lod.indices, 'uint32');
         pass.drawIndexedIndirect(lod.arguments, recovery ? 32 : 0);
         continue;
       }
       pass.setBindGroup(1, batch.render); pass.setIndexBuffer(batch.indices, 'uint32');
-      pass.drawIndexed(batch.mesh.indices.length, batch.scene.instances.length);
+      pass.drawIndexed(batch.mesh.indices.length, instanceCount);
     }
   }
   private async readTiming(frame: number): Promise<void> {
@@ -1401,6 +1429,92 @@ export class Renderer {
   async probeVelocity(points: readonly { x: number; y: number }[]): Promise<number[][]> {
     if (this.disposed || !this.velocity || !this.lastViewProjection) throw new Error('NO_RENDERED_VELOCITY');
     return this.readFloat16Pixels(this.velocity, points, 2, 'VELOCITY');
+  }
+
+  /** Explicit diagnostic redraw of the last submitted surface. Pause rendering
+   * while pipelines are prepared. No simulation, GI sampling or LOD selection
+   * advances, and production HDR/depth/history targets remain untouched. */
+  async probeDiffuseGiReconstruction(points: readonly { x: number; y: number }[]) {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.diffuseGiOptions?.finalGather || !this.lastViewProjection) throw new Error('FINAL_GATHER_DIAGNOSTIC_NO_FRAME');
+    if (this.gatherDiagnosticPending) throw new Error('FINAL_GATHER_DIAGNOSTIC_PENDING');
+    if (this.errors.length) throw new Error(this.errors.join('\n'));
+    const width = this.stats.width, height = this.stats.height, frame = this.stats.frames, revision = this.materialRevision;
+    if (revision !== this.lastRenderedMaterialRevision) throw new Error('FINAL_GATHER_DIAGNOSTIC_STALE_MATERIAL');
+    const requested = validateFinalGatherDiagnosticPoints(points, width, height);
+    const temporaryBytes = width * height * 36 + requested.length * 1024;
+    if (temporaryBytes > 64 * 1024 * 1024) throw new Error('FINAL_GATHER_DIAGNOSTIC_MEMORY_BUDGET');
+    this.gatherDiagnosticPending = true;
+    const textures: GPUTexture[] = [], leases: { pool: GpuGeometryPagePool; lease: GeometryGpuFrameLease }[] = [];
+    let read: GPUBuffer | undefined, owned = 0, submitted = false;
+    const account = (bytes: number) => { owned += bytes; this.stats.ownedGpuBytes += bytes; };
+    try {
+      const programs = [...new Set(this.batches.map(batch => batch.materialPipelines))];
+      const compiled = await Promise.all(programs.map(async program =>
+        Promise.all([program.gatherDiagnostic!(), program.gatherDiagnostic!(true)])));
+      if (this.disposed) throw new Error('RENDERER_DISPOSED');
+      if (this.stats.frames !== frame || this.materialRevision !== revision) throw new Error('FINAL_GATHER_DIAGNOSTIC_FRAME_CHANGED');
+      for (let i = 0; i < 3; i++) {
+        textures.push(this.device.createTexture({ label: 'temporary GI reconstruction ' + i, size: [width, height],
+          format: i === 2 ? 'depth32float' : 'rgba32uint',
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | (i === 2 ? 0 : GPUTextureUsage.COPY_SRC) }));
+        account(width * height * (i === 2 ? 4 : 16));
+      }
+      read = this.device.createBuffer({ label: 'bounded GI reconstruction readback', size: requested.length * 1024,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }); account(read.size);
+      for (const batch of this.batches) if (batch.stream) {
+        const pool = batch.stream.runtime.pool; leases.push({ pool, lease: pool.acquireFrame([...pool.residentPageIds()]) });
+      }
+      const encoder = this.device.createCommandEncoder({ label: 'explicit GI reconstruction diagnostic' });
+      const minX = Math.min(...requested.map(p => p.x)), minY = Math.min(...requested.map(p => p.y));
+      const maxX = Math.max(...requested.map(p => p.x)), maxY = Math.max(...requested.map(p => p.y));
+      for (let mode = 0; mode < 2; mode++) {
+        const overrides = new Map(programs.map((program, i) => [program, compiled[i][mode]]));
+        for (const recovery of this.occlusion ? [false, true] : [false]) {
+        const pass = encoder.beginRenderPass({ label: 'GI reconstruction decisions', colorAttachments: [
+          { view: textures[0].createView(), clearValue: mode ? [0, 0, 0, 0] : [4, 0, 0, 0], loadOp: recovery ? 'load' : 'clear', storeOp: 'store' },
+          { view: textures[1].createView(), clearValue: mode ? [0, 0, 0, 0] : [0x80808080, 0x80808080, 0x80808080, 0x80808080],
+            loadOp: recovery ? 'load' : 'clear', storeOp: 'store' },
+        ], depthStencilAttachment: { view: textures[2].createView(), depthClearValue: 1,
+          depthLoadOp: recovery ? 'load' : 'clear', depthStoreOp: 'store' } });
+        pass.setScissorRect(minX, minY, maxX - minX + 1, maxY - minY + 1);
+        pass.setBindGroup(0, this.frameBindGroup);
+        pass.setBindGroup(3, this.lightingGroups[this.diffuseGi!.surfaceBindingIndex]);
+        this.draw(pass, 'surface', recovery, overrides); pass.end();
+        }
+        for (let i = 0; i < requested.length; i++) for (let attachment = 0; attachment < 2; attachment++) {
+          encoder.copyTextureToBuffer({ texture: textures[attachment], origin: requested[i] },
+            { buffer: read, offset: i * 1024 + mode * 512 + attachment * 256, bytesPerRow: 256, rowsPerImage: 1 }, { width: 1, height: 1 });
+        }
+      }
+      if (leases.length) {
+        const completion = GpuGeometryPagePool.submitFrames(leases, [encoder.finish()]); submitted = true;
+        const result = await completion; if (result.error) throw new Error(result.error);
+      } else { this.device.queue.submit([encoder.finish()]); submitted = true; }
+      await read.mapAsync(GPUMapMode.READ);
+      if (this.disposed) throw new Error('RENDERER_DISPOSED');
+      if (this.errors.length) throw new Error(this.errors.join('\n'));
+      const mapped = new Uint32Array(read.getMappedRange()), words = new Uint32Array(requested.length * 8), surfaceWords = new Uint32Array(words.length);
+      for (let i = 0; i < requested.length; i++) {
+        words.set(mapped.subarray(i * 256, i * 256 + 4), i * 8);
+        words.set(mapped.subarray(i * 256 + 64, i * 256 + 68), i * 8 + 4);
+        surfaceWords.set(mapped.subarray(i * 256 + 128, i * 256 + 132), i * 8);
+        surfaceWords.set(mapped.subarray(i * 256 + 192, i * 256 + 196), i * 8 + 4);
+      }
+      const surfaces = decodeFinalGatherDiagnosticSurfaces(surfaceWords, requested);
+      return { frame, materialRevision: revision, width, height, temporaryBytes,
+        points: decodeFinalGatherDiagnostics(words, requested).map((point, index) => {
+          const surface = surfaces[index];
+          if (surface && !this.batches[surface.sourceId - 1]) throw new Error('FINAL_GATHER_DIAGNOSTIC_SOURCE');
+          return { ...point, surface: surface ? { ...surface, batch: this.batches[surface.sourceId - 1].scene.name } : null };
+        }) };
+    } finally {
+      if (!submitted) for (const { pool, lease } of leases) try { pool.cancelFrame(lease); } catch { /* Already retired. */ }
+      if (read?.mapState === 'mapped') read.unmap(); read?.destroy();
+      for (const texture of textures) texture.destroy();
+      if (!this.disposed) this.stats.ownedGpuBytes -= owned;
+      this.gatherDiagnosticPending = false;
+    }
   }
 
   /** Diagnostic only: linear scene radiance including media, before exposure/display transfer. */

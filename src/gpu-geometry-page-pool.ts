@@ -22,6 +22,17 @@ export interface GeometryGpuClusterLocation {
   firstIndex: number; indexCount: number;
 }
 export interface GeometryGpuFrameLease { readonly serial: number }
+export interface GeometryGpuPoolMigrationOptions {
+  /** Capacity of the new pool; the source pool stays owned and usable. */
+  readonly maxResidentBytes: number;
+  /** Actual source + target GPU allocations, including both metadata sets. */
+  readonly maxPeakBytes: number;
+  /** Defaults to all resident pages. Roots are always retained automatically. */
+  readonly retainedPages?: readonly number[];
+  /** One migration's GPU copy work, not a per-render-frame upload allowance. */
+  readonly maxCopyBytes?: number;
+  readonly maxCopyPages?: number;
+}
 type Slot = { page: number | null; generation: number };
 type Resident = { slot: number; generation: number; touched: number };
 type Pending = { packed: PackedGeometryGpuPage; bytes: number; priority: number; sequence: number;
@@ -72,6 +83,7 @@ export class GpuGeometryPagePool {
   private error: string | null = null;
   private uploads = 0;
   private evictions = 0;
+  private migrating = false;
 
   static async create(device: GPUDevice, directory: GeometryStreamDirectory, options: GeometryGpuPoolOptions = {},
     track: (bytes: number) => void = () => {}): Promise<GpuGeometryPagePool> {
@@ -194,6 +206,94 @@ export class GpuGeometryPagePool {
     const at = clusterId * 8;
     return { baseVertex: this.locations[at], firstVertex: this.locations[at + 1], vertexCount: this.locations[at + 2],
       firstIndex: this.locations[at + 3], indexCount: this.locations[at + 4], pageId, generation: resident.generation, slot: resident.slot };
+  }
+
+  /** Prepare a separately owned pool by GPU-to-GPU copying a leased snapshot.
+   * Publication is the returned promise: no target or new bindings escape before
+   * the copy fence and validation scopes complete. The caller must rebuild its
+   * selection/deformation bindings and retire the source separately. This is a
+   * bounded migration primitive, not automatic scene-wide capacity scheduling. */
+  async migrateResident(options: GeometryGpuPoolMigrationOptions): Promise<{
+    pool: GpuGeometryPagePool; copiedPages: number[]; copiedBytes: number; peakBytes: number;
+  }> {
+    this.live();
+    if (this.migrating) throw new Error('GEOMETRY_GPU_POOL_MIGRATION_BUSY');
+    const targetBudget = option(options?.maxResidentBytes, 0, 1, 256 * MiB, 'migration.maxResidentBytes');
+    const peakBudget = option(options?.maxPeakBytes, 0, 1, 512 * MiB, 'migration.maxPeakBytes');
+    const maxCopyBytes = option(options.maxCopyBytes, 16 * MiB, 1, 256 * MiB, 'migration.maxCopyBytes');
+    const maxCopyPages = option(options.maxCopyPages, 256, 1, 4096, 'migration.maxCopyPages');
+    const requested = options.retainedPages ?? [...this.resident.keys()];
+    const pages = this.pageSet(requested);
+    if (pages.size !== requested.length) throw new Error('GEOMETRY_GPU_POOL_MIGRATION_DUPLICATE_PAGE');
+    for (const page of this.directory.rootPages) pages.add(page);
+    const ordered = [...this.directory.rootPages, ...[...pages].filter(id => !this.rootSlots.has(id)).sort((a, b) => a - b)];
+    const layout = geometryGpuPoolLayout(this.directory);
+    const slots = Math.min(this.directory.pages.length, Math.floor((targetBudget - layout.metadataBytes) / this.bytesPerSlot));
+    if (slots < ordered.length) throw new Error('GEOMETRY_GPU_POOL_MIGRATION_CAPACITY');
+    const peakBytes = this.allocatedBytes + layout.metadataBytes + slots * this.bytesPerSlot;
+    if (peakBytes > peakBudget) throw new Error('GEOMETRY_GPU_POOL_MIGRATION_PEAK_BUDGET');
+    const copiedBytes = ordered.reduce((sum, id) => sum + this.directory.pages[id].clusterIds.reduce((bytes, cluster) => bytes
+      + this.directory.clusters[cluster].vertexCount * GEOMETRY_GPU_VERTEX_BYTES + this.directory.clusters[cluster].triangleCount * 12, 0), 0);
+    if (ordered.length > maxCopyPages || copiedBytes > maxCopyBytes) throw new Error('GEOMETRY_GPU_POOL_MIGRATION_COPY_BUDGET');
+    // Acquiring before the first await protects the exact source offsets during
+    // target allocation; ordinary rendering can still lease the same pages.
+    const lease = this.acquireFrame(ordered);
+    this.migrating = true;
+    let target: GpuGeometryPagePool | undefined, submitted = false;
+    try {
+      target = await GpuGeometryPagePool.create(this.device, this.directory,
+        { ...this.options, maxResidentBytes: targetBudget }, this.track);
+      this.live(); target.live();
+      this.device.pushErrorScope('out-of-memory'); this.device.pushErrorScope('validation');
+      let completion: Promise<{ error: string | null }> | undefined;
+      let encodeError: unknown;
+      try {
+        const encoder = this.device.createCommandEncoder({ label: 'migrate resident geometry pages' });
+        const flags = new Uint32Array(this.directory.pages.length);
+        for (const [slot, pageId] of ordered.entries()) {
+          const previous = this.resident.get(pageId)!;
+          const clusters = this.directory.pages[pageId].clusterIds;
+          const vertexBytes = clusters.reduce((sum, id) => sum + this.directory.clusters[id].vertexCount * GEOMETRY_GPU_VERTEX_BYTES, 0);
+          const indexBytes = clusters.reduce((sum, id) => sum + this.directory.clusters[id].triangleCount * 12, 0);
+          encoder.copyBufferToBuffer(this.vertices, previous.slot * this.verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES,
+            target.vertices, slot * this.verticesPerSlot * GEOMETRY_GPU_VERTEX_BYTES, vertexBytes);
+          encoder.copyBufferToBuffer(this.indices, previous.slot * this.indicesPerSlot * 4,
+            target.indices, slot * this.indicesPerSlot * 4, indexBytes);
+          target.slots[slot] = { page: pageId, generation: 1 };
+          target.resident.set(pageId, { slot, generation: 1, touched: ++target.sequence });
+          for (const cluster of clusters) {
+            const at = cluster * 8;
+            target.locations.set(this.locations.subarray(at, at + 8), at);
+            target.locations[at] = slot * this.verticesPerSlot;
+            target.locations[at + 3] = slot * this.indicesPerSlot + this.locations[at + 3] - previous.slot * this.indicesPerSlot;
+            target.locations[at + 6] = 1; target.locations[at + 7] = slot;
+          }
+          flags[pageId] = 1;
+        }
+        // These writes are private preparation, not public residency: the target
+        // remains inaccessible until all copies and the completion fence settle.
+        this.device.queue.writeBuffer(target.clusterLocations, 0, target.locations.buffer, 0, target.locations.byteLength);
+        this.device.queue.writeBuffer(target.pageResidency, 0, flags.buffer, 0, flags.byteLength);
+        completion = this.submitFrame(lease, [encoder.finish()]); submitted = true;
+      } catch (error) { encodeError = error; }
+      const checks = await Promise.allSettled([this.device.popErrorScope(), this.device.popErrorScope(),
+        completion ?? Promise.resolve({ error: null })]);
+      if (encodeError) throw encodeError;
+      for (const check of checks) {
+        if (check.status === 'rejected') throw check.reason;
+        const value = check.value;
+        if (value && ('message' in value || value.error)) throw new Error('GEOMETRY_GPU_POOL_MIGRATION_FAILED: '
+          + ('message' in value ? value.message : value.error));
+      }
+      this.live(); target.live();
+      return { pool: target, copiedPages: ordered, copiedBytes, peakBytes };
+    } catch (error) {
+      try { target?.dispose(); } catch { /* Preserve the migration failure. */ }
+      throw error;
+    } finally {
+      if (!submitted && !this.disposed && this.frames.has(lease)) this.cancelFrame(lease);
+      this.migrating = false;
+    }
   }
 
   /** A positive, monotonic frame number prevents repeated calls from resetting the budget. */
@@ -347,6 +447,7 @@ export class GpuGeometryPagePool {
       pinnedPages: this.disposed ? [] : [...new Set([...this.directory.rootPages, ...this.pinned])].sort((a, b) => a - b),
       leasedPages: [...this.leased.keys()].sort((a, b) => a - b), framesInFlight: this.frames.size,
       activePage: this.activePage ?? null, uploadFrame: this.uploadFrameNumber, uploads: this.uploads, evictions: this.evictions,
+      migrationPending: this.migrating,
       residency: 'published-on-queue' as const, limits: { ...this.options } };
   }
   dispose(): void {

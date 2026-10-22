@@ -24,6 +24,7 @@ test('production final gather resolves the analytic black half-roof and exposes 
   });
   console.log('GI_FILTER_BOUNDARY_PRODUCTION ' + JSON.stringify({ schedule: result.schedule,
     samples: result.samples.length, metrics: result.metrics, widths: result.widths,
+    receiverAudit: result.receiverAudit,
     errors: result.errors, afterDispose: result.afterDispose }));
   expect(pageErrors).toEqual([]); expect(result.errors).toEqual([]); expect(result.afterDispose).toBe(0);
   expect(result.size).toEqual({ width: 128, height: 128 });

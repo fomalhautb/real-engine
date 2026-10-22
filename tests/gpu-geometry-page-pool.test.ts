@@ -17,6 +17,9 @@ class FakeDevice {
   readonly lost: Promise<{ message: string }>;
   private lose!: (info: { message: string }) => void;
   failBufferAt = -1;
+  failCopy = false;
+  validationOnCopy = false;
+  private copyValidationPending = false;
 
   constructor() { this.lost = new Promise(resolve => { this.lose = resolve; }); }
   createBuffer = ({ label, size }: { label: string; size: number }): GPUBuffer => {
@@ -27,7 +30,25 @@ class FakeDevice {
     return buffer as unknown as GPUBuffer;
   };
   pushErrorScope = (_filter: string): void => {};
-  popErrorScope = async (): Promise<null> => null;
+  popErrorScope = async (): Promise<GPUError | null> => {
+    if (this.copyValidationPending) { this.copyValidationPending = false; return { message: 'FAKE_COPY_VALIDATION' } as GPUError; }
+    return null;
+  };
+  createCommandEncoder = (): GPUCommandEncoder => {
+    const copies: (() => void)[] = [];
+    return {
+      copyBufferToBuffer: (source: GPUBuffer, sourceOffset: number, target: GPUBuffer, targetOffset: number, size: number) => {
+        if (this.failCopy) throw new Error('FAKE_COPY_FAILED');
+        if (this.validationOnCopy) this.copyValidationPending = true;
+        copies.push(() => {
+          const from = source as unknown as FakeBuffer, to = target as unknown as FakeBuffer;
+          if (from.destroyed || to.destroyed) throw new Error('FAKE_COPY_DESTROYED');
+          to.data.set(from.data.subarray(sourceOffset, sourceOffset + size), targetOffset);
+        });
+      },
+      finish: () => ({ copies }),
+    } as unknown as GPUCommandEncoder;
+  };
   queue = {
     writeBuffer: (target: GPUBuffer, offset: number, source: ArrayBuffer, sourceOffset: number, size: number): void => {
       const buffer = target as unknown as FakeBuffer;
@@ -35,7 +56,10 @@ class FakeDevice {
       buffer.data.set(new Uint8Array(source, sourceOffset, size), offset);
       this.writes.push({ label: buffer.label, offset, bytes: size });
     },
-    submit: (commands: readonly GPUCommandBuffer[]): void => { this.submissions.push(commands); },
+    submit: (commands: readonly GPUCommandBuffer[]): void => {
+      this.submissions.push(commands);
+      for (const command of commands) for (const copy of (command as unknown as { copies?: (() => void)[] }).copies ?? []) copy();
+    },
     onSubmittedWorkDone: (): Promise<void> => new Promise((resolve, reject) => {
       this.fences.push({ resolve, reject });
     }),
@@ -131,6 +155,101 @@ beforeEach(() => {
 });
 afterEach(() => { for (const pool of pools.splice(0)) pool.dispose(); vi.unstubAllGlobals(); });
 afterAll(() => { pages = []; });
+
+describe('leased GPU pool capacity migration', () => {
+  async function ready(device: FakeDevice, track: (bytes: number) => void = () => {}) {
+    const fixture = smallPoolFixture(), slotBytes = 456, metadata = 108;
+    const pool = await GpuGeometryPagePool.create(device as unknown as GPUDevice, fixture.directory,
+      { maxResidentBytes: metadata + 3 * slotBytes }, track);
+    pools.push(pool);
+    for (const id of [2, 0, 1]) pool.enqueue(id, fixture.decoded[id]);
+    uploadUntil(pool, [0, 1, 2]);
+    return { pool, slotBytes, metadata };
+  }
+  const bytes = (buffer: GPUBuffer) => (buffer as unknown as FakeBuffer).data;
+
+  it('copies only retained pages into compact slots, keeps old draws leased, and publishes after the fence', async () => {
+    const device = new FakeDevice(); let owned = 0, peak = 0;
+    const { pool, slotBytes, metadata } = await ready(device, delta => { owned += delta; peak = Math.max(peak, owned); });
+    const oldBytes = owned, oldLocations = pool.clusterLocation(1)!;
+    const oldFrame = pool.acquireFrame([0, 1, 2]);
+    let published = false;
+    const task = pool.migrateResident({ maxResidentBytes: metadata + 2 * slotBytes,
+      maxPeakBytes: oldBytes + metadata + 2 * slotBytes, retainedPages: [1] }).then(result => { published = true; return result; });
+    expect(pool.diagnostics()).toMatchObject({ migrationPending: true, framesInFlight: 2 });
+    await expect(pool.migrateResident({ maxResidentBytes: oldBytes, maxPeakBytes: oldBytes * 2 })).rejects.toThrow('MIGRATION_BUSY');
+    await vi.waitFor(() => expect(device.fences).toHaveLength(1));
+    expect(published).toBe(false);
+    expect(pool.residentPageIds()).toEqual(new Set([2, 0, 1]));
+    device.completeNext(); const result = await task; pools.push(result.pool);
+    const target = result.pool, moved = target.clusterLocation(1)!;
+    expect(result.copiedPages).toEqual([2, 1]);
+    expect(result.copiedBytes).toBe(3 * 144 * 2 + (6 + 3) * 4);
+    expect(result.peakBytes).toBe(peak); expect(owned).toBe(peak);
+    expect(target.slotCount).toBe(2); expect(moved.slot).toBe(1); expect(oldLocations.slot).toBe(2);
+    expect(bytes(target.vertices).slice(moved.baseVertex * 144, (moved.baseVertex + 3) * 144))
+      .toEqual(bytes(pool.vertices).slice(oldLocations.baseVertex * 144, (oldLocations.baseVertex + 3) * 144));
+    expect(bytes(target.indices).slice(moved.firstIndex * 4, (moved.firstIndex + 3) * 4))
+      .toEqual(bytes(pool.indices).slice(oldLocations.firstIndex * 4, (oldLocations.firstIndex + 3) * 4));
+    expect(Array.from(new Uint32Array(bytes(target.pageResidency).buffer))).toEqual([0, 1, 1]);
+    expect(target.diagnostics()).toMatchObject({ rootsReady: true, pendingPages: [], framesInFlight: 0 });
+    expect(pool.diagnostics()).toMatchObject({ migrationPending: false, framesInFlight: 1, residentPages: [0, 1, 2] });
+    pool.cancelFrame(oldFrame); pool.dispose(); expect(owned).toBe(metadata + 2 * slotBytes);
+    target.dispose(); expect(owned).toBe(0);
+  });
+
+  it('rejects overlap, copy-work, capacity and malformed page budgets before allocation or leasing', async () => {
+    const device = new FakeDevice(), { pool, metadata, slotBytes } = await ready(device);
+    const allocationCount = device.buffers.length, current = pool.diagnostics().allocatedGpuBytes;
+    const base = { maxResidentBytes: current, maxPeakBytes: current * 2 };
+    await expect(pool.migrateResident({ ...base, maxPeakBytes: current * 2 - 1 })).rejects.toThrow('PEAK_BUDGET');
+    await expect(pool.migrateResident({ ...base, maxCopyPages: 2 })).rejects.toThrow('COPY_BUDGET');
+    await expect(pool.migrateResident({ ...base, maxCopyBytes: 1 })).rejects.toThrow('COPY_BUDGET');
+    await expect(pool.migrateResident({ ...base, maxResidentBytes: metadata + slotBytes })).rejects.toThrow('CAPACITY');
+    await expect(pool.migrateResident({ ...base, retainedPages: [0, 0] })).rejects.toThrow('DUPLICATE_PAGE');
+    expect(device.buffers).toHaveLength(allocationCount); expect(pool.diagnostics().framesInFlight).toBe(0);
+    expect(pool.diagnostics().migrationPending).toBe(false);
+  });
+
+  it('cleans partial allocation and encoding failure while preserving the source', async () => {
+    const device = new FakeDevice(); let owned = 0;
+    const { pool } = await ready(device, delta => { owned += delta; });
+    const current = owned, base = { maxResidentBytes: current, maxPeakBytes: current * 2 };
+    device.failBufferAt = device.buffers.length + 2;
+    await expect(pool.migrateResident(base)).rejects.toThrow('FAKE_ALLOCATION_FAILED');
+    expect(owned).toBe(current); expect(pool.diagnostics()).toMatchObject({ disposed: false, framesInFlight: 0, migrationPending: false });
+    device.failBufferAt = -1; device.failCopy = true;
+    await expect(pool.migrateResident(base)).rejects.toThrow('FAKE_COPY_FAILED');
+    expect(owned).toBe(current); expect(pool.diagnostics()).toMatchObject({ disposed: false, framesInFlight: 0, migrationPending: false });
+    expect(pool.residentPageIds()).toEqual(new Set([2, 0, 1]));
+  });
+
+  it('waits for the copy fence even when validation fails, then releases only the candidate', async () => {
+    const device = new FakeDevice(); let owned = 0;
+    const { pool } = await ready(device, delta => { owned += delta; });
+    const current = owned; device.validationOnCopy = true;
+    const task = pool.migrateResident({ maxResidentBytes: current, maxPeakBytes: 2 * current });
+    const rejected = expect(task).rejects.toThrow('FAKE_COPY_VALIDATION');
+    await vi.waitFor(() => expect(device.fences).toHaveLength(1));
+    expect(owned).toBe(2 * current); expect(pool.diagnostics().framesInFlight).toBe(1);
+    device.completeNext(); await rejected;
+    expect(owned).toBe(current); expect(pool.diagnostics()).toMatchObject({ disposed: false, framesInFlight: 0, migrationPending: false });
+  });
+
+  it('cleans both owners on queue failure and refuses publication after source disposal', async () => {
+    const device = new FakeDevice(); let owned = 0;
+    const { pool } = await ready(device, delta => { owned += delta; });
+    const current = owned, task = pool.migrateResident({ maxResidentBytes: current, maxPeakBytes: 2 * current });
+    const rejected = expect(task).rejects.toThrow('FAKE_QUEUE_FAILED');
+    await vi.waitFor(() => expect(device.fences).toHaveLength(1));
+    device.fences.shift()!.reject(new Error('FAKE_QUEUE_FAILED')); await rejected;
+    expect(owned).toBe(0); expect(pool.diagnostics()).toMatchObject({ disposed: true, framesInFlight: 0, migrationPending: false });
+    const other = await ready(device, delta => { owned += delta; });
+    const disposeTask = other.pool.migrateResident({ maxResidentBytes: owned, maxPeakBytes: owned * 2 });
+    other.pool.dispose(); await expect(disposeTask).rejects.toThrow('DISPOSED');
+    expect(owned).toBe(0); expect(device.buffers.every(buffer => buffer.destroyed)).toBe(true);
+  });
+});
 
 describe('GPU geometry page pool CPU lifecycle with deferred fake queue', () => {
   it('rejects a root budget before allocating any buffers', async () => {

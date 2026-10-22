@@ -9,7 +9,9 @@ interface Query { position: Vec3; normal: Vec3; pixel?: [number, number]; }
 interface Field { radiance: Vec3; blocked: (index: number) => boolean;
   invalid?: (index: number) => boolean; stale?: (index: number) => boolean;
   blockedMoments?: [number, number]; }
-interface Anchor { position: Vec3; normal: Vec3; geometry?: [number, number]; irradiance: Vec3; frame?: number; }
+interface Anchor { position: Vec3; normal: Vec3; geometry?: [number, number]; irradiance: Vec3; frame?: number;
+  identity?: [number, number]; }
+interface Diagnostic { total: number; branch: number; primaryAccepted: number; ringAccepted: number; rejections: number[]; }
 
 /** Known inputs are supplied directly to the production reconstruction shaders.
  * This isolates interpolation from triangle traversal, ray sampling and textures. */
@@ -26,25 +28,37 @@ export async function runGiReconstructionFixture() {
   };
   device.pushErrorScope('validation');
   const results: { label: string; actual: number[]; expected?: Vec3; upperFraction?: number }[] = [];
+  const diagnostics: Diagnostic[] = [];
   try {
     const giParameters = allocate(112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const probes = allocate(8 * DIFFUSE_GI_PROBE_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const gatherParameters = allocate(FINAL_GATHER_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const anchors = allocate(16 * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const input = allocate(64, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    const output = allocate(16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    const readback = allocate(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    const outputBytes = 112;
+    const output = allocate(outputBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const readback = allocate(outputBytes, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     const source = surfaceFrameSource + diffuseGiSampleSource + finalGatherSampleSource + `
 struct ReconstructionQuery { pixel: vec4f, position: vec4f, normal: vec4f, geometry: vec4f }
+struct ReconstructionOutput {
+  irradiance: vec4f, measures: vec4f, state: vec4u, rejections: array<u32, 16>,
+}
 @group(0) @binding(0) var<storage, read> query: ReconstructionQuery;
-@group(0) @binding(1) var<storage, read_write> answer: vec4f;
+@group(0) @binding(1) var<storage, read_write> answer: ReconstructionOutput;
 @compute @workgroup_size(1)
 fn reconstruct() {
+  answer.measures = vec4f(0.0);
+  answer.state = vec4u(0u);
+  for (var slot = 0u; slot < 16u; slot++) { answer.rejections[slot] = 128u; }
   if (query.pixel.z == 0.0) {
-    answer = vec4f(diffuseGiSurfaceIrradiance(query.position.xyz, query.normal.xyz, query.geometry.xyz), 1.0);
+    answer.irradiance = vec4f(diffuseGiSurfaceIrradiance(query.position.xyz, query.normal.xyz, query.geometry.xyz), 1.0);
   } else {
-    answer = vec4f(finalGatherIrradiance(query.pixel.xy, query.position.xyz, query.normal.xyz, query.geometry.xyz,
-      vec2u(1u, 1u)), 1.0);
+    let result = finalGatherReconstruct(query.pixel.xy, query.position.xyz, query.normal.xyz, query.geometry.xyz,
+      vec2u(1u, 1u));
+    answer.irradiance = vec4f(result.irradiance, 1.0);
+    answer.measures.x = result.total;
+    answer.state = vec4u(result.branch, result.primaryAccepted, result.ringAccepted, 0u);
+    for (var slot = 0u; slot < 16u; slot++) { answer.rejections[slot] = result.rejections[slot]; }
   }
 }`;
     const shader = device.createShaderModule({ code: source });
@@ -105,7 +119,8 @@ fn reconstruct() {
         const base = index * anchorFloats, geometry = anchor.geometry ?? [0, 1];
         packedAnchors.set([...anchor.position, geometry[0]], base);
         packedAnchors.set([...anchor.normal, geometry[1]], base + 4);
-        anchorWords.set([1, 1, 1, index], base + 8); anchorWords.set([1, 1, 1, 0], base + 12);
+        anchorWords.set([anchor.identity?.[0] ?? 1, anchor.identity?.[1] ?? 1, 1, index], base + 8);
+        anchorWords.set([1, 1, 1, 0], base + 12);
         packedAnchors.set([...anchor.irradiance, 64], base + 16);
         anchorWords.set([1, anchor.frame ?? 1, 0, 0], base + 20);
       });
@@ -117,9 +132,15 @@ fn reconstruct() {
       const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
       pass.setPipeline(pipeline); pass.setBindGroup(0, ioGroup);
       pass.setBindGroup(1, emptyGroup); pass.setBindGroup(2, emptyGroup); pass.setBindGroup(3, lightingGroup);
-      pass.dispatchWorkgroups(1); pass.end(); encoder.copyBufferToBuffer(output, 0, readback, 0, 16);
+      pass.dispatchWorkgroups(1); pass.end(); encoder.copyBufferToBuffer(output, 0, readback, 0, outputBytes);
       device.queue.submit([encoder.finish()]); await readback.mapAsync(GPUMapMode.READ);
-      try { return Array.from(new Float32Array(readback.getMappedRange()).slice(0, 3)); }
+      try {
+        const raw = readback.getMappedRange();
+        const floats = new Float32Array(raw), words = new Uint32Array(raw);
+        diagnostics.push({ total: floats[4], branch: words[8], primaryAccepted: words[9], ringAccepted: words[10],
+          rejections: Array.from(words.slice(12, 28)) });
+        return Array.from(floats.slice(0, 3));
+      }
       finally { readback.unmap(); }
     };
     const sky: Vec3 = [0.1, 0.2, 0.3], expected = sky.map(value => Math.PI * value) as Vec3;
@@ -171,15 +192,20 @@ fn reconstruct() {
     results.push({ label: 'stale-ring-anchor-rejected', actual: await dispatch(open, gatherQuery, stale), expected });
     const far = makeAnchors(); far[4] = { ...ring[4], position: [-0.3, 0, 0] };
     results.push({ label: 'distant-ring-anchor-rejected', actual: await dispatch(open, gatherQuery, far), expected });
+    const otherIdentity = makeAnchors(); otherIdentity[4] = { ...ring[4], identity: [1, 2] };
+    results.push({ label: 'different-entity-ring-anchor-rejected', actual: await dispatch(open, gatherQuery, otherIdentity), expected });
     const primary = makeAnchors(); primary.forEach(anchor => { anchor.normal = [0, 1, 0]; anchor.irradiance = recovered; });
     primary[4].irradiance = [40, 0, 0];
     results.push({ label: 'covered-cell-does-not-use-ring', actual: await dispatch(open, gatherQuery, primary), expected: recovered });
     const partial = makeAnchors(); partial.forEach(anchor => { anchor.normal = [0, 1, 0]; anchor.irradiance = [10, 10, 10]; });
     partial[15].irradiance = recovered;
     results.push({ label: 'partial-last-cell-position', actual: await dispatch(open, { ...center, pixel: [13.5, 13.5] }, partial, 14), expected: recovered });
+    results.push({ label: 'edge-out-of-bounds-order', actual: await dispatch(open,
+      { ...center, pixel: [0.5, 0.5] }, makeAnchors()), expected });
   } finally {
     try { validationError = String((await device.popErrorScope())?.message ?? ''); }
     finally { for (const buffer of buffers) { buffer.destroy(); ownedBytes -= buffer.size; } device.destroy(); }
   }
-  return { results, errors, validationError, ownedBytes };
+  return { results: results.map((sample, index) => ({ ...sample, diagnostic: diagnostics[index] })),
+    errors, validationError, ownedBytes };
 }

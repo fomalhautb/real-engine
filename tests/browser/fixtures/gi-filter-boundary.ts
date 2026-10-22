@@ -1,5 +1,5 @@
 import type { InstanceState, SceneBatch } from '../../../src/contracts';
-import { createPlane } from '../../../src/geometry';
+import { createPlane, type MeshData } from '../../../src/geometry';
 import { FINAL_GATHER_ANCHOR_BYTES, FINAL_GATHER_PARAMETER_BYTES,
   type FinalGatherProbeResult } from '../../../src/gpu-final-gather';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, octaEncode } from '../../../src/gi-visibility';
@@ -16,7 +16,7 @@ type GatherAnchor = FinalGatherProbeResult['anchors'][number];
 const sky: Vec3 = [0.1, 0.2, 0.3];
 const roofHeight = 0.03, normalBias = 0.0001, maxDistance = 12;
 const width = 128, spacing = 4, columns = width / spacing;
-const frameCount = 256, raysPerAnchor = 16;
+const maxFrameCount = 256, raysPerAnchor = 16;
 
 /** Cosine-weighted sky visibility below an infinite black roof at y=h, x>=0.
  * The receiver has normal +Y. Its irradiance is pi * sky * this fraction. */
@@ -67,6 +67,30 @@ function batch(name: string, id: number, state: InstanceState, black = false): S
       doubleSided: true, baseColor: m.constant(black ? [0, 0, 0, 1] : [0.5, 0.5, 0.5, 1]),
       emissive: m.constant([0, 0, 0, 1]), metallic: 0, roughness: 1 } } };
 }
+function tiledReceiverPlane(cells: number): MeshData {
+  const plane = createPlane();
+  const cellCount = cells * cells;
+  const stride = plane.vertices.byteLength / plane.vertexCount;
+  const vertices = new ArrayBuffer(plane.vertices.byteLength * cellCount);
+  const bytes = new Uint8Array(vertices), sourceBytes = new Uint8Array(plane.vertices);
+  const positions = new Float32Array(vertices), sourcePositions = new Float32Array(plane.vertices);
+  const indices = new Uint32Array(plane.indices.length * cellCount);
+  const uvs = plane.uvs && new Float32Array(plane.uvs.length * cellCount);
+  for (let row = 0; row < cells; row++) for (let col = 0; col < cells; col++) {
+    const cell = row * cells + col;
+    for (let vertex = 0; vertex < plane.vertexCount; vertex++) {
+      const source = vertex * stride, destination = (cell * plane.vertexCount + vertex) * stride;
+      bytes.set(sourceBytes.subarray(source, source + stride), destination);
+      positions[destination / 4] = (col + sourcePositions[source / 4] + 0.5) / cells - 0.5;
+      positions[destination / 4 + 2] = (row + sourcePositions[source / 4 + 2] + 0.5) / cells - 0.5;
+    }
+    for (let i = 0; i < plane.indices.length; i++) {
+      indices[cell * plane.indices.length + i] = cell * plane.vertexCount + plane.indices[i];
+    }
+    if (uvs && plane.uvs) uvs.set(plane.uvs, cell * plane.uvs.length);
+  }
+  return { ...plane, vertices, indices, vertexCount: plane.vertexCount * cellCount, uvs };
+}
 function isReceiver(anchor: GatherAnchor): boolean {
   return anchor.valid && anchor.identity[1] === 1 && Math.abs(anchor.position[1]) < 1e-5
     && anchor.geometricNormal[1] > 0.9999 && anchor.normal[1] > 0.9999;
@@ -74,11 +98,20 @@ function isReceiver(anchor: GatherAnchor): boolean {
 
 /** Full production raster receivers, triangle traversal, cosine sampling,
  * raw history and denoise. Every render call is explicit. */
-export async function runGiFilterBoundaryFixture() {
+export async function runGiFilterBoundaryFixture(samplingFrames = maxFrameCount) {
+  if (!Number.isInteger(samplingFrames) || samplingFrames < 1 || samplingFrames > maxFrameCount) {
+    throw new RangeError(`samplingFrames must be an integer in [1, ${maxFrameCount}]`);
+  }
+  const frameCount = samplingFrames;
   const canvas = document.createElement('canvas');
   canvas.style.cssText = 'position:fixed;left:0;top:0;width:128px;height:128px;';
   document.body.appendChild(canvas);
-  const receiver = batch('floor', 1, instance(1, 0, 0, 80, 80));
+  // The 2 m receiver is split into 16x16 cells to isolate GI transport from
+  // large-triangle raster interpolation at this 2.5 cm grazing camera. This
+  // test does not prove giant two-triangle near-clipping precision; that
+  // runtime defect remains open. The roof and analytic tail are unchanged.
+  const receiver = batch('floor', 1, instance(1, 0, 0, 2, 2));
+  receiver.mesh = tiledReceiverPlane(16);
   // createPlane spans [-.5,.5]: this roof is x=[0,40], z=[-40,40].
   const roofState = instance(2, 20, roofHeight, 40, 80);
   const roof = batch('black-half-roof', 2, roofState, true);
@@ -92,7 +125,7 @@ export async function runGiFilterBoundaryFixture() {
       diffuseGi: { origin: [-0.5, 0.1, -0.5], spacing: [1, 1, 1], counts: [2, 2, 2],
         raysPerProbe: 16, maxDistance, skyRadiance: sky, multiBounce: false,
         finalGather: { receiver: 'raster', pixelSpacing: spacing, maxAnchors: indices.length, raysPerAnchor,
-          maxHistory: frameCount, normalBias, pathSegments: 1 } },
+          maxHistory: maxFrameCount, normalBias, pathSegments: 1 } },
     });
     renderer.setSun({ direction: [0, 1, 0], color: [0, 0, 0] });
     for (let frame = 0; frame < 2; frame++) renderer.render(eye, target);
@@ -102,6 +135,41 @@ export async function runGiFilterBoundaryFixture() {
     const firstSamplingFrame = renderer.stats.frames + 1;
     for (let frame = 0; frame < frameCount; frame++) renderer.render(eye, target);
     const boundary = await renderer.probeDiffuseGiFinalGather(indices);
+    const surfaceIndices = [495, 527, 559] as const;
+    const surfacePixels = surfaceIndices.map(index => ({
+      x: (index % columns) * spacing + 2,
+      y: Math.floor(index / columns) * spacing + 2,
+    }));
+    const surfaceProbe = await renderer.probeDiffuseGiReconstruction(surfacePixels);
+    const surfaceExamples = surfaceProbe.points.map((point, sample) => {
+      const anchor = boundary.anchors[surfaceIndices[sample]];
+      return { anchorIndex: surfaceIndices[sample], anchor: {
+        position: anchor.position, normal: anchor.normal,
+        geometricNormal: anchor.geometricNormal, identity: anchor.identity,
+      }, pixel: point.pixel, branch: point.branch, surface: point.surface };
+    });
+    const floor = boundary.anchors.filter(anchor => anchor.identity[1] === 1);
+    const floorWindow = floor.filter(anchor => Math.abs(anchor.position[0]) <= 0.16
+      && Math.abs(anchor.position[2]) <= 0.5);
+    const receiverAudit = {
+      total: boundary.anchors.length,
+      valid: boundary.anchors.filter(anchor => anchor.valid).length,
+      identityCounts: Object.fromEntries([...new Set(boundary.anchors.map(anchor => anchor.identity[1]))]
+        .map(id => [id, boundary.anchors.filter(anchor => anchor.identity[1] === id).length])),
+      floor: floor.length,
+      floorWindow: floorWindow.length,
+      floorWindowValid: floorWindow.filter(anchor => anchor.valid).length,
+      floorWindowNearPlane: floorWindow.filter(anchor => Math.abs(anchor.position[1]) < 1e-5).length,
+      floorWindowGeometryUp: floorWindow.filter(anchor => anchor.geometricNormal[1] > 0.9999).length,
+      floorWindowShadingUp: floorWindow.filter(anchor => anchor.normal[1] > 0.9999).length,
+      floorWindowAllConditions: floorWindow.filter(isReceiver).length,
+      examples: [...(floorWindow.length ? floorWindow : floor.length ? floor : boundary.anchors)]
+        .sort((a, b) => Math.abs(a.position[0]) + Math.abs(a.position[2] - target[2])
+          - Math.abs(b.position[0]) - Math.abs(b.position[2] - target[2]))
+        .slice(0, 12).map(anchor => ({ index: anchor.index, valid: anchor.valid,
+          position: anchor.position, normal: anchor.normal, geometricNormal: anchor.geometricNormal,
+          identity: anchor.identity, state: anchor.state, historyUpdates: anchor.historyUpdates })),
+    };
     const selected = boundary.anchors.filter(anchor => isReceiver(anchor)
       && Math.abs(anchor.position[0]) <= 0.16 && Math.abs(anchor.position[2]) <= 0.5);
     const samples = selected.map(anchor => {
@@ -135,7 +203,7 @@ export async function runGiFilterBoundaryFixture() {
         frameCount, raysPerAnchor, samplesPerAnchor: frameCount * raysPerAnchor },
       method: 'production raster-receiver single-bounce final gather; analytic infinite half-plane with bounded finite-range tail',
       constant: { frame: constant.frame, anchors: constant.anchors.filter(isReceiver) },
-      samples, metrics: metrics(samples), profileRow, profile, widths: profileWidths(profile),
+      samples, receiverAudit, surfaceExamples, metrics: metrics(samples), profileRow, profile, widths: profileWidths(profile),
       diagnostics, errors, afterDispose: renderer.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }
 }

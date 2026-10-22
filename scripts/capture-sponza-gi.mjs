@@ -27,6 +27,8 @@ const switches = new Map([
   ['--source-raster', 'sourceRaster'], ['--fine-gather', 'fineGather'],
   ['--reference', 'reference'], ['--final-gather', 'finalGather'],
   ['--raster-receiver', 'rasterReceiver'],
+  ['--reconstruction-diagnostics', 'reconstructionDiagnostics'],
+  ['--local-reference', 'localReference'],
   ['--scene-budget', 'sceneBudget'],
 ]);
 const options = { ...defaults };
@@ -48,6 +50,8 @@ if (options.sourceRaster && !options.queryRoot) throw Error('SPONZA_GI_SOURCE_RA
 if (options.sourceRaster && options.sceneBudget) throw Error('SPONZA_GI_SOURCE_RASTER_HAS_NO_PAGE_POOLS');
 if (options.fineGather) options.finalGather = true;
 if (options.rasterReceiver && !options.finalGather) throw Error('SPONZA_GI_RASTER_RECEIVER_REQUIRES_FINAL_GATHER');
+if (options.reconstructionDiagnostics && !options.finalGather) throw Error('SPONZA_GI_RECONSTRUCTION_REQUIRES_FINAL_GATHER');
+if (options.localReference && !options.reconstructionDiagnostics) throw Error('SPONZA_GI_LOCAL_REFERENCE_REQUIRES_RECONSTRUCTION');
 if (options.anisotropy !== undefined) {
   options.anisotropy = Number(options.anisotropy);
   if (!Number.isInteger(options.anisotropy) || options.anisotropy < 1 || options.anisotropy > 16) throw Error('SPONZA_GI_ANISOTROPY');

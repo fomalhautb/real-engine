@@ -48,6 +48,10 @@ export interface IntelSponzaGiOptions {
   reference?: boolean;
   finalGather?: boolean;
   rasterReceiver?: boolean;
+  /** Explicit actual-fragment reconstruction decisions; no extra GI frames. */
+  reconstructionDiagnostics?: boolean;
+  /** Bounded single-bounce irradiance reference at actual visible fragments. */
+  localReference?: boolean;
   sourceRaster?: boolean;
   fineGather?: boolean;
   anisotropy?: number;
@@ -60,6 +64,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
   const warmupFrames = settings.warmupFrames ?? 600;
   if (!Number.isSafeInteger(warmupFrames) || warmupFrames < 90 || warmupFrames > 3600) throw Error('SPONZA_WARMUP_FRAMES');
   if (settings.rasterReceiver && !settings.finalGather) throw Error('SPONZA_RASTER_RECEIVER_REQUIRES_FINAL_GATHER');
+  if (settings.reconstructionDiagnostics && !settings.finalGather) throw Error('SPONZA_RECONSTRUCTION_REQUIRES_FINAL_GATHER');
+  if (settings.localReference && !settings.reconstructionDiagnostics) throw Error('SPONZA_LOCAL_REFERENCE_REQUIRES_RECONSTRUCTION');
   const root = settings.geometryRoot ?? '/artifacts/sponza-group16-pages-20261022/';
   const textureGpuRoot = settings.textureGpuRoot ?? '/artifacts/sponza-textures-gpu-20261020/';
   const textureReferenceRoot = settings.textureReferenceRoot ?? '/artifacts/sponza-textures-reference-20261020/';
@@ -244,6 +250,14 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
     {
       const points = [{x:640,y:620},{x:480,y:560},{x:260,y:400},{x:1020,y:400},{x:640,y:300},{x:900,y:140},
         {x:80,y:475},{x:300,y:260},{x:960,y:265},{x:590,y:185}];
+      if (settings.reconstructionDiagnostics) {
+        for (const center of [{x:80,y:475},{x:285,y:480},{x:957,y:350},{x:300,y:250}]) {
+          for (const dx of [-6,-4,-2,0,2,4,6]) {
+            const pixel = { x: center.x + dx, y: center.y };
+            if (!points.some(p => p.x === pixel.x && p.y === pixel.y)) points.push(pixel);
+          }
+        }
+      }
       const captures: any[] = [];
       const capture = async (label: string, count: number) => {
         const signatureBefore = residencySignature(), hdrFrames = [];
@@ -267,9 +281,20 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
         const finalGather = candidates.length ? { candidates,
           probe: await renderer!.probeDiffuseGiFinalGather([...new Set(candidates.flatMap(row => row.indices))]),
           note: 'Candidate anchors only; inclusion does not prove surface compatibility or acceptance by reconstruction.' } : null;
+        const reconstruction = settings.reconstructionDiagnostics ? await renderer!.probeDiffuseGiReconstruction(points) : null;
+        let localReference = null;
+        if (settings.localReference && label === 'gather-single-bounce' && reconstruction) {
+          const wanted = new Set(['640,620', '260,400', '80,475', '279,480', '281,480', '283,480', '291,480',
+            '955,350', '957,350', '959,350', '961,350', '963,350', '640,300', '300,250', '900,140']);
+          const receivers = reconstruction.points.flatMap(point => point.surface && wanted.has(`${point.pixel.x},${point.pixel.y}`)
+            ? [{ pixel: point.pixel, ...point.surface }] : []);
+          const { intelSponzaLocalReference } = await import('./intel-sponza-local-reference');
+          localReference = await intelSponzaLocalReference(renderer!, receivers, giOptions.skyRadiance,
+            [4, 3.8, 3.5], [.35, .8, .4], giOptions.maxDistance);
+        }
         const signatureAfter = residencySignature();
         const result = { label, firstFrame, lastFrame: renderedFrame, renderedFrames: count,
-          png: canvas.toDataURL(), points, hdrFrames, probe, finalGather,
+          png: canvas.toDataURL(), points, hdrFrames, probe, finalGather, reconstruction, localReference,
           residencyUnchanged: signatureBefore === signatureAfter, diagnostics };
         captures.push(result);
         progress('gi-capture', { label, invalidProbes: probe?.invalidProbes, residencyUnchanged: result.residencyUnchanged, hdr: hdrFrames.at(-1) });

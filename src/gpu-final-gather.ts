@@ -16,7 +16,7 @@ import { DEFORMED_VERTEX_BYTES, type MeshData } from './geometry';
 type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
 export const finalGatherSampleSource = sampleSource;
-export const FINAL_GATHER_ANCHOR_BYTES = 96;
+export const FINAL_GATHER_ANCHOR_BYTES = 112;
 export const FINAL_GATHER_PARAMETER_BYTES = 304;
 const PARAMETER_BYTES = FINAL_GATHER_PARAMETER_BYTES;
 const AREA_SAMPLE_BYTES = 48;
@@ -51,6 +51,10 @@ export interface FinalGatherProbeResult {
     irradiance: [number, number, number];
     /** Actual GPU effective history count, not the CPU nominal update counter. */
     historyUpdates: number;
+    /** Population variance of raw cross-frame irradiance luminance estimates. */
+    luminanceVariance: number;
+    /** Estimated variance of the history mean; unavailable with fewer than two updates. */
+    meanLuminanceVariance: number | null;
     valid: boolean;
     state: [number, number, number, number];
     filteredIrradiance: [number, number, number];
@@ -503,16 +507,23 @@ export class GpuFinalGather {
       const vector4u = (base: number): [number, number, number, number] =>
         [integers[base], integers[base + 1], integers[base + 2], integers[base + 3]];
       const anchors: FinalGatherProbeResult['anchors'] = requested.map((index, i) => {
-        const base = i * 48, filtered = base + 24;
+        const anchorFloats = FINAL_GATHER_ANCHOR_BYTES / Float32Array.BYTES_PER_ELEMENT;
+        const base = i * anchorFloats * 2, filtered = base + anchorFloats;
         const position = vector3(base), normal = vector3(base + 4), identity = vector4u(base + 8);
         const versions = vector4u(base + 12), irradiance = vector3(base + 16), historyUpdates = data[base + 19];
         const state = vector4u(base + 20), filteredState = vector4u(filtered + 20);
         const filteredIrradiance = vector3(filtered + 16);
+        const luminanceVariance = data[base + 24];
         if (state[1] !== frame || filteredState[1] !== frame || versions[0] !== frame) throw new Error('FINAL_GATHER_FRAME_MISMATCH');
         const metadataMatches = Array.from({ length: 16 }, (_, j) => j).every(j =>
           j < 8 ? data[base + j] === data[filtered + j] : integers[base + j] === integers[filtered + j]);
         if ((state[0] !== 0 && state[0] !== 1) || filteredState.some((value, j) => value !== state[j])
           || !metadataMatches || data[filtered + 19] !== historyUpdates
+          || !Array.from({ length: 4 }, (_, j) => j).every(j =>
+            data[base + 24 + j] === data[filtered + 24 + j]
+            && Number.isFinite(data[base + 24 + j])
+            && (j === 0 || data[base + 24 + j] === 0))
+          || luminanceVariance < 0
           || ![...position, ...normal, ...irradiance, ...filteredIrradiance, historyUpdates].every(Number.isFinite)
           || historyUpdates < 1 || historyUpdates > this.options.maxHistory
           || [...irradiance, ...filteredIrradiance].some(value => value < 0 || value > 65504)) {
@@ -520,6 +531,7 @@ export class GpuFinalGather {
         }
         const geometricNormal = octaDecode([(data[base + 3] + 1) * 0.5, (data[base + 7] + 1) * 0.5]);
         return { index, position, normal, geometricNormal, identity, versions, irradiance, historyUpdates,
+          luminanceVariance, meanLuminanceVariance: historyUpdates < 2 ? null : luminanceVariance / Math.max(historyUpdates - 1, 1),
           valid: state[0] === 1, state, filteredIrradiance };
       });
       return { frame, anchors };
@@ -573,9 +585,10 @@ export class GpuFinalGather {
       dynamicOcclusionHistory: 'conservative-global-reset-on-geometry-change',
       diagnosticMaxAnchors: MAX_PROBE_ANCHORS, diagnosticReadbackBytes: READBACK_BYTES,
       diagnosticReadbackPending: this.readbackPending,
-      spatialDenoise: 'Gaussian-irradiance-only-with-surface-identity-plane-normal-rejection',
+      spatialDenoise: 'variance-guided-irradiance-with-surface-identity-plane-normal-rejection',
       spatialDenoiseRadius: 2, spatialDenoiseMaxNeighbors: 25, spatialDenoiseMaxWorldDistance: 0.10,
       spatialDenoiseNormalThreshold: 0.98, spatialDenoisePlaneTolerance: 0.001,
+      historyBootstrapFrames: 4, spatialDenoiseStandardDeviationScale: 4,
       filteredOutputFeedsHistory: false,
       spatialFilter: 'four-anchor-bilinear-with-bounded-compatible-ring-recovery', maxSpatialFilterDistance: 0.25,
       spatialFilterPrimaryCandidates: 4, spatialFilterRecoveryCandidates: 12,

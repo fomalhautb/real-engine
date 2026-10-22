@@ -89,7 +89,9 @@ test('production denoise quantifies analytic boundary diffusion while preserving
   });
   console.log('GI_FILTER_BOUNDARY_DENOISE ' + JSON.stringify({ metrics: result.halfPlane.metrics,
     widths: result.halfPlane.widths, constant: result.constant.metrics.filtered,
-    thinWall: result.thinWall.metrics.filtered, errors: result.errors }));
+    thinWall: result.thinWall.metrics.filtered, noisyConstant: result.noisyConstant.metrics,
+    startup: [result.startupZero.samples[result.startupIndex],
+      result.startupRecovered.samples[result.startupIndex]], errors: result.errors }));
   expect(pageErrors).toEqual([]); expect(result.errors).toEqual([]);
   expect(result.validationError).toBe(''); expect(result.ownedBytes).toBe(0);
   expect(result.wallSeparation).toBe(0.004);
@@ -101,6 +103,7 @@ test('production denoise quantifies analytic boundary diffusion while preserving
   }
   const half = result.halfPlane;
   expect(half.metrics.raw.maxAbsoluteError).toBeLessThan(1e-7);
+  expect(half.metrics.filtered.rmse, 'exact half-plane must retain its boundary').toBeLessThan(1e-4);
   expect(Math.abs(half.metrics.filtered.meanSignedError), 'symmetric field total energy').toBeLessThan(2e-6);
   for (const sample of half.samples) {
     expect(Number.isFinite(sample.filtered)).toBe(true);
@@ -109,8 +112,22 @@ test('production denoise quantifies analytic boundary diffusion while preserving
     const mirrored = half.samples[rowStart + result.gridColumns - 1 - sample.index % result.gridColumns];
     expect(Math.abs(sample.filtered + mirrored.filtered - 1), 'complementary half-plane symmetry').toBeLessThan(2e-6);
   }
-  // Exact input removes stochastic noise: dark-side gain, bright-side loss and
-  // width change quantify spatial diffusion without prescribing today's kernel.
+  // These limits come from the known analytic field, rather than a measured
+  // baseline of the current filter. A wider transition is a light leak.
   expect(half.widths.expected.width).not.toBeNull();
   expect(half.widths.filtered.width).not.toBeNull();
+  expect(Math.abs(half.widths.filtered.width! - half.widths.expected.width!)).toBeLessThan(0.001);
+  const noisy = result.noisyConstant;
+  expect(result.noiseHistory).toBe(16);
+  expect(result.noiseVariance / (result.noiseHistory - 1)).toBeCloseTo(result.noiseAmplitude ** 2, 8);
+  expect(noisy.metrics.raw.rmse).toBeCloseTo(result.noiseAmplitude, 6);
+  expect(noisy.metrics.filtered.rmse, 'known zero-mean temporal noise should be reduced')
+    .toBeLessThan(noisy.metrics.raw.rmse * 0.75);
+  expect(Math.abs(noisy.metrics.filtered.meanSignedError), 'uniform-field energy').toBeLessThan(0.005);
+  const first = result.startupZero.samples[result.startupIndex];
+  const recovered = result.startupRecovered.samples[result.startupIndex];
+  expect(first.raw).toBe(0);
+  expect(first.filtered, 'one zero frame should not acquire permanent black confidence').toBeGreaterThan(0.05);
+  expect(Math.abs(recovered.filtered - result.constantValue), 'later valid sample should recover')
+    .toBeLessThan(2e-6);
 });

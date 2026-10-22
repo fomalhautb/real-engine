@@ -21,6 +21,7 @@ struct FinalGatherAnchor {
     versions: vec4u, // rendered frame, history, topology, material
     irradiance: vec4f, // RGB irradiance, accumulated sample updates
     state: vec4u, // valid, rendered frame, primary/area failures, shadow failures
+    moments: vec4f, // raw temporal luminance population variance, reserved zeros
 }
 struct Ray { origin: vec4f, direction: vec4f, ignore: vec4u }
 struct Hit {
@@ -72,6 +73,9 @@ fn gatherHitGeometry(hit: Hit) -> vec3f {
 }
 fn gatherAnchorGeometry(anchor: FinalGatherAnchor) -> vec3f {
     return surfaceOctDecode(vec2f(anchor.position.w, anchor.normal.w));
+}
+fn gatherLuminance(irradiance: vec3f) -> f32 {
+    return dot(irradiance, vec3f(0.2126, 0.7152, 0.0722));
 }
 
 fn gatherHash(value: u32) -> u32 {
@@ -326,6 +330,10 @@ fn integrateArea(@builtin(global_invocation_id) id: vec3u) {
 fn accumulate(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= gather.settings.y) { return; }
     var current = anchors[id.x];
+    // A fresh estimate carries no evidence of temporal variance. Clear this
+    // explicitly, including moving reprojection's early rejection paths.
+    current.moments = vec4f(0.0);
+    anchors[id.x].moments = current.moments;
     if (gather.emissive.w == 0u) {
         // Preserve the stationary estimator exactly, including its strict
         // triangle identity and 0.1 mm positional checks.
@@ -337,6 +345,9 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
             && distance(current.position.xyz, previous.position.xyz) < 0.0001;
         if (historyMatches) {
             let count = min(previous.irradiance.w + 1.0, f32(gather.settings.w));
+            let alpha = 1.0 / count;
+            let delta = gatherLuminance(current.irradiance.xyz) - gatherLuminance(previous.irradiance.xyz);
+            current.moments.x = max(0.0, (1.0 - alpha) * (previous.moments.x + alpha * delta * delta));
             current.irradiance = vec4f(mix(previous.irradiance.xyz, current.irradiance.xyz, 1.0 / count), count);
         }
         anchors[id.x] = current;
@@ -358,6 +369,8 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
     var sum = vec3f(0.0);
     var total = 0.0;
     var history = 0.0;
+    var mixtureMean = 0.0;
+    var varianceMass = 0.0;
     for (var corner = 0u; corner < 4u; corner++) {
         let offset = vec2i(i32(corner & 1u), i32((corner >> 1u) & 1u));
         let coordinate = lower + offset;
@@ -372,12 +385,22 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
             || abs(dot(delta, gatherAnchorGeometry(previous))) > 0.001) { continue; }
         let axisWeights = select(vec2f(1.0) - fraction, fraction, offset == vec2i(1));
         let weight = axisWeights.x * axisWeights.y;
+        if (weight <= 0.0) { continue; }
+        // Weighted mixture variance includes differences among reprojected
+        // means, without subtracting two large second moments.
+        let nextTotal = total + weight;
+        let meanDelta = gatherLuminance(previous.irradiance.xyz) - mixtureMean;
+        varianceMass += weight * previous.moments.x + meanDelta * meanDelta * total * weight / nextTotal;
+        mixtureMean += meanDelta * weight / nextTotal;
         sum += previous.irradiance.xyz * weight;
         history += previous.irradiance.w * weight;
         total += weight;
     }
     if (total > 0.00000001) {
         let count = min(history / total + 1.0, f32(min(gather.settings.w, 8u)));
+        let alpha = 1.0 / count;
+        let delta = gatherLuminance(current.irradiance.xyz) - mixtureMean;
+        current.moments.x = max(0.0, (1.0 - alpha) * (varianceMass / total + alpha * delta * delta));
         current.irradiance = vec4f(mix(sum / total, current.irradiance.xyz, 1.0 / count), count);
     }
     anchors[id.x] = current;
@@ -395,6 +418,8 @@ fn denoise(@builtin(global_invocation_id) id: vec3u) {
         return;
     }
     let coordinate = vec2i(i32(id.x % gather.viewport.z), i32(id.x / gather.viewport.z));
+    let centerLuminance = gatherLuminance(center.irradiance.xyz);
+    let centerMeanVariance = center.moments.x / max(center.irradiance.w - 1.0, 1.0);
     var sum = vec3f(0.0);
     var total = 0.0;
     for (var y = -2; y <= 2; y++) {
@@ -410,7 +435,15 @@ fn denoise(@builtin(global_invocation_id) id: vec3u) {
             let delta = neighbor.position.xyz - center.position.xyz;
             if (length(delta) > 0.10 || abs(dot(delta, gatherAnchorGeometry(center))) > 0.001
                 || abs(dot(delta, gatherAnchorGeometry(neighbor))) > 0.001) { continue; }
-            let weight = exp(-f32(x * x + y * y) * 0.25);
+            let neighborLuminance = gatherLuminance(neighbor.irradiance.xyz);
+            let meanVariance = centerMeanVariance + neighbor.moments.x / max(neighbor.irradiance.w - 1.0, 1.0);
+            let epsilon = 1e-8 + 1e-6 * max(centerLuminance, neighborLuminance);
+            let range = exp(-abs(centerLuminance - neighborLuminance) / (4.0 * sqrt(meanVariance) + epsilon));
+            // One sample cannot establish a noiseless field. Introduce range
+            // rejection over four updates; saturated history uses an effective
+            // count estimate, not a formal independent-sample confidence bound.
+            let reliability = clamp((min(center.irradiance.w, neighbor.irradiance.w) - 1.0) / 3.0, 0.0, 1.0);
+            let weight = exp(-f32(x * x + y * y) * 0.25) * mix(1.0, range, reliability);
             sum += neighbor.irradiance.xyz * weight;
             total += weight;
         }

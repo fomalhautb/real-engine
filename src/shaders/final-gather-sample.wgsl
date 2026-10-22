@@ -20,6 +20,7 @@ struct FinalGatherAnchor {
     versions: vec4u,
     irradiance: vec4f,
     state: vec4u,
+    moments: vec4f,
 }
 @group(3) @binding(2) var<uniform> gather: FinalGatherParameters;
 @group(3) @binding(3) var<storage, read> finalGatherAnchors: array<FinalGatherAnchor>;

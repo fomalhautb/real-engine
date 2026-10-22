@@ -157,6 +157,13 @@ export async function runGiFilterBoundaryDenoiseFixture() {
   };
   const gridColumns = 64, gridRows = 5, count = gridColumns * gridRows;
   const gridStep = 0.01, h = 0.01, wallSeparation = 0.004;
+  const anchorWords = FINAL_GATHER_ANCHOR_BYTES / Float32Array.BYTES_PER_ELEMENT;
+  if (anchorWords !== 28) throw new Error('GI_FILTER_BOUNDARY_MOMENT_LAYOUT');
+  // moments.x stores population variance of individual frame estimates. For
+  // N=16, v=(N-1)*0.08^2 gives a known standard error of the mean of 0.08.
+  const noiseAmplitude = 0.08, noiseHistory = 16;
+  const noiseVariance = (noiseHistory - 1) * noiseAmplitude ** 2;
+  const constantValue = 0.375, startupIndex = Math.floor(gridRows / 2) * gridColumns + gridColumns / 2;
   try {
     const parameters = allocate(FINAL_GATHER_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const raw = allocate(count * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -178,22 +185,29 @@ export async function runGiFilterBoundaryDenoiseFixture() {
     params.set([4, count, 1, 256], 40); params.set([1, 1, 0, 0], 44);
     device.queue.writeBuffer(parameters, 0, params);
     const encodedNormal = octaEncode([0, 1, 0]);
-    const dispatch = async (mode: 'half-plane' | 'constant' | 'four-mm-wall') => {
-      const records = new Float32Array(count * 24), words = new Uint32Array(records.buffer);
+    const dispatch = async (mode: 'half-plane' | 'constant' | 'four-mm-wall' | 'noisy-constant'
+      | 'startup-zero' | 'startup-recovered') => {
+      const records = new Float32Array(count * anchorWords), words = new Uint32Array(records.buffer);
       const reference: ProfilePoint[] = [];
       for (let index = 0; index < count; index++) {
         const column = index % gridColumns, row = Math.floor(index / gridColumns);
         const x = (column - (gridColumns - 1) / 2) * gridStep;
-        const value = mode === 'constant' ? 0.375 : mode === 'four-mm-wall' ? Number(x >= 0) : skyFraction(x, h);
-        const offset = index * 24;
+        const expected = mode === 'half-plane' ? skyFraction(x, h)
+          : mode === 'four-mm-wall' ? Number(x >= 0) : constantValue;
+        const noise = mode === 'noisy-constant' ? (column + row) % 2 === 0 ? noiseAmplitude : -noiseAmplitude : 0;
+        const value = mode === 'startup-zero' && index === startupIndex ? 0 : expected + noise;
+        const offset = index * anchorWords;
         // Identical scene identity and material normal deliberately prevent
         // identity rejection from hiding a broken geometric plane check.
         records.set([x, mode === 'four-mm-wall' && x >= 0 ? wallSeparation : 0,
           (row - 2) * gridStep, encodedNormal[0]], offset);
         records.set([0, 1, 0, encodedNormal[1]], offset + 4);
         words.set([1, 1, 1, 0], offset + 8); words.set([1, 0, 1, 1], offset + 12);
-        records.set([value, value, value, 256], offset + 16); words.set([1, 1, 0, 0], offset + 20);
-        reference.push({ x, expected: value, raw: records[offset + 16], filtered: 0 });
+        records.set([value, value, value,
+          mode === 'startup-zero' ? 1 : mode === 'noisy-constant' ? noiseHistory : 256], offset + 16);
+        words.set([1, 1, 0, 0], offset + 20);
+        records.set([mode === 'noisy-constant' ? noiseVariance : 0, 0, 0, 0], offset + 24);
+        reference.push({ x, expected, raw: records[offset + 16], filtered: 0 });
       }
       device.queue.writeBuffer(raw, 0, records);
       const encoder = device.createCommandEncoder();
@@ -204,17 +218,22 @@ export async function runGiFilterBoundaryDenoiseFixture() {
       await readback.mapAsync(GPUMapMode.READ);
       const values = new Float32Array(readback.getMappedRange().slice(0)); readback.unmap();
       const samples = reference.map((point, index) => ({ ...point, index,
-        filtered: values[index * 24 + 16], rgb: Array.from(values.slice(index * 24 + 16, index * 24 + 19)) }));
+        filtered: values[index * anchorWords + 16],
+        rgb: Array.from(values.slice(index * anchorWords + 16, index * anchorWords + 19)) }));
       const profile = samples.slice(gridColumns * 2, gridColumns * 3);
       return { mode, samples, profile, metrics: metrics(samples), widths: profileWidths(profile) };
     };
     const halfPlane = await dispatch('half-plane');
     const constant = await dispatch('constant');
     const thinWall = await dispatch('four-mm-wall');
+    const noisyConstant = await dispatch('noisy-constant');
+    const startupZero = await dispatch('startup-zero');
+    const startupRecovered = await dispatch('startup-recovered');
     validationError = (await device.popErrorScope())?.message ?? '';
     for (const buffer of buffers) buffer.destroy(); ownedBytes = 0;
-    return { method: 'production denoise entry point, exact analytic inputs; no trace or temporal-history claim',
-      gridColumns, gridRows, gridStep, h, wallSeparation, halfPlane, constant, thinWall,
+    return { method: 'production denoise entry point, exact analytic and deterministic-noise inputs; no trace or temporal-history claim',
+      gridColumns, gridRows, gridStep, h, wallSeparation, noiseAmplitude, noiseHistory, noiseVariance, constantValue,
+      startupIndex, halfPlane, constant, thinWall, noisyConstant, startupZero, startupRecovered,
       errors, validationError, ownedBytes };
   } finally {
     for (const buffer of buffers) buffer.destroy();

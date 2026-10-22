@@ -99,9 +99,10 @@ fn reconstruct() {
       integers.set([viewport, viewport, 4, 4], 36); integers.set([4, 16, 1, 64], 40);
       integers.set([1, 1, 0, 0], 44); parameters.set([0.0001, 0, 0.001, 0.25], 48);
       device.queue.writeBuffer(gatherParameters, 0, parameters);
-      const packedAnchors = new Float32Array(16 * 24), anchorWords = new Uint32Array(packedAnchors.buffer);
+      const anchorFloats = FINAL_GATHER_ANCHOR_BYTES / Float32Array.BYTES_PER_ELEMENT;
+      const packedAnchors = new Float32Array(16 * anchorFloats), anchorWords = new Uint32Array(packedAnchors.buffer);
       anchorData?.forEach((anchor, index) => {
-        const base = index * 24, geometry = anchor.geometry ?? [0, 1];
+        const base = index * anchorFloats, geometry = anchor.geometry ?? [0, 1];
         packedAnchors.set([...anchor.position, geometry[0]], base);
         packedAnchors.set([...anchor.normal, geometry[1]], base + 4);
         anchorWords.set([1, 1, 1, index], base + 8); anchorWords.set([1, 1, 1, 0], base + 12);

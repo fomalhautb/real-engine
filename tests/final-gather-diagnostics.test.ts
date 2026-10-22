@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { decodeFinalGatherDiagnostics, decodeFinalGatherDiagnosticSurfaces, FINAL_GATHER_DIAGNOSTIC_MAX_POINTS,
-  validateFinalGatherDiagnosticPoints } from '../src/final-gather-diagnostics';
+  validateFinalGatherDiagnosticPoints, decodeFinalGatherCoverage } from '../src/final-gather-diagnostics';
 
 function record(): Uint32Array {
   const bytes = new ArrayBuffer(32), words = new Uint32Array(bytes), floats = new Float32Array(bytes);
@@ -11,6 +11,20 @@ function record(): Uint32Array {
 }
 
 describe('Final Gather diagnostic CPU contract', () => {
+  it('counts every visible branch while excluding row padding and handling partial tiles', () => {
+    const words = new Uint32Array(32 * 3).fill(0xffffffff);
+    const values = [1, 1, 3, 4, 2, 3, 3, 0, 5, 1, 4, 4, 3, 1, 1];
+    values.forEach((v, i) => { words[Math.floor(i / 5) * 32 + (i % 5) * 4] = v | (2 << 8); });
+    const result = decodeFinalGatherCoverage(words, 5, 3, 32, 2);
+    expect(Array.from(result.branches)).toEqual(values);
+    expect(result.counts).toEqual({ disabled: 1, primary: 5, ring: 1, uncovered: 4, background: 3, unlit: 1, supplemental: 0 });
+    expect(result.tilesWithUncoveredPixels).toBe(3);
+    expect(result.uncoveredPixelsPerTile).toEqual([3, 2, 1, 0, 0]);
+    words[0] = 7;
+    expect(() => decodeFinalGatherCoverage(words, 5, 3, 32)).toThrow(/BRANCH/);
+    expect(() => decodeFinalGatherCoverage(words, 5, 3, 31)).toThrow(/LAYOUT/);
+    expect(() => decodeFinalGatherCoverage(words, 5, 3, 32, 0)).toThrow(/LAYOUT/);
+  });
   it('decodes exact integer surface identities and signed normals from a subview', () => {
     const backing = new ArrayBuffer(96), words = new Uint32Array(backing, 32, 16), floats = new Float32Array(backing, 32, 16);
     floats.set([1.5, -2, 0.125]);

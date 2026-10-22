@@ -7,7 +7,7 @@ export interface FinalGatherDiagnosticPoint {
   readonly y: number;
 }
 
-export type FinalGatherDiagnosticBranch = 'disabled' | 'primary' | 'ring' | 'uncovered' | 'background' | 'unlit';
+export type FinalGatherDiagnosticBranch = 'disabled' | 'primary' | 'ring' | 'uncovered' | 'background' | 'unlit' | 'supplemental';
 export type FinalGatherCandidateRejection =
   'invalid-or-stale' | 'identity' | 'shading-normal' | 'receiver-plane' | 'anchor-plane'
   | 'distance' | 'out-of-bounds' | 'not-visited';
@@ -17,6 +17,7 @@ export interface FinalGatherDiagnosticRecord {
   readonly branch: FinalGatherDiagnosticBranch;
   readonly primaryAccepted: number;
   readonly ringAccepted: number;
+  readonly supplementalAccepted: number;
   readonly totalWeight: number;
   readonly selectedLuminance: number;
   readonly worldLuminance: number;
@@ -67,7 +68,33 @@ export function decodeFinalGatherDiagnosticSurfaces(words: Uint32Array, points: 
   });
 }
 
-const BRANCHES: readonly FinalGatherDiagnosticBranch[] = ['disabled', 'primary', 'ring', 'uncovered', 'background', 'unlit'];
+const BRANCHES: readonly FinalGatherDiagnosticBranch[] = ['disabled', 'primary', 'ring', 'uncovered', 'background', 'unlit', 'supplemental'];
+
+/** Full-frame diagnostic census, never a runtime readback or sampling policy.
+ * One byte per pixel is retained for a lossless coverage visualization. */
+export function decodeFinalGatherCoverage(words: Uint32Array, width: number, height: number, wordsPerRow: number,
+  tileSize = 4) {
+  if (!(words instanceof Uint32Array) || !Number.isSafeInteger(width) || width < 1
+    || !Number.isSafeInteger(height) || height < 1 || width * height > 4_194_304
+    || !Number.isSafeInteger(wordsPerRow) || wordsPerRow < width * 4
+    || words.length !== wordsPerRow * height || !Number.isSafeInteger(tileSize) || tileSize < 1 || tileSize > 128) {
+    throw new RangeError('FINAL_GATHER_COVERAGE_LAYOUT');
+  }
+  const branches = new Uint8Array(width * height);
+  const counts = Object.fromEntries(BRANCHES.map(branch => [branch, 0])) as Record<FinalGatherDiagnosticBranch, number>;
+  const columns = Math.ceil(width / tileSize), rows = Math.ceil(height / tileSize);
+  const gaps = new Uint32Array(columns * rows);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const branch = words[y * wordsPerRow + x * 4] & 0xff;
+    if (branch >= BRANCHES.length) throw new RangeError('FINAL_GATHER_COVERAGE_BRANCH');
+    branches[y * width + x] = branch; counts[BRANCHES[branch]]++;
+    if (branch === 3) gaps[Math.floor(y / tileSize) * columns + Math.floor(x / tileSize)]++;
+  }
+  const uncoveredPixelsPerTile = Array<number>(tileSize * tileSize + 1).fill(0);
+  for (const count of gaps) uncoveredPixelsPerTile[count]++;
+  return { width, height, counts, tileSize, columns, rows, uncoveredPixelsPerTile,
+    tilesWithUncoveredPixels: gaps.length - uncoveredPixelsPerTile[0], branches };
+}
 const REASONS: readonly [number, FinalGatherCandidateRejection][] = [
   [1, 'invalid-or-stale'], [2, 'identity'], [4, 'shading-normal'], [8, 'receiver-plane'],
   [16, 'anchor-plane'], [32, 'distance'], [64, 'out-of-bounds'], [128, 'not-visited'],
@@ -111,7 +138,9 @@ export function decodeFinalGatherDiagnostics(
     const packed = words[base];
     const branchId = packed & 0xff, primaryAccepted = (packed >>> 8) & 0xff;
     const ringAccepted = (packed >>> 16) & 0xff;
-    if ((packed >>> 24) !== 0 || branchId >= BRANCHES.length || primaryAccepted > 4 || ringAccepted > 12) {
+    const supplementalAccepted = packed >>> 24;
+    if (supplementalAccepted > 9 || (branchId !== 6 && supplementalAccepted !== 0)
+      || (branchId === 6 && supplementalAccepted === 0) || branchId >= BRANCHES.length || primaryAccepted > 4 || ringAccepted > 12) {
       throw new RangeError('FINAL_GATHER_DIAGNOSTIC_HEADER');
     }
     const totalWeight = floats[base + 1], selectedLuminance = floats[base + 2];
@@ -126,12 +155,12 @@ export function decodeFinalGatherDiagnostics(
       }
       return { mask, reasons: REASONS.filter(([bit]) => (mask & bit) !== 0).map(([, reason]) => reason) };
     });
-    if (branchId >= 4 && (primaryAccepted !== 0 || ringAccepted !== 0
+    if ((branchId === 4 || branchId === 5) && (primaryAccepted !== 0 || ringAccepted !== 0
       || totalWeight !== 0 || selectedLuminance !== 0 || worldLuminance !== 0
       || candidateRejections.some(candidate => candidate.mask !== 128))) {
       throw new RangeError('FINAL_GATHER_DIAGNOSTIC_NON_SURFACE');
     }
-    return { pixel, branch: BRANCHES[branchId], primaryAccepted, ringAccepted,
+    return { pixel, branch: BRANCHES[branchId], primaryAccepted, ringAccepted, supplementalAccepted,
       totalWeight, selectedLuminance, worldLuminance, candidateRejections };
   });
 }

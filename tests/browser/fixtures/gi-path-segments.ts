@@ -37,7 +37,7 @@ function irradianceReference(position: Vec3, color: Vec3): Vec3 {
   return sky.map((value, c) => Math.PI * (value * (1 - fraction) + color[c] * fraction)) as Vec3;
 }
 
-export async function runGiPathSegmentsFixture(segments: 2 | 3 | 4) {
+export async function runGiPathSegmentsFixture(segments: 2 | 3 | 4, supplemental = false) {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = 'position:fixed;left:0;top:0;width:64px;height:64px';
   document.body.append(canvas);
@@ -61,13 +61,19 @@ export async function runGiPathSegmentsFixture(segments: 2 | 3 | 4) {
     material: { definition: { ...DEFAULT_MATERIAL_DEFINITION, shading: 'unlit', doubleSided: true,
       baseColor: m.constant([0, 0, 0, 1]), emissive: m.parameter(0) },
       parameters: new Float32Array([...emission, 1]) } };
+  // Two adjacent half rectangles retain the independent full-rectangle truth
+  // while exercising source-major area-ray packing for supplemental queries.
+  const second: SceneBatch | null = supplemental ? { ...roof, name: 'path-emitter-second', instances: [] } : null;
+  const roofPose = supplemental ? multiply(translation(-0.5, 1.8, 0), scaling(1, 1, 2)) : roofModel;
+  const secondPose = multiply(translation(0.5, 1.8, 0), scaling(1, 1, 2));
   let renderer: Renderer | undefined;
   try {
-    renderer = await Renderer.create(canvas, [floor, roof], {
+    renderer = await Renderer.create(canvas, [floor, roof, ...(second ? [second] : [])], {
       worldQueries: { maxRays: 1024 },
       diffuseGi: { origin: [-1, 0.25, -1], spacing: [2, 1, 2], counts: [2, 2, 2],
         raysPerProbe: 32, maxDistance: 8, skyRadiance: sky, multiBounce: true,
         finalGather: { pixelSpacing: 4, raysPerAnchor: 1, pathSegments: segments,
+          ...(supplemental ? { receiver: 'raster' as const, maxSupplementalAnchors: 128, maxSupplementalWorkUnits: 1_048_576 } : {}),
           maxAnchors: 1024, maxHistory: 128 } },
     });
     const active = renderer;
@@ -77,29 +83,41 @@ export async function runGiPathSegmentsFixture(segments: 2 | 3 | 4) {
       const [hdr, probe] = await Promise.all([
         active.probeHdr([centerPixel]), active.probeDiffuseGiFinalGather([anchorIndex]),
       ]);
-      return { hdr: hdr[0], anchor: probe.anchors[0], diagnostics: active.diagnostics().diffuseGi!.finalGather! };
+      const diagnostics = active.diagnostics().diffuseGi!.finalGather!;
+      const supplementalAnchors = supplemental ? (await active.probeDiffuseGiFinalGather(Array.from(
+        { length: diagnostics.supplementalAnchorsPerUpdate }, (_, i) => diagnostics.primaryAnchorsPerUpdate + i))).anchors : [];
+      return { hdr: hdr[0], anchor: probe.anchors[0], supplementalAnchors, diagnostics };
     };
     active.setDiffuseGiMultiBounce(false);
     const missSingle = await capture(2);
     active.setDiffuseGiMultiBounce(true);
     const missMulti = await capture(2);
-    roof.instances = [state(2, roofModel, [0])];
+    roof.instances = [state(2, roofPose, [0])];
+    if (second) second.instances = [state(3, secondPose, [0])];
     active.setDiffuseGiMultiBounce(false);
     const unlitSingle = await capture(128);
     active.setDiffuseGiMultiBounce(true);
     const unlitMulti = await capture(128);
     await active.setMaterial('path-emitter', { ...roof.material!,
       parameters: new Float32Array([emission[0] * 2, emission[1] * 2, emission[2] * 2, 1]) });
+    if (second) await active.setMaterial(second.name, { ...second.material!,
+      parameters: new Float32Array([emission[0] * 2, emission[1] * 2, emission[2] * 2, 1]) });
     const doubled = await capture(128);
     roof.instances[0] = { ...roof.instances[0], deformScalars: [1] };
+    if (second) second.instances[0] = { ...second.instances[0], deformScalars: [1] };
     const morphedAway = await capture(2);
     const reference = irradianceReference(unlitMulti.anchor.position, emission);
     const doubledReference = irradianceReference(doubled.anchor.position,
       emission.map(value => value * 2) as Vec3);
+    const supplementalAreaChecks = [unlitSingle, unlitMulti, doubled].flatMap((stage, stageIndex) =>
+      stage.supplementalAnchors.filter(anchor => anchor.valid && anchor.identity[1] === 1)
+        .sort((a, b) => Math.hypot(a.position[0], a.position[2]) - Math.hypot(b.position[0], b.position[2]))
+        .slice(0, 3).map(anchor => ({ stage: stageIndex, anchor,
+          reference: irradianceReference(anchor.position, emission.map(value => value * (stageIndex === 2 ? 2 : 1)) as Vec3) })));
     const adapter = active.info.adapterInfo;
     const errors = [...active.errors]; active.dispose();
     return { segments, sky, emission, base, missSingle, missMulti, unlitSingle,
-      unlitMulti, doubled, morphedAway, reference, doubledReference,
+      unlitMulti, doubled, morphedAway, reference, doubledReference, supplementalAreaChecks,
       adapter, errors, afterDispose: active.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }
 }

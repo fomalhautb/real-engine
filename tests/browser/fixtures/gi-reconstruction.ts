@@ -33,7 +33,7 @@ export async function runGiReconstructionFixture() {
     const giParameters = allocate(112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const probes = allocate(8 * DIFFUSE_GI_PROBE_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const gatherParameters = allocate(FINAL_GATHER_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    const anchors = allocate(16 * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const anchors = allocate(20 * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const input = allocate(64, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const outputBytes = 112;
     const output = allocate(outputBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
@@ -93,7 +93,7 @@ fn reconstruct() {
     giIntegers.set([2, 2, 2, 64], 8); gi[23] = 0.2; giIntegers[24] = 1;
     device.queue.writeBuffer(giParameters, 0, gi);
 
-    const dispatch = async (field: Field, query: Query, anchorData?: Anchor[], viewport = 16): Promise<number[]> => {
+    const dispatch = async (field: Field, query: Query, anchorData?: Anchor[], viewport = 16, extra?: Anchor[]): Promise<number[]> => {
       const records = new Float32Array(8 * DIFFUSE_GI_PROBE_FLOATS), words = new Uint32Array(records.buffer);
       for (let index = 0; index < 8; index++) {
         const base = index * DIFFUSE_GI_PROBE_FLOATS;
@@ -112,10 +112,11 @@ fn reconstruct() {
       const parameters = new Float32Array(FINAL_GATHER_PARAMETER_BYTES / 4), integers = new Uint32Array(parameters.buffer);
       integers.set([viewport, viewport, 4, 4], 36); integers.set([4, 16, 1, 64], 40);
       integers.set([1, 1, 0, 0], 44); parameters.set([0.0001, 0, 0.001, 0.25], 48);
+      if (extra) integers.set([1, 0, 8, 4], 72);
       device.queue.writeBuffer(gatherParameters, 0, parameters);
       const anchorFloats = FINAL_GATHER_ANCHOR_BYTES / Float32Array.BYTES_PER_ELEMENT;
-      const packedAnchors = new Float32Array(16 * anchorFloats), anchorWords = new Uint32Array(packedAnchors.buffer);
-      anchorData?.forEach((anchor, index) => {
+      const packedAnchors = new Float32Array(20 * anchorFloats), anchorWords = new Uint32Array(packedAnchors.buffer);
+      [...(anchorData ?? []), ...(extra ?? [])].forEach((anchor, index) => {
         const base = index * anchorFloats, geometry = anchor.geometry ?? [0, 1];
         packedAnchors.set([...anchor.position, geometry[0]], base);
         packedAnchors.set([...anchor.normal, geometry[1]], base + 4);
@@ -202,6 +203,19 @@ fn reconstruct() {
     results.push({ label: 'partial-last-cell-position', actual: await dispatch(open, { ...center, pixel: [13.5, 13.5] }, partial, 14), expected: recovered });
     results.push({ label: 'edge-out-of-bounds-order', actual: await dispatch(open,
       { ...center, pixel: [0.5, 0.5] }, makeAnchors()), expected });
+    const extra = makeAnchors().slice(0, 4);
+    extra[3] = { position: [0, 0, 0], normal: [0, 1, 0], irradiance: recovered };
+    results.push({ label: 'supplemental-compatible', actual: await dispatch(open, gatherQuery, makeAnchors(), 16, extra), expected: recovered });
+    for (const [label, change] of [
+      ['supplemental-four-mm-wall', { position: [0, 0.004, 0] }],
+      ['supplemental-other-entity', { identity: [1, 2] }],
+      ['supplemental-stale', { frame: 0 }],
+    ] as [string, Partial<Anchor>][]) {
+      const changed = extra.map((a, i) => i === 3 ? { ...a, ...change } : a);
+      results.push({ label, actual: await dispatch(open, gatherQuery, makeAnchors(), 16, changed), expected });
+    }
+    extra[3].irradiance = [50, 0, 0];
+    results.push({ label: 'primary-preserved-with-bright-supplemental', actual: await dispatch(open, gatherQuery, primary, 16, extra), expected: recovered });
   } finally {
     try { validationError = String((await device.popErrorScope())?.message ?? ''); }
     finally { for (const buffer of buffers) { buffer.destroy(); ownedBytes -= buffer.size; } device.destroy(); }

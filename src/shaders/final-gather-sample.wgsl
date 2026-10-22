@@ -31,6 +31,7 @@ struct FinalGatherReconstruction {
     branch: u32, // 0 disabled, 1 primary, 2 recovery ring, 3 insufficient weight
     primaryAccepted: u32,
     ringAccepted: u32,
+    supplementalAccepted: u32,
     rejections: array<u32, 16>, // four corners, then twelve ring cells
 }
 
@@ -124,6 +125,33 @@ fn finalGatherReconstruct(pixel: vec2f, position: vec3f, normal: vec3f, geometri
         }
     }
     result.total = total;
+    if (total < 0.001 && gather.raster.w != 0u && gather.raster.z != 0u) {
+        let pitch = gather.raster.z;
+        let shape = (gather.viewport.xy + vec2u(pitch - 1u)) / pitch;
+        let cell = vec2i(floor(pixel / f32(pitch)));
+        // A bounded second set of actual raster receivers. Primary and ring
+        // success are unchanged; thin walls retain exactly the same gates.
+        var extraSum = vec3f(0.0);
+        var extraTotal = 0.0;
+        for (var y = -1; y <= 1; y++) { for (var x = -1; x <= 1; x++) {
+            let coordinate = cell + vec2i(x, y);
+            if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(shape))) { continue; }
+            let index = gather.viewport.z * gather.viewport.w + u32(coordinate.x) + u32(coordinate.y) * shape.x;
+            let anchor = finalGatherAnchors[index];
+            if (!finalGatherCompatible(anchor, position, normal, geometricNormal, expectedIdentity)) { continue; }
+            let delta = position - anchor.position.xyz;
+            let weight = 1.0 / (dot(delta, delta) + 0.000001);
+            extraSum += anchor.irradiance.xyz * weight;
+            extraTotal += weight;
+            result.supplementalAccepted++;
+        } }
+        if (extraTotal > 0.0) {
+            result.branch = 6u;
+            result.total = extraTotal;
+            result.irradiance = clamp(extraSum / extraTotal, vec3f(0.0), vec3f(65504.0));
+            return result;
+        }
+    }
     if (total < 0.001) {
         result.branch = 3u;
         result.irradiance = diffuseGiSurfaceIrradiance(position, normal, geometricNormal);

@@ -28,6 +28,8 @@ const switches = new Map([
   ['--reference', 'reference'], ['--final-gather', 'finalGather'],
   ['--raster-receiver', 'rasterReceiver'],
   ['--reconstruction-diagnostics', 'reconstructionDiagnostics'],
+  ['--coverage-diagnostics', 'coverageDiagnostics'],
+  ['--supplemental-gather', 'supplementalGather'],
   ['--local-reference', 'localReference'],
   ['--scene-budget', 'sceneBudget'],
 ]);
@@ -51,6 +53,8 @@ if (options.sourceRaster && options.sceneBudget) throw Error('SPONZA_GI_SOURCE_R
 if (options.fineGather) options.finalGather = true;
 if (options.rasterReceiver && !options.finalGather) throw Error('SPONZA_GI_RASTER_RECEIVER_REQUIRES_FINAL_GATHER');
 if (options.reconstructionDiagnostics && !options.finalGather) throw Error('SPONZA_GI_RECONSTRUCTION_REQUIRES_FINAL_GATHER');
+if (options.coverageDiagnostics && !options.reconstructionDiagnostics) throw Error('SPONZA_GI_COVERAGE_REQUIRES_RECONSTRUCTION');
+if (options.supplementalGather && !options.rasterReceiver) throw Error('SPONZA_GI_SUPPLEMENTAL_REQUIRES_RASTER');
 if (options.localReference && !options.reconstructionDiagnostics) throw Error('SPONZA_GI_LOCAL_REFERENCE_REQUIRES_RECONSTRUCTION');
 if (options.anisotropy !== undefined) {
   options.anisotropy = Number(options.anisotropy);
@@ -79,6 +83,10 @@ try {
   for (const capture of result.giAudit.captures) {
     await writeFile(join(options.output, `${capture.label}.png`), Buffer.from(capture.png.split(',')[1], 'base64'));
     delete capture.png;
+    if (capture.coveragePng) {
+      await writeFile(join(options.output, `${capture.label}-coverage.png`), Buffer.from(capture.coveragePng.split(',')[1], 'base64'));
+      delete capture.coveragePng;
+    }
   }
   await writeFile(join(options.output, 'report.json'), JSON.stringify({ ...result, captureOptions: options, pageErrors }, null, 2));
   if (pageErrors.length || result.errors.length || result.afterDispose !== 0 || result.info.adapterInfo.isFallbackAdapter ||

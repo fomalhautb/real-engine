@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { finalGatherRasterRayBasis, invertFinalGatherProjection, planFinalGatherGrid, resolveFinalGatherOptions } from '../src/final-gather';
+import { finalGatherRasterRayBasis, invertFinalGatherProjection, planFinalGatherGrid, planFinalGatherSupplemental, resolveFinalGatherOptions } from '../src/final-gather';
 import { lookAt, multiply, perspective } from '../src/math';
 
 describe('final gather CPU contract', () => {
@@ -7,10 +7,25 @@ describe('final gather CPU contract', () => {
     const defaults = resolveFinalGatherOptions();
     expect(defaults).toEqual({ pixelSpacing: 8, maxAnchors: 16_384, raysPerAnchor: 2,
       pathSegments: 1, maxHistory: 64, normalBias: 0.0001, maxBytes: 16 * 1024 * 1024,
-      receiver: 'world-query', maxReceiverBytes: 128 * 1024 * 1024 });
+      receiver: 'world-query', maxReceiverBytes: 128 * 1024 * 1024, maxSupplementalAnchors: 0, maxSupplementalWorkUnits: 0 });
     expect(Object.isFrozen(defaults)).toBe(true);
     expect(resolveFinalGatherOptions({ pixelSpacing: 1, normalBias: 0.01 }).normalBias).toBe(0.01);
     expect(resolveFinalGatherOptions({ pixelSpacing: 128, normalBias: 0 }).normalBias).toBe(0);
+  });
+
+  it('fits optional coverage receivers in spare capacity without an unbounded tile scan', () => {
+    expect(planFinalGatherSupplemental(1280, 720, 7936, 8192))
+      .toEqual({ spacing: 11, columns: 117, rows: 66, anchorCount: 7722 });
+    expect(planFinalGatherSupplemental(1280, 720, 0, 8192).anchorCount).toBe(0);
+    expect(planFinalGatherSupplemental(1280, 720, 7936, 0).anchorCount).toBe(0);
+    expect(planFinalGatherSupplemental(32768, 32768, 65536, 16384).anchorCount).toBe(0);
+    expect(planFinalGatherSupplemental(1, 1, 1, 1).anchorCount).toBe(1);
+    expect(() => resolveFinalGatherOptions({ maxSupplementalAnchors: 1 })).toThrow(/REQUIRES_RASTER/);
+    expect(() => resolveFinalGatherOptions({ receiver: 'raster', maxSupplementalAnchors: 1 })).toThrow(/WORK_REQUIRED/);
+    for (const requested of [-1, 16385, 0.5, NaN]) {
+      expect(() => planFinalGatherSupplemental(128, 128, 100, requested)).toThrow();
+      expect(() => resolveFinalGatherOptions({ receiver: 'raster', maxSupplementalAnchors: requested })).toThrow();
+    }
   });
 
   it('validates each option at its hard boundary', () => {

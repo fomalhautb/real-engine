@@ -5,9 +5,26 @@ import type { GeometryLodSettings } from './gpu-geometry-lod';
 import type { Mat4 } from './math';
 import type { GeometryGroupDemand } from './geometry-stream-working-set';
 import { occlusionTestSource, type GpuOcclusion } from './gpu-occlusion';
+import type { GeometryStreamDirectory } from './geometry-stream-types';
 
 /** Includes persistent buffers and the maximum one-at-a-time feedback buffer. */
 export interface GeometryStreamSelectionOptions { maxGpuBytes?: number }
+
+/** Shared allocation accounting for the owner and runtime capacity scheduler.
+ * Includes its largest optional diagnostic readback, not just persistent data. */
+export function geometryStreamSelectionResources(directory: GeometryStreamDirectory, capacity: number, uniformAlignment: number) {
+  if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 256) throw new Error('GEOMETRY_STREAM_INSTANCE_BUDGET');
+  if (!Number.isSafeInteger(uniformAlignment) || uniformAlignment < 1 || uniformAlignment > 65536) throw new Error('GEOMETRY_STREAM_UNIFORM_ALIGNMENT');
+  const packed = packGeometryStreamSelection(directory), pairs = packed.directory.clusters.length * capacity;
+  const parameterStride = Math.ceil(48 / uniformAlignment) * uniformAlignment;
+  const maxIndices = packed.directory.sourceTriangleCount * 3 * capacity;
+  const sizes = [96, parameterStride * (packed.levels.length + 1), packed.words.byteLength, pairs * 4,
+    (packed.directory.pages.length + packed.directory.groups.length) * 4, maxIndices * 4, 64];
+  const feedbackBytes = 64 + sizes[4] + pairs * 4;
+  return { packed, pairs, parameterStride, maxIndices, sizes, feedbackBytes,
+    persistentBytes: sizes.reduce((sum, bytes) => sum + bytes, 0),
+    maxBytes: sizes.reduce((sum, bytes) => sum + bytes, 0) + feedbackBytes };
+}
 export interface GeometryStreamSelectionFeedback {
   frame: number;
   requestedPages: { pageId: number; priority: number }[];
@@ -92,15 +109,15 @@ export class GpuGeometryStreamSelection {
   private constructor(private readonly device: GPUDevice, readonly pool: GpuGeometryPagePool, instances: GPUBuffer,
     readonly capacity: number, private readonly track: (bytes: number) => void,
     options: GeometryStreamSelectionOptions, private readonly occlusion?: GpuOcclusion) {
-    if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 256) throw new Error('GEOMETRY_STREAM_INSTANCE_BUDGET');
-    this.packed = packGeometryStreamSelection(pool.directory);
-    const directory = this.packed.directory, pairs = directory.clusters.length * capacity;
+    const allocation = geometryStreamSelectionResources(pool.directory, capacity, device.limits.minUniformBufferOffsetAlignment);
+    this.packed = allocation.packed;
+    const directory = this.packed.directory, pairs = allocation.pairs;
     this.physicalVertexCount = pool.slotCount * pool.verticesPerSlot;
-    const maxIndices = directory.sourceTriangleCount * 3 * capacity;
+    const maxIndices = allocation.maxIndices;
     if (pairs > 262144 || Math.ceil(pairs / 64) > device.limits.maxComputeWorkgroupsPerDimension
       || directory.groups.length * capacity > 262144 || this.physicalVertexCount * capacity > 0xffffffff
       || maxIndices > 0xffffffff) throw new Error('GEOMETRY_STREAM_WORK_BUDGET');
-    this.parameterStride = Math.ceil(48 / device.limits.minUniformBufferOffsetAlignment) * device.limits.minUniformBufferOffsetAlignment;
+    this.parameterStride = allocation.parameterStride;
     this.parameterData = new Uint32Array(this.parameterStride / 4 * (this.packed.levels.length + 1));
     for (let slot = 0; slot <= this.packed.levels.length; slot++) {
       const level = this.packed.levels[slot - 1];
@@ -108,10 +125,9 @@ export class GpuGeometryStreamSelection {
         level?.firstGroup ?? 0, level?.groupCount ?? directory.groups.length, this.packed.clusterOffset, this.packed.groupOffset,
         this.packed.edgeOffset, directory.pages.length, level?.level ?? 0, 0], slot * this.parameterStride / 4);
     }
-    const sizes = [96, this.parameterData.byteLength, this.packed.words.byteLength, pairs * 4,
-      (directory.pages.length + directory.groups.length) * 4, maxIndices * 4, 64];
+    const sizes = allocation.sizes;
     const budget = options.maxGpuBytes ?? 128 * 1024 * 1024;
-    this.feedbackBudget = 64 + sizes[4] + pairs * 4;
+    this.feedbackBudget = allocation.feedbackBytes;
     this.maxGpuBytes = budget;
     if (!Number.isSafeInteger(budget) || budget < 1 || budget > 256 * 1024 * 1024
       || sizes.some(size => size > device.limits.maxBufferSize || size > device.limits.maxStorageBufferBindingSize)
@@ -157,6 +173,11 @@ export class GpuGeometryStreamSelection {
     for (const key of ['maxErrorPixels', 'frustumCulling', 'frozen', 'debug'] as const) {
       if (next[key] !== undefined) Object.assign(this.settings, { [key]: next[key] });
     }
+  }
+  /** A replacement owner must preserve the frozen camera as well as settings. */
+  copyViewStateFrom(previous: GpuGeometryStreamSelection) {
+    this.live(); previous.live(); this.setSettings(previous.settings);
+    this.viewData.set(previous.viewData); this.hasView = previous.hasView;
   }
   update(frame: number, count: number, vp: Mat4, eye: readonly number[], projectionScale: number) {
     this.live();

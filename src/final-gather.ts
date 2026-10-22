@@ -13,6 +13,10 @@ export interface FinalGatherOptions {
   receiver?: 'world-query' | 'raster';
   /** Renderer-owned full-resolution receiver attachments and metadata, separate from maxBytes. */
   maxReceiverBytes?: number;
+  /** Opt-in raster coverage repair using spare anchor capacity; never reduces the primary grid. */
+  maxSupplementalAnchors?: number;
+  /** Additional traversal work per supplementary trace, separate from the primary query budget. */
+  maxSupplementalWorkUnits?: number;
 }
 
 export interface ResolvedFinalGatherOptions {
@@ -25,6 +29,8 @@ export interface ResolvedFinalGatherOptions {
   readonly maxBytes: number;
   readonly receiver: 'world-query' | 'raster';
   readonly maxReceiverBytes: number;
+  readonly maxSupplementalAnchors: number;
+  readonly maxSupplementalWorkUnits: number;
 }
 
 export interface FinalGatherGridPlan {
@@ -61,7 +67,29 @@ export function resolveFinalGatherOptions(options: FinalGatherOptions = {}): Res
   if (receiver !== 'world-query' && receiver !== 'raster') throw new RangeError('FINAL_GATHER_RECEIVER');
   const maxReceiverBytes = boundedInteger(options.maxReceiverBytes === undefined ? 128 * 1024 * 1024 : options.maxReceiverBytes,
     1, 512 * 1024 * 1024, 'MAX_RECEIVER_BYTES');
-  return Object.freeze({ pixelSpacing, maxAnchors, raysPerAnchor, pathSegments, maxHistory, normalBias, maxBytes, receiver, maxReceiverBytes });
+  const maxSupplementalAnchors = boundedInteger(options.maxSupplementalAnchors === undefined ? 0 : options.maxSupplementalAnchors,
+    0, 16_384, 'MAX_SUPPLEMENTAL_ANCHORS');
+  if (maxSupplementalAnchors && receiver !== 'raster') throw new RangeError('FINAL_GATHER_SUPPLEMENTAL_REQUIRES_RASTER');
+  const maxSupplementalWorkUnits = boundedInteger(options.maxSupplementalWorkUnits === undefined ? 0 : options.maxSupplementalWorkUnits,
+    0, 67_108_864, 'MAX_SUPPLEMENTAL_WORK_UNITS');
+  if (maxSupplementalAnchors && !maxSupplementalWorkUnits) throw new RangeError('FINAL_GATHER_SUPPLEMENTAL_WORK_REQUIRED');
+  return Object.freeze({ pixelSpacing, maxAnchors, raysPerAnchor, pathSegments, maxHistory, normalBias, maxBytes, receiver,
+    maxReceiverBytes, maxSupplementalAnchors, maxSupplementalWorkUnits });
+}
+
+/** One deterministic candidate per tile. At most 1,024 receiver pixels are
+ * inspected per candidate; insufficient spare capacity disables this optional
+ * path rather than coarsening the primary grid or exceeding its ray budget. */
+export function planFinalGatherSupplemental(width: number, height: number, spareCapacity: number, requested: number) {
+  boundedInteger(width, 1, 32_768, 'WIDTH'); boundedInteger(height, 1, 32_768, 'HEIGHT');
+  boundedInteger(spareCapacity, 0, 65_536, 'SPARE_CAPACITY');
+  boundedInteger(requested, 0, 16_384, 'MAX_SUPPLEMENTAL_ANCHORS');
+  const budget = Math.min(spareCapacity, requested);
+  for (let spacing = 1; spacing <= 32 && budget; spacing++) {
+    const columns = Math.ceil(width / spacing), rows = Math.ceil(height / spacing);
+    if (columns * rows <= budget) return { spacing, columns, rows, anchorCount: columns * rows };
+  }
+  return { spacing: 0, columns: 0, rows: 0, anchorCount: 0 };
 }
 
 /** Bounded double-precision inversion. Keep doubles until camera-relative ray

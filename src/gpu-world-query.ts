@@ -164,7 +164,7 @@ export class GpuWorldQuery {
     this.preflight(sizes);
     // readonly public references; ownership remains entirely with this module.
     Object.assign(this, {
-      rayBuffer: this.buffer('world rays', sizes[0], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
+      rayBuffer: this.buffer('world rays', sizes[0], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC),
       hitBuffer: this.buffer('world hits', sizes[1], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC),
     });
     this.readBuffer = this.buffer('world hit diagnostics', sizes[2], GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
@@ -410,16 +410,22 @@ export class GpuWorldQuery {
    * rays with encoded GPU operations, not queue writes that alias recorded work.
    * Submit it before encoding another encoder with different parameters: GPU
    * snapshots and uniform buffers assume serial encode/submit. Callers own ray
-   * generation and inspect hit.work.z for an explicit overflow. Returns the
+   * generation and inspect hit.work.z for an explicit overflow. An optional
+   * maxWorkUnits limits this trace independently; callers account for the sum
+   * of budgets when splitting one logical query into multiple traces. Returns the
    * number of uniform bytes actually queued for upload. */
-  encodeTrace(encoder: GPUCommandEncoder, count: number, textureLod: number, materialRevision: number): number {
+  encodeTrace(encoder: GPUCommandEncoder, count: number, textureLod: number, materialRevision: number,
+    maxWorkUnits = this.options.maxTotalWorkUnits): number {
     if (this.disposed || !this.frame) throw new Error('WORLD_QUERY_NO_RENDERED_FRAME');
     this.validateTopology();
     if (!Number.isSafeInteger(count) || count < 0 || count > this.options.maxRays) throw new Error('WORLD_QUERY_RAY_BUDGET');
     if (!Number.isFinite(textureLod) || textureLod < 0 || textureLod > 32) throw new Error('WORLD_QUERY_TEXTURE_LOD');
     u32(materialRevision, 'MATERIAL_REVISION');
+    if (!Number.isSafeInteger(maxWorkUnits) || maxWorkUnits < 1 || maxWorkUnits > this.options.maxTotalWorkUnits) {
+      throw new Error('WORLD_QUERY_TRACE_WORK_BUDGET');
+    }
     if (!count) return 0;
-    const workPerRay = Math.min(this.options.maxNodeVisits, Math.floor(this.options.maxTotalWorkUnits / count));
+    const workPerRay = Math.min(this.options.maxNodeVisits, Math.floor(maxWorkUnits / count));
     if (workPerRay < 1) throw new Error('WORLD_QUERY_WORK_BUDGET: total budget cannot cover every ray');
     const snapshot = JSON.stringify([this.frame, materialRevision,
       this.batches.map((batch, index) => [index + 1, batch.nodeCount, batch.mesh.vertexCount, batch.count,

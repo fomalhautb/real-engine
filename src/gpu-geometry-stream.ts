@@ -1,5 +1,5 @@
 import { GeometryPageCache, type GeometryPageCacheOptions } from './geometry-stream-cache';
-import { GpuGeometryPagePool, type GeometryGpuPoolOptions } from './gpu-geometry-page-pool';
+import { GpuGeometryPagePool, type GeometryGpuPoolOptions, type GeometryGpuPoolMigrationOptions } from './gpu-geometry-page-pool';
 import { GpuGeometryStreamSelection, type GeometryStreamSelectionFeedback, type GeometryStreamSelectionOptions } from './gpu-geometry-stream-selection';
 import type { GeometryPageProvider, GeometryStreamDirectory } from './geometry-stream-types';
 import { residentMesh, type RenderBatch } from './contracts';
@@ -25,6 +25,15 @@ export interface GeometryStreamSource {
   readonly maxRequestsPerFrame?: number;
 }
 
+export interface PreparedGeometryStreamCapacity {
+  readonly pool: GpuGeometryPagePool;
+  readonly selection: GpuGeometryStreamSelection;
+  readonly sourceEpoch: number;
+  readonly copiedPages: readonly number[];
+  readonly copiedBytes: number;
+  readonly poolPeakBytes: number;
+}
+
 /** Renderer bridge. Paged surfaces share instance/material state with either
  * an exact resident mesh or an explicit fixed shadow/query proxy. */
 export class GpuGeometryStream {
@@ -41,7 +50,7 @@ export class GpuGeometryStream {
   private readonly requestsPerFrame: number;
   private pending: GeometryStreamSelectionFeedback['requestedPages'] = [];
   private pendingCursor = 0;
-  private readonly workingSet: GeometryStreamWorkingSet;
+  private workingSet: GeometryStreamWorkingSet;
   private allocation: ReturnType<GeometryStreamWorkingSet['plan']>;
   private cpuWindow: number[] = [];
   private cpuWindowBudgetDeferred: number[] = [];
@@ -53,9 +62,15 @@ export class GpuGeometryStream {
   private lastFeedback: GeometryStreamSelectionFeedback | null = null;
   private readonly checkedPages = new Set<number>();
   private cleanup?: Promise<void>;
+  private epoch = 0;
+  private preparing?: Promise<PreparedGeometryStreamCapacity>;
+  private prepared?: PreparedGeometryStreamCapacity;
+  private readonly retiring = new Set<{ pool: GpuGeometryPagePool; selection: GpuGeometryStreamSelection; done: Promise<void> }>();
 
   private constructor(readonly scene: RenderBatch, readonly cache: GeometryPageCache,
-    readonly pool: GpuGeometryPagePool, readonly selection: GpuGeometryStreamSelection) {
+    private activePool: GpuGeometryPagePool, private activeSelection: GpuGeometryStreamSelection,
+    private readonly device: GPUDevice, private readonly instances: GPUBuffer,
+    private readonly track: (bytes: number) => void, private readonly occlusion?: GpuOcclusion) {
     this.source = scene.geometryStream!;
     this.fullSource = scene.mesh; this.proxy = this.source.queryProxy;
     const mesh = this.sourceMesh = residentMesh(scene);
@@ -63,9 +78,12 @@ export class GpuGeometryStream {
     this.sourceVertices = mesh.vertices; this.sourceIndices = mesh.indices;
     this.sourceUvs = mesh.uvs; this.sourceTangents = mesh.tangents; this.sourceColors = mesh.colors;
     this.requestsPerFrame = this.source.maxRequestsPerFrame ?? 16;
-    this.workingSet = new GeometryStreamWorkingSet(pool.directory, pool.slotCount);
+    this.workingSet = new GeometryStreamWorkingSet(this.pool.directory, this.pool.slotCount);
     this.allocation = this.workingSet.plan([]);
   }
+  get pool() { return this.activePool; }
+  get selection() { return this.activeSelection; }
+  get capacityEpoch() { return this.epoch; }
   static async create(device: GPUDevice, scene: RenderBatch, instances: GPUBuffer, track: (bytes: number) => void,
     decoder?: GeometryPageDecodeService, occlusion?: GpuOcclusion) {
     const source = scene.geometryStream;
@@ -88,7 +106,7 @@ export class GpuGeometryStream {
       pool = await GpuGeometryPagePool.create(device, source.directory, source.gpuPool, track);
       cache = await GeometryPageCache.create(source.directory, source.provider, source.cpuCache, decoder);
       selection = await GpuGeometryStreamSelection.create(device, pool, instances, scene.capacity, track, source.selection, occlusion);
-      const result = new GpuGeometryStream(scene, cache, pool, selection);
+      const result = new GpuGeometryStream(scene, cache, pool, selection, device, instances, track, occlusion);
       // Initialization is cooperative and completes every root before the first
       // frame. The regular render path performs exactly one bounded upload tick.
       for (const page of pool.directory.rootPages) {
@@ -106,6 +124,80 @@ export class GpuGeometryStream {
       try { await cache?.dispose(); } catch { /* preserve initialization failure */ }
       throw error;
     }
+  }
+  /** Prepare without changing the active stream or its CPU cache. The caller
+   * reserves the complete scene overlap (selection and rendered state included)
+   * before calling; maxPeakBytes here retains the pool-only migration meaning. */
+  prepareCapacity(options: GeometryGpuPoolMigrationOptions): Promise<PreparedGeometryStreamCapacity> {
+    this.validateSources();
+    if (this.preparing || this.prepared || this.retiring.size) throw new Error('GEOMETRY_STREAM_CAPACITY_BUSY');
+    const sourceEpoch = this.epoch, sourcePool = this.pool;
+    const task = (async () => {
+      let pool: GpuGeometryPagePool | undefined, selection: GpuGeometryStreamSelection | undefined;
+      try {
+        const migration = await sourcePool.migrateResident(options); pool = migration.pool;
+        this.validateSources();
+        if (this.epoch !== sourceEpoch || this.pool !== sourcePool) throw new Error('GEOMETRY_STREAM_CAPACITY_STALE');
+        selection = await GpuGeometryStreamSelection.create(this.device, pool, this.instances, this.scene.capacity,
+          this.track, this.source.selection, this.occlusion);
+        this.validateSources();
+        if (this.epoch !== sourceEpoch || this.pool !== sourcePool) throw new Error('GEOMETRY_STREAM_CAPACITY_STALE');
+        selection.copyViewStateFrom(this.selection);
+        const candidate = Object.freeze({ pool, selection, sourceEpoch, copiedPages: Object.freeze([...migration.copiedPages]),
+          copiedBytes: migration.copiedBytes, poolPeakBytes: migration.peakBytes });
+        this.prepared = candidate; return candidate;
+      } catch (error) {
+        try { selection?.dispose(); } catch { /* Preserve the preparation failure. */ }
+        try { pool?.dispose(); } catch { /* Preserve the preparation failure. */ }
+        throw error;
+      }
+    })();
+    this.preparing = task;
+    void task.then(() => { if (this.preparing === task) this.preparing = undefined; },
+      () => { if (this.preparing === task) this.preparing = undefined; });
+    return task;
+  }
+  abortCapacity(candidate: PreparedGeometryStreamCapacity): void {
+    if (this.prepared !== candidate) throw new Error('GEOMETRY_STREAM_CAPACITY_CANDIDATE');
+    this.prepared = undefined; const errors: unknown[] = [];
+    try { candidate.selection.dispose(); } catch (error) { errors.push(error); }
+    try { candidate.pool.dispose(); } catch (error) { errors.push(error); }
+    if (errors.length) throw new AggregateError(errors, 'GEOMETRY_STREAM_CAPACITY_CLEANUP');
+  }
+  /** Call at a synchronous frame boundary, then install the matching render
+   * bindings without awaiting. Until retirement resolves, the caller continues
+   * charging ALL old bindings and rendered buffers against the peak budget. */
+  commitCapacity(candidate: PreparedGeometryStreamCapacity): { retired: Promise<void>; epoch: number } {
+    this.validateSources();
+    if (candidate !== this.prepared || candidate.sourceEpoch !== this.epoch) throw new Error('GEOMETRY_STREAM_CAPACITY_STALE');
+    if (candidate.pool.diagnostics().disposed || candidate.selection.diagnostics().disposed) throw new Error('GEOMETRY_STREAM_CAPACITY_DISPOSED');
+    candidate.selection.copyViewStateFrom(this.selection);
+    const workingSet = new GeometryStreamWorkingSet(candidate.pool.directory, candidate.pool.slotCount);
+    const allocation = workingSet.plan(this.lastFeedback?.desiredGroups ?? []);
+    const pool = this.pool, selection = this.selection, feedback = this.feedbackTask;
+    // Capture the fence before publishing. No frame encoding can interleave with
+    // this synchronous commit; later submissions may only use the new owners.
+    const fence = this.device.queue.onSubmittedWorkDone();
+    this.activePool = candidate.pool; this.activeSelection = candidate.selection;
+    this.workingSet = workingSet; this.allocation = allocation; this.pending = allocation.requestedPages;
+    this.pendingCursor = 0; this.reading = false; this.feedbackTask = undefined; this.lastFeedback = null;
+    this.prepared = undefined; this.epoch++;
+    const retired = { pool, selection, done: Promise.resolve() };
+    retired.done = Promise.allSettled([fence, feedback]).then(results => {
+      const errors: unknown[] = results.filter(result => result.status === 'rejected').map(result => result.reason);
+      try { selection.dispose(); } catch (error) { errors.push(error); }
+      try { pool.dispose(); } catch (error) { errors.push(error); }
+      this.retiring.delete(retired);
+      if (errors.length) {
+        if (!this.disposed) this.error = 'GEOMETRY_STREAM_CAPACITY_RETIRE_FAILED: ' + String(errors[0]);
+        throw new AggregateError(errors, 'GEOMETRY_STREAM_CAPACITY_RETIRE_FAILED');
+      }
+    });
+    this.retiring.add(retired);
+    // The returned promise still rejects for the caller; this observer prevents
+    // an unhandled rejection when the Renderer is disposed before observing it.
+    void retired.done.catch(() => {});
+    return { retired: retired.done, epoch: this.epoch };
   }
   validateSources() {
     if (this.disposed) throw new Error('GEOMETRY_STREAM_DISPOSED');
@@ -189,13 +281,16 @@ export class GpuGeometryStream {
   /** Queue readback contains only bounded requests/counters, never geometry. */
   afterSubmit() {
     if (this.reading || this.disposed) return; this.reading = true;
-    this.feedbackTask = this.selection.feedback().then(result => {
-      if (this.disposed) return;
+    const selection = this.selection, epoch = this.epoch;
+    const current = () => !this.disposed && this.selection === selection && this.epoch === epoch;
+    this.feedbackTask = selection.feedback().then(result => {
+      if (!current()) return;
       if (result.overflow) { this.error = 'GEOMETRY_STREAM_DRAW_OVERFLOW'; return; }
       this.lastFeedback = result; this.allocation = this.workingSet.plan(result.desiredGroups);
       this.pending = this.allocation.requestedPages;
       this.pendingCursor = this.pending.length ? this.pendingCursor % this.pending.length : 0;
-    }).catch(error => { if (!this.disposed) this.error = 'GEOMETRY_STREAM_FEEDBACK_FAILED: ' + String(error); }).finally(() => { this.reading = false; });
+    }).catch(error => { if (current()) this.error = 'GEOMETRY_STREAM_FEEDBACK_FAILED: ' + String(error); })
+      .finally(() => { if (current()) this.reading = false; });
   }
   async probe() {
     await this.feedbackTask; this.validateSources();
@@ -204,6 +299,8 @@ export class GpuGeometryStream {
   retry(page: number) { this.validateSources(); this.cache.retry(page); }
   diagnostics() { return { pool: this.pool.diagnostics(), cache: this.cache.diagnostics(), selection: this.selection.diagnostics(),
     error: this.error, feedback: this.lastFeedback,
+    capacity: { epoch: this.epoch, preparing: !!this.preparing, preparedSlots: this.prepared?.pool.slotCount ?? null,
+      retiringOwners: this.retiring.size },
     sourceRepresentation: this.proxy ? 'fixed-shadow-query-proxy' as const : 'full-detail-shadow-query-and-masked' as const,
     queryProxy: this.proxy ? { primitiveKey: this.proxy.primitiveKey, directorySha256: this.proxy.directorySha256,
       topologyVersion: this.proxy.topologyVersion, vertices: this.sourceVertexCount, triangles: this.sourceIndices.length / 3,
@@ -224,10 +321,20 @@ export class GpuGeometryStream {
     // ledger immediately. Publish cleanup first to make callbacks reentrant.
     try { this.selection.dispose(); } catch (error) { errors.push(error); }
     try { this.pool.dispose(); } catch (error) { errors.push(error); }
+    if (this.prepared) try { this.abortCapacity(this.prepared); } catch (error) { errors.push(error); }
+    for (const retired of this.retiring) {
+      try { retired.selection.dispose(); } catch (error) { errors.push(error); }
+      try { retired.pool.dispose(); } catch (error) { errors.push(error); }
+    }
     this.pending = []; this.cpuWindow = []; this.cpuWindowBudgetDeferred = []; this.checkedPages.clear(); this.lastFeedback = null;
     const finish = () => errors.length ? reject(new AggregateError(errors, 'GEOMETRY_STREAM_CLEANUP_FAILED')) : resolve();
-    try { void this.cache.dispose().then(finish, error => { errors.push(error); finish(); }); }
-    catch (error) { errors.push(error); finish(); }
+    let cacheCleanup: Promise<void>;
+    try { cacheCleanup = Promise.resolve(this.cache.dispose()); }
+    catch (error) { cacheCleanup = Promise.reject(error); }
+    void Promise.allSettled([cacheCleanup, this.preparing, ...[...this.retiring].map(owner => owner.done)]).then(results => {
+      if (results[0].status === 'rejected') errors.push(results[0].reason);
+      finish();
+    });
     return this.cleanup;
   }
 }

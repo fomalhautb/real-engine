@@ -42,13 +42,13 @@ function setup(maxRequestsPerFrame = 1) {
     retainPendingPages: vi.fn(), setPinnedPages: vi.fn(),
     uploadFrame: vi.fn(() => ({ bytes: 0 })),
     diagnostics: vi.fn(() => ({ pendingPages: [] as number[], stagingBytes: 0, limits: { maxQueuedPages: 4, maxStagingBytes: 1024 } })),
-    dispose: vi.fn(),
+    dispose: vi.fn(), migrateResident: vi.fn(),
   };
   const selection = {
     capacity: 1, update: vi.fn(() => 0),
     feedback: vi.fn(async (): Promise<GeometryStreamSelectionFeedback> =>
       ({ frame: 1, requestedPages: [], desiredGroups: [], indices: 0, overflow: false, occlusion: zeroOcclusion })),
-    diagnostics: vi.fn(() => ({})), dispose: vi.fn(),
+    diagnostics: vi.fn(() => ({})), dispose: vi.fn(), copyViewStateFrom: vi.fn(),
   };
   const device = { queue: { onSubmittedWorkDone: vi.fn(async () => {}) } } as unknown as GPUDevice;
   mocks.cacheCreate.mockResolvedValue(cache);
@@ -65,6 +65,98 @@ async function feedbackSettled(stream: GpuGeometryStream): Promise<void> {
 beforeEach(() => { vi.resetAllMocks(); mocks.validateProxy.mockResolvedValue(undefined); });
 
 describe('GPU geometry stream bridge lifecycle', () => {
+  it('prepares a replacement with the same cache, commits synchronously, and retires old owners after feedback and fence', async () => {
+    const { scene, device, cache, pool, selection } = setup();
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    let finishFeedback!: (value: GeometryStreamSelectionFeedback) => void, finishFence!: () => void;
+    selection.feedback.mockImplementationOnce(() => new Promise(resolve => { finishFeedback = resolve; }));
+    stream.afterSubmit();
+    const nextPool = { ...pool, slotCount: 3, dispose: vi.fn() };
+    const nextSelection = { ...selection, feedback: vi.fn(async (): Promise<GeometryStreamSelectionFeedback> =>
+      ({ frame: 2, requestedPages: [], desiredGroups: [{ groupId: 2, projectedError: 5 }], indices: 0, overflow: false, occlusion: zeroOcclusion })),
+      dispose: vi.fn(), copyViewStateFrom: vi.fn() };
+    pool.migrateResident.mockResolvedValue({ pool: nextPool, copiedPages: [0], copiedBytes: 100, peakBytes: 500 });
+    mocks.selectionCreate.mockResolvedValueOnce(nextSelection);
+    const candidate = await stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 });
+    expect(stream.pool).toBe(pool); expect(stream.selection).toBe(selection); expect(cache.dispose).not.toHaveBeenCalled();
+    expect(() => stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 })).toThrow('CAPACITY_BUSY');
+    vi.mocked(device.queue.onSubmittedWorkDone).mockImplementationOnce(() => new Promise(resolve => { finishFence = () => resolve(undefined); }));
+    const commit = stream.commitCapacity(candidate);
+    expect(stream.pool).toBe(nextPool); expect(stream.selection).toBe(nextSelection); expect(stream.capacityEpoch).toBe(1);
+    expect(nextSelection.copyViewStateFrom).toHaveBeenLastCalledWith(selection);
+    expect(pool.dispose).not.toHaveBeenCalled(); expect(selection.dispose).not.toHaveBeenCalled();
+    expect(() => stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 })).toThrow('CAPACITY_BUSY');
+    await feedbackSettled(stream);
+    finishFeedback({ frame: 1, requestedPages: [], desiredGroups: [{ groupId: 3, projectedError: 100 }], indices: 0,
+      overflow: true, occlusion: zeroOcclusion });
+    await Promise.resolve(); expect(stream.diagnostics().error).toBeNull();
+    finishFence(); await commit.retired;
+    expect(stream.diagnostics().allocation.pages).toEqual([0, 2]);
+    expect(pool.dispose).toHaveBeenCalledOnce(); expect(selection.dispose).toHaveBeenCalledOnce();
+    expect(() => stream.commitCapacity(candidate)).toThrow('CAPACITY_STALE');
+    await stream.dispose(); expect(cache.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('aborts an unused replacement and preserves the original stream when selection creation fails', async () => {
+    const { scene, device, pool, selection } = setup();
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    const nextPool = { ...pool, slotCount: 2, dispose: vi.fn() }, nextSelection = { ...selection, dispose: vi.fn() };
+    pool.migrateResident.mockResolvedValue({ pool: nextPool, copiedPages: [0], copiedBytes: 100, peakBytes: 500 });
+    mocks.selectionCreate.mockRejectedValueOnce(new Error('FAKE_SELECTION_FAILURE'));
+    await expect(stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 })).rejects.toThrow('FAKE_SELECTION_FAILURE');
+    expect(nextPool.dispose).toHaveBeenCalledOnce(); expect(pool.dispose).not.toHaveBeenCalled(); expect(stream.pool).toBe(pool);
+    mocks.selectionCreate.mockResolvedValueOnce(nextSelection);
+    const candidate = await stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 });
+    stream.abortCapacity(candidate);
+    expect(nextSelection.dispose).toHaveBeenCalledOnce(); expect(stream.pool).toBe(pool);
+    expect(() => stream.commitCapacity(candidate)).toThrow('CAPACITY_STALE'); await stream.dispose();
+  });
+
+  it('awaits and cleans an in-progress preparation when the stream is disposed', async () => {
+    const { scene, device, pool } = setup();
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    let finishMigration!: (value: unknown) => void;
+    pool.migrateResident.mockImplementationOnce(() => new Promise(resolve => { finishMigration = resolve; }));
+    const pending = stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 });
+    const rejection = expect(pending).rejects.toThrow('DISPOSED');
+    let cleaned = false; const cleanup = stream.dispose().then(() => { cleaned = true; });
+    await Promise.resolve(); expect(cleaned).toBe(false);
+    const candidatePool = { ...pool, dispose: vi.fn() };
+    finishMigration({ pool: candidatePool, copiedPages: [0], copiedBytes: 100, peakBytes: 500 });
+    await rejection; await cleanup; expect(cleaned).toBe(true); expect(candidatePool.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('still waits for migration cleanup when cache disposal throws synchronously', async () => {
+    const { scene, device, cache, pool } = setup();
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    let finishMigration!: (value: unknown) => void;
+    pool.migrateResident.mockImplementationOnce(() => new Promise(resolve => { finishMigration = resolve; }));
+    const pending = stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 });
+    const rejection = expect(pending).rejects.toThrow('DISPOSED');
+    cache.dispose.mockImplementationOnce(() => { throw new Error('FAKE_SYNC_CACHE_FAILURE'); });
+    let cleaned = false;
+    const cleanup = stream.dispose(); void cleanup.then(() => { cleaned = true; }, () => { cleaned = true; });
+    const cleanupRejected = expect(cleanup).rejects.toThrow('GEOMETRY_STREAM_CLEANUP_FAILED');
+    await Promise.resolve(); expect(cleaned).toBe(false);
+    const candidatePool = { ...pool, dispose: vi.fn() };
+    finishMigration({ pool: candidatePool, copiedPages: [0], copiedBytes: 100, peakBytes: 500 });
+    await rejection; await cleanupRejected; expect(cleaned).toBe(true);
+    expect(candidatePool.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('reports a retirement fence failure and releases the old GPU owners', async () => {
+    const { scene, device, pool, selection } = setup();
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    const nextPool = { ...pool, slotCount: 3, dispose: vi.fn() }, nextSelection = { ...selection, dispose: vi.fn() };
+    pool.migrateResident.mockResolvedValue({ pool: nextPool, copiedPages: [0], copiedBytes: 100, peakBytes: 500 });
+    mocks.selectionCreate.mockResolvedValueOnce(nextSelection);
+    const candidate = await stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 });
+    vi.mocked(device.queue.onSubmittedWorkDone).mockRejectedValueOnce(new Error('FAKE_RETIRE_QUEUE_FAILURE'));
+    await expect(stream.commitCapacity(candidate).retired).rejects.toThrow('CAPACITY_RETIRE_FAILED');
+    expect(stream.diagnostics().error).toContain('FAKE_RETIRE_QUEUE_FAILURE');
+    expect(pool.dispose).toHaveBeenCalledOnce(); expect(selection.dispose).toHaveBeenCalledOnce();
+    await stream.dispose(); expect(nextPool.dispose).toHaveBeenCalledOnce(); expect(nextSelection.dispose).toHaveBeenCalledOnce();
+  });
   it('rejects proxy budgets without a proxy before GPU allocation', async () => {
     const { scene, device } = setup();
     const invalid = { ...scene, geometryStream: { ...scene.geometryStream!, queryProxyLimits: { maxTriangles: 1 } } };

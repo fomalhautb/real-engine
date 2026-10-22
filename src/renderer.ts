@@ -33,7 +33,7 @@ import { TextureStreaming } from './texture-streaming';
 import { meshWorldUnitsPerUv, modelStretch, textureViewDemand } from './texture-stream-demand';
 import type { TextureStreamDemand, TextureStreamingOptions } from './texture-stream-types';
 import { GpuSurfaceReceivers } from './gpu-surface-receivers';
-import { decodeFinalGatherDiagnostics, decodeFinalGatherDiagnosticSurfaces, validateFinalGatherDiagnosticPoints } from './final-gather-diagnostics';
+import { decodeFinalGatherDiagnostics, decodeFinalGatherDiagnosticSurfaces, decodeFinalGatherCoverage, validateFinalGatherDiagnosticPoints } from './final-gather-diagnostics';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 0, length = values.length): boolean {
@@ -66,7 +66,7 @@ export interface FrameStats {
   /** triangles is source instance-expanded geometry; use probeGeometryLod for actual selected triangles. */
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
-  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number; surfaceReceivers: number; reflections: number; occlusion: number; volumetricFog: number } | null;
+  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number; supplementalReceivers: number; surfaceReceivers: number; reflections: number; occlusion: number; volumetricFog: number } | null;
   /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
   gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
@@ -279,6 +279,7 @@ export class Renderer {
     this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0)
       + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.reflections ? 2 : 0) + (options.occlusion ? 6 : 0)
       + (this.diffuseGiOptions?.finalGather?.receiver === 'raster' ? (options.occlusion ? 4 : 2) : 0)
+      + (this.diffuseGiOptions?.finalGather?.maxSupplementalAnchors ? 2 : 0)
       + (options.volumetricFog ? (options.volumetricFog.temporal ? 8 : 6) : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes, adapter.info);
     this.textureStreamingOptions = options.textureStreaming;
@@ -504,7 +505,8 @@ export class Renderer {
         ] : []),
       ], execute: (encoder: GPUCommandEncoder) => {
         this.stats.uploadedBytes += this.diffuseGi!.encodeFinalGather(encoder, this.materialRevision,
-          this.timestamp(12 + (this.geometryLod ? 2 : 0)));
+          this.timestamp(12 + (this.geometryLod ? 2 : 0)), this.diffuseGiOptions!.finalGather!.maxSupplementalAnchors
+            ? this.timestamp(this.supplementalTimestampIndex) : undefined);
       } }] : []),
       { name: 'shadow', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'write' }], execute: encoder => this.encodeShadow(encoder) },
       ...(this.reflections ? [{ name: 'reflections', uses: [
@@ -1239,6 +1241,7 @@ export class Renderer {
   }
   private get occlusionTimestampIndex(): number { return this.reflectionTimestampIndex + (this.reflections ? 2 : 0); }
   private get receiverTimestampIndex(): number { return this.occlusionTimestampIndex + (this.occlusion ? 6 : 0); }
+  private get supplementalTimestampIndex(): number { return this.receiverTimestampIndex + (this.surfaceReceivers ? (this.occlusion ? 4 : 2) : 0); }
   private timestamp(index: number): GPUComputePassTimestampWrites | undefined {
     return this.querySet ? { querySet: this.querySet, beginningOfPassWriteIndex: index, endOfPassWriteIndex: index + 1 } : undefined;
   }
@@ -1375,6 +1378,9 @@ export class Renderer {
         geometryLod: this.geometryLod ? Number(values[this.worldQueries ? 11 : 9] - values[this.worldQueries ? 10 : 8]) / 1e6 : 0,
         diffuseGi: this.diffuseGi ? Number(values[this.geometryLod ? 13 : 11] - values[this.geometryLod ? 12 : 10]) / 1e6 : 0,
         finalGather: this.diffuseGiOptions?.finalGather ? Number(values[this.geometryLod ? 15 : 13] - values[this.geometryLod ? 14 : 12]) / 1e6 : 0,
+        // This is a subset of finalGather; do not add it again to total GPU time.
+        supplementalReceivers: this.diffuseGiOptions?.finalGather?.maxSupplementalAnchors
+          ? Number(values[this.supplementalTimestampIndex + 1] - values[this.supplementalTimestampIndex]) / 1e6 : 0,
         surfaceReceivers: this.surfaceReceivers ? Number(values[this.receiverTimestampIndex + 1] - values[this.receiverTimestampIndex]
           + (this.occlusion ? values[this.receiverTimestampIndex + 3] - values[this.receiverTimestampIndex + 2] : 0n)) / 1e6 : 0,
         reflections: this.reflections ? Number(values[this.reflectionTimestampIndex + 1] - values[this.reflectionTimestampIndex]) / 1e6 : 0,
@@ -1434,7 +1440,7 @@ export class Renderer {
   /** Explicit diagnostic redraw of the last submitted surface. Pause rendering
    * while pipelines are prepared. No simulation, GI sampling or LOD selection
    * advances, and production HDR/depth/history targets remain untouched. */
-  async probeDiffuseGiReconstruction(points: readonly { x: number; y: number }[]) {
+  async probeDiffuseGiReconstruction(points: readonly { x: number; y: number }[], options: { coverage?: boolean } = {}) {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.diffuseGiOptions?.finalGather || !this.lastViewProjection) throw new Error('FINAL_GATHER_DIAGNOSTIC_NO_FRAME');
     if (this.gatherDiagnosticPending) throw new Error('FINAL_GATHER_DIAGNOSTIC_PENDING');
@@ -1442,7 +1448,11 @@ export class Renderer {
     const width = this.stats.width, height = this.stats.height, frame = this.stats.frames, revision = this.materialRevision;
     if (revision !== this.lastRenderedMaterialRevision) throw new Error('FINAL_GATHER_DIAGNOSTIC_STALE_MATERIAL');
     const requested = validateFinalGatherDiagnosticPoints(points, width, height);
-    const temporaryBytes = width * height * 36 + requested.length * 1024;
+    if (options.coverage !== undefined && typeof options.coverage !== 'boolean') throw new Error('FINAL_GATHER_DIAGNOSTIC_OPTIONS');
+    const coverageRowBytes = options.coverage ? Math.ceil(width * 16 / 256) * 256 : 0;
+    const coverageOffset = requested.length * 1024;
+    const readBytes = coverageOffset + coverageRowBytes * height;
+    const temporaryBytes = width * height * 36 + readBytes;
     if (temporaryBytes > 64 * 1024 * 1024) throw new Error('FINAL_GATHER_DIAGNOSTIC_MEMORY_BUDGET');
     this.gatherDiagnosticPending = true;
     const textures: GPUTexture[] = [], leases: { pool: GpuGeometryPagePool; lease: GeometryGpuFrameLease }[] = [];
@@ -1460,7 +1470,7 @@ export class Renderer {
           usage: GPUTextureUsage.RENDER_ATTACHMENT | (i === 2 ? 0 : GPUTextureUsage.COPY_SRC) }));
         account(width * height * (i === 2 ? 4 : 16));
       }
-      read = this.device.createBuffer({ label: 'bounded GI reconstruction readback', size: requested.length * 1024,
+      read = this.device.createBuffer({ label: 'bounded GI reconstruction readback', size: readBytes,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }); account(read.size);
       for (const batch of this.batches) if (batch.stream) {
         const pool = batch.stream.runtime.pool; leases.push({ pool, lease: pool.acquireFrame([...pool.residentPageIds()]) });
@@ -1477,7 +1487,7 @@ export class Renderer {
             loadOp: recovery ? 'load' : 'clear', storeOp: 'store' },
         ], depthStencilAttachment: { view: textures[2].createView(), depthClearValue: 1,
           depthLoadOp: recovery ? 'load' : 'clear', depthStoreOp: 'store' } });
-        pass.setScissorRect(minX, minY, maxX - minX + 1, maxY - minY + 1);
+        if (!options.coverage || mode !== 0) pass.setScissorRect(minX, minY, maxX - minX + 1, maxY - minY + 1);
         pass.setBindGroup(0, this.frameBindGroup);
         pass.setBindGroup(3, this.lightingGroups[this.diffuseGi!.surfaceBindingIndex]);
         this.draw(pass, 'surface', recovery, overrides); pass.end();
@@ -1486,6 +1496,8 @@ export class Renderer {
           encoder.copyTextureToBuffer({ texture: textures[attachment], origin: requested[i] },
             { buffer: read, offset: i * 1024 + mode * 512 + attachment * 256, bytesPerRow: 256, rowsPerImage: 1 }, { width: 1, height: 1 });
         }
+        if (options.coverage && mode === 0) encoder.copyTextureToBuffer({ texture: textures[0] },
+          { buffer: read, offset: coverageOffset, bytesPerRow: coverageRowBytes, rowsPerImage: height }, { width, height });
       }
       if (leases.length) {
         const completion = GpuGeometryPagePool.submitFrames(leases, [encoder.finish()]); submitted = true;
@@ -1502,7 +1514,10 @@ export class Renderer {
         surfaceWords.set(mapped.subarray(i * 256 + 192, i * 256 + 196), i * 8 + 4);
       }
       const surfaces = decodeFinalGatherDiagnosticSurfaces(surfaceWords, requested);
+      const coverage = options.coverage ? decodeFinalGatherCoverage(mapped.subarray(coverageOffset / 4),
+        width, height, coverageRowBytes / 4) : null;
       return { frame, materialRevision: revision, width, height, temporaryBytes,
+        coverage,
         points: decodeFinalGatherDiagnostics(words, requested).map((point, index) => {
           const surface = surfaces[index];
           if (surface && !this.batches[surface.sourceId - 1]) throw new Error('FINAL_GATHER_DIAGNOSTIC_SOURCE');

@@ -17,7 +17,8 @@ fn gatherDiagnosticFragment(input: Varyings, @builtin(front_facing) front: bool)
     let luminance = vec3f(0.2126, 0.7152, 0.0722);
     var packed = vec4u(0u);
     for (var i = 0u; i < 16u; i++) { packed[i / 4u] |= result.rejections[i] << ((i % 4u) * 8u); }
-    return GatherDiagnosticOutput(vec4u(result.branch | (result.primaryAccepted << 8u) | (result.ringAccepted << 16u),
+    return GatherDiagnosticOutput(vec4u(result.branch | (result.primaryAccepted << 8u) | (result.ringAccepted << 16u)
+        | (result.supplementalAccepted << 24u),
         bitcast<u32>(result.total), bitcast<u32>(dot(result.irradiance, luminance)), bitcast<u32>(dot(world, luminance))), packed);
 }
 

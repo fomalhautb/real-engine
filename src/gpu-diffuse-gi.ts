@@ -189,8 +189,8 @@ export class GpuDiffuseGi {
       multiBounce: this.multiBounce, materialRevision }) ?? 0;
   }
   encodeFinalGather(encoder: GPUCommandEncoder, materialRevision: number,
-    timing?: GPUComputePassTimestampWrites): number {
-    return this.finalGather?.encode(encoder, materialRevision, this.currentIndex, timing) ?? 0;
+    timing?: GPUComputePassTimestampWrites, coverageTiming?: GPUComputePassTimestampWrites): number {
+    return this.finalGather?.encode(encoder, materialRevision, this.currentIndex, timing, coverageTiming) ?? 0;
   }
   setFinalGatherEnabled(enabled: boolean): void {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');

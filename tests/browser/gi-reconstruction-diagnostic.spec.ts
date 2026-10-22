@@ -31,6 +31,11 @@ test('GPU reconstruction diagnostic reports actual branches and leaves the rende
     expect(capture.diagnostic.temporaryBytes).toBeLessThan(64 * 1024 * 1024);
     expect(capture.after).toEqual(capture.before);
     expect(capture.hdrAfter).toEqual(capture.hdrBefore);
+    const census = capture.diagnostic.coverage;
+    expect(Object.values(census.counts).reduce((a, b) => a + b, 0)).toBe(128 * 128);
+    expect(census.uncoveredPixelsPerTile.reduce((sum, count, gaps) => sum + count * gaps, 0)).toBe(census.counts.uncovered);
+    const branches = ['disabled', 'primary', 'ring', 'uncovered', 'background', 'unlit', 'supplemental'];
+    expect(capture.sampledBranches.map(id => branches[id])).toEqual(capture.diagnostic.points.map(p => p.branch));
     for (const point of capture.diagnostic.points) {
       expect(point.candidateRejections).toHaveLength(16);
       expect(Number.isFinite(point.totalWeight)).toBe(true);

@@ -56,10 +56,13 @@ export async function runGiReconstructionDiagnosticFixture() {
     const capture = async () => {
       const hdrBefore = await renderer!.probeHdr(pixels);
       const before = { frames: renderer!.stats.frames, ownedGpuBytes: renderer!.stats.ownedGpuBytes };
-      const diagnostic = await renderer!.probeDiffuseGiReconstruction(pixels);
+      const diagnostic = await renderer!.probeDiffuseGiReconstruction(pixels, { coverage: true });
+      const coverage = diagnostic.coverage!;
+      const sampledBranches = pixels.map(p => coverage.branches[p.y * coverage.width + p.x]);
+      const { branches: _branches, ...census } = coverage;
       const after = { frames: renderer!.stats.frames, ownedGpuBytes: renderer!.stats.ownedGpuBytes };
       const hdrAfter = await renderer!.probeHdr(pixels);
-      return { hdrBefore, diagnostic, hdrAfter, before, after };
+      return { hdrBefore, diagnostic: { ...diagnostic, coverage: census }, sampledBranches, hdrAfter, before, after };
     };
     const active = await capture();
     renderer.setDiffuseGiFinalGatherEnabled(false);

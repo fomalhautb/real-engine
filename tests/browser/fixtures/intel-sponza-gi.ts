@@ -50,6 +50,8 @@ export interface IntelSponzaGiOptions {
   rasterReceiver?: boolean;
   /** Explicit actual-fragment reconstruction decisions; no extra GI frames. */
   reconstructionDiagnostics?: boolean;
+  coverageDiagnostics?: boolean;
+  supplementalGather?: boolean;
   /** Bounded single-bounce irradiance reference at actual visible fragments. */
   localReference?: boolean;
   sourceRaster?: boolean;
@@ -198,6 +200,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
       skyRadiance: [0.2, 0.25, 0.35] as [number, number, number], multiBounce: false, maxBytes: 128 * MiB,
       ...(settings.finalGather ? { finalGather: { pixelSpacing: settings.fineGather ? 4 : 8, maxAnchors: settings.fineGather ? 65536 : 32768, raysPerAnchor: 1,
         pathSegments: 2, maxHistory: settings.fineGather ? 256 : 64, maxBytes: 64 * MiB,
+        maxSupplementalAnchors: settings.supplementalGather ? 8192 : 0,
+        maxSupplementalWorkUnits: settings.supplementalGather ? 8_388_608 : 0,
         receiver: settings.rasterReceiver ? 'raster' as const : 'world-query' as const } } : {}) };
     const renderBatches = settings.sourceRaster ? batches.map(({ geometryStream, ...batch }): SceneBatch => ({ ...batch, mesh: geometryStream.queryProxy.mesh })) : batches;
     renderer = await Renderer.create(canvas, renderBatches, { maxBatches: 512, antiAliasing: 'fxaa', textureBudgetBytes: 512 * MiB,
@@ -260,9 +264,12 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
       }
       const captures: any[] = [];
       const capture = async (label: string, count: number) => {
-        const signatureBefore = residencySignature(), hdrFrames = [];
+        const signatureBefore = residencySignature(), hdrFrames = [], gpuSamples = [];
         const firstFrame = renderedFrame + 1;
-        for (let i = 0; i < count; i++) { renderer!.render(eye, target); renderedFrame++; hdrFrames.push(await renderer!.probeHdr(points)); }
+        for (let i = 0; i < count; i++) {
+          renderer!.render(eye, target); renderedFrame++; hdrFrames.push(await renderer!.probeHdr(points));
+          if (renderer!.stats.gpuMs) gpuSamples.push({ frame: renderer!.stats.gpuSampleFrame, ...renderer!.stats.gpuMs });
+        }
         const probe = label === 'direct-only' ? null : await renderer!.probeDiffuseGi();
         const diagnostics = renderer!.diagnostics();
         if (!residencySettled(diagnostics)) throw Error('SPONZA_CAPTURE_RESIDENCY_NOT_SETTLED');
@@ -276,12 +283,35 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
               (dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1 ? primary : recovery).push(x + dx + (y + dy) * grid.columns);
             }
           }
-          return { pixel, primary, recovery, indices: [...primary, ...recovery] };
+          const supplemental: number[] = [];
+          if (grid.supplementalTileSpacing) {
+            const pitch = grid.supplementalTileSpacing, columns = Math.ceil(canvas.width / pitch), rows = Math.ceil(canvas.height / pitch);
+            const sx = Math.floor(pixel.x / pitch), sy = Math.floor(pixel.y / pitch);
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+              if (sx + dx >= 0 && sy + dy >= 0 && sx + dx < columns && sy + dy < rows) {
+                supplemental.push(grid.primaryAnchorsPerUpdate + sx + dx + (sy + dy) * columns);
+              }
+            }
+          }
+          return { pixel, primary, recovery, supplemental, indices: [...primary, ...recovery, ...supplemental] };
         }) : [];
         const finalGather = candidates.length ? { candidates,
           probe: await renderer!.probeDiffuseGiFinalGather([...new Set(candidates.flatMap(row => row.indices))]),
           note: 'Candidate anchors only; inclusion does not prove surface compatibility or acceptance by reconstruction.' } : null;
-        const reconstruction = settings.reconstructionDiagnostics ? await renderer!.probeDiffuseGiReconstruction(points) : null;
+        const diagnostic = settings.reconstructionDiagnostics ? await renderer!.probeDiffuseGiReconstruction(points,
+          { coverage: settings.coverageDiagnostics }) : null;
+        let coveragePng: string | null = null;
+        if (diagnostic?.coverage) {
+          const map = document.createElement('canvas'); map.width = diagnostic.width; map.height = diagnostic.height;
+          const context = map.getContext('2d')!, image = context.createImageData(map.width, map.height);
+          const palette = [[90,90,90], [36,150,80], [30,185,225], [255,55,45], [8,10,12], [95,80,210], [255,190,25]];
+          diagnostic.coverage.branches.forEach((branch, i) => { image.data.set([...palette[branch], 255], i * 4); });
+          context.putImageData(image, 0, 0); coveragePng = map.toDataURL();
+        }
+        const reconstruction = diagnostic ? { ...diagnostic, coverage: diagnostic.coverage ? {
+          ...diagnostic.coverage, branches: undefined,
+          legend: { primary: 'green', ring: 'cyan', uncovered: 'red', disabled: 'gray', background: 'black', unlit: 'purple', supplemental: 'amber' },
+        } : null } : null;
         let localReference = null;
         if (settings.localReference && label === 'gather-single-bounce' && reconstruction) {
           const wanted = new Set(['640,620', '260,400', '80,475', '279,480', '281,480', '283,480', '291,480',
@@ -294,7 +324,7 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
         }
         const signatureAfter = residencySignature();
         const result = { label, firstFrame, lastFrame: renderedFrame, renderedFrames: count,
-          png: canvas.toDataURL(), points, hdrFrames, probe, finalGather, reconstruction, localReference,
+          png: canvas.toDataURL(), coveragePng, points, hdrFrames, gpuSamples, probe, finalGather, reconstruction, localReference,
           residencyUnchanged: signatureBefore === signatureAfter, diagnostics };
         captures.push(result);
         progress('gi-capture', { label, invalidProbes: probe?.invalidProbes, residencyUnchanged: result.residencyUnchanged, hdr: hdrFrames.at(-1) });

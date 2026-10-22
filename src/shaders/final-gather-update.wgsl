@@ -12,7 +12,7 @@ struct FinalGatherParameters {
     rasterDx: vec4f,
     rasterDy: vec4f,
     rasterDz: vec4f,
-    raster: vec4u, // receiver mode, metadata row count, reserved
+    raster: vec4u, // receiver mode, metadata rows, supplemental tile pitch, supplemental count
 }
 struct FinalGatherAnchor {
     position: vec4f,
@@ -103,12 +103,7 @@ fn gatherEmptyRay() -> Ray {
     return Ray(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(0.0), vec4u(0u));
 }
 
-@compute @workgroup_size(64)
-fn loadRasterReceivers(@builtin(global_invocation_id) id: vec3u) {
-    if (id.x >= gather.settings.y) { return; }
-    let coordinate = vec2u(id.x % gather.viewport.z, id.x / gather.viewport.z);
-    let pixelOffset = f32(gather.settings.x / 2u) + 0.5;
-    let pixel = min(vec2f(coordinate) * f32(gather.settings.x) + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
+fn gatherRasterHit(pixel: vec2f) -> Hit {
     let texel = vec2i(floor(pixel));
     let packed = textureLoad(receiverIdentityNormals, texel, 0);
     let motionDepth = textureLoad(receiverMotionDepth, texel, 0);
@@ -134,7 +129,99 @@ fn loadRasterReceivers(@builtin(global_invocation_id) id: vec3u) {
             hit.versions = metadata.versions;
         }
     }
-    rasterCameraHits[id.x] = hit;
+    return hit;
+}
+
+@compute @workgroup_size(64)
+fn loadRasterReceivers(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= gather.viewport.z * gather.viewport.w) { return; }
+    let coordinate = vec2u(id.x % gather.viewport.z, id.x / gather.viewport.z);
+    let pixelOffset = f32(gather.settings.x / 2u) + 0.5;
+    let pixel = min(vec2f(coordinate) * f32(gather.settings.x) + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
+    rasterCameraHits[id.x] = gatherRasterHit(pixel);
+}
+
+// Match the production reconstruction's geometry gates and weights. This pass
+// reads only completed primary receivers; it never reads another workgroup's
+// supplemental output or uses an atomic race to choose a surface.
+fn gatherReceiverCompatible(anchor: Hit, receiver: Hit) -> bool {
+    let delta = receiver.position.xyz - anchor.position.xyz;
+    return anchor.identity.x != 0u && anchor.versions.x == gather.state.x
+        && anchor.versions.w == gather.emissive.z && all(anchor.identity.xy == receiver.identity.xy)
+        && dot(anchor.normal.xyz, receiver.normal.xyz) >= 0.95
+        && abs(dot(delta, gatherHitGeometry(receiver))) <= gather.sampling.z
+        && abs(dot(delta, gatherHitGeometry(anchor))) <= gather.sampling.z
+        && length(delta) <= gather.sampling.w;
+}
+
+fn gatherPrimaryCovers(pixel: vec2f, receiver: Hit) -> bool {
+    let pitch = f32(gather.settings.x);
+    let pixelOffset = f32(gather.settings.x / 2u) + 0.5;
+    let lower = vec2i(floor((pixel - pixelOffset) / pitch));
+    let lowerPixel = min(vec2f(lower) * pitch + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
+    let upperPixel = min(vec2f(lower + vec2i(1)) * pitch + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
+    let fraction = clamp((pixel - lowerPixel) / max(upperPixel - lowerPixel, vec2f(1.0)), vec2f(0.0), vec2f(1.0));
+    var total = 0.0;
+    for (var corner = 0u; corner < 4u; corner++) {
+        let offset = vec2i(i32(corner & 1u), i32((corner >> 1u) & 1u));
+        let coordinate = lower + offset;
+        if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(gather.viewport.zw))) { continue; }
+        if (!gatherReceiverCompatible(rasterCameraHits[u32(coordinate.x) + u32(coordinate.y) * gather.viewport.z], receiver)) { continue; }
+        let weight = select(vec2f(1.0) - fraction, fraction, offset == vec2i(1));
+        total += weight.x * weight.y;
+    }
+    if (total >= 0.001) { return true; }
+    for (var y = -1; y <= 2; y++) { for (var x = -1; x <= 2; x++) {
+        if (x >= 0 && x <= 1 && y >= 0 && y <= 1) { continue; }
+        let coordinate = lower + vec2i(x, y);
+        if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(gather.viewport.zw))) { continue; }
+        if (!gatherReceiverCompatible(rasterCameraHits[u32(coordinate.x) + u32(coordinate.y) * gather.viewport.z], receiver)) { continue; }
+        let anchorPixel = min(vec2f(coordinate) * pitch + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
+        let delta = (pixel - anchorPixel) / pitch;
+        total += exp(-dot(delta, delta));
+    } }
+    return total >= 0.001;
+}
+
+@compute @workgroup_size(64)
+fn loadSupplementalReceivers(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= gather.raster.w || gather.raster.z == 0u) { return; }
+    let pitch = gather.raster.z;
+    let columns = (gather.viewport.x + pitch - 1u) / pitch;
+    let begin = vec2u(id.x % columns, id.x / columns) * pitch;
+    let end = min(begin + vec2u(pitch), gather.viewport.xy);
+    var selected: Hit;
+    selected.versions = vec4u(gather.state.x, 0u, 0u, gather.emissive.z);
+    var candidates: array<Hit, 4>;
+    var support = vec4u(0u);
+    for (var y = begin.y; y < end.y; y++) {
+        for (var x = begin.x; x < end.x; x++) {
+            let pixel = vec2f(f32(x) + 0.5, f32(y) + 0.5);
+            let hit = gatherRasterHit(pixel);
+            if (hit.identity.x != 0u && hit.emissive.w == 0.0 && !gatherPrimaryCovers(pixel, hit)) {
+                var matched = false;
+                for (var i = 0u; i < 4u; i++) {
+                    if (support[i] != 0u && gatherReceiverCompatible(candidates[i], hit)) {
+                        support[i]++;
+                        matched = true;
+                    }
+                }
+                if (!matched) {
+                    // Keep a bounded set of representative surfaces. Replace
+                    // the least-supported candidate; ties are deterministic.
+                    // Counts measure retained matches, not an optimal cover.
+                    var slot = 0u;
+                    for (var i = 1u; i < 4u; i++) { if (support[i] < support[slot]) { slot = i; } }
+                    candidates[slot] = hit;
+                    support[slot] = 1u;
+                }
+            }
+        }
+    }
+    var best = 0u;
+    for (var i = 1u; i < 4u; i++) { if (support[i] > support[best]) { best = i; } }
+    if (support[best] != 0u) { selected = candidates[best]; }
+    rasterCameraHits[gather.viewport.z * gather.viewport.w + id.x] = selected;
 }
 
 @compute @workgroup_size(64)
@@ -366,16 +453,22 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
     let lowerPixel = min(vec2f(lower) * f32(gather.settings.x) + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
     let upperPixel = min(vec2f(lower + vec2i(1)) * f32(gather.settings.x) + pixelOffset, vec2f(gather.viewport.xy) - 0.5);
     let fraction = clamp((pixel - lowerPixel) / max(upperPixel - lowerPixel, vec2f(1.0)), vec2f(0.0), vec2f(1.0));
+    let supplemental = id.x >= gather.viewport.z * gather.viewport.w;
+    let extraPitch = max(gather.raster.z, 1u);
+    let extraShape = (gather.viewport.xy + vec2u(extraPitch - 1u)) / extraPitch;
+    let extraCell = vec2i(floor(pixel / f32(extraPitch)));
     var sum = vec3f(0.0);
     var total = 0.0;
     var history = 0.0;
     var mixtureMean = 0.0;
     var varianceMass = 0.0;
-    for (var corner = 0u; corner < 4u; corner++) {
+    for (var corner = 0u; corner < select(4u, 9u, supplemental); corner++) {
         let offset = vec2i(i32(corner & 1u), i32((corner >> 1u) & 1u));
-        let coordinate = lower + offset;
-        if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(gather.viewport.zw))) { continue; }
-        let previous = oldAnchors[u32(coordinate.x) + u32(coordinate.y) * gather.viewport.z];
+        let coordinate = select(lower + offset, extraCell + vec2i(i32(corner % 3u) - 1, i32(corner / 3u) - 1), supplemental);
+        let shape = select(gather.viewport.zw, extraShape, supplemental);
+        if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(shape))) { continue; }
+        let previous = oldAnchors[u32(coordinate.x) + u32(coordinate.y) * shape.x
+            + select(0u, gather.viewport.z * gather.viewport.w, supplemental)];
         if (previous.state.x == 0u || previous.state.y + 1u != gather.state.x
             || !all(previous.identity.xyz == current.identity.xyz)
             || !all(previous.versions.yzw == current.versions.yzw)
@@ -384,7 +477,7 @@ fn accumulate(@builtin(global_invocation_id) id: vec3u) {
         if (length(delta) > 0.10 || abs(dot(delta, gatherAnchorGeometry(current))) > 0.001
             || abs(dot(delta, gatherAnchorGeometry(previous))) > 0.001) { continue; }
         let axisWeights = select(vec2f(1.0) - fraction, fraction, offset == vec2i(1));
-        let weight = axisWeights.x * axisWeights.y;
+        let weight = select(axisWeights.x * axisWeights.y, 1.0 / (dot(delta, delta) + 0.000001), supplemental);
         if (weight <= 0.0) { continue; }
         // Weighted mixture variance includes differences among reprojected
         // means, without subtracting two large second moments.
@@ -417,7 +510,11 @@ fn denoise(@builtin(global_invocation_id) id: vec3u) {
         anchors[id.x] = center;
         return;
     }
-    let coordinate = vec2i(i32(id.x % gather.viewport.z), i32(id.x / gather.viewport.z));
+    let supplemental = id.x >= gather.viewport.z * gather.viewport.w;
+    let extraPitch = max(gather.raster.z, 1u);
+    let shape = select(gather.viewport.zw, (gather.viewport.xy + vec2u(extraPitch - 1u)) / extraPitch, supplemental);
+    let indexBase = select(0u, gather.viewport.z * gather.viewport.w, supplemental);
+    let coordinate = vec2i(i32((id.x - indexBase) % shape.x), i32((id.x - indexBase) / shape.x));
     let centerLuminance = gatherLuminance(center.irradiance.xyz);
     let centerMeanVariance = center.moments.x / max(center.irradiance.w - 1.0, 1.0);
     var sum = vec3f(0.0);
@@ -425,8 +522,8 @@ fn denoise(@builtin(global_invocation_id) id: vec3u) {
     for (var y = -2; y <= 2; y++) {
         for (var x = -2; x <= 2; x++) {
             let neighborCoordinate = coordinate + vec2i(x, y);
-            if (any(neighborCoordinate < vec2i(0)) || any(neighborCoordinate >= vec2i(gather.viewport.zw))) { continue; }
-            let index = u32(neighborCoordinate.x) + u32(neighborCoordinate.y) * gather.viewport.z;
+            if (any(neighborCoordinate < vec2i(0)) || any(neighborCoordinate >= vec2i(shape))) { continue; }
+            let index = indexBase + u32(neighborCoordinate.x) + u32(neighborCoordinate.y) * shape.x;
             let neighbor = oldAnchors[index];
             if (neighbor.state.x == 0u || neighbor.state.y != gather.state.x
                 || !all(neighbor.identity.xyz == center.identity.xyz)
@@ -443,7 +540,8 @@ fn denoise(@builtin(global_invocation_id) id: vec3u) {
             // rejection over four updates; saturated history uses an effective
             // count estimate, not a formal independent-sample confidence bound.
             let reliability = clamp((min(center.irradiance.w, neighbor.irradiance.w) - 1.0) / 3.0, 0.0, 1.0);
-            let weight = exp(-f32(x * x + y * y) * 0.25) * mix(1.0, range, reliability);
+            let spatial = select(exp(-f32(x * x + y * y) * 0.25), exp(-dot(delta, delta) / 0.0025), supplemental);
+            let weight = spatial * mix(1.0, range, reliability);
             sum += neighbor.irradiance.xyz * weight;
             total += weight;
         }

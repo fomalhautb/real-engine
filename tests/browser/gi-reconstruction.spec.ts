@@ -15,7 +15,7 @@ test('GI reconstruction retains occlusion confidence and recovers only compatibl
     return fixture.runGiReconstructionFixture();
   });
   console.log('GI_RECONSTRUCTION ' + JSON.stringify(result));
-  expect(result.results).toHaveLength(21);
+  expect(result.results).toHaveLength(26);
   for (const sample of result.results) for (let channel = 0; channel < 3; channel++) {
     const value = sample.actual[channel], expected = sample.expected![channel];
     expect(Number.isFinite(value), sample.label).toBe(true);
@@ -74,6 +74,11 @@ test('GI reconstruction retains occlusion confidence and recovers only compatibl
     expect(diagnostic.rejections, label).toEqual([0, 0, 0, 0, ...Array(12).fill(128)]);
   }
   const edge = by('edge-out-of-bounds-order');
+  expect(by('supplemental-compatible').branch).toBe(6);
+  for (const label of ['supplemental-four-mm-wall', 'supplemental-other-entity', 'supplemental-stale']) {
+    expect(by(label).branch, label).toBe(3);
+  }
+  expect(by('primary-preserved-with-bright-supplemental').branch).toBe(1);
   expect(edge.branch).toBe(3);
   expect(edge.total).toBe(0);
   expect([edge.primaryAccepted, edge.ringAccepted]).toEqual([0, 0]);

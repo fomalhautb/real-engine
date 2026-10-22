@@ -4,7 +4,7 @@ import sampleSource from './shaders/diffuse-gi-sample.wgsl?raw';
 import interpolateSource from './shaders/diffuse-gi-interpolate.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET,
-  giRayDirection, resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
+  giRayDirection, resolveDiffuseGiOptions, validateDiffuseGiQueryBudget, type DiffuseGiOptions, type GiVisibilityDirection } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, buildGiDistanceWeights } from './gi-visibility';
 import { WORLD_HIT_BYTES } from './world-query';
 import type { GpuWorldQuery } from './gpu-world-query';
@@ -22,7 +22,7 @@ export const diffuseGiFinalGatherSampleSource = diffuseGiSampleSource + '\n' + f
 export interface DiffuseGiProbeResult {
   frame: number;
   invalidProbes: number;
-  probes: { coefficients: number[][]; moments: number[][]; maxRadiance: number[]; valid: boolean; primaryOverflows: number; shadowOverflows: number; emissiveOverflows: number }[];
+  probes: { coefficients: number[][]; moments: number[][]; maxRadiance: number[]; valid: boolean; primaryOverflows: number; shadowOverflows: number; emissiveOverflows: number; visibilityOverflows: number }[];
 }
 
 /** Fixed world-space probes with optional cross-frame diffuse transport. Each
@@ -46,12 +46,14 @@ export class GpuDiffuseGi {
   private generateShadows!: GPUComputePipeline;
   private integrate!: GPUComputePipeline;
   private integrateVisibility!: GPUComputePipeline;
+  private validateVisibility!: GPUComputePipeline;
   private bytes = 0;
   private frame = 0;
   private pending = false;
   private disposed = false;
   private enabled = true;
   private multiBounce: boolean;
+  private visibilityDirection: GiVisibilityDirection;
   private historyUpdates = 0;
   private lastHistoryFrame = 0;
   private historyResetReason = 'initial';
@@ -76,14 +78,7 @@ export class GpuDiffuseGi {
     account: (bytes: number) => void): Promise<GpuDiffuseGi> {
     const resolved = resolveDiffuseGiOptions(options);
     if (device.limits.maxStorageBuffersPerShaderStage < 6) throw new Error('DIFFUSE_GI_STORAGE_BINDING_LIMIT');
-    if (resolved.rayCount > queries.options.maxRays) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
-    if (resolved.emissiveSamplesPerProbe && queries.options.maxTraceParameterSetsPerEncoder < 2) {
-      throw new Error('DIFFUSE_GI_QUERY_PARAMETER_BUDGET');
-    }
-    if (resolved.finalGather && queries.options.maxTraceParameterSetsPerEncoder < 6) {
-      throw new Error('FINAL_GATHER_QUERY_PARAMETER_BUDGET');
-    }
-    if (resolved.rayCount > queries.options.maxTotalWorkUnits) throw new Error('DIFFUSE_GI_QUERY_WORK_BUDGET');
+    validateDiffuseGiQueryBudget(resolved, queries.options);
     const sizes = [112, resolved.rayCount * WORLD_HIT_BYTES, resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
@@ -98,6 +93,7 @@ export class GpuDiffuseGi {
     options: ReturnType<typeof resolveDiffuseGiOptions>, private readonly account: (bytes: number) => void) {
     this.options = options;
     this.multiBounce = options.multiBounce;
+    this.visibilityDirection = options.visibilityDirection;
   }
   private initializeResources(): void {
     const { device, queries, options } = this;
@@ -143,8 +139,8 @@ export class GpuDiffuseGi {
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `diffuse GI:${error.lineNum}: ${error.message}`).join('\n'));
     const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
-    [this.generate, this.generateShadows, this.integrate, this.integrateVisibility] = await Promise.all(
-      ['generate', 'generateShadows', 'integrate', 'integrateVisibility'].map(entryPoint =>
+    [this.generate, this.generateShadows, this.integrate, this.integrateVisibility, this.validateVisibility] = await Promise.all(
+      ['generate', 'generateShadows', 'integrate', 'integrateVisibility', 'validateVisibility'].map(entryPoint =>
       this.device.createComputePipelineAsync({ label: 'diffuse GI ' + entryPoint, layout, compute: { module, entryPoint } })));
     if (this.options.emissiveSamplesPerProbe) {
       this.emissiveSampler = await GpuGiEmissiveSampler.create(this.device, this.queries, this.parameters,
@@ -222,6 +218,13 @@ export class GpuDiffuseGi {
     if (this.multiBounce !== enabled) this.resetRequested = 'mode-changed';
     this.multiBounce = enabled;
   }
+  setVisibilityDirection(direction: GiVisibilityDirection): void {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    if (direction !== 'probe-to-receiver' && direction !== 'receiver-to-probe') throw new Error('DIFFUSE_GI_VISIBILITY_DIRECTION');
+    if (direction === 'receiver-to-probe' && !this.options.maxVisibilityWorkUnits) throw new Error('DIFFUSE_GI_VISIBILITY_WORK_BUDGET');
+    if (direction !== this.visibilityDirection) this.resetRequested = 'visibility-direction-changed';
+    this.visibilityDirection = direction;
+  }
   invalidateHistory(): void {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
     this.resetRequested = 'explicit';
@@ -243,6 +246,7 @@ export class GpuDiffuseGi {
     data.set([...o.origin, this.enabled ? 1 : 0]); data.set([...o.spacing, o.maxDistance], 4);
     integers.set([...o.counts, o.raysPerProbe], 8);
     data.set([...direction, o.normalBias], 12); data.set(color, 16); data.set(o.skyRadiance, 20);
+    data[19] = this.visibilityDirection === 'receiver-to-probe' ? 1 : 0;
     data[23] = o.visibilityWeightThreshold;
     integers[24] = frame;
     integers[25] = this.lastHistoryFrame;
@@ -268,6 +272,14 @@ export class GpuDiffuseGi {
     this.queries.encodeTrace(encoder, count, 0, materialRevision);
     dispatch('integrate world-space GI radiance', this.integrate, this.options.probeCount);
     uploaded += this.emissiveSampler?.encode(encoder, outputIndex, materialRevision) ?? 0;
+    if (this.visibilityDirection === 'receiver-to-probe') {
+      // Radiance, sun and emissive consumers are complete. Reuse only the shared
+      // query scratch; the radiance SH is never integrated from support hits.
+      dispatch('generate receiver-directed GI support rays', this.generate, count);
+      uploaded += this.queries.encodeTrace(encoder, count, 0, materialRevision,
+        this.options.maxVisibilityWorkUnits, undefined, 'reverse-material-support');
+      dispatch('validate receiver-directed GI support', this.validateVisibility, this.options.probeCount);
+    }
     dispatch('integrate GI directional visibility', this.integrateVisibility, this.options.probeCount * GI_DISTANCE_CELLS,
       timing && { querySet: timing.querySet, endOfPassWriteIndex: timing.endOfPassWriteIndex });
     this.frame = frame;
@@ -296,12 +308,15 @@ export class GpuDiffuseGi {
           const moments = Array.from({ length: GI_DISTANCE_CELLS }, (_, j) => Array.from(data.slice(base + 36 + j * 4, base + 39 + j * 4)));
           const maxRadiance = [data[base + 3], data[base + 7], data[base + 11]];
           const emissiveOverflows = data[base + 39];
+          const visibilityOverflows = data[base + 43];
           if (![...coefficients.flat(), ...moments.flat(), ...maxRadiance].every(Number.isFinite)
             || !Number.isInteger(emissiveOverflows) || emissiveOverflows < 0
-            || emissiveOverflows > this.options.raysPerProbe) throw new Error('DIFFUSE_GI_NONFINITE');
+            || emissiveOverflows > this.options.raysPerProbe
+            || !Number.isInteger(visibilityOverflows) || visibilityOverflows < 0
+            || visibilityOverflows > this.options.raysPerProbe) throw new Error('DIFFUSE_GI_NONFINITE');
           probes.push({ coefficients, moments, maxRadiance, valid: u32[state] === 1,
             primaryOverflows: u32[state + 2], shadowOverflows: u32[state + 3],
-            emissiveOverflows });
+            emissiveOverflows, visibilityOverflows });
         }
         return { frame, probes, invalidProbes: probes.filter(probe => !probe.valid).length };
       } finally { this.readback.unmap(); }
@@ -310,12 +325,16 @@ export class GpuDiffuseGi {
   diagnostics() {
     const emissive = this.emissiveSampler?.diagnostics();
     const gather = this.finalGather?.diagnostics();
+    const supportRays = this.visibilityDirection === 'receiver-to-probe' ? this.options.rayCount : 0;
     return { enabled: this.enabled, frame: this.frame, options: this.options, ownedGpuBytes: this.bytes,
       multiBounce: this.multiBounce, historyUpdates: this.historyUpdates, lastHistoryFrame: this.lastHistoryFrame,
       historyResetReason: this.historyResetReason, transport: this.multiBounce ? 'cross-frame-diffuse-feedback' : 'single-diffuse-bounce',
       capture: 'diffuse-and-emissive', update: 'full-grid-every-frame', representation: 'radiance-SH9',
       visibility: 'octahedral-distance-moments', visibilityResolution: GI_DISTANCE_RESOLUTION,
       visibilityCapture: 'normalized-cosine-power-32', distanceCaptureSamplesPerUpdate: GI_DISTANCE_CELLS * this.options.rayCount,
+      visibilityDirection: this.visibilityDirection,
+      visibilityQueriesPerUpdate: this.enabled ? supportRays : 0,
+      visibilityMaxWorkUnitsPerUpdate: this.enabled && supportRays ? this.options.maxVisibilityWorkUnits : 0,
       placement: 'caller-provided-free-space-grid',
       queryGeometryRepresentations: this.queries.diagnostics().geometryRepresentations,
       finalGather: gather ?? null,
@@ -325,10 +344,11 @@ export class GpuDiffuseGi {
         inactiveBlockRaysPerUpdate: this.enabled ? emissive.inactiveBlockRaysPerUpdate : 0,
         queryRaysPerUpdate: this.enabled ? emissive.queryRaysPerUpdate : 0,
         maxWorkUnitsPerUpdate: this.enabled ? emissive.maxWorkUnitsPerUpdate : 0 } : null,
-      queriesPerUpdate: this.enabled ? this.options.rayCount * 2 + (this.emissiveSampler?.queryRayCount ?? 0)
+      queriesPerUpdate: this.enabled ? this.options.rayCount * 2 + supportRays + (this.emissiveSampler?.queryRayCount ?? 0)
         + (gather?.queryRaysPerUpdate ?? 0) : 0,
       maxWorkUnitsPerUpdate: this.enabled ? this.queries.options.maxTotalWorkUnits
-        * (this.emissiveSampler?.queryRayCount ? 3 : 2) + (gather?.maxWorkUnitsPerUpdate ?? 0) : 0,
+        * (this.emissiveSampler?.queryRayCount ? 3 : 2) + (supportRays ? this.options.maxVisibilityWorkUnits : 0)
+        + (gather?.maxWorkUnitsPerUpdate ?? 0) : 0,
       temporalAccumulation: this.finalGather ? 'surface-validated-camera-reprojection' : false,
       automaticRelocation: false, reflections: false };
   }

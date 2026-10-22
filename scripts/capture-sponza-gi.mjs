@@ -25,6 +25,7 @@ const valueFlags = new Map([
   ['--gather-spacing', 'gatherPixelSpacing'], ['--gather-capacity', 'gatherCapacity'],
   ['--supplemental-capacity', 'supplementalCapacity'], ['--supplemental-work', 'supplementalWork'],
   ['--diagnostic-points', 'diagnosticPoints'],
+  ['--visibility-direction', 'visibilityDirection'],
 ]);
 const switches = new Map([
   ['--source-raster', 'sourceRaster'], ['--fine-gather', 'fineGather'],
@@ -51,6 +52,9 @@ for (const key of ['geometryRoot', 'queryRoot', 'textureGpuRoot', 'textureRefere
     throw Error(`SPONZA_GI_LOCAL_ROOT:${key}`);
 }
 if (!options.uvAuditUrl.startsWith('/') || options.uvAuditUrl.startsWith('//')) throw Error('SPONZA_GI_LOCAL_UV_AUDIT');
+if (options.visibilityDirection !== undefined && !['probe-to-receiver', 'receiver-to-probe'].includes(options.visibilityDirection)) {
+  throw Error('SPONZA_GI_VISIBILITY_DIRECTION');
+}
 if (options.sourceRaster && !options.queryRoot) throw Error('SPONZA_GI_SOURCE_RASTER_REQUIRES_FINE_QUERY');
 if (options.sourceRaster && options.sceneBudget) throw Error('SPONZA_GI_SOURCE_RASTER_HAS_NO_PAGE_POOLS');
 if (options.fineGather) options.finalGather = true;

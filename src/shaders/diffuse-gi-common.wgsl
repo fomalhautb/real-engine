@@ -4,13 +4,13 @@ struct GiParameters {
     spacing: vec4f, // xyz spacing, w maximum ray distance
     counts: vec4u, // xyz grid dimensions, w rays per probe
     sunDirection: vec4f, // xyz unit vector, w world-space normal bias
-    sunColor: vec4f,
+    sunColor: vec4f, // xyz radiance, w receiver-directed support enabled
     sky: vec4f, // xyz radiance, w low-confidence visibility weight threshold
     state: vec4u, // rendered frame, usable history frame, feedback enabled, emissive area sampling enabled
 }
 struct GiProbe {
     coefficients: array<vec4f, 9>, // RGB incoming radiance SH; first three w values store sampled RGB maxima
-    moments: array<vec4f, GI_DISTANCE_CELLS>, // mean distance, squared distance, weight; texel 0.w counts emissive capture failures
+    moments: array<vec4f, GI_DISTANCE_CELLS>, // mean distance, squared distance, weight; 0.w emissive failures, 1.w support failures
     state: vec4u, // valid, frame, primary overflows, shadow overflows
 }
 fn giDirection(index: u32, count: u32) -> vec3f {

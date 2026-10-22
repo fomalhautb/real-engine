@@ -1,6 +1,8 @@
 /** CPU contracts and numerical reference for a bounded diffuse probe grid. */
 import { GI_DISTANCE_CELLS } from './gi-visibility';
 import { resolveFinalGatherOptions, type FinalGatherOptions, type ResolvedFinalGatherOptions } from './final-gather';
+import type { WorldQueryOptions } from './world-query';
+export type GiVisibilityDirection = 'probe-to-receiver' | 'receiver-to-probe';
 export interface DiffuseGiOptions {
   origin: readonly [number, number, number];
   spacing: readonly [number, number, number];
@@ -16,6 +18,11 @@ export interface DiffuseGiOptions {
   /** Smoothly suppress low-confidence visibility weights and unsupported probe
    * interpolation; 0 disables the curve. Moment confidence is not transmittance. */
   visibilityWeightThreshold?: number;
+  /** Direction of material-sidedness used by the cache support estimate. */
+  visibilityDirection?: GiVisibilityDirection;
+  /** Additional traversal allowance for receiver-directed support. Zero (default)
+   * disables that capture and rejects switching to it at runtime. */
+  maxVisibilityWorkUnits?: number;
   maxBytes?: number;
   /** Optional bounded diffuse path segments at visible surfaces, ahead of the world probe cache. */
   finalGather?: FinalGatherOptions;
@@ -32,6 +39,8 @@ export interface ResolvedDiffuseGiOptions {
   readonly multiBounce: boolean;
   readonly emissiveSamplesPerProbe: number;
   readonly visibilityWeightThreshold: number;
+  readonly visibilityDirection: GiVisibilityDirection;
+  readonly maxVisibilityWorkUnits: number;
   readonly maxBytes: number;
   readonly probeCount: number;
   readonly rayCount: number;
@@ -105,6 +114,16 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
     || visibilityWeightThreshold < 0 || visibilityWeightThreshold > 1) {
     throw new RangeError('DIFFUSE_GI_VISIBILITY_WEIGHT_THRESHOLD');
   }
+  const visibilityDirection = options.visibilityDirection === undefined ? 'probe-to-receiver' : options.visibilityDirection;
+  if (visibilityDirection !== 'probe-to-receiver' && visibilityDirection !== 'receiver-to-probe') {
+    throw new RangeError('DIFFUSE_GI_VISIBILITY_DIRECTION');
+  }
+  const maxVisibilityWorkUnits = options.maxVisibilityWorkUnits === undefined ? 0 : options.maxVisibilityWorkUnits;
+  if (!Number.isSafeInteger(maxVisibilityWorkUnits) || maxVisibilityWorkUnits < 0 || maxVisibilityWorkUnits > 67_108_864
+    || (maxVisibilityWorkUnits > 0 && maxVisibilityWorkUnits < rayCount)
+    || (visibilityDirection === 'receiver-to-probe' && maxVisibilityWorkUnits === 0)) {
+    throw new RangeError('DIFFUSE_GI_VISIBILITY_WORK_BUDGET');
+  }
   const normalBiasLimit = Math.min(...spacing) * 0.25;
   // A millimetre-scale grid must remain legal when the caller omits the bias.
   const normalBias = options.normalBias ?? Math.min(0.03, normalBiasLimit);
@@ -117,7 +136,25 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   if (probeCount * DIFFUSE_GI_PROBE_BYTES > maxBytes) throw new RangeError('DIFFUSE_GI_MEMORY_BUDGET');
   const finalGather = options.finalGather === undefined ? undefined : resolveFinalGatherOptions(options.finalGather);
   return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias,
-    skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, maxBytes, probeCount, rayCount, finalGather });
+    skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, visibilityDirection,
+    maxVisibilityWorkUnits, maxBytes, probeCount, rayCount, finalGather });
+}
+
+/** Conservative slots for all configured GI modes, including a later support
+ * direction switch. The ordinary primary/shadow traces reuse one slot. */
+export function diffuseGiQueryParameterSlots(options: ResolvedDiffuseGiOptions): number {
+  return (options.finalGather ? 6 : options.emissiveSamplesPerProbe ? 2 : 1)
+    + Number(options.maxVisibilityWorkUnits > 0);
+}
+
+export function validateDiffuseGiQueryBudget(options: ResolvedDiffuseGiOptions,
+  queries: Pick<Required<WorldQueryOptions>, 'maxRays' | 'maxTotalWorkUnits' | 'maxTraceParameterSetsPerEncoder'>): void {
+  if (options.rayCount > queries.maxRays) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
+  if (options.rayCount > queries.maxTotalWorkUnits) throw new Error('DIFFUSE_GI_QUERY_WORK_BUDGET');
+  if (options.maxVisibilityWorkUnits > queries.maxTotalWorkUnits) throw new Error('DIFFUSE_GI_VISIBILITY_WORK_BUDGET');
+  if (queries.maxTraceParameterSetsPerEncoder < diffuseGiQueryParameterSlots(options)) {
+    throw new Error(options.finalGather ? 'FINAL_GATHER_QUERY_PARAMETER_BUDGET' : 'DIFFUSE_GI_QUERY_PARAMETER_BUDGET');
+  }
 }
 
 /** Deterministic Fibonacci-sphere direction; rayIndex is zero based. */

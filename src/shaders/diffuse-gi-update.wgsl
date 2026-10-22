@@ -93,6 +93,20 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     }
     probes[id.x].state = vec4u(select(0u, 1u, primaryOverflows + shadowOverflows == 0u), gi.state.x, primaryOverflows, shadowOverflows);
     probes[id.x].moments[0].w = 0.0;
+    probes[id.x].moments[1].w = 0.0;
+}
+
+// One invocation per probe owns validity and the failure count. This pass is
+// ordered before per-texel integration, so no texel races to publish validity.
+@compute @workgroup_size(64)
+fn validateVisibility(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= gi.counts.x * gi.counts.y * gi.counts.z) { return; }
+    var failures = 0u;
+    for (var i = 0u; i < gi.counts.w; i++) {
+        failures += select(0u, 1u, shadows[id.x * gi.counts.w + i].work.z != 0u);
+    }
+    probes[id.x].moments[1].w = f32(failures);
+    if (failures != 0u) { probes[id.x].state.x = 0u; }
 }
 
 // Separate texel invocations avoid a large private GiProbe copy, and all surface
@@ -108,12 +122,15 @@ fn integrateVisibility(@builtin(global_invocation_id) id: vec3u) {
     for (var i = 0u; i < gi.counts.w; i++) {
         let index = probeIndex * gi.counts.w + i;
         var distance = gi.spacing.w;
-        if (primary[index].identity.x != 0u) { distance = primary[index].metric.x; }
+        if (gi.sunColor.w != 0.0) {
+            if (shadows[index].identity.x != 0u) { distance = shadows[index].metric.x; }
+        } else if (primary[index].identity.x != 0u) { distance = primary[index].metric.x; }
         let weight = distanceWeights[cell * gi.counts.w + i];
         moments += vec2f(distance, distance * distance) * weight;
         total += weight;
     }
-    var emissiveFailures = 0.0;
-    if (cell == 0u) { emissiveFailures = probes[probeIndex].moments[0].w; }
-    probes[probeIndex].moments[cell] = vec4f(moments / max(total, 0.00000001), total, emissiveFailures);
+    var failures = 0.0;
+    if (cell == 0u) { failures = probes[probeIndex].moments[0].w; }
+    if (cell == 1u) { failures = probes[probeIndex].moments[1].w; }
+    probes[probeIndex].moments[cell] = vec4f(moments / max(total, 0.00000001), total, failures);
 }

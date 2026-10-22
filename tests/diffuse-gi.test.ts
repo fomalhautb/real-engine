@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET,
   evaluateGiIrradiance, giRayDirection, giShBasis,
-  resolveDiffuseGiOptions, type DiffuseGiOptions,
+  resolveDiffuseGiOptions, validateDiffuseGiQueryBudget, diffuseGiQueryParameterSlots, type DiffuseGiOptions,
 } from '../src/diffuse-gi';
 import { GI_DISTANCE_CELLS } from '../src/gi-visibility';
 
@@ -107,6 +107,26 @@ describe('diffuse GI probe contract', () => {
     expect(resolveDiffuseGiOptions({ ...grid, maxBytes: minimumBytes }).maxBytes).toBe(minimumBytes);
     expect(() => resolveDiffuseGiOptions({ ...grid, maxBytes: 128 * 1024 * 1024 + 1 })).toThrow();
     expect(() => resolveDiffuseGiOptions({ ...grid, maxBytes: minimumBytes + 0.5 })).toThrow();
+  });
+
+  it('reserves a separate bounded receiver-directed support trace and its immutable parameter slot', () => {
+    const base = resolveDiffuseGiOptions(grid);
+    expect(base.visibilityDirection).toBe('probe-to-receiver');
+    expect(base.maxVisibilityWorkUnits).toBe(0);
+    expect(diffuseGiQueryParameterSlots(base)).toBe(1);
+    const support = resolveDiffuseGiOptions({ ...grid, visibilityDirection: 'receiver-to-probe', maxVisibilityWorkUnits: 512 });
+    expect(diffuseGiQueryParameterSlots(support)).toBe(2);
+    const query = { maxRays: 512, maxTotalWorkUnits: 1024, maxTraceParameterSetsPerEncoder: 2 };
+    expect(() => validateDiffuseGiQueryBudget(support, query)).not.toThrow();
+    expect(() => validateDiffuseGiQueryBudget(support, { ...query, maxTraceParameterSetsPerEncoder: 1 })).toThrow('PARAMETER_BUDGET');
+    expect(() => validateDiffuseGiQueryBudget({ ...support, maxVisibilityWorkUnits: 1025 }, query)).toThrow('VISIBILITY_WORK_BUDGET');
+    const gather = resolveDiffuseGiOptions({ ...grid, maxVisibilityWorkUnits: 512, finalGather: {} });
+    expect(diffuseGiQueryParameterSlots(gather)).toBe(7);
+    expect(() => validateDiffuseGiQueryBudget(gather, { ...query, maxTraceParameterSetsPerEncoder: 6 })).toThrow('PARAMETER_BUDGET');
+    for (const value of [undefined, 0, 511, -1, 67_108_865, 512.5, NaN, null]) {
+      expect(() => resolveDiffuseGiOptions({ ...grid, visibilityDirection: 'receiver-to-probe', maxVisibilityWorkUnits: value as number })).toThrow('VISIBILITY_WORK_BUDGET');
+    }
+    for (const value of [null, '', 'both', 1]) expect(() => resolveDiffuseGiOptions({ ...grid, visibilityDirection: value as never })).toThrow('VISIBILITY_DIRECTION');
   });
 });
 

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SceneBatch } from '../src/contracts';
 import { createPlane } from '../src/geometry';
-import { GpuWorldQuery } from '../src/gpu-world-query';
+import { GpuWorldQuery, WORLD_QUERY_TRACE_PARAMETER_BYTES, type WorldQueryFacePolicy } from '../src/gpu-world-query';
 import { identity } from '../src/math';
 
 interface FakeBuffer {
@@ -14,7 +14,7 @@ interface FakeBuffer {
   unmap(): void;
 }
 
-async function setup(maxNodeVisits = 1000, sceneBvh = false) {
+async function setup(maxNodeVisits = 1000, sceneBvh = false, maxTraceParameterSetsPerEncoder = 8, alignment = 256) {
   const buffers: FakeBuffer[] = [];
   const writeBuffer = vi.fn((buffer: FakeBuffer, offset: number, data: ArrayBuffer | ArrayBufferView,
     dataOffset = 0, size?: number) => {
@@ -27,7 +27,7 @@ async function setup(maxNodeVisits = 1000, sceneBvh = false) {
   });
   const pipeline = { getBindGroupLayout: () => ({}) };
   const device = {
-    limits: { minUniformBufferOffsetAlignment: 256, maxStorageBufferBindingSize: 16 * 1024 * 1024,
+    limits: { minUniformBufferOffsetAlignment: alignment, maxUniformBufferBindingSize: 65536, maxStorageBufferBindingSize: 16 * 1024 * 1024,
       maxBufferSize: 16 * 1024 * 1024 },
     queue: { writeBuffer },
     createBuffer: ({ label = '', size, usage }: GPUBufferDescriptor) => {
@@ -40,7 +40,8 @@ async function setup(maxNodeVisits = 1000, sceneBvh = false) {
     createComputePipelineAsync: async () => pipeline,
   } as unknown as GPUDevice;
   const query = await GpuWorldQuery.create(device, {} as GPUBindGroupLayout, () => {}, {
-    maxRays: 8, maxBatches: 8, maxTotalWorkUnits: 100, maxNodeVisits, sceneAcceleration: sceneBvh ? 'bvh' : 'linear',
+    maxRays: 8, maxBatches: 8, maxTotalWorkUnits: 100, maxNodeVisits, maxTraceParameterSetsPerEncoder,
+    sceneAcceleration: sceneBvh ? 'bvh' : 'linear',
   });
   const scene: SceneBatch = { name: 'budget-plane', mesh: createPlane(), capacity: 1,
     deformation: { jointCount: 0, nodes: [] }, morphTargets: [],
@@ -55,8 +56,8 @@ async function setup(maxNodeVisits = 1000, sceneBvh = false) {
   const pass = { setPipeline: vi.fn(), setBindGroup: vi.fn(), dispatchWorkgroups: vi.fn(), end: vi.fn() };
   const encoder = { beginComputePass: vi.fn(() => pass) };
   writeBuffer.mockClear();
-  const quotas = () => writeBuffer.mock.calls.filter(([buffer, , data]) => data.byteLength === 96)
-    .map(([buffer, offset]) => new Uint32Array(buffer.bytes, offset, 24)[9]);
+  const quotas = () => writeBuffer.mock.calls.filter(([, , data]) => data.byteLength === WORLD_QUERY_TRACE_PARAMETER_BYTES)
+    .map(([buffer, offset]) => new Uint32Array(buffer.bytes, offset, WORLD_QUERY_TRACE_PARAMETER_BYTES / 4)[9]);
   return { query, buffers, writeBuffer, encoder, quotas };
 }
 
@@ -67,6 +68,54 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('world query per-trace work budget', () => {
+  it('isolates face policies within the same encoder while retaining partition quotas and default reuse', async () => {
+    const { query, writeBuffer, encoder, buffers } = await setup(1000, true, 2, 16);
+    try {
+      const gpuEncoder = encoder as unknown as GPUCommandEncoder;
+      const partition = { raysPerBlock: 4, primaryRaysPerBlock: 2, supplementalMaxWorkUnits: 40 };
+      const before = query.diagnostics().ownedGpuBytes;
+      const materialUpload = query.encodeTrace(gpuEncoder, 8, 0, 2, 100, partition);
+      const reverseUpload = query.encodeTrace(gpuEncoder, 8, 0, 2, 100, partition, 'reverse-material-support');
+      expect(reverseUpload).toBe(materialUpload);
+      const writes = writeBuffer.mock.calls.filter(([buffer]) => buffer.label === 'world batch parameter slots');
+      expect(writes).toHaveLength(2);
+      expect(writes.map(([, offset]) => offset)).toEqual([0, 112]);
+      const words = writes.map(([buffer, offset]) => new Uint32Array(buffer.bytes, offset, 28));
+      expect(words.map(data => data[24])).toEqual([0, 1]);
+      expect(Array.from(words[0].slice(0, 24))).toEqual(Array.from(words[1].slice(0, 24)));
+      expect(Array.from(words[1].slice(17, 20))).toEqual([4, 2, 10]);
+      expect(query.encodeTrace(gpuEncoder, 8, 0, 2, 100, partition, 'material')).toBe(0);
+      expect(query.encodeTrace(gpuEncoder, 8, 0, 2, 100, partition)).toBe(0);
+      expect(query.encodeTrace(gpuEncoder, 8, 0, 2, 100, partition, 'reverse-material-support')).toBe(0);
+      expect(query.diagnostics().traceParameterBytes).toBe(112);
+      expect(query.diagnostics().ownedGpuBytes).toBe(before);
+      expect(buffers.filter(buffer => buffer.label === 'world batch parameter slots').every(buffer => buffer.size === 224)).toBe(true);
+    } finally { query.dispose(); }
+  });
+  it('rejects unknown face policies before any upload or dispatch, even for zero rays', async () => {
+    const { query, writeBuffer, encoder } = await setup();
+    try {
+      for (const value of [null, '', 'reverse', false, 1, {}, []]) for (const count of [0, 4]) {
+        expect(() => query.encodeTrace(encoder as unknown as GPUCommandEncoder, count, 0, 2,
+          undefined, undefined, value as WorldQueryFacePolicy)).toThrow('WORLD_QUERY_FACE_POLICY');
+      }
+      expect(encoder.beginComputePass).not.toHaveBeenCalled();
+      expect(writeBuffer).not.toHaveBeenCalled();
+    } finally { query.dispose(); }
+  });
+  it('charges a distinct slot for reversed support and preserves the earlier slot after budget rejection', async () => {
+    const { query, writeBuffer, encoder } = await setup(1000, false, 1);
+    try {
+      const gpuEncoder = encoder as unknown as GPUCommandEncoder;
+      query.encodeTrace(gpuEncoder, 4, 0, 2);
+      const writes = writeBuffer.mock.calls.length, passes = encoder.beginComputePass.mock.calls.length;
+      expect(() => query.encodeTrace(gpuEncoder, 4, 0, 2, undefined, undefined, 'reverse-material-support'))
+        .toThrow('WORLD_QUERY_ENCODER_PARAMETER_BUDGET');
+      expect(writeBuffer).toHaveBeenCalledTimes(writes);
+      expect(encoder.beginComputePass).toHaveBeenCalledTimes(passes);
+      expect(query.encodeTrace(gpuEncoder, 4, 0, 2)).toBe(0);
+    } finally { query.dispose(); }
+  });
   it('records matching scene/triangle partitions once and isolates different block layouts in immutable slots', async () => {
     const { query, writeBuffer, encoder } = await setup(1000, true);
     try {

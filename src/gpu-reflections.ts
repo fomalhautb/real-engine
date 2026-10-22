@@ -11,6 +11,7 @@ import { lookAt } from './math';
 import { planReflectionGrid, resolveReflectionsOptions, type ReflectionsOptions, type ReflectionGridPlan } from './reflections';
 import type { GpuWorldQuery } from './gpu-world-query';
 import type { GpuDiffuseGi } from './gpu-diffuse-gi';
+import { diffuseGiQueryParameterSlots } from './diffuse-gi';
 import { WORLD_HIT_BYTES } from './world-query';
 
 export const reflectionSurfaceSource = common + '\n' + sampleSource;
@@ -61,7 +62,7 @@ export class GpuReflections {
     const capacity = Math.min(resolved.maxAnchors, Math.floor(queries.options.maxRays / resolved.samplesPerAnchor),
       Math.floor(queries.options.maxTotalWorkUnits / resolved.samplesPerAnchor));
     if (capacity < 1) throw new Error('REFLECTIONS_QUERY_RAY_BUDGET');
-    const parameterSlots = (gi ? (gi.options.finalGather ? 6 : 2) : 0) + 2;
+    const parameterSlots = (gi ? Math.max(2, diffuseGiQueryParameterSlots(gi.options)) : 0) + 2;
     if (queries.options.maxTraceParameterSetsPerEncoder < parameterSlots) throw new Error('REFLECTIONS_QUERY_PARAMETER_BUDGET');
     if (device.limits.maxStorageBuffersPerShaderStage < 5 + Number(!!gi) + Number(!!fog)) throw new Error('REFLECTIONS_STORAGE_BINDING_LIMIT');
     if (fog && !shadow) throw new Error('REFLECTIONS_FOG_SHADOW_REQUIRED');

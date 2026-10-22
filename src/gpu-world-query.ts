@@ -14,6 +14,11 @@ import { decodeWorldHits, packWorldRays, resolveWorldQueryOptions, WORLD_HIT_BYT
 
 type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
+/** Support captures may reverse single-sided eligibility without changing the
+ * material's coverage or the authored face policy used by transport queries. */
+export type WorldQueryFacePolicy = 'material' | 'reverse-material-support';
+export const WORLD_QUERY_TRACE_PARAMETER_BYTES = 112;
+
 /** Every source-major block contains a primary prefix and a supplemental suffix.
  * The primary budget remains the encodeTrace maxWorkUnits argument. */
 export interface WorldQueryWorkPartition {
@@ -177,7 +182,10 @@ export class GpuWorldQuery {
     private readonly account: (bytes: number) => void, options: WorldQueryOptions) {
     this.options = Object.freeze(resolveWorldQueryOptions(options));
     const alignment = device.limits.minUniformBufferOffsetAlignment;
-    this.traceUniformStride = Math.ceil(96 / alignment) * alignment;
+    if (WORLD_QUERY_TRACE_PARAMETER_BYTES > device.limits.maxUniformBufferBindingSize) {
+      throw new Error('WORLD_QUERY_UNIFORM_BINDING_LIMIT');
+    }
+    this.traceUniformStride = Math.ceil(WORLD_QUERY_TRACE_PARAMETER_BYTES / alignment) * alignment;
     this.resetUniformStride = Math.ceil(16 / alignment) * alignment;
     this.refitLayout = device.createBindGroupLayout({ entries: [0, 1, 2, 3].map(binding => ({
       binding, visibility: GPUShaderStage.COMPUTE,
@@ -301,7 +309,7 @@ export class GpuWorldQuery {
     const trace = Array.from({ length: this.options.maxTraceParameterSetsPerEncoder }, (_, slot) =>
       this.device.createBindGroup({ layout: this.traceLayout,
       entries: traceBuffers.map((buffer, binding) => ({ binding, resource: binding === 0
-        ? { buffer, offset: slot * this.traceUniformStride, size: 96 } : { buffer } })) }));
+        ? { buffer, offset: slot * this.traceUniformStride, size: WORLD_QUERY_TRACE_PARAMETER_BYTES } : { buffer } })) }));
     const createLevels = (input: readonly Uint32Array[], starts: readonly number[]): RefitLevel[] => input.map((level, i) => {
       const params = this.buffer('world refit depth parameters', 48, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
       return { params, count: level.length, offset: starts[i],
@@ -462,11 +470,14 @@ export class GpuWorldQuery {
    * snapshots and uniform buffers assume serial encode/submit. Callers own ray
    * generation and inspect hit.work.z for an explicit overflow. An optional
    * maxWorkUnits limits this trace. An explicit partition adds a separate bounded
-   * supplemental budget without changing primary quotas or ray/hit indices. Returns the
-   * number of uniform bytes actually queued for upload. */
+   * supplemental budget without changing primary quotas or ray/hit indices.
+   * Reversed material support changes only single-sided eligibility; its hits
+   * are not receiver-origin nearest shading hits. Returns queued uniform bytes. */
   encodeTrace(encoder: GPUCommandEncoder, count: number, textureLod: number, materialRevision: number,
-    maxWorkUnits = this.options.maxTotalWorkUnits, partition?: WorldQueryWorkPartition): number {
+    maxWorkUnits = this.options.maxTotalWorkUnits, partition?: WorldQueryWorkPartition,
+    facePolicy: WorldQueryFacePolicy = 'material'): number {
     if (this.disposed || !this.frame) throw new Error('WORLD_QUERY_NO_RENDERED_FRAME');
+    if (facePolicy !== 'material' && facePolicy !== 'reverse-material-support') throw new Error('WORLD_QUERY_FACE_POLICY');
     this.validateTopology();
     if (!Number.isSafeInteger(count) || count < 0 || count > this.options.maxRays) throw new Error('WORLD_QUERY_RAY_BUDGET');
     if (!Number.isFinite(textureLod) || textureLod < 0 || textureLod > 32) throw new Error('WORLD_QUERY_TEXTURE_LOD');
@@ -480,7 +491,7 @@ export class GpuWorldQuery {
     let state = this.traceParameters.get(encoder);
     if (state && state.snapshot !== snapshot) throw new Error('WORLD_QUERY_ENCODER_SNAPSHOT_CHANGED');
     const key = JSON.stringify([count, Math.fround(textureLod), workPerRay,
-      budget.raysPerBlock, budget.primaryRaysPerBlock, budget.supplementalWorkPerRay]);
+      budget.raysPerBlock, budget.primaryRaysPerBlock, budget.supplementalWorkPerRay, facePolicy]);
     let slot = state?.slots.get(key);
     const upload = slot === undefined;
     if (upload) {
@@ -508,15 +519,16 @@ export class GpuWorldQuery {
       const batch = this.batches[index];
       if (!batch.count) continue;
       if (upload) {
-        const params = new ArrayBuffer(96);
+        const params = new ArrayBuffer(WORLD_QUERY_TRACE_PARAMETER_BYTES);
         new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
           ...batch.offsets, batch.colorOffset, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
           batch.emissiveSampling === 'triangle-area' ? 1 : 0, this.sceneEnabled ? 1 : 0, this.sceneBvh?.maskWords ?? 0]);
         new Float32Array(params)[16] = textureLod;
         new Uint32Array(params).set([budget.raysPerBlock, budget.primaryRaysPerBlock, budget.supplementalWorkPerRay], 17);
         new Uint32Array(params).set(batch.instanceTree, 20);
+        new Uint32Array(params)[24] = facePolicy === 'reverse-material-support' ? 1 : 0;
         this.device.queue.writeBuffer(batch.params, parameterSlot * this.traceUniformStride, params);
-        uploadedBytes += 96;
+        uploadedBytes += WORLD_QUERY_TRACE_PARAMETER_BYTES;
       }
       // Distinct passes provide ordering for closest-hit updates between batches.
       const pass = encoder.beginComputePass({ label: 'world rays ' + batch.name });
@@ -567,6 +579,7 @@ export class GpuWorldQuery {
       geometryRepresentations: this.batches.map(batch => ({ batch: batch.name, geometry: { ...batch.geometry } })),
       instances: this.batches.reduce((sum, batch) => sum + batch.count, 0), options: { ...this.options },
       traceParameters: 'aligned-immutable-slots-per-encoder', traceUniformStride: this.traceUniformStride,
+      traceParameterBytes: WORLD_QUERY_TRACE_PARAMETER_BYTES,
       resetUniformStride: this.resetUniformStride,
       instanceAcceleration: this.batches.some(batch => batch.instanceTree[3]) ? 'batch-bvh' : 'linear-root-scan',
       instanceBvhNodes: this.batches.reduce((sum, batch) => sum + batch.instanceTree[3], 0),

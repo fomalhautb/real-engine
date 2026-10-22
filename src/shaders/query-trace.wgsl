@@ -20,6 +20,7 @@ struct Params {
     budgetPrimary: u32, // primary prefix length within each block
     budgetSupplemental: u32, // work quota for each suffix ray
     instanceTree: vec4u, // node offset, order offset, bounds offset, node count (0 = linear)
+    queryPolicy: vec4u, // x: 0 = authored material faces, 1 = reversed material support
 }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> vertices: array<Deformed>;
@@ -139,7 +140,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 let crossDirection = cross(ray.direction.xyz, edge2);
                 let determinant = dot(edge1, crossDirection);
                 let epsilon = max(1e-30, length(edge1) * length(edge2) * 1e-7);
-                if (abs(determinant) <= epsilon || (!MATERIAL_DOUBLE_SIDED && determinant < 0.0)) { continue; }
+                // Reversing a finite segment negates its determinant. Support
+                // captures use this opposite single-sided eligibility without
+                // changing double-sided coverage or ordinary transport queries.
+                let rejectedFace = select((determinant < 0.0), (determinant > 0.0), params.queryPolicy.x == 1u);
+                if (abs(determinant) <= epsilon || (!MATERIAL_DOUBLE_SIDED && rejectedFace)) { continue; }
                 let delta = ray.origin.xyz - a.position.xyz;
                 let u = dot(delta, crossDirection) / determinant;
                 if (u < 0.0 || u > 1.0) { continue; }

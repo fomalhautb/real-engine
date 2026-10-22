@@ -15,7 +15,7 @@ import { GpuWorldQuery } from './gpu-world-query';
 import { resolveWorldQueryOptions, type WorldQueryOptions, type WorldRay, type WorldQueryResult } from './world-query';
 import { GpuGeometryLod, type GeometryLodBinding, type GeometryLodSettings, type GeometryLodProbe } from './gpu-geometry-lod';
 import { GpuDiffuseGi, diffuseGiSampleSource, diffuseGiFinalGatherSampleSource, type DiffuseGiProbeResult } from './gpu-diffuse-gi';
-import { resolveDiffuseGiOptions, type DiffuseGiOptions } from './diffuse-gi';
+import { resolveDiffuseGiOptions, validateDiffuseGiQueryBudget, type DiffuseGiOptions, type GiVisibilityDirection } from './diffuse-gi';
 import { resolveSunShadowOptions, sunShadowProjection, type SunShadowOptions, type ResolvedSunShadowOptions } from './sun-shadow';
 import type { FinalGatherProbeResult } from './gpu-final-gather';
 import { DEFORMED_VERTEX_BYTES, validateMeshColors, type MeshData } from './geometry';
@@ -215,13 +215,8 @@ export class Renderer {
     if (options.textureBudgetBytes !== undefined && (!Number.isSafeInteger(options.textureBudgetBytes) || options.textureBudgetBytes < 0)) throw new Error('INVALID_TEXTURE_BUDGET');
     if (options.diffuseGi) {
       const gi = resolveDiffuseGiOptions(options.diffuseGi);
-      if (!options.worldQueries || (options.worldQueries.maxRays ?? 1024) < gi.rayCount) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
-      if (gi.emissiveSamplesPerProbe && (options.worldQueries.maxTraceParameterSetsPerEncoder ?? 8) < 2) {
-        throw new Error('DIFFUSE_GI_QUERY_PARAMETER_BUDGET');
-      }
-      if (gi.finalGather && (options.worldQueries.maxTraceParameterSetsPerEncoder ?? 8) < 6) {
-        throw new Error('FINAL_GATHER_QUERY_PARAMETER_BUDGET');
-      }
+      if (!options.worldQueries) throw new Error('DIFFUSE_GI_QUERY_RAY_BUDGET');
+      validateDiffuseGiQueryBudget(gi, resolveWorldQueryOptions(options.worldQueries));
     }
     if (!navigator.gpu) throw new Error('WEBGPU_UNAVAILABLE: use a WebGPU browser on HTTPS or localhost.');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
@@ -834,6 +829,12 @@ export class Renderer {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
     this.diffuseGi.setMultiBounce(enabled);
+  }
+  /** Switching support direction resets world feedback and surface GI history. */
+  setDiffuseGiVisibilityDirection(direction: GiVisibilityDirection): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    this.diffuseGi.setVisibilityDirection(direction);
   }
   /** Toggle configured surface gathering; disabled gathering uses the world probe field. */
   setDiffuseGiFinalGatherEnabled(enabled: boolean): void {

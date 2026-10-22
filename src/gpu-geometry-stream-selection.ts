@@ -7,6 +7,19 @@ import type { GeometryGroupDemand } from './geometry-stream-working-set';
 import { occlusionTestSource, type GpuOcclusion } from './gpu-occlusion';
 import type { GeometryStreamDirectory } from './geometry-stream-types';
 import { subscribeGpuDeviceLoss } from './gpu-device-loss';
+import { geometryStreamCompaction } from './geometry-stream-compaction';
+
+const stageLayouts = {
+  demand: 'select', initialize: 'select', refine: 'select', compact: 'compact', finalize: 'compact',
+  recover: 'compact', finalizeRecovery: 'compact', classify: 'classify', classifyRecovery: 'classify',
+  scanFirst: 'scan', scanRecovery: 'scan', scatter: 'scatter', scatterRecovery: 'scatter',
+} as const;
+type Stage = keyof typeof stageLayouts;
+type LayoutKind = typeof stageLayouts[Stage];
+const stageBindings: Record<LayoutKind, number[]> = {
+  select: [0, 1, 2, 3, 4, 5, 6], compact: [0, 1, 2, 3, 4, 5, 7, 8, 9, 10],
+  classify: [0, 1, 2, 3, 4, 5, 7, 10, 11], scan: [1, 10, 11], scatter: [1, 5, 7, 8, 9, 10, 11],
+};
 
 /** Includes persistent buffers and the maximum one-at-a-time feedback buffer. */
 export interface GeometryStreamSelectionOptions { maxGpuBytes?: number }
@@ -17,12 +30,14 @@ export function geometryStreamSelectionResources(directory: GeometryStreamDirect
   if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 256) throw new Error('GEOMETRY_STREAM_INSTANCE_BUDGET');
   if (!Number.isSafeInteger(uniformAlignment) || uniformAlignment < 1 || uniformAlignment > 65536) throw new Error('GEOMETRY_STREAM_UNIFORM_ALIGNMENT');
   const packed = packGeometryStreamSelection(directory), pairs = packed.directory.clusters.length * capacity;
+  const compaction = geometryStreamCompaction(pairs);
   const parameterStride = Math.ceil(48 / uniformAlignment) * uniformAlignment;
   const maxIndices = packed.directory.sourceTriangleCount * 3 * capacity;
   const sizes = [96, parameterStride * (packed.levels.length + 1), packed.words.byteLength, pairs * 4,
     (packed.directory.pages.length + packed.directory.groups.length) * 4, maxIndices * 4, 64];
+  if (compaction.scratchBytes) sizes.push(compaction.scratchBytes);
   const feedbackBytes = 64 + sizes[4] + pairs * 4;
-  return { packed, pairs, parameterStride, maxIndices, sizes, feedbackBytes,
+  return { packed, pairs, compaction, parameterStride, maxIndices, sizes, feedbackBytes,
     persistentBytes: sizes.reduce((sum, bytes) => sum + bytes, 0),
     maxBytes: sizes.reduce((sum, bytes) => sum + bytes, 0) + feedbackBytes };
 }
@@ -53,15 +68,13 @@ export class GpuGeometryStreamSelection {
   private readonly params: GPUBuffer;
   private readonly selected: GPUBuffer;
   private readonly requests: GPUBuffer;
-  private readonly selectGroup: GPUBindGroup;
-  private readonly compactGroup: GPUBindGroup;
-  private readonly selectLayout: GPUBindGroupLayout;
-  private readonly compactLayout: GPUBindGroupLayout;
+  private readonly groups: Partial<Record<LayoutKind, GPUBindGroup>> = {};
+  private readonly layouts: Partial<Record<LayoutKind, GPUBindGroupLayout>> = {};
+  private readonly compaction;
   private readonly parameterData: Uint32Array<ArrayBuffer>;
   private readonly parameterStride: number;
   private readonly viewData = new Float32Array(24);
-  private pipelines!: Record<'demand' | 'initialize' | 'refine' | 'compact' | 'finalize', GPUComputePipeline>
-    & Partial<Record<'recover' | 'finalizeRecovery', GPUComputePipeline>>;
+  private pipelines: Partial<Record<Stage, GPUComputePipeline>> = {};
   private hasView = false;
   private count = 0;
   private frame = 0;
@@ -75,13 +88,17 @@ export class GpuGeometryStreamSelection {
   private readonly maxGpuBytes: number;
   private unsubscribeLoss?: () => void;
 
+  /** Reuse shares compiled pipelines, never scratch. A fused-only owner cannot
+   * seed a >512-pair owner; omit reuse for that change. Pool-capacity migrations
+   * retain the directory and instance capacity, so retain the same scan shape. */
   static async create(device: GPUDevice, pool: GpuGeometryPagePool, instances: GPUBuffer, capacity: number,
     track: (bytes: number) => void = () => {}, options: GeometryStreamSelectionOptions = {}, occlusion?: GpuOcclusion,
     reuse?: GpuGeometryStreamSelection) {
     let result: GpuGeometryStreamSelection | undefined;
     if (reuse) {
       reuse.live();
-      if (reuse.device !== device || reuse.occlusion !== occlusion) throw new Error('GEOMETRY_STREAM_PIPELINE_REUSE');
+      if (reuse.device !== device || reuse.occlusion !== occlusion
+        || pool.directory.clusters.length * capacity > 512 && !reuse.pipelines.classify) throw new Error('GEOMETRY_STREAM_PIPELINE_REUSE');
       device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
       let failure: unknown;
       try {
@@ -107,11 +124,13 @@ export class GpuGeometryStreamSelection {
       const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
       if (errors.length) throw new Error(errors.map(e => `GEOMETRY_STREAM_SHADER:${e.lineNum}: ${e.message}`).join('\n'));
       const pipelines = {} as GpuGeometryStreamSelection['pipelines'];
-      const entries = ['demand', 'initialize', 'refine', 'compact', 'finalize',
-        ...(occlusion ? ['recover', 'finalizeRecovery'] as const : [])] as const;
+      const entries: Stage[] = ['demand', 'initialize', 'refine', 'compact', 'finalize',
+        ...(occlusion ? ['recover', 'finalizeRecovery'] as const : []),
+        ...(result.compaction.scratchBytes ? ['classify', 'scanFirst', 'scatter'] as const : []),
+        ...(result.compaction.scratchBytes && occlusion ? ['classifyRecovery', 'scanRecovery', 'scatterRecovery'] as const : [])];
       for (const entryPoint of entries) {
-        const layout = ['demand', 'initialize', 'refine'].includes(entryPoint) ? result.selectLayout : result.compactLayout;
-        const occlusionPass = !!occlusion && (entryPoint === 'compact' || entryPoint === 'recover');
+        const layout = result.layouts[stageLayouts[entryPoint]]!;
+        const occlusionPass = !!occlusion && (['compact', 'recover', 'classify', 'classifyRecovery'].includes(entryPoint));
         pipelines[entryPoint] = await device.createComputePipelineAsync({ label: 'stream geometry ' + entryPoint,
           layout: device.createPipelineLayout({ bindGroupLayouts: occlusionPass ? [layout, occlusion.testLayout] : [layout] }),
           compute: { module, entryPoint } });
@@ -132,20 +151,22 @@ export class GpuGeometryStreamSelection {
     readonly capacity: number, private readonly track: (bytes: number) => void,
     options: GeometryStreamSelectionOptions, private readonly occlusion?: GpuOcclusion, reuse?: GpuGeometryStreamSelection) {
     const allocation = geometryStreamSelectionResources(pool.directory, capacity, device.limits.minUniformBufferOffsetAlignment);
-    this.packed = allocation.packed;
+    this.packed = allocation.packed; this.compaction = allocation.compaction;
     const directory = this.packed.directory, pairs = allocation.pairs;
     this.physicalVertexCount = pool.slotCount * pool.verticesPerSlot;
     const maxIndices = allocation.maxIndices;
     if (pairs > 262144 || Math.ceil(pairs / 64) > device.limits.maxComputeWorkgroupsPerDimension
       || directory.groups.length * capacity > 262144 || this.physicalVertexCount * capacity > 0xffffffff
-      || maxIndices > 0xffffffff) throw new Error('GEOMETRY_STREAM_WORK_BUDGET');
+      || maxIndices > 0xffffffff
+      || device.limits.maxComputeWorkgroupSizeX < 256 || device.limits.maxComputeInvocationsPerWorkgroup < 256
+      || device.limits.maxComputeWorkgroupStorageSize < 2052) throw new Error('GEOMETRY_STREAM_WORK_BUDGET');
     this.parameterStride = allocation.parameterStride;
     this.parameterData = new Uint32Array(this.parameterStride / 4 * (this.packed.levels.length + 1));
     for (let slot = 0; slot <= this.packed.levels.length; slot++) {
       const level = this.packed.levels[slot - 1];
       this.parameterData.set([directory.clusters.length, this.physicalVertexCount, 0, maxIndices,
         level?.firstGroup ?? 0, level?.groupCount ?? directory.groups.length, this.packed.clusterOffset, this.packed.groupOffset,
-        this.packed.edgeOffset, directory.pages.length, level?.level ?? 0, 0], slot * this.parameterStride / 4);
+        this.packed.edgeOffset, directory.pages.length, level?.level ?? 0, pairs], slot * this.parameterStride / 4);
     }
     const sizes = allocation.sizes;
     const budget = options.maxGpuBytes ?? 128 * 1024 * 1024;
@@ -164,16 +185,18 @@ export class GpuGeometryStreamSelection {
       this.indices = this.buffer('stream selected physical indices', sizes[5], GPUBufferUsage.STORAGE | GPUBufferUsage.INDEX | GPUBufferUsage.COPY_SRC);
       this.arguments = this.buffer('stream indirect draw arguments', sizes[6], GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
       const layouts = (bindings: number[]) => device.createBindGroupLayout({ entries: bindings.map(binding => ({ binding,
-        visibility: GPUShaderStage.COMPUTE, buffer: { type: binding < 2 ? 'uniform' : [5, 6, 9, 10].includes(binding) ? 'storage' : 'read-only-storage',
+        visibility: GPUShaderStage.COMPUTE, buffer: { type: binding < 2 ? 'uniform' : [5, 6, 9, 10, 11].includes(binding) ? 'storage' : 'read-only-storage',
           ...(binding === 1 ? { hasDynamicOffset: true, minBindingSize: 48 } : {}) } })) });
-      this.selectLayout = reuse?.selectLayout ?? layouts([0, 1, 2, 3, 4, 5, 6]);
-      this.compactLayout = reuse?.compactLayout ?? layouts([0, 1, 2, 3, 4, 5, 7, 8, 9, 10]);
+      const scratch = allocation.compaction.scratchBytes ? this.buffer('stream stable compaction prefixes', sizes[7], GPUBufferUsage.STORAGE) : undefined;
       const buffers = [this.view, this.params, metadata, instances, pool.pageResidency, this.selected,
-        this.requests, pool.clusterLocations, pool.indices, this.indices, this.arguments];
-      const group = (layout: GPUBindGroupLayout, bindings: number[]) => device.createBindGroup({ layout,
-        entries: bindings.map(binding => ({ binding, resource: { buffer: buffers[binding], ...(binding === 1 ? { size: 48 } : {}) } })) });
-      this.selectGroup = group(this.selectLayout, [0, 1, 2, 3, 4, 5, 6]);
-      this.compactGroup = group(this.compactLayout, [0, 1, 2, 3, 4, 5, 7, 8, 9, 10]);
+        this.requests, pool.clusterLocations, pool.indices, this.indices, this.arguments, scratch];
+      const kinds: LayoutKind[] = ['select', 'compact', ...(scratch ? ['classify', 'scan', 'scatter'] as const : [])];
+      for (const kind of kinds) {
+        const bindings = stageBindings[kind];
+        const layout = this.layouts[kind] = reuse?.layouts[kind] ?? layouts(bindings);
+        this.groups[kind] = device.createBindGroup({ layout, entries: bindings.map(binding => ({ binding,
+          resource: { buffer: buffers[binding]!, ...(binding === 1 ? { size: 48 } : {}) } })) });
+      }
     } catch (error) { try { this.dispose(); } catch { /* preserve allocation failure */ } throw error; }
     this.unsubscribeLoss = subscribeGpuDeviceLoss(device, () => {
       this.error = 'GEOMETRY_STREAM_DEVICE_LOST';
@@ -217,17 +240,11 @@ export class GpuGeometryStreamSelection {
     if (!this.frame || this.encodedFrame === this.frame) throw new Error('GEOMETRY_STREAM_SELECTION_FRAME');
     if (!this.pool.diagnostics().rootsReady) throw new Error('GEOMETRY_STREAM_ROOTS_NOT_READY');
     encoder.clearBuffer(this.arguments); encoder.clearBuffer(this.requests);
-    const dispatch = (entry: keyof GpuGeometryStreamSelection['pipelines'], work: number, offset = 0) => {
-      if (!work) return;
-      const pass = encoder.beginComputePass({ label: 'stream geometry ' + entry }); pass.setPipeline(this.pipelines[entry]!);
-      pass.setBindGroup(0, ['demand', 'initialize', 'refine'].includes(entry) ? this.selectGroup : this.compactGroup, [offset]);
-      if (entry === 'compact' && this.occlusion) pass.setBindGroup(1, this.occlusion.previousGroup);
-      pass.dispatchWorkgroups(entry === 'finalize' ? 1 : Math.ceil(work / 64)); pass.end();
-    };
-    dispatch('demand', this.packed.directory.groups.length * this.count);
-    dispatch('initialize', this.packed.directory.clusters.length * this.count);
-    this.packed.levels.forEach((level, index) => dispatch('refine', level.groupCount * this.count, (index + 1) * this.parameterStride));
-    dispatch('compact', this.packed.directory.clusters.length * this.count); dispatch('finalize', this.count);
+    this.dispatch(encoder, 'demand', Math.ceil(this.packed.directory.groups.length * this.count / 64));
+    this.dispatch(encoder, 'initialize', Math.ceil(this.packed.directory.clusters.length * this.count / 64));
+    this.packed.levels.forEach((level, index) => this.dispatch(encoder, 'refine',
+      Math.ceil(level.groupCount * this.count / 64), (index + 1) * this.parameterStride));
+    this.compact(encoder, false);
     this.encodedFrame = this.frame; this.recoveredFrame = this.occlusion ? 0 : this.frame;
   }
   /** Recheck deferred candidates against the current frame's completed Hi-Z. */
@@ -236,17 +253,28 @@ export class GpuGeometryStreamSelection {
     if (!this.occlusion) return;
     if (!this.frame || this.encodedFrame !== this.frame || this.recoveredFrame === this.frame)
       throw new Error('GEOMETRY_STREAM_RECOVERY_FRAME');
-    const work = this.packed.directory.clusters.length * this.count;
-    if (work) {
-      const pass = encoder.beginComputePass({ label: 'stream geometry recover' });
-      pass.setPipeline(this.pipelines.recover!); pass.setBindGroup(0, this.compactGroup, [0]);
-      pass.setBindGroup(1, this.occlusion.currentGroup);
-      pass.dispatchWorkgroups(Math.ceil(work / 64)); pass.end();
-      const finalize = encoder.beginComputePass({ label: 'stream geometry finalizeRecovery' });
-      finalize.setPipeline(this.pipelines.finalizeRecovery!); finalize.setBindGroup(0, this.compactGroup, [0]);
-      finalize.dispatchWorkgroups(1); finalize.end();
-    }
+    this.compact(encoder, true);
     this.recoveredFrame = this.frame;
+  }
+  private dispatch(encoder: GPUCommandEncoder, entry: Stage, groups: number, offset = 0) {
+    if (!groups) return;
+    const pass = encoder.beginComputePass({ label: 'stream geometry ' + entry });
+    pass.setPipeline(this.pipelines[entry]!); pass.setBindGroup(0, this.groups[stageLayouts[entry]]!, [offset]);
+    if (this.occlusion && ['compact', 'classify', 'recover', 'classifyRecovery'].includes(entry)) {
+      pass.setBindGroup(1, entry === 'compact' || entry === 'classify' ? this.occlusion.previousGroup : this.occlusion.currentGroup);
+    }
+    pass.dispatchWorkgroups(groups); pass.end();
+  }
+  private compact(encoder: GPUCommandEncoder, recovery: boolean) {
+    const pairs = this.packed.directory.clusters.length * this.count;
+    if (!pairs) return;
+    if (pairs <= 512) this.dispatch(encoder, recovery ? 'recover' : 'compact', 1);
+    else {
+      this.dispatch(encoder, recovery ? 'classifyRecovery' : 'classify', Math.ceil(pairs / 512));
+      this.dispatch(encoder, recovery ? 'scanRecovery' : 'scanFirst', 1);
+      this.dispatch(encoder, recovery ? 'scatterRecovery' : 'scatter', Math.ceil(pairs / 64));
+    }
+    this.dispatch(encoder, recovery ? 'finalizeRecovery' : 'finalize', 1);
   }
   /** Bounded async page IDs/counters. Include cut flags only for explicit diagnostics. */
   async feedback(includeSelected = false): Promise<GeometryStreamSelectionFeedback> {
@@ -285,6 +313,7 @@ export class GpuGeometryStreamSelection {
   }
   diagnostics() { return { frame: this.encodedFrame, instances: this.count, gpuBytes: this.bytes + (this.reading?.size ?? 0), disposed: this.disposed,
     error: this.error, maxGpuBytes: this.maxGpuBytes, maxFeedbackBytes: this.feedbackBudget,
+    compaction: { ...this.compaction, stableWithinPhase: true },
     physicalVertexCount: this.physicalVertexCount, levels: this.packed.levels.length, feedbackPending: !!this.reading,
     occlusion: { enabled: !!this.occlusion, stages: this.occlusion ? 2 : 1,
       recoveredFrame: this.recoveredFrame }, settings: { ...this.settings } }; }

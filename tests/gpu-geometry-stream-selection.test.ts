@@ -4,10 +4,11 @@ import { encodeGeometryPages } from '../src/geometry-pages';
 import { buildGeometryStreamDirectory } from '../src/geometry-stream-directory';
 import type { GeometryStreamDirectory } from '../src/geometry-stream-types';
 import { GpuGeometryPagePool } from '../src/gpu-geometry-page-pool';
-import { GpuGeometryStreamSelection } from '../src/gpu-geometry-stream-selection';
+import { GpuGeometryStreamSelection, geometryStreamSelectionResources } from '../src/gpu-geometry-stream-selection';
 import { identity } from '../src/math';
 import type { GpuOcclusion } from '../src/gpu-occlusion';
 import { packGeometryStreamSelection } from '../src/geometry-stream-selection-data';
+import { geometryStreamCompaction } from '../src/geometry-stream-compaction';
 
 type FakeBuffer = { label: string; size: number; bytes: ArrayBuffer; destroyed: boolean;
   getMappedRange: () => ArrayBuffer; unmap: () => void; mapAsync: () => Promise<void>; destroy: () => void };
@@ -21,6 +22,7 @@ function buffer(label: string, size: number): FakeBuffer {
 class FakeDevice {
   readonly buffers: FakeBuffer[] = [];
   readonly limits = { maxBufferSize: 256 * 1024 * 1024, maxStorageBufferBindingSize: 256 * 1024 * 1024,
+    maxComputeWorkgroupSizeX: 256, maxComputeInvocationsPerWorkgroup: 256, maxComputeWorkgroupStorageSize: 16384,
     maxComputeWorkgroupsPerDimension: 65_535, minUniformBufferOffsetAlignment: 256 };
   readonly lost: Promise<{ message: string }>;
   private lose!: (info: { message: string }) => void;
@@ -29,6 +31,8 @@ class FakeDevice {
   failBufferAt = -1;
   failPipelineAt = -1;
   pipelines = 0;
+  readonly layouts: GPUBindGroupLayoutDescriptor[] = [];
+  readonly dispatches: { entry: string; count: number }[] = [];
   readonly boundGroups: { index: number; group: unknown }[] = [];
 
   constructor() { this.lost = new Promise(resolve => { this.lose = resolve; }); }
@@ -40,20 +44,23 @@ class FakeDevice {
     const result = buffer(label, size); this.buffers.push(result); return result as unknown as GPUBuffer;
   };
   createShaderModule = () => ({ getCompilationInfo: async () => ({ messages: [] }) });
-  createBindGroupLayout = () => ({});
+  createBindGroupLayout = (layout: GPUBindGroupLayoutDescriptor) => { this.layouts.push(layout); return {}; };
   createPipelineLayout = () => ({});
   createBindGroup = () => ({});
-  createComputePipelineAsync = async () => {
+  createComputePipelineAsync = async (descriptor: GPUComputePipelineDescriptor) => {
     if (this.pipelines++ === this.failPipelineAt) throw new Error('FAKE_PIPELINE_FAILURE');
-    return {};
+    return { entry: descriptor.compute.entryPoint! };
   };
   createCommandEncoder = () => ({
     clearBuffer() {}, copyBufferToBuffer(source: FakeBuffer, sourceOffset: number, target: FakeBuffer, targetOffset: number, size: number) {
       new Uint8Array(target.bytes, targetOffset, size).set(new Uint8Array(source.bytes, sourceOffset, size));
     }, finish: () => ({}),
-    beginComputePass: () => ({ setPipeline() {}, setBindGroup: (index: number, group: unknown) => {
-      this.boundGroups.push({ index, group });
-    }, dispatchWorkgroups() {}, end() {} }),
+    beginComputePass: () => {
+      let entry = '';
+      return { setPipeline(pipeline: { entry: string }) { entry = pipeline.entry; },
+        setBindGroup: (index: number, group: unknown) => { this.boundGroups.push({ index, group }); },
+        dispatchWorkgroups: (count: number) => { this.dispatches.push({ entry, count }); }, end() {} };
+    },
   });
   queue = { writeBuffer() {}, submit() {} };
 }
@@ -70,9 +77,9 @@ function fakePool(): GpuGeometryPagePool {
 }
 
 async function selection(device: FakeDevice, track: (bytes: number) => void = () => {}, maxGpuBytes?: number,
-  occlusion?: GpuOcclusion) {
+  occlusion?: GpuOcclusion, capacity = 1) {
   const result = await GpuGeometryStreamSelection.create(device as unknown as GPUDevice, fakePool(),
-    buffer('instances', 224) as unknown as GPUBuffer, 1, track, { maxGpuBytes }, occlusion);
+    buffer('instances', 224 * capacity) as unknown as GPUBuffer, capacity, track, { maxGpuBytes }, occlusion);
   selections.push(result);
   return result;
 }
@@ -243,5 +250,85 @@ describe('GPU streamed selection ownership and failure lifecycle', () => {
     ]);
     args[14] = 1;
     expect(await current.feedback()).toMatchObject({ overflow: true });
+  });
+});
+
+
+describe('bounded stable stream compaction', () => {
+  it('bounds zero, block edges, tail blocks and the maximum two-level scan', () => {
+    for (const invalid of [0, -1, 1.5, NaN, Infinity, 262145]) expect(() => geometryStreamCompaction(invalid)).toThrow('GEOMETRY_STREAM_WORK_BUDGET');
+    expect(geometryStreamCompaction(1)).toMatchObject({ blocks: 1, scratchBytes: 0 });
+    expect(geometryStreamCompaction(512)).toMatchObject({ blocks: 1, scratchBytes: 0 });
+    expect(geometryStreamCompaction(513)).toMatchObject({ blocks: 2, scratchBytes: 2060 });
+    expect(geometryStreamCompaction(1024)).toMatchObject({ blocks: 2, scratchBytes: 4104 });
+    expect(geometryStreamCompaction(262144)).toMatchObject({ blocks: 512, scratchBytes: 1050624 });
+  });
+
+  it('accounts scratch in exact owner/shared budgets, isolates reuse and releases on disposal', async () => {
+    const capacity = Math.floor(512 / directory.clusters.length) + 1;
+    const allocation = geometryStreamSelectionResources(directory, capacity, 256);
+    const device = new FakeDevice(); let owned = 0;
+    const current = await selection(device, bytes => { owned += bytes; }, allocation.maxBytes, undefined, capacity);
+    expect(allocation.sizes).toHaveLength(8);
+    expect(owned).toBe(allocation.persistentBytes);
+    expect(current.diagnostics().compaction.scratchBytes).toBe(allocation.sizes[7]);
+    const compiled = device.pipelines;
+    const next = await GpuGeometryStreamSelection.create(device as unknown as GPUDevice, fakePool(),
+      buffer('instances', capacity * 224) as unknown as GPUBuffer, capacity, bytes => { owned += bytes; },
+      { maxGpuBytes: allocation.maxBytes }, undefined, current);
+    selections.push(next);
+    expect(device.pipelines).toBe(compiled);
+    expect(owned).toBe(allocation.persistentBytes * 2);
+    const scratch = device.buffers.filter(entry => entry.label === 'stream stable compaction prefixes');
+    expect(scratch).toHaveLength(2); expect(scratch[0]).not.toBe(scratch[1]);
+    current.dispose(); expect(scratch[0].destroyed).toBe(true); expect(scratch[1].destroyed).toBe(false);
+    next.dispose(); expect(owned).toBe(0);
+    const allocated = device.buffers.length;
+    await expect(selection(device, () => {}, allocation.maxBytes - 1, undefined, capacity)).rejects.toThrow('GEOMETRY_STREAM_RESOURCE_BUDGET');
+    expect(device.buffers).toHaveLength(allocated);
+    expect(device.layouts.every(layout => [...layout.entries].filter(entry => entry.buffer?.type?.includes('storage')).length <= 8)).toBe(true);
+  });
+
+  it('uses fused small work and bounded large scans in both Hi-Z phases, including zero and shrink/regrow', async () => {
+    const capacity = Math.floor(512 / directory.clusters.length) + 1;
+    const device = new FakeDevice();
+    const occlusion = { testLayout: {}, previousGroup: {}, currentGroup: {} } as unknown as GpuOcclusion;
+    const current = await selection(device, () => {}, undefined, occlusion, capacity);
+    let frame = 0;
+    for (const count of [capacity, 1, 0, capacity]) {
+      device.dispatches.length = 0; device.boundGroups.length = 0;
+      current.update(++frame, count, identity(), [0, 0, 4], 400);
+      current.encode(device.createCommandEncoder() as unknown as GPUCommandEncoder);
+      current.encodeRecovery(device.createCommandEncoder() as unknown as GPUCommandEncoder);
+      const pairs = count * directory.clusters.length;
+      const actual = device.dispatches.filter(item => !['demand', 'initialize', 'refine'].includes(item.entry));
+      const expected = pairs > 512 ? [
+        { entry: 'classify', count: Math.ceil(pairs / 512) }, { entry: 'scanFirst', count: 1 },
+        { entry: 'scatter', count: Math.ceil(pairs / 64) }, { entry: 'finalize', count: 1 },
+        { entry: 'classifyRecovery', count: Math.ceil(pairs / 512) }, { entry: 'scanRecovery', count: 1 },
+        { entry: 'scatterRecovery', count: Math.ceil(pairs / 64) }, { entry: 'finalizeRecovery', count: 1 },
+      ] : pairs ? ['compact', 'finalize', 'recover', 'finalizeRecovery'].map(entry => ({ entry, count: 1 })) : [];
+      expect(actual).toEqual(expected);
+      expect(device.boundGroups.filter(binding => binding.index === 1).map(binding => binding.group))
+        .toEqual(count ? [occlusion.previousGroup, occlusion.currentGroup] : []);
+    }
+  });
+
+  it('cleans large scratch on late pipeline failure and device loss, rejects unsupported reuse before allocation', async () => {
+    const capacity = Math.floor(512 / directory.clusters.length) + 1;
+    const device = new FakeDevice(); let owned = 0;
+    device.failPipelineAt = 7;
+    await expect(selection(device, bytes => { owned += bytes; }, undefined, undefined, capacity)).rejects.toThrow('FAKE_PIPELINE_FAILURE');
+    expect(owned).toBe(0); expect(device.buffers).toHaveLength(8); expect(device.buffers.every(entry => entry.destroyed)).toBe(true);
+    device.failPipelineAt = -1;
+    const small = await selection(device), allocated = device.buffers.length;
+    await expect(GpuGeometryStreamSelection.create(device as unknown as GPUDevice, fakePool(),
+      buffer('instances', capacity * 224) as unknown as GPUBuffer, capacity, () => {}, {}, undefined, small))
+      .rejects.toThrow('GEOMETRY_STREAM_PIPELINE_REUSE');
+    expect(device.buffers).toHaveLength(allocated);
+    const large = await selection(device, bytes => { owned += bytes; }, undefined, undefined, capacity);
+    device.loseDevice(); await Promise.resolve();
+    expect(large.diagnostics()).toMatchObject({ disposed: true, gpuBytes: 0, error: 'GEOMETRY_STREAM_DEVICE_LOST' });
+    expect(owned).toBe(0); expect(device.buffers.every(entry => entry.destroyed)).toBe(true);
   });
 });

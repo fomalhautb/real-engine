@@ -5,6 +5,7 @@ import { GeometryPageCache } from '../../../src/geometry-stream-cache';
 import { GeometryStreamCut, type GeometryStreamView } from '../../../src/geometry-stream-cut';
 import { GpuGeometryPagePool } from '../../../src/gpu-geometry-page-pool';
 import { GpuGeometryStreamSelection } from '../../../src/gpu-geometry-stream-selection';
+import type { GpuOcclusion } from '../../../src/gpu-occlusion';
 import type { GeometryStreamDirectory } from '../../../src/geometry-stream-types';
 import { GEOMETRY_GPU_VERTEX_BYTES } from '../../../src/geometry-gpu-page';
 import { identity, lookAt, multiply, normalMatrix, perspective, scaling, translation, type Mat4 } from '../../../src/math';
@@ -126,6 +127,8 @@ export async function runGeometryStreamSelectionCases() {
   let cache: GeometryPageCache | undefined, pool: GpuGeometryPagePool | undefined;
   let selection: GpuGeometryStreamSelection | undefined, instanceBuffer: GPUBuffer | undefined;
   let poolOwned = 0, selectionOwned = 0;
+  let recoverySelection: GpuGeometryStreamSelection | undefined;
+  const testBuffers: GPUBuffer[] = [], testTextures: GPUTexture[] = [];
   try {
     const allPageIds = directory.pages.map(page => page.id);
     cache = await GeometryPageCache.create(directory, async page => encoded.pages[page.id].bytes,
@@ -154,11 +157,13 @@ export async function runGeometryStreamSelectionCases() {
     for (const id of directory.rootPages) currentPool.enqueue(id, cache.get(id)!);
     flush(directory.rootPages);
     const models = transforms(), planner = new GeometryStreamCut(directory);
-    const input = instances(models);
+    const capacity = Math.max(3, Math.floor(512 / directory.clusters.length) + 1);
+    const manyModels = Array.from({ length: capacity }, (_, index) => models[index % 2]);
+    const input = instances(manyModels);
     instanceBuffer = device.createBuffer({ size: input.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true });
     new Float32Array(instanceBuffer.getMappedRange()).set(input); instanceBuffer.unmap();
-    selection = await GpuGeometryStreamSelection.create(device, currentPool, instanceBuffer, models.length,
+    selection = await GpuGeometryStreamSelection.create(device, currentPool, instanceBuffer, capacity,
       bytes => { selectionOwned += bytes; });
     const gpu = selection;
     let frame = 0;
@@ -187,14 +192,21 @@ export async function runGeometryStreamSelectionCases() {
         return new Uint32Array(read.getMappedRange()).slice();
       } finally { read.destroy(); }
     };
-    const triangleKeys = (words: Uint32Array) => {
-      const keys: string[] = [];
-      for (let i = 0; i < words.length; i += 3) keys.push(`${words[i]},${words[i + 1]},${words[i + 2]}`);
-      return keys.sort();
+    const physicalIndices = (selected: readonly { clusterId: number; instanceIndex: number; visible: boolean }[],
+      pageIndices: Uint32Array, physicalVertexCount: number) => selected.flatMap(entry => {
+      if (!entry.visible) return [];
+      const location = currentPool.clusterLocation(entry.clusterId)!;
+      return Array.from({ length: location.indexCount }, (_, i) => pageIndices[location.firstIndex + i]
+        + location.baseVertex + entry.instanceIndex * physicalVertexCount);
+    });
+    const indexHash = (indices: Uint32Array) => {
+      let hash = 2166136261;
+      for (const value of indices) hash = Math.imul(hash ^ value, 16777619) >>> 0;
+      return hash;
     };
     const capture = async (label: string, count: number, maxErrorPixels: number, frustumCulling: boolean,
       compareIndices = false, expectOffscreen = false, camera: Camera = { eye, vp }, caseModels: readonly Mat4[] = models) => {
-      if (caseModels !== models) device.queue.writeBuffer(instanceBuffer!, 0, instances(caseModels));
+      device.queue.writeBuffer(instanceBuffer!, 0, instances(caseModels));
       gpu.setSettings({ maxErrorPixels, frustumCulling });
       gpu.update(++frame, count, camera.vp, camera.eye, projectionScale);
       if (!gpu.settings.frozen) demandCamera = camera;
@@ -222,21 +234,15 @@ export async function runGeometryStreamSelectionCases() {
           + (entry.visible ? directory.clusters[entry.clusterId].triangleCount * 3 : 0), 0);
         same(actual.indices, visibleCount, label + ': CULLED_INDEX_COUNT');
       }
+      let orderedHash: number | null = null;
       if (compareIndices && actual.indices) {
         const pageIndices = await readWords(currentPool.indices, currentPool.indices.size);
         const compacted = await readWords(gpu.indices, actual.indices * 4);
-        const expectedPhysical: number[] = [];
-        for (const entry of actual.selectedClusters!) {
-          if (!entry.visible) continue;
-          const location = currentPool.clusterLocation(entry.clusterId)!;
-          for (let i = 0; i < location.indexCount; i++) {
-            expectedPhysical.push(pageIndices[location.firstIndex + i] + location.baseVertex
-              + entry.instanceIndex * gpu.physicalVertexCount);
-          }
-        }
-        same(triangleKeys(compacted), triangleKeys(Uint32Array.from(expectedPhysical)), label + ': PHYSICAL_INDICES');
+        const expectedPhysical = physicalIndices(actual.selectedClusters!, pageIndices, gpu.physicalVertexCount);
+        same([...compacted], expectedPhysical, label + ': EXACT_ORDERED_PHYSICAL_INDICES');
+        orderedHash = indexHash(compacted);
       }
-      return { label, count, maxErrorPixels, frustumCulling, clusters: expected.selected.length,
+      return { label, count, pairs: count * directory.clusters.length, orderedHash, maxErrorPixels, frustumCulling, clusters: expected.selected.length,
         indices: actual.indices, requests: actual.requestedPages.length, desiredGroups: actual.desiredGroups,
         visibleClusters: actual.selectedClusters!.filter(entry => entry.visible).length,
         culledInstanceClusters: actual.selectedClusters!.filter(entry => entry.instanceIndex === 2 && !entry.visible).length };
@@ -268,15 +274,120 @@ export async function runGeometryStreamSelectionCases() {
     const zero = await capture('zero-active-instances', 0, intermediate, false);
     const allOffscreen = await capture('all-offscreen', 1, intermediate, true, false, false,
       { eye, vp }, [models[2]]);
-    const swapped = await capture('swapped-affine-instances', 2, 0, false, false, false,
+    const swapped = await capture('swapped-affine-instances', 2, 0, false, true, false,
       { eye, vp }, [models[1], models[0]]);
     same(swapped.desiredGroups, fine.desiredGroups, 'DEMAND_INSTANCE_MAX_ORDER');
+    // Same actual index sequence on static frames, both sides of a 512-pair
+    // boundary; changing active count exercises scratch reuse and zero tails.
+    const stableSmall = [], stableLarge = [];
+    for (let repeat = 0; repeat < 12; repeat++) {
+      stableSmall.push(await capture('stable-small-' + repeat, 1, 0, false, true));
+      stableLarge.push(await capture('stable-large-' + repeat, capacity, 0, false, true, false, { eye, vp }, manyModels));
+    }
+    same(stableSmall.map(entry => entry.orderedHash), Array(12).fill(stableSmall[0].orderedHash), 'STATIC_SMALL_ORDER');
+    same(stableLarge.map(entry => entry.orderedHash), Array(12).fill(stableLarge[0].orderedHash), 'STATIC_LARGE_ORDER');
+    const boundaryBelow = await capture('below-block-boundary', Math.floor(512 / directory.clusters.length),
+      0, false, true, false, { eye, vp }, manyModels);
+    const boundaryZero = await capture('large-to-zero', 0, 0, false);
+    const boundaryRegrow = await capture('zero-to-large', capacity, 0, false, true, false, { eye, vp }, manyModels);
+    same(boundaryRegrow.orderedHash, stableLarge[0].orderedHash, 'REGROWN_ORDER');
+
+    // Controlled Hi-Z planes exercise first-phase draws, all-deferred recovery,
+    // current-frame rejection and mixed first/recovery output without readback
+    // driving production selection. The projection maps every box to depth .5.
+    const testLayout = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+    ] });
+    const occlusionUniform = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    testBuffers.push(occlusionUniform);
+    const occlusionWords = new ArrayBuffer(96), floats = new Float32Array(occlusionWords), uints = new Uint32Array(occlusionWords);
+    floats[14] = 0.5; floats[15] = 1; uints[16] = 1; uints[17] = 1;
+    floats[20] = 1; floats[22] = 1;
+    device.queue.writeBuffer(occlusionUniform, 0, occlusionWords);
+    const plane = () => {
+      const texture = device.createTexture({ size: [1, 1], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      testTextures.push(texture);
+      return { texture, group: device.createBindGroup({ layout: testLayout, entries: [
+        { binding: 0, resource: { buffer: occlusionUniform } }, { binding: 1, resource: texture.createView() },
+      ] }) };
+    };
+    const previous = plane(), current = plane();
+    const occlusion = { testLayout, previousGroup: previous.group, currentGroup: current.group } as unknown as GpuOcclusion;
+    recoverySelection = await GpuGeometryStreamSelection.create(device, currentPool, instanceBuffer, capacity,
+      bytes => { selectionOwned += bytes; }, {}, occlusion);
+    const recoveryGpu = recoverySelection, recoveryCases = [];
+    device.queue.writeBuffer(instanceBuffer, 0, instances(manyModels));
+    const pageWords = await readWords(currentPool.indices, currentPool.indices.size);
+    for (const count of [1, capacity]) for (const mode of ['first', 'recover', 'reject', 'mixed'] as const) {
+      const modeModels = mode === 'mixed' ? manyModels.map((model, index) => index % 2 ? model : multiply(translation(1000, 0, 0), model)) : manyModels;
+      device.queue.writeBuffer(instanceBuffer, 0, instances(modeModels));
+      floats[0] = mode === 'mixed' ? 0.01 : 0;
+      device.queue.writeBuffer(occlusionUniform, 0, occlusionWords);
+      device.queue.writeTexture({ texture: previous.texture }, new Float32Array([mode === 'first' ? 1 : 0]), { bytesPerRow: 4 }, [1, 1]);
+      device.queue.writeTexture({ texture: current.texture }, new Float32Array([mode === 'reject' ? 0 : 1]), { bytesPerRow: 4 }, [1, 1]);
+      const hashes = [];
+      for (let repeat = 0; repeat < 4; repeat++) {
+        recoveryGpu.setSettings({ maxErrorPixels: 0, frustumCulling: false });
+        recoveryGpu.update(++frame, count, vp, eye, projectionScale);
+        const lease = currentPool.acquireFrame([...currentPool.residentPageIds()]);
+        const encoder = device.createCommandEncoder(); recoveryGpu.encode(encoder); recoveryGpu.encodeRecovery(encoder);
+        const done = await currentPool.submitFrame(lease, [encoder.finish()]);
+        if (done.error) throw new Error(done.error);
+        const feedback = await recoveryGpu.feedback(true);
+        if (feedback.overflow) throw new Error('RECOVERY_OVERFLOW');
+        const wanted = reference(currentPool.residentPageIds(), count, 0, modeModels);
+        const firstSelected = mode === 'first' ? wanted.selected : mode === 'mixed'
+          ? wanted.selected.filter(entry => entry.instanceIndex % 2 === 0) : [];
+        const recoverySelected = mode === 'recover' ? wanted.selected : mode === 'mixed'
+          ? wanted.selected.filter(entry => entry.instanceIndex % 2 === 1) : [];
+        const firstIndices = physicalIndices(firstSelected, pageWords, recoveryGpu.physicalVertexCount);
+        const recoveredIndices = physicalIndices(recoverySelected, pageWords, recoveryGpu.physicalVertexCount);
+        const expectedCount = mode === 'reject' ? 0 : wanted.indices;
+        same(feedback.indices, expectedCount, 'RECOVERY_INDEX_COUNT');
+        same(feedback.occlusion, { deferredClusters: wanted.selected.length - firstSelected.length,
+          culledClusters: mode === 'reject' ? wanted.selected.length : 0,
+          recoveredClusters: recoverySelected.length }, 'RECOVERY_COUNTERS');
+        const indices = await readWords(recoveryGpu.indices, feedback.indices * 4);
+        same([...indices], [...firstIndices, ...recoveredIndices], 'RECOVERY_EXACT_ORDERED_INDICES');
+        const args = await readWords(recoveryGpu.arguments, 64);
+        same([args[0], args[8], args[10]], [firstIndices.length, recoveredIndices.length, firstIndices.length], 'RECOVERY_OFFSETS');
+        hashes.push(indexHash(indices));
+      }
+      same(hashes, Array(4).fill(hashes[0]), 'STATIC_RECOVERY_ORDER');
+      recoveryCases.push({ count, pairs: count * directory.clusters.length, mode, hashes });
+    }
+    // Corrupt a visible cluster's count, then its physical input range. Both
+    // fail closed without an out-of-bounds GPU write, including recovery.
+    device.queue.writeBuffer(instanceBuffer, 0, instances(manyModels));
+    floats[0] = 0; device.queue.writeBuffer(occlusionUniform, 0, occlusionWords);
+    const firstCluster = reference(currentPool.residentPageIds(), 1, 0, manyModels).selected[0].clusterId;
+    const savedLocation = (await readWords(currentPool.clusterLocations, currentPool.clusterLocations.size)).slice(firstCluster * 8, firstCluster * 8 + 8);
+    const overflowCases = [];
+    for (const mode of ['first', 'recover'] as const) for (const defect of ['count', 'range'] as const) {
+      const broken = savedLocation.slice();
+      if (defect === 'count') broken[4] = 1539; else broken[3] = 0xffffffff;
+      device.queue.writeBuffer(currentPool.clusterLocations, firstCluster * 32, broken);
+      device.queue.writeTexture({ texture: previous.texture }, new Float32Array([mode === 'first' ? 1 : 0]), { bytesPerRow: 4 }, [1, 1]);
+      device.queue.writeTexture({ texture: current.texture }, new Float32Array([1]), { bytesPerRow: 4 }, [1, 1]);
+      recoveryGpu.update(++frame, capacity, vp, eye, projectionScale);
+      const lease = currentPool.acquireFrame([...currentPool.residentPageIds()]);
+      const encoder = device.createCommandEncoder(); recoveryGpu.encode(encoder); recoveryGpu.encodeRecovery(encoder);
+      const done = await currentPool.submitFrame(lease, [encoder.finish()]); if (done.error) throw new Error(done.error);
+      const feedback = await recoveryGpu.feedback(true);
+      same({ indices: feedback.indices, overflow: feedback.overflow }, { indices: 0, overflow: true }, 'FAIL_CLOSED_' + mode + '_' + defect);
+      overflowCases.push({ mode, defect, indices: feedback.indices, overflow: feedback.overflow });
+      device.queue.writeBuffer(currentPool.clusterLocations, firstCluster * 32, savedLocation);
+    }
+    recoverySelection.dispose();
     selection.dispose(); currentPool.dispose(); await cache.dispose(); await device.queue.onSubmittedWorkDone();
     return { adapter: { vendor: adapter.info.vendor, isFallbackAdapter: adapter.info.isFallbackAdapter },
       pages: directory.pages.length, sourceTriangles: directory.sourceTriangleCount,
       rootOnly, fine, middle, frozen, farCount, coarse, culled, zero, allOffscreen, swapped, poolOwned, selectionOwned,
+      stableSmall, stableLarge, boundaryBelow, boundaryZero, boundaryRegrow, recoveryCases, overflowCases,
       pool: currentPool.diagnostics(), selection: selection.diagnostics(), errors };
   } finally {
-    selection?.dispose(); pool?.dispose(); await cache?.dispose(); instanceBuffer?.destroy(); device.destroy();
+    recoverySelection?.dispose(); selection?.dispose(); pool?.dispose();
+    for (const buffer of testBuffers) buffer.destroy(); for (const texture of testTextures) texture.destroy(); await cache?.dispose(); instanceBuffer?.destroy(); device.destroy();
   }
 }

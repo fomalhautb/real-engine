@@ -39,7 +39,8 @@ function hash(value: number): number {
   v = Math.imul(v ^ (v >>> 15), 0x846ca68b);
   return (v ^ (v >>> 16)) >>> 0;
 }
-function moments() { return { count: 0, mean: [0, 0, 0] as MutableVec3, m2: [0, 0, 0] as MutableVec3 }; }
+function moments() { return { count: 0, mean: [0, 0, 0] as MutableVec3, m2: [0, 0, 0] as MutableVec3,
+  luminanceMean: 0, luminanceM2: 0 }; }
 function include(stats: ReturnType<typeof moments>, value: Vec3): void {
   stats.count++;
   for (let channel = 0; channel < 3; channel++) {
@@ -47,9 +48,13 @@ function include(stats: ReturnType<typeof moments>, value: Vec3): void {
     stats.mean[channel] += delta / stats.count;
     stats.m2[channel] += delta * (value[channel] - stats.mean[channel]);
   }
+  const luminance = dot(value, [0.2126, 0.7152, 0.0722]), delta = luminance - stats.luminanceMean;
+  stats.luminanceMean += delta / stats.count;
+  stats.luminanceM2 += delta * (luminance - stats.luminanceMean);
 }
 function summarize(stats: ReturnType<typeof moments>) {
-  return { mean: stats.mean, standardError: stats.m2.map(value => Math.sqrt(Math.max(0, value) / (SAMPLES - 1) / SAMPLES)) };
+  return { mean: stats.mean, standardError: stats.m2.map(value => Math.sqrt(Math.max(0, value) / (SAMPLES - 1) / SAMPLES)),
+    luminance: { mean: stats.luminanceMean, standardError: Math.sqrt(Math.max(0, stats.luminanceM2) / (SAMPLES - 1) / SAMPLES) } };
 }
 const sameInstance = (hit: WorldHit, other: { batch: string; entityId: number }) =>
   hit.batch === other.batch && hit.entityId === other.entityId;
@@ -63,8 +68,10 @@ const sameInstance = (hit: WorldHit, other: { batch: string; entityId: number })
  * reproduce a raster derivative footprint. This is not a geometry truth oracle.
  */
 export async function intelSponzaLocalReference(renderer: Renderer, points: readonly IntelSponzaLocalReceiver[],
-  sky: Vec3, sunColor: Vec3, sunDirection: Vec3, maxDistance: number) {
+  sky: Vec3, sunColor: Vec3, sunDirection: Vec3, maxDistance: number, options: { seed?: number } = {}) {
   if (!Array.isArray(points) || points.length < 1 || points.length > MAX_POINTS) throw Error('SPONZA_LOCAL_REFERENCE_POINT_BUDGET');
+  const randomSeed = options.seed ?? SEED;
+  if (!Number.isSafeInteger(randomSeed) || randomSeed < 0 || randomSeed > 0xffff_ffff) throw Error('SPONZA_LOCAL_REFERENCE_SEED');
   const skyRadiance = vector(sky, 'SKY'), sunRadiance = vector(sunColor, 'SUN'), sun = unit(sunDirection, 'SUN_DIRECTION');
   if ([...skyRadiance, ...sunRadiance].some(value => value < 0 || value > 65504)
     || !Number.isFinite(maxDistance) || maxDistance <= T_MIN || maxDistance > 1000) throw Error('SPONZA_LOCAL_REFERENCE_LIGHTING');
@@ -102,7 +109,7 @@ export async function intelSponzaLocalReference(renderer: Renderer, points: read
     // Common random numbers make neighboring receiver comparisons and reordered
     // input lists reproducible. Directions are transformed by each local frame.
     for (let sample = 0; sample < SAMPLES; sample++) {
-      const seed = hash(sample ^ SEED);
+      const seed = hash(sample ^ randomSeed);
       const u = (hash(seed ^ 0x68bc21eb) + 0.5) / 0x1_0000_0000;
       const angle = 2 * Math.PI * (hash(seed ^ 0x02e5be93) + 0.5) / 0x1_0000_0000;
       const x = Math.sqrt(u) * Math.cos(angle), y = Math.sqrt(u) * Math.sin(angle), z = Math.sqrt(1 - u);
@@ -177,7 +184,7 @@ export async function intelSponzaLocalReference(renderer: Renderer, points: read
         emissive: summarize(contributions.emissive), total: summarize(contributions.total) }, samplesAboveHdrLimit });
   }
   return { method: 'Independent CPU cosine Monte Carlo single-bounce irradiance at supplied raster receivers; shared renderer query geometry and hit materials, not independent geometry truth.',
-    seed: SEED, samplesPerPoint: SAMPLES, normalBias: NORMAL_BIAS, tMin: T_MIN, nearDistance: NEAR_DISTANCE,
+    seed: randomSeed, samplesPerPoint: SAMPLES, normalBias: NORMAL_BIAS, tMin: T_MIN, nearDistance: NEAR_DISTANCE,
     maxDistance, skyRadiance, sunRadiance, sunDirection: sun, snapshot: snapshot ?? null,
     budget: { maxPoints: MAX_POINTS, maxSamplesPerPoint: SAMPLES, maxRaysPerPoint: 2 * SAMPLES,
       maxTotalRays: 2 * MAX_POINTS * SAMPLES, maxTraceCalls: 2 * MAX_POINTS },

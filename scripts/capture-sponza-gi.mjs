@@ -22,6 +22,9 @@ const valueFlags = new Map([
   ['--uv-audit', 'uvAuditUrl'],
   ['--anisotropy', 'anisotropy'],
   ['--warmup-frames', 'warmupFrames'],
+  ['--gather-spacing', 'gatherPixelSpacing'], ['--gather-capacity', 'gatherCapacity'],
+  ['--supplemental-capacity', 'supplementalCapacity'], ['--supplemental-work', 'supplementalWork'],
+  ['--diagnostic-points', 'diagnosticPoints'],
 ]);
 const switches = new Map([
   ['--source-raster', 'sourceRaster'], ['--fine-gather', 'fineGather'],
@@ -56,6 +59,21 @@ if (options.reconstructionDiagnostics && !options.finalGather) throw Error('SPON
 if (options.coverageDiagnostics && !options.reconstructionDiagnostics) throw Error('SPONZA_GI_COVERAGE_REQUIRES_RECONSTRUCTION');
 if (options.supplementalGather && !options.rasterReceiver) throw Error('SPONZA_GI_SUPPLEMENTAL_REQUIRES_RASTER');
 if (options.localReference && !options.reconstructionDiagnostics) throw Error('SPONZA_GI_LOCAL_REFERENCE_REQUIRES_RECONSTRUCTION');
+for (const [key, maximum] of [['gatherPixelSpacing', 128], ['gatherCapacity', 65536],
+  ['supplementalCapacity', 16384], ['supplementalWork', 67108864]]) {
+  if (options[key] === undefined) continue;
+  options[key] = Number(options[key]);
+  if (!Number.isSafeInteger(options[key]) || options[key] < 1 || options[key] > maximum) throw Error('SPONZA_GI_' + key);
+  if (!options.finalGather || (key.startsWith('supplemental') && !options.supplementalGather)) throw Error('SPONZA_GI_QUALITY_REQUIRES_ENABLED_PATH');
+}
+if (options.diagnosticPoints !== undefined) {
+  if (!options.reconstructionDiagnostics || !/^\d+,\d+(;\d+,\d+){0,127}$/.test(options.diagnosticPoints)) throw Error('SPONZA_GI_DIAGNOSTIC_POINTS');
+  options.diagnosticPoints = options.diagnosticPoints.split(';').map(pair => {
+    const [x, y] = pair.split(',').map(Number);
+    if (x < 0 || x >= 1280 || y < 0 || y >= 720) throw Error('SPONZA_GI_DIAGNOSTIC_POINTS');
+    return { x, y };
+  });
+}
 if (options.anisotropy !== undefined) {
   options.anisotropy = Number(options.anisotropy);
   if (!Number.isInteger(options.anisotropy) || options.anisotropy < 1 || options.anisotropy > 16) throw Error('SPONZA_GI_ANISOTROPY');

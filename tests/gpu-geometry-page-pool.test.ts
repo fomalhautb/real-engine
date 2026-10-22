@@ -76,6 +76,37 @@ function uploadUntil(pool: GpuGeometryPagePool, wanted: readonly number[], first
   return frame;
 }
 
+/** Tiny three-page DAG: root page 2, replaceable detail pages 0 and 1. */
+function smallPoolFixture(): { directory: GeometryStreamDirectory; decoded: DecodedGeometryPage[]; residentBytes: number } {
+  const bounds = { min: [-1, -1, -1] as [number, number, number],
+    max: [1, 1, 1] as [number, number, number] };
+  const cluster = (level: number, group: number, refinedGroup: number | null, triangleCount: number) =>
+    ({ level, group, refinedGroup, vertexCount: 3, triangleCount, bounds, lodBounds: bounds,
+      error: level });
+  const directory: GeometryStreamDirectory = {
+    version: 1, primitiveKey: 'tiny-page-pool-submit', sourceVertexCount: 6,
+    sourceTriangleCount: 2, vertexStride: 80,
+    clusters: [cluster(0, 0, null, 1), cluster(0, 0, null, 1), cluster(1, 1, 0, 2)],
+    groups: [
+      { level: 0, children: [0, 1], parents: [2], bounds, error: 1, terminal: false },
+      { level: 1, children: [2], parents: [], bounds, error: 1, terminal: true },
+    ], roots: [2],
+    pages: [0, 1, 2].map(id => ({ id, clusterIds: [id], encodedBytes: 41,
+      decodedBytes: id === 2 ? 276 : 272, sha256: '0'.repeat(64) })),
+    clusterPages: [0, 1, 2], rootPages: [2],
+  };
+  const decoded: DecodedGeometryPage[] = [0, 1, 2].map(id => ({
+    version: 1, vertexStride: 80, hasUvs: false, hasTangents: false,
+    sourceVertexCount: 6, hierarchyClusterCount: 3,
+    clusters: [{ id, sourceVertexIds: new Uint32Array(id === 1 ? [3, 4, 5] : [0, 1, 2]),
+      rest: new Uint8Array(3 * 80),
+      localTriangles: new Uint8Array(id === 2 ? [0, 1, 2, 0, 2, 1] : [0, 1, 2]) }],
+  }));
+  const metadata = 3 * 32 + 3 * 4;
+  const slot = 3 * GEOMETRY_GPU_VERTEX_BYTES + 6 * 4;
+  return { directory, decoded, residentBytes: metadata + 2 * slot };
+}
+
 beforeAll(async () => {
   const hierarchy = (await GeometryDemoScene.create()).hierarchy;
   const encoded = await encodeGeometryPages(hierarchy, { maxPageBytes: 49152 });
@@ -315,6 +346,62 @@ describe('GPU geometry page pool CPU lifecycle with deferred fake queue', () => 
     expect(second.residentPageIds().has(a)).toBe(false);
   });
 
+  it('submits 4096 distinct pool leases atomically with one queue fence', async () => {
+    const device = new FakeDevice();
+    const tiny = smallPoolFixture();
+    const entries: { pool: GpuGeometryPagePool; lease: { readonly serial: number } }[] = [];
+    let tracked = 0;
+    for (let index = 0; index < 4096; index++) {
+      const pool = await GpuGeometryPagePool.create(device as unknown as GPUDevice, tiny.directory,
+        { maxResidentBytes: tiny.residentBytes }, bytes => { tracked += bytes; });
+      pools.push(pool);
+      expect(pool.slotCount).toBe(2);
+      expect(pool.enqueue(2, tiny.decoded[2])).toBe('queued');
+      expect(pool.enqueue(0, tiny.decoded[0])).toBe('queued');
+      expect(pool.uploadFrame(1).pagesUploaded).toEqual([2, 0]);
+      const lease = pool.acquireFrame([0]);
+      expect(pool.enqueue(1, tiny.decoded[1])).toBe('queued');
+      entries.push({ pool, lease });
+    }
+
+    const rejectAt = (index: number, replacement: (typeof entries)[number]) => {
+      const changed = entries.slice();
+      changed[index] = replacement;
+      expect(() => GpuGeometryPagePool.submitFrames(changed, [command])).toThrow(/FRAME_LEASE/);
+      expect(device.submissions).toHaveLength(0);
+      expect(device.fences).toHaveLength(0);
+    };
+    const forged = (index: number) => ({ pool: entries[index].pool,
+      lease: { serial: entries[index].lease.serial } });
+    rejectAt(256, entries[0]);
+    rejectAt(4095, entries[0]);
+    rejectAt(256, forged(256));
+    rejectAt(4095, forged(4095));
+    for (const { pool } of entries) {
+      expect(pool.diagnostics()).toMatchObject({ framesInFlight: 1, leasedPages: [0] });
+    }
+
+    const completion = GpuGeometryPagePool.submitFrames(entries, [command]);
+    expect(device.submissions).toEqual([[command]]);
+    expect(device.fences).toHaveLength(1);
+    for (const { pool, lease } of entries) {
+      expect(pool.uploadFrame(2).blocked).toBe(true);
+      expect(pool.diagnostics()).toMatchObject({ framesInFlight: 1, leasedPages: [0] });
+      expect(() => pool.cancelFrame(lease)).toThrow(/FRAME_LEASE/);
+    }
+    device.completeNext();
+    await expect(completion).resolves.toEqual({ error: null });
+    for (const { pool } of entries) {
+      expect(pool.diagnostics()).toMatchObject({ framesInFlight: 0, leasedPages: [] });
+      expect(pool.uploadFrame(3).pagesUploaded).toEqual([1]);
+      expect(pool.residentPageIds().has(0)).toBe(false);
+      pool.dispose();
+      expect(pool.diagnostics().allocatedGpuBytes).toBe(0);
+    }
+    expect(tracked).toBe(0);
+    expect(device.buffers.every(buffer => buffer.destroyed)).toBe(true);
+  }, 60_000);
+
   it('rejects different devices, duplicate pools and forged leases without changing valid leases', async () => {
     const device = new FakeDevice(), otherDevice = new FakeDevice();
     const first = await poolWithSlots(device, roots.length + 1);
@@ -325,7 +412,7 @@ describe('GPU geometry page pool CPU lifecycle with deferred fake queue', () => 
     const otherLease = other.acquireFrame(roots);
     expect(() => GpuGeometryPagePool.submitFrames([], [command])).toThrow(/FRAME_LEASE/);
     expect(() => GpuGeometryPagePool.submitFrames(
-      Array(257).fill({ pool: first, lease: firstLease }), [command])).toThrow(/FRAME_LEASE/);
+      Array(4097).fill({ pool: first, lease: firstLease }), [command])).toThrow(/FRAME_LEASE/);
     expect(() => GpuGeometryPagePool.submitFrames([{ pool: first, lease: firstLease }], [])).toThrow(/FRAME_LEASE/);
     expect(() => GpuGeometryPagePool.submitFrames(
       [{ pool: first, lease: firstLease }], Array(33).fill(command))).toThrow(/FRAME_LEASE/);

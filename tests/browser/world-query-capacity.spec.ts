@@ -1,8 +1,35 @@
 import { expect, test } from '@playwright/test';
-import type { runSceneBvhMaskCapacityFixture, runWorldQueryCapacityFixture } from './fixtures/world-query-capacity';
+import type { runSceneBvhMaskCapacityFixture, runWorldQueryCapacityFixture, runStreamedBatchCapacityFixture } from './fixtures/world-query-capacity';
 
 type Result = Awaited<ReturnType<typeof runWorldQueryCapacityFixture>>;
 type Hit = NonNullable<Result['results'][number]['initial']['hits'][number]>;
+
+test('405 independently paged batches submit together and release all page leases across frames', async ({ page }) => {
+  test.setTimeout(180_000);
+  const pageErrors: string[] = []; page.on('pageerror', error => pageErrors.push(error.message));
+  await page.goto('/?trees=1');
+  await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
+  await expect(page.locator('#error')).toBeHidden();
+  const result = await page.evaluate(async () => {
+    window.__REAL_ENGINE__!.pause(true); window.__REAL_ENGINE__!.dispose();
+    const fixture = await import('/tests/browser/fixtures/' + 'world-query-capacity.ts') as {
+      runStreamedBatchCapacityFixture: typeof runStreamedBatchCapacityFixture };
+    return fixture.runStreamedBatchCapacityFixture();
+  });
+  for (const [frame, sample] of result.samples.entries()) {
+    expect(sample.renderedFrames).toBe(frame + 1);
+    expect(sample.hdr).toHaveLength(405); expect(sample.pools).toHaveLength(405);
+    sample.hdr.forEach((pixel, index) => near(pixel.slice(0, 3), [(index + 1) / 512, 0.25, 0.6], 0.002));
+    for (const pool of sample.pools) {
+      expect(pool.framesInFlight).toBe(0); expect(pool.residentPages).toEqual(result.rootPages); expect(pool.error).toBeNull();
+    }
+  }
+  expect(result.errors).toEqual([]); expect(pageErrors).toEqual([]); expect(result.afterDispose).toBe(0);
+  if (process.env.PLAYWRIGHT_GPU === 'hardware') expect(result.adapter.isFallbackAdapter).toBe(false);
+  if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) expect(result.adapter.vendor.toLowerCase()).toBe(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR);
+  console.log('STREAMED_BATCH_CAPACITY_DIAGNOSTIC', JSON.stringify({ adapter: result.adapter, batches: 405,
+    frames: result.samples.length, afterDispose: result.afterDispose, errors: result.errors }));
+});
 
 function hit(value: Hit | null): Hit {
   expect(value).not.toBeNull();

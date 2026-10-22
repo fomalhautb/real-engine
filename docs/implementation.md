@@ -2,6 +2,24 @@
 
 更新日期：2026-10-22。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## glTF 节点布局与 Sponza 分页场景预览
+
+`parseGltfNodeLayout(json, meshWeights)` 将 glTF 2.0 的节点、父子关系、场景根、默认场景与 TRS/矩阵、skin 引用和 Morph 权重读取独立出来，不解码几何、图像或 BIN。调用者提供与 mesh 数量一致的默认权重，每个 mesh 至多 32 项有限 float32；节点上限 4096。解析器验证引用、唯一父节点、矩阵/TRS 互斥和合法场景根，以线性工作量先拒绝自引用/环；返回的 `rigNodes` 仍交给共享 `AnimationRig` 验证变换并求世界姿态。它不独立加载动画片段、蒙皮矩阵或 Morph 几何。完整 `importGltf` 复用此入口，并保留解码前的节点数量/格式预检。
+
+实际 Sponza 装配暴露了旧限制：Renderer 虽已允许最多 4096 批次，`GpuGeometryPagePool.submitFrames` 仍拒绝超过 256 个独立池，401 个分页批次初始化成功后无法提交首帧。现将共享提交上限对齐到 4096；所有池继续在一次队列提交和同一个完成 fence 下持有租约，不拆成多次无保护提交。CPU 回归覆盖 4096 个独立池、第 257 个及最后一个重复/伪造租约的原子拒绝、执行中页面固定、完成后淘汰和释放归零。
+
+23 张实际法线图已全部构建 RGBA8 linear 参考包，每图 13 级 mip，逐级核对长度与 SHA-256；总载荷 2,058,005,132 字节，低清尾链合计 502,412 字节。报告 `artifacts/sponza-normal-reference-20261022.json` 与构建日志 `artifacts/sponza-normal-reference-build-20261022.log` 留在本地。这些参考包避免使用此前质量未通过的 BC7 法线；其他角色仍使用既有 BC7 候选包，不表示整个材质已经通过质量验收。
+
+本地 NVIDIA/ampere 浏览器已实际绘制 **401 个静态 Opaque 分页批次、3,738,848 个源 LOD0 三角形**，通过节点布局和共享 `AnimationRig` 保留原场景变换，72 个纹理来源接入自动流送。预览明确排除材质 21 的 4 个 BLEND primitive（8,140 三角形），因此 405 个原始实例引用只有 401 个绘制；完整源文档/BIN 保留，灯泡因子的修正仍只发生在预览输入副本。主视图不持有完整源网格，阴影使用固定查询代理；相机为 eye `[9,1.8,0]`、target `[-6,3.5,0]`，输出 1280×720，太阳阴影 2048²、FXAA、LOD 误差参数 2 像素。实际[材质图](../artifacts/sponza-scene-preview-20261022/color.png)和[分簇图](../artifacts/sponza-scene-preview-20261022/clusters.png)已保存并展示；分色来自实际参与绘制的簇。
+
+这次只启用太阳和既有常量环境补光，未启用世界 GI、反射或雾。室内明显偏暗，法线/材质、阴影代理、透明贴花及最终观感未验收。90 帧有限预热结束时纹理仍在上传，不是流送收敛或帧率基准：记录中的几何驻留页从 1,795 增至 2,639，图像账本从 771,324 增至 134,240,876 字节，Renderer 应用 GPU 账本从 568,320,812 增至 701,790,364 字节，释放后为零，页面及 GPU 错误为空。每批次几何槽按总页数四分之一向上取整并保留全部根页，合计物理池 278,638,580 字节；这不是全局严格四分之一或全应用显存上限，几何上传也仍缺统一全局预算。报告及成功日志为 `artifacts/sponza-scene-preview-20261022/report.json`、`artifacts/sponza-scene-preview-capacity-20261022.log`。
+
+`npm run check` 已通过 **601 项 CPU 测试（72 文件）**、类型检查和构建，日志 `artifacts/gltf-node-layout-check-capacity-20261022.log`。首次提取将场景根检查提前，导致既有环错误断言失败，修正为先查环后检查根，失败记录 `artifacts/gltf-node-layout-check-20261022.log` 保留。预览第一次因临时 helper 的 query proxy 参数顺序错误失败，第二次暴露上述 256 池限制；对应 `artifacts/sponza-scene-preview-20261022.log`、`artifacts/sponza-scene-preview-recheck-20261022.log` 同样保留。
+
+完整原生 NVIDIA 浏览器回归 **111/111 通过**，日志 `artifacts/gltf-node-layout-browser-native-20261022.log`。新增用例同时绘制 405 个独立分页批次，连续三帧逐个核对 HDR 材质颜色、根页驻留及完成后租约释放，资源释放归零且错误为空；同一用例在 Intel/gen-12lp 和 SwiftShader 各 **1/1** 通过，日志 `artifacts/gltf-node-layout-target-intel-20261022.log`、`artifacts/gltf-node-layout-target-software-20261022.log`。GPU 测试串行运行，期间运行时/测试代码冻结且未并行 CPU 测试或构建；这些有限功能用例不证明 Sponza 最终画质、整帧性能或完整跨设备验收，软件适配器也不作为硬件性能证据。
+
+上一提交 `84ad2e13` 的 [远程 CI run 39741882656](https://github.com/fomalhautb/real-engine/actions/runs/39741882656) 已完成并成功，不覆盖本轮节点布局与页池改动。
+
 ## 独立 glTF 材质库与预制纹理身份
 
 `createGltfMaterialLibrary(json, options)` 从 glTF 2.0 元数据直接建立材质库，不读取几何、BIN 或下载图片。`materialCount` 给出材料数量，`get(index)` 按需验证并缓存绑定，`get(null)` 返回同一套默认 PBR 材质。调用者须在库和返回绑定的使用期保持输入元数据及图像载荷不可变。完整 `importGltf` 复用此实现，但继续提前验证全部材质及全局 required extensions；材质库只判断实际材质/纹理扩展，不将场景灯光等扩展误当成材质能力。数组仍有 65,536 项上限，非法索引、未知材质扩展、非 UV0、occlusion texture 及 BLEND 仍明确拒绝。

@@ -43,6 +43,8 @@
 
 `createGltfMaterialLibrary(json, { images })` 可以独立于几何读取 glTF 材质，以 `get(index)` 或 `get(null)` 取得实际/默认绑定。将清单来源的 `fallback` 原对象放进按 glTF image 索引组织的 Map，即可保持自动纹理流送关联；预制图像必须匹配材质角色的色彩空间。需要同一图像的不同角色包时提供 `resolveImage(index, colorSpace)`。支持范围、严格校验和真实资产限制见[独立 glTF 材质库](docs/implementation.md#独立-gltf-材质库与预制纹理身份)。
 
+`parseGltfNodeLayout(json, meshWeights)` 独立读取节点层级、场景选择和变换/权重元数据；把返回的 `rigNodes` 交给 `AnimationRig`，即可将预制分页几何放回原始场景变换下。完整 glTF 导入复用同一入口。实际 Sponza 已有不透明部分的分页材质/分簇预览；透明贴花、完整照明、流送收敛和目标画质仍待验收，见[节点布局与场景预览](docs/implementation.md#gltf-节点布局与-sponza-分页场景预览)。
+
 需要 Node.js 24 与支持 WebGPU 的浏览器。使用 localhost 或 HTTPS。
 
 ```sh

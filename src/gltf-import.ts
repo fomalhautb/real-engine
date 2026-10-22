@@ -1,5 +1,5 @@
 import { readAccessor, type GltfBinaryDocument } from './gltf-binary';
-import { AnimationRig, type AnimationNode, type AnimationTrack, type AnimationClip } from './animation';
+import { AnimationRig, type AnimationTrack, type AnimationClip } from './animation';
 import type { MeshData } from './geometry';
 import type { MorphTarget } from './deformation';
 import type { MaterialBinding } from './contracts';
@@ -7,6 +7,7 @@ import { createGltfMaterialLibrary, type GltfMaterialOptions } from './gltf-mate
 import { identity, inverseAffine, type Mat4 } from './math';
 import { buildMorphTarget } from './morph-assets';
 import { generateGltfTangents } from './gltf-tangents';
+import { parseGltfNodeLayout } from './gltf-node-layout';
 
 export { prepareGltfTangents } from './gltf-tangents';
 
@@ -53,10 +54,6 @@ function vector(value: unknown, defaults: readonly number[], label: string): num
   if (values.length !== defaults.length) throw new Error('GLTF_VECTOR: ' + label);
   return values.map(v => number(v, 0, label));
 }
-function optionalIndex(value: unknown, list: readonly unknown[], label: string): number | undefined {
-  return value === undefined ? undefined : index(value, list.length, label);
-}
-
 /** Imports the supported core glTF subset. Unsupported rendering semantics fail explicitly.
  * Reference: https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html */
 export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], options: GltfImportOptions = {}): GltfAsset {
@@ -67,7 +64,8 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
     if (typeof extension !== 'string' || !supportedExtensions.has(extension)) throw new Error('GLTF_REQUIRED_EXTENSION: ' + String(extension));
   }
   const binary = doc as unknown as GltfBinaryDocument;
-  const nodeJson = array(doc.nodes ?? [], 'nodes', 4096).map((node, i) => object(node, 'node' + i));
+  // Reject oversized or malformed node tables before decoding any mesh data.
+  array(doc.nodes ?? [], 'nodes', 4096).forEach((node, i) => object(node, 'node' + i));
   const meshJson = array(doc.meshes ?? [], 'meshes').map((mesh, i) => object(mesh, 'mesh' + i));
   const skinJson = array(doc.skins ?? [], 'skins').map((skin, i) => object(skin, 'skin' + i));
   array(doc.materials ?? [], 'materials').forEach((value, i) => object(value, 'material' + i));
@@ -260,25 +258,7 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
     return { name: typeof source.name === 'string' ? source.name : 'mesh-' + meshIndex, primitives,
       weights: vector(source.weights, new Array(targetCount).fill(0), 'mesh.weights') };
   });
-  const parents: (number | null)[] = new Array(nodeJson.length).fill(null);
-  for (let parent = 0; parent < nodeJson.length; parent++) for (const childValue of array(nodeJson[parent].children ?? [], 'children')) {
-    const child = index(childValue, nodeJson.length, 'child');
-    if (parents[child] !== null) throw new Error('GLTF_MULTIPLE_PARENTS');
-    parents[child] = parent;
-  }
-  const nodes = nodeJson.map((node, i) => ({ parent: parents[i], mesh: optionalIndex(node.mesh, meshes, 'node.mesh'), skin: optionalIndex(node.skin, skinJson, 'node.skin'),
-    name: typeof node.name === 'string' ? node.name : 'node-' + i }));
-  const rigNodes: AnimationNode[] = nodeJson.map((node, i) => {
-    if (node.matrix !== undefined && [node.translation, node.rotation, node.scale].some(value => value !== undefined)) throw new Error('GLTF_MATRIX_WITH_TRS');
-    const meshIndex = nodes[i].mesh;
-    if (nodes[i].skin !== undefined && meshIndex === undefined) throw new Error('GLTF_SKIN_REQUIRES_MESH');
-    if (node.weights !== undefined && meshIndex === undefined) throw new Error('GLTF_NODE_WEIGHTS_REQUIRES_MESH');
-    return { parent: parents[i], translation: vector(node.translation, [0, 0, 0], 'translation') as [number, number, number],
-      rotation: vector(node.rotation, [0, 0, 0, 1], 'rotation') as [number, number, number, number],
-      scale: vector(node.scale, [1, 1, 1], 'scale') as [number, number, number],
-      matrix: node.matrix === undefined ? undefined : new Float32Array(vector(node.matrix, Array.from(identity()), 'matrix')),
-      weights: vector(node.weights, meshIndex === undefined ? [] : meshes[meshIndex].weights, 'node.weights') };
-  });
+  const { nodes, rigNodes, scenes, scene } = parseGltfNodeLayout(json, meshes.map(mesh => mesh.weights));
   const skins: GltfSkin[] = skinJson.map(skin => {
     const joints = array(skin.joints, 'skin.joints', 1024).map(value => index(value, nodes.length, 'skin.joint'));
     if (!joints.length || new Set(joints).size !== joints.length) throw new Error('GLTF_SKIN_JOINTS');
@@ -351,11 +331,5 @@ export function importGltf(json: unknown, buffers: readonly ArrayBuffer[], optio
       duration: tracks.reduce((duration, track) => Math.max(duration, track.times.at(-1) ?? 0), 0) };
   });
   const rig = new AnimationRig(rigNodes, clips);
-  const scenes = array(doc.scenes ?? [], 'scenes').map((value, i) => {
-    const source = object(value, 'scene'), roots = array(source.nodes ?? [], 'scene.nodes').map(node => index(node, nodes.length, 'scene.node'));
-    if (roots.some(root => parents[root] !== null) || new Set(roots).size !== roots.length) throw new Error('GLTF_SCENE_ROOTS');
-    return { name: typeof source.name === 'string' ? source.name : 'scene-' + i, roots };
-  });
-  if (!scenes.length) scenes.push({ name: 'implicit-scene', roots: parents.flatMap((parent, i) => parent === null ? [i] : []) });
-  return { rig, meshes, skins, nodes, scenes, scene: doc.scene === undefined ? 0 : index(doc.scene, scenes.length, 'scene'), warnings };
+  return { rig, meshes, skins, nodes, scenes, scene, warnings };
 }

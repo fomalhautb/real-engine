@@ -6,6 +6,9 @@ import { Renderer } from '../../../src/renderer';
 import { GpuQuerySceneBvh } from '../../../src/gpu-query-scene-bvh';
 import { packWorldRays, WORLD_HIT_BYTES, type WorldRay, type WorldQueryResult } from '../../../src/world-query';
 import type { Bounds3 } from '../../../src/deformation';
+import { buildGeometryHierarchy } from '../../../src/geometry-hierarchy';
+import { encodeGeometryPages } from '../../../src/geometry-pages';
+import { buildGeometryStreamDirectory } from '../../../src/geometry-stream-directory';
 
 const COUNT = 405;
 const LAST = COUNT - 1;
@@ -77,6 +80,38 @@ function diagnostics(renderer: Renderer) {
 
 async function reject(operation: () => Promise<unknown>): Promise<string> {
   try { await operation(); return ''; } catch (error) { return String(error); }
+}
+
+/** Every batch owns a separate physical page pool, including batches beyond 256. */
+export async function runStreamedBatchCapacityFixture() {
+  const canvas = document.createElement('canvas'); canvas.width = 720; canvas.height = 432;
+  canvas.style.cssText = 'width:720px;height:432px'; document.body.append(canvas);
+  const hierarchy = await buildGeometryHierarchy({ primitiveKey: 'capacity-paged-quad', mesh: quad(), coverage: 'opaque' });
+  const encoded = await encodeGeometryPages(hierarchy);
+  const directory = await buildGeometryStreamDirectory(hierarchy, encoded);
+  const batches = scene(hierarchy.source).map(batch => ({ ...batch,
+    geometryStream: { directory, provider: async (page: { id: number }) => encoded.pages[page.id].bytes,
+      gpuPool: { maxResidentBytes: 4096, maxStagingBytes: 4096 } } }));
+  let renderer: Renderer | undefined;
+  try {
+    renderer = await Renderer.create(canvas, batches, { maxBatches: COUNT, antiAliasing: 'none', sunShadow: { resolution: 256 } });
+    renderer.setGeometryLod({ maxErrorPixels: 0, frustumCulling: false });
+    const focal = canvas.height / (2 * Math.tan(Math.PI / 6.4));
+    const points = batches.map((_, index) => {
+      const [x, y] = center(index);
+      return { x: Math.floor(canvas.width / 2 + focal * x / 35), y: Math.floor(canvas.height / 2 - focal * y / 35) };
+    });
+    const samples = [];
+    for (let frame = 0; frame < 3; frame++) {
+      renderer.render([0, 0, 35], [0, 0, 0]);
+      const hdr = await renderer.probeHdr(points);
+      const pools = renderer.diagnostics().geometryStreams.map(stream => ({
+        framesInFlight: stream.pool.framesInFlight, residentPages: stream.pool.residentPages, error: stream.pool.error }));
+      samples.push({ hdr, pools, renderedFrames: renderer.stats.frames });
+    }
+    const adapter = renderer.info.adapterInfo, errors = [...renderer.errors];
+    renderer.dispose(); return { adapter, samples, errors, rootPages: [...directory.rootPages], afterDispose: renderer.stats.ownedGpuBytes };
+  } finally { renderer?.dispose(); canvas.remove(); }
 }
 
 export async function runWorldQueryCapacityFixture() {

@@ -295,7 +295,9 @@ export class GpuGeometryPagePool {
    * Every lease stays pinned until the same queue completion fence settles. */
   static submitFrames(entries: readonly { pool: GpuGeometryPagePool; lease: GeometryGpuFrameLease }[],
     commands: readonly GPUCommandBuffer[]): Promise<{ error: string | null }> {
-    if (!Array.isArray(entries) || entries.length < 1 || entries.length > 256
+    // A renderer can contain up to 4096 independently paged batches. Every pool
+    // must participate in the same queue submission and completion fence.
+    if (!Array.isArray(entries) || entries.length < 1 || entries.length > 4096
       || !Array.isArray(commands) || commands.length < 1 || commands.length > 32) {
       throw new Error('GEOMETRY_GPU_POOL_FRAME_LEASE');
     }

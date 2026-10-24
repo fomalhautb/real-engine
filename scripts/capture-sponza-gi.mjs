@@ -24,6 +24,7 @@ const valueFlags = new Map([
   ['--warmup-frames', 'warmupFrames'],
   ['--gather-spacing', 'gatherPixelSpacing'], ['--gather-capacity', 'gatherCapacity'],
   ['--supplemental-capacity', 'supplementalCapacity'], ['--supplemental-work', 'supplementalWork'],
+  ['--gather-sampling-seed', 'gatherSamplingSeed'],
   ['--diagnostic-points', 'diagnosticPoints'],
   ['--visibility-direction', 'visibilityDirection'],
   ['--visibility-filter', 'visibilityFilter'],
@@ -35,6 +36,7 @@ const switches = new Map([
   ['--reconstruction-diagnostics', 'reconstructionDiagnostics'],
   ['--coverage-diagnostics', 'coverageDiagnostics'],
   ['--supplemental-gather', 'supplementalGather'],
+  ['--retained-gather', 'retainedGather'], ['--progressive-gather', 'progressiveGather'],
   ['--local-reference', 'localReference'],
   ['--scene-budget', 'sceneBudget'],
 ]);
@@ -66,6 +68,13 @@ if (options.rasterReceiver && !options.finalGather) throw Error('SPONZA_GI_RASTE
 if (options.reconstructionDiagnostics && !options.finalGather) throw Error('SPONZA_GI_RECONSTRUCTION_REQUIRES_FINAL_GATHER');
 if (options.coverageDiagnostics && !options.reconstructionDiagnostics) throw Error('SPONZA_GI_COVERAGE_REQUIRES_RECONSTRUCTION');
 if (options.supplementalGather && !options.rasterReceiver) throw Error('SPONZA_GI_SUPPLEMENTAL_REQUIRES_RASTER');
+if (options.retainedGather && !options.supplementalGather) throw Error('SPONZA_GI_RETAINED_REQUIRES_SUPPLEMENTAL');
+if (options.progressiveGather && !options.retainedGather) throw Error('SPONZA_GI_PROGRESSIVE_REQUIRES_RETAINED');
+if (options.gatherSamplingSeed !== undefined) {
+  options.gatherSamplingSeed = Number(options.gatherSamplingSeed);
+  if (!options.progressiveGather || !Number.isSafeInteger(options.gatherSamplingSeed)
+    || options.gatherSamplingSeed < 0 || options.gatherSamplingSeed > 0xffff_ffff) throw Error('SPONZA_GI_SAMPLING_SEED');
+}
 if (options.localReference && !options.reconstructionDiagnostics) throw Error('SPONZA_GI_LOCAL_REFERENCE_REQUIRES_RECONSTRUCTION');
 for (const [key, maximum] of [['gatherPixelSpacing', 128], ['gatherCapacity', 65536],
   ['supplementalCapacity', 16384], ['supplementalWork', 67108864]]) {

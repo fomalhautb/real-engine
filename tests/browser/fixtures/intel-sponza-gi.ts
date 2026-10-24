@@ -30,6 +30,9 @@ export interface IntelSponzaGiOptions {
   supplementalGather?: boolean;
   /** Keep untraced supplemental candidates for up to eight frames; explicit larger memory ceiling. */
   retainedGather?: boolean;
+  /** Opt-in progressive directions for retained supplemental surfaces. */
+  progressiveGather?: boolean;
+  gatherSamplingSeed?: number;
   /** Explicit quality experiment controls; omitted values preserve the baseline. */
   gatherPixelSpacing?: number;
   gatherCapacity?: number;
@@ -62,6 +65,12 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
   if (settings.localReference && !settings.reconstructionDiagnostics) throw Error('SPONZA_LOCAL_REFERENCE_REQUIRES_RECONSTRUCTION');
   if (settings.retainedGather !== undefined && typeof settings.retainedGather !== 'boolean') throw Error('SPONZA_RETAINED_GATHER');
   if (settings.retainedGather && (!settings.finalGather || !settings.supplementalGather)) throw Error('SPONZA_RETAINED_GATHER_REQUIRES_SUPPLEMENTAL');
+  if (settings.progressiveGather !== undefined && typeof settings.progressiveGather !== 'boolean') throw Error('SPONZA_PROGRESSIVE_GATHER');
+  if (settings.progressiveGather && !settings.retainedGather) throw Error('SPONZA_PROGRESSIVE_GATHER_REQUIRES_HISTORY');
+  if (settings.gatherSamplingSeed !== undefined && (!settings.progressiveGather
+    || !Number.isSafeInteger(settings.gatherSamplingSeed) || settings.gatherSamplingSeed < 0 || settings.gatherSamplingSeed > 0xffff_ffff)) {
+    throw Error('SPONZA_GATHER_SAMPLING_SEED');
+  }
   for (const [value, maximum, label] of [[settings.gatherPixelSpacing, 128, 'GATHER_SPACING'],
     [settings.gatherCapacity, 65536, 'GATHER_CAPACITY'], [settings.supplementalCapacity, 16384, 'SUPPLEMENTAL_CAPACITY'],
     [settings.supplementalWork, 67108864, 'SUPPLEMENTAL_WORK']] as const) {
@@ -126,6 +135,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
         maxAnchors: settings.gatherCapacity ?? (settings.fineGather ? 65536 : 32768), raysPerAnchor: 1,
         pathSegments: 2, maxHistory: settings.fineGather ? 256 : 64, maxBytes: (settings.retainedGather ? 96 : 64) * MiB,
         supplementalHistoryFrames: settings.retainedGather ? 8 : 0,
+        supplementalSampling: settings.progressiveGather ? 'progressive-halton' as const : 'frame-hash' as const,
+        supplementalSamplingSeed: settings.gatherSamplingSeed ?? 0,
         maxSupplementalAnchors: settings.supplementalGather ? settings.supplementalCapacity ?? 8192 : 0,
         maxSupplementalWorkUnits: settings.supplementalGather ? settings.supplementalWork ?? 8_388_608 : 0,
         receiver: settings.rasterReceiver ? 'raster' as const : 'world-query' as const } } : {}) };

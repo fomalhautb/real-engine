@@ -21,6 +21,12 @@ export interface FinalGatherOptions {
   /** Maximum completed frames since a retained supplemental sample was traced.
    * Zero disables the cache. Candidate storage is separate from per-frame ray capacity. */
   supplementalHistoryFrames?: number;
+  /** Sampling for retained supplemental raster surfaces only; primary grid and
+   * area sampling are unchanged. Progressive uses a consecutive per-surface
+   * count independent of maxHistory. */
+  supplementalSampling?: 'frame-hash' | 'progressive-halton';
+  /** Full uint32 sequence seed for progressive supplemental sampling only. */
+  supplementalSamplingSeed?: number;
 }
 
 export interface ResolvedFinalGatherOptions {
@@ -36,6 +42,8 @@ export interface ResolvedFinalGatherOptions {
   readonly maxSupplementalAnchors: number;
   readonly maxSupplementalWorkUnits: number;
   readonly supplementalHistoryFrames: number;
+  readonly supplementalSampling: 'frame-hash' | 'progressive-halton';
+  readonly supplementalSamplingSeed: number;
 }
 
 export interface FinalGatherGridPlan {
@@ -83,8 +91,21 @@ export function resolveFinalGatherOptions(options: FinalGatherOptions = {}): Res
   if (supplementalHistoryFrames > 0 && !maxSupplementalAnchors) {
     throw new RangeError('FINAL_GATHER_SUPPLEMENTAL_HISTORY_REQUIRES_COVERAGE');
   }
+  const supplementalSampling = options.supplementalSampling === undefined ? 'frame-hash' : options.supplementalSampling;
+  if (supplementalSampling !== 'frame-hash' && supplementalSampling !== 'progressive-halton') {
+    throw new RangeError('FINAL_GATHER_SUPPLEMENTAL_SAMPLING');
+  }
+  const supplementalSamplingSeed = boundedInteger(options.supplementalSamplingSeed === undefined ? 0 : options.supplementalSamplingSeed,
+    0, 0xffff_ffff, 'SUPPLEMENTAL_SAMPLING_SEED');
+  if (supplementalSampling === 'progressive-halton' && supplementalHistoryFrames === 0) {
+    throw new RangeError('FINAL_GATHER_PROGRESSIVE_REQUIRES_HISTORY');
+  }
+  if (supplementalSampling === 'frame-hash' && supplementalSamplingSeed !== 0) {
+    throw new RangeError('FINAL_GATHER_SAMPLING_SEED_REQUIRES_PROGRESSIVE');
+  }
   return Object.freeze({ pixelSpacing, maxAnchors, raysPerAnchor, pathSegments, maxHistory, normalBias, maxBytes, receiver,
-    maxReceiverBytes, maxSupplementalAnchors, maxSupplementalWorkUnits, supplementalHistoryFrames });
+    maxReceiverBytes, maxSupplementalAnchors, maxSupplementalWorkUnits, supplementalHistoryFrames,
+    supplementalSampling, supplementalSamplingSeed });
 }
 
 export const FINAL_GATHER_COVERAGE_CANDIDATES = 8;

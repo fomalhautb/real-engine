@@ -22,7 +22,7 @@ struct FinalGatherAnchor {
     versions: vec4u, // rendered frame, history, topology, material
     irradiance: vec4f, // RGB irradiance, accumulated sample updates
     state: vec4u, // valid, rendered frame, primary/area failures, shadow failures
-    moments: vec4f, // raw luminance population variance, retained sample age, reserved zeros
+    moments: vec4f, // raw variance, retained age, optional sequence count and 24-bit key
 }
 struct Ray { origin: vec4f, direction: vec4f, ignore: vec4u }
 struct Hit {
@@ -96,13 +96,15 @@ fn gatherDirection(anchor: u32, sample: u32, normal: vec3f) -> vec3f {
     let seed = gatherHash(anchor ^ (gather.state.x * 0x9e3779b9u) ^ (path.x * 0x85ebca6bu));
     let u = (f32(sample) + gatherRandom(seed)) / f32(gather.settings.z);
     let v = gatherRandom(seed ^ (sample * 0x632be59bu) ^ 0xa511e9b3u);
-    let radius = sqrt(u);
-    let angle = 6.28318530718 * v;
+    var uv = vec2f(u, v);
+    // GATHER_PROGRESSIVE_DIRECTION
+    let radius = sqrt(uv.x);
+    let angle = 6.28318530718 * uv.y;
     let helper = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(normal.y) > 0.9);
     let tangent = normalize(cross(helper, normal));
     let bitangent = cross(normal, tangent);
     return normalize(tangent * (radius * cos(angle)) + bitangent * (radius * sin(angle))
-        + normal * sqrt(max(0.0, 1.0 - u)));
+        + normal * sqrt(max(0.0, 1.0 - uv.x)));
 }
 fn gatherEmptyRay() -> Ray {
     return Ray(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(0.0), vec4u(0u));

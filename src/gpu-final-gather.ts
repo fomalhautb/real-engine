@@ -25,8 +25,9 @@ const AREA_SAMPLE_BYTES = 48;
 const AREA_PARAMETER_BYTES = 32;
 const MAX_PROBE_ANCHORS = 1_024;
 const READBACK_BYTES = MAX_PROBE_ANCHORS * FINAL_GATHER_ANCHOR_BYTES * 2;
+const PROGRESSIVE_SEQUENCE_UPDATES = 1_048_576;
 type EntryPoint = 'generateCamera' | 'generateHemisphere' | 'generateShadows' | 'integrate'
-  | 'updateSupplementalHistory' | 'filterSupplementalHistory'
+  | 'prepareSupplementalHistory' | 'updateSupplementalHistory' | 'filterSupplementalHistory'
   | 'clearArea' | 'generateArea' | 'integrateArea' | 'accumulate' | 'denoise' | 'loadRasterReceivers' | 'loadSupplementalReceivers'
   | 'clearSupplementalReceivers' | 'scanSupplementalTiles' | 'scanSupplementalBlocks' | 'scatterSupplementalReceivers';
 export interface FinalGatherUpdate {
@@ -57,6 +58,8 @@ export interface FinalGatherProbeResult {
     historyUpdates: number;
     /** Completed frames since this retained sample was traced; zero for the ordinary active field. */
     sampleAgeFrames: number;
+    /** Independent sequence state for retained progressive sampling only. */
+    progressiveSampling?: { updates: number; key: number };
     /** Population variance of raw cross-frame irradiance luminance estimates. */
     luminanceVariance: number;
     /** Estimated variance of the history mean; unavailable with fewer than two updates. */
@@ -145,6 +148,7 @@ export class GpuFinalGather {
   private supplementalHistory?: [GPUBuffer, GPUBuffer];
   private supplementalSurfaceMap?: GPUBuffer;
   private supplementalHistoryGroups: GPUBindGroup[] = [];
+  private supplementalPrepareGroups: GPUBindGroup[] = [];
   private supplementalFilterGroups: GPUBindGroup[] = [];
   private coverageGroups!: Record<'clear' | 'tiles' | 'blocks', GPUBindGroup>;
   private coverageScatterGroups!: GPUBindGroup[];
@@ -154,7 +158,7 @@ export class GpuFinalGather {
   private groups!: Record<'generateCamera' | 'generateShadows' | 'clearArea', GPUBindGroup>;
   private rasterReceivers?: RasterReceiverBindings;
   private rasterReceiverGroup?: GPUBindGroup;
-  private hemisphereGroups!: GPUBindGroup[];
+  private hemisphereGroups!: GPUBindGroup[][];
   private integrateGroups!: GPUBindGroup[][][];
   private areaIntegrateGroups!: GPUBindGroup[];
   private accumulateGroups!: GPUBindGroup[];
@@ -257,15 +261,23 @@ export class GpuFinalGather {
     }
     const common = commonSource.replace('// GI_DISTANCE_CONSTANTS',
       `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`);
+    const progressive = this.options.supplementalSampling === 'progressive-halton';
+    const update = updateSource.replace('// GI_COMMON', common).replace('// GI_INTERPOLATE', interpolateSource)
+      .replace('// GATHER_PROGRESSIVE_DIRECTION', progressive ? 'uv = cacheProgressiveUv(anchor, sample, uv);' : '');
+    const cache = cacheSource.replace('// CACHE_CONSTANTS', `const CACHE_PRIMARY_CAPACITY: u32 = ${cap}u;`)
+      .replace('const CACHE_PROGRESSIVE_SAMPLING: bool = false;', `const CACHE_PROGRESSIVE_SAMPLING: bool = ${progressive};`)
+      .replace('const CACHE_SAMPLING_SEED: u32 = 0u;', `const CACHE_SAMPLING_SEED: u32 = ${this.options.supplementalSamplingSeed}u;`)
+      .replace('let history = cacheResolveHistory(id.x, current, hit.previous.xyz);', progressive
+        ? 'let history = cachePreparedHistory(id.x);' : 'let history = cacheResolveHistory(id.x, current, hit.previous.xyz);');
     const module = this.device.createShaderModule({ label: 'surface final gather',
-      code: surfaceFrameSource + '\n' + updateSource.replace('// GI_COMMON', common).replace('// GI_INTERPOLATE', interpolateSource)
-        + '\n' + coverageSource + '\n' + cacheSource.replace('// CACHE_CONSTANTS', `const CACHE_PRIMARY_CAPACITY: u32 = ${cap}u;`) });
+      code: surfaceFrameSource + '\n' + update + '\n' + coverageSource + '\n' + cache });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `final gather:${error.lineNum}: ${error.message}`).join('\n'));
     const names: EntryPoint[] = ['generateCamera', 'generateHemisphere', 'generateShadows', 'integrate',
       'clearArea', 'generateArea', 'integrateArea', 'accumulate', 'denoise', 'loadRasterReceivers', 'loadSupplementalReceivers',
       'clearSupplementalReceivers', 'scanSupplementalTiles', 'scanSupplementalBlocks', 'scatterSupplementalReceivers'];
     if (retained) names.push('updateSupplementalHistory', 'filterSupplementalHistory');
+    if (progressive) names.push('prepareSupplementalHistory');
     const receiverLayout = this.device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       { binding: 19, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -287,9 +299,10 @@ export class GpuFinalGather {
         [5, this.primaryHits], [15, this.throughput]]),
       clearArea: this.bind(p.clearArea, [[0, this.parameters], [2, q.rayBuffer], [13, this.areaSamples]]),
     };
-    this.hemisphereGroups = this.pathParameters.map(path => this.bind(p.generateHemisphere,
+    this.hemisphereGroups = [0, 1].map(index => this.pathParameters.map(path => this.bind(p.generateHemisphere,
       [[0, this.parameters], [1, this.giParameterBuffer], [2, q.rayBuffer], [4, this.cameraHits],
-        [5, this.primaryHits], [14, path], [15, this.throughput]]));
+        [5, this.primaryHits], [14, path], [15, this.throughput],
+        ...(progressive ? [[22, this.coverageMaps[index]], [25, this.supplementalHistory![index]]] as [number, GPUBuffer][] : [])])));
     this.integrateGroups = this.anchors.map(output => this.giProbeBuffers.map(probes => this.pathParameters.map(path => this.bind(p.integrate,
       [[0, this.parameters], [1, this.giParameterBuffer], [3, q.hitBuffer], [4, this.cameraHits],
         [5, this.primaryHits], [6, output], [8, probes], [14, path], [15, this.throughput]]))));
@@ -307,9 +320,12 @@ export class GpuFinalGather {
     this.coverageScatterGroups = this.coverageMaps.map(map => this.bind(p.scatterSupplementalReceivers,
       [[0, this.parameters], [19, this.cameraHits], [20, this.coverageCandidates], [21, this.coveragePrefix], [22, map]]));
     if (this.supplementalHistory) {
+      if (progressive) this.supplementalPrepareGroups = this.supplementalHistory.map((next, index) =>
+        this.bind(p.prepareSupplementalHistory, [[0, this.parameters], [20, this.coverageCandidates],
+          [24, this.supplementalHistory![1 - index]], [25, next]]));
       this.supplementalHistoryGroups = this.supplementalHistory.map((next, index) => this.bind(p.updateSupplementalHistory,
         [[0, this.parameters], [6, this.anchors[index]], [20, this.coverageCandidates], [22, this.coverageMaps[index]],
-          [24, this.supplementalHistory![1 - index]], [25, next]]));
+          ...(!progressive ? [[24, this.supplementalHistory![1 - index]]] as [number, GPUBuffer][] : []), [25, next]]));
       this.supplementalFilterGroups = this.supplementalHistory.map(next => this.bind(p.filterSupplementalHistory,
         [[0, this.parameters], [25, next], [26, this.filteredAnchors], [27, this.supplementalSurfaceMap!]]));
     }
@@ -529,8 +545,12 @@ export class GpuFinalGather {
         uploaded += this.queries.encodeTrace(encoder, grid.anchorCount, 0, materialRevision);
         encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.cameraHits, 0, grid.anchorCount * WORLD_HIT_BYTES);
       }
+      const retainedCount = this.supplementalHistory && this.supplemental.anchorCount ? this.supplemental.tileCount * 8 : 0;
+      if (retainedCount && this.options.supplementalSampling === 'progressive-halton') {
+        dispatch('prepareSupplementalHistory', retainedCount, this.supplementalPrepareGroups[output]);
+      }
       for (let segment = 0; segment < this.pathSegments; segment++) {
-        dispatch('generateHemisphere', rayCount, this.hemisphereGroups[segment]);
+        dispatch('generateHemisphere', rayCount, this.hemisphereGroups[output][segment]);
         uploaded += this.traceReceivers(encoder, this.options.raysPerAnchor, 1, materialRevision);
         encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.primaryHits, 0, rayCount * WORLD_HIT_BYTES);
         dispatch('generateShadows', rayCount, this.groups.generateShadows);
@@ -543,7 +563,6 @@ export class GpuFinalGather {
         uploaded += this.traceReceivers(encoder, 1, this.sourceBlocks, materialRevision);
         dispatch('integrateArea', anchors, this.areaIntegrateGroups[output]);
       }
-      const retainedCount = this.supplementalHistory && this.supplemental.anchorCount ? this.supplemental.tileCount * 8 : 0;
       if (retainedCount) dispatch('updateSupplementalHistory', retainedCount, this.supplementalHistoryGroups[output]);
       dispatch('accumulate', anchors, this.accumulateGroups[output]);
       dispatch('denoise', anchors, this.denoiseGroups[output],
@@ -646,12 +665,16 @@ export class GpuFinalGather {
         const filteredIrradiance = vector3(filtered + 16);
         const luminanceVariance = data[base + 24];
         const cached = !!this.supplementalHistory && index >= this.anchorCapacity;
+        const progressive = cached && this.options.supplementalSampling === 'progressive-halton';
         const sampleAgeFrames = data[base + 25];
         const momentsValid = Array.from({ length: 4 }, (_, j) => j).every(j => {
           const value = data[base + 24 + j];
-          return value === data[filtered + 24 + j] && Number.isFinite(value)
-            && (j === 0 || (j === 1 && cached
-              ? Number.isInteger(value) && value >= 0 && value <= this.options.supplementalHistoryFrames : value === 0));
+          if (value !== data[filtered + 24 + j] || !Number.isFinite(value)) return false;
+          if (j === 0) return true;
+          if (j === 1 && cached) return Number.isInteger(value) && value >= 0 && value <= this.options.supplementalHistoryFrames;
+          if (j >= 2 && progressive) return Number.isInteger(value) && value >= (j === 2 && state[0] === 1 ? 1 : 0)
+            && value <= (j === 2 ? PROGRESSIVE_SEQUENCE_UPDATES : 0xff_ffff) && (state[0] !== 0 || value === 0);
+          return value === 0;
         });
         if (state[1] !== frame || filteredState[1] !== frame || versions[0] !== frame) throw new Error('FINAL_GATHER_FRAME_MISMATCH');
         const metadataMatches = Array.from({ length: 16 }, (_, j) => j).every(j =>
@@ -667,6 +690,7 @@ export class GpuFinalGather {
         }
         const geometricNormal = octaDecode([(data[base + 3] + 1) * 0.5, (data[base + 7] + 1) * 0.5]);
         return { index, position, normal, geometricNormal, identity, versions, irradiance, historyUpdates, sampleAgeFrames,
+          ...(progressive ? { progressiveSampling: { updates: data[base + 26], key: data[base + 27] } } : {}),
           luminanceVariance, meanLuminanceVariance: historyUpdates < 2 ? null : luminanceVariance / Math.max(historyUpdates - 1, 1),
           valid: state[0] === 1, state, filteredIrradiance };
       });
@@ -688,6 +712,12 @@ export class GpuFinalGather {
     const partitionedPasses = this.supplemental.anchorCount ? transportPasses : 0;
     const primaryPasses = this.enabled ? Number(this.options.receiver !== 'raster') + transportPasses : 0;
     return { enabled: this.enabled, frame: this.encodedFrame, options: this.options, ownedGpuBytes: this.bytes,
+      supplementalDirectionSampling: this.options.supplementalSampling === 'progressive-halton'
+        ? { method: 'random-shifted-halton-prime-dimensions' as const, dimensionBases: [2, 3, 5, 7, 11, 13, 17, 19],
+          sequenceUpdateLimit: PROGRESSIVE_SEQUENCE_UPDATES,
+          keyBits: 24, maximumHistoryRecordsPerCandidate: 73, maximumPreparedRecordsPerRay: 1,
+          maximumInverseMapEntriesPerRay: 8, preparationPassesPerUpdate: anchors && this.supplemental.anchorCount ? 1 : 0 }
+        : null,
       representation: this.options.receiver === 'raster' ? 'actual-raster-camera-receiver-screen-grid-irradiance'
         : this.queries.diagnostics().geometryRepresentations.some(entry => entry.geometry.kind === 'fixed-query-proxy')
           ? 'fixed-query-proxy-camera-hit-screen-grid-irradiance' : 'exact-camera-hit-screen-grid-irradiance',

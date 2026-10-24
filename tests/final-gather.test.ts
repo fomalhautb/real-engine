@@ -10,7 +10,8 @@ describe('final gather CPU contract', () => {
     expect(defaults).toEqual({ pixelSpacing: 8, maxAnchors: 16_384, raysPerAnchor: 2,
       pathSegments: 1, maxHistory: 64, normalBias: 0.0001, maxBytes: 16 * 1024 * 1024,
       receiver: 'world-query', maxReceiverBytes: 128 * 1024 * 1024, maxSupplementalAnchors: 0,
-      maxSupplementalWorkUnits: 0, supplementalHistoryFrames: 0 });
+      maxSupplementalWorkUnits: 0, supplementalHistoryFrames: 0,
+      supplementalSampling: 'frame-hash', supplementalSamplingSeed: 0 });
     expect(Object.isFrozen(defaults)).toBe(true);
     expect(resolveFinalGatherOptions({ pixelSpacing: 1, normalBias: 0.01 }).normalBias).toBe(0.01);
     expect(resolveFinalGatherOptions({ pixelSpacing: 128, normalBias: 0 }).normalBias).toBe(0);
@@ -63,6 +64,40 @@ describe('final gather CPU contract', () => {
     expect(() => resolveFinalGatherOptions({ ...coverage, maxSupplementalWorkUnits: 0, supplementalHistoryFrames: 1 }))
       .toThrow('FINAL_GATHER_SUPPLEMENTAL_WORK_REQUIRED');
     expect(resolveFinalGatherOptions({ maxBytes: 128 * 1024 * 1024 }).maxBytes).toBe(128 * 1024 * 1024);
+  });
+
+  it('opts into progressive supplemental sampling with its own history and uint32 seed', () => {
+    const coverage = { receiver: 'raster' as const, maxSupplementalAnchors: 1,
+      maxSupplementalWorkUnits: 1 };
+    expect(resolveFinalGatherOptions({ ...coverage, supplementalHistoryFrames: 64,
+      maxHistory: 1, supplementalSampling: 'progressive-halton', supplementalSamplingSeed: 0xffff_ffff }))
+      .toMatchObject({ supplementalHistoryFrames: 64, maxHistory: 1,
+        supplementalSampling: 'progressive-halton', supplementalSamplingSeed: 0xffff_ffff });
+    expect(resolveFinalGatherOptions({ ...coverage, supplementalHistoryFrames: 1,
+      supplementalSampling: 'progressive-halton' }).supplementalSamplingSeed).toBe(0);
+    expect(resolveFinalGatherOptions({ ...coverage, supplementalHistoryFrames: 1,
+      supplementalSampling: 'frame-hash' }).supplementalSampling).toBe('frame-hash');
+    expect(() => resolveFinalGatherOptions({ ...coverage, supplementalSampling: 'progressive-halton' }))
+      .toThrow('FINAL_GATHER_PROGRESSIVE_REQUIRES_HISTORY');
+    expect(() => resolveFinalGatherOptions({ ...coverage, supplementalSampling: 'progressive-halton',
+      supplementalHistoryFrames: 0 })).toThrow('FINAL_GATHER_PROGRESSIVE_REQUIRES_HISTORY');
+    for (const invalid of [null, 0, true, '', 'halton', 'FRAME-HASH']) {
+      expect(() => resolveFinalGatherOptions({ supplementalSampling: invalid as 'frame-hash' }))
+        .toThrow('FINAL_GATHER_SUPPLEMENTAL_SAMPLING');
+    }
+    for (const invalid of [-1, 0.5, 0x1_0000_0000, NaN, Infinity, null, '1', true]) {
+      expect(() => resolveFinalGatherOptions({ ...coverage, supplementalHistoryFrames: 1,
+        supplementalSampling: 'progressive-halton', supplementalSamplingSeed: invalid as number }))
+        .toThrow('FINAL_GATHER_SUPPLEMENTAL_SAMPLING_SEED');
+    }
+    expect(() => resolveFinalGatherOptions({ supplementalSamplingSeed: 1 }))
+      .toThrow('FINAL_GATHER_SAMPLING_SEED_REQUIRES_PROGRESSIVE');
+    expect(() => resolveFinalGatherOptions({ ...coverage, supplementalHistoryFrames: 1,
+      supplementalSampling: 'frame-hash', supplementalSamplingSeed: 1 }))
+      .toThrow('FINAL_GATHER_SAMPLING_SEED_REQUIRES_PROGRESSIVE');
+    const grid = planFinalGatherGrid(320, 180, {}, 1840, 1840);
+    expect(planFinalGatherGrid(320, 180, { ...coverage, supplementalHistoryFrames: 1,
+      supplementalSampling: 'progressive-halton', supplementalSamplingSeed: 7 }, 1840, 1840)).toEqual(grid);
   });
 
   it('rotates a bounded candidate update window across a fixed queue', () => {

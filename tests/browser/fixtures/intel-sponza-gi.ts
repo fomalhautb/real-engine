@@ -28,6 +28,8 @@ export interface IntelSponzaGiOptions {
   reconstructionDiagnostics?: boolean;
   coverageDiagnostics?: boolean;
   supplementalGather?: boolean;
+  /** Keep untraced supplemental candidates for up to eight frames; explicit larger memory ceiling. */
+  retainedGather?: boolean;
   /** Explicit quality experiment controls; omitted values preserve the baseline. */
   gatherPixelSpacing?: number;
   gatherCapacity?: number;
@@ -58,6 +60,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
   if (settings.rasterReceiver && !settings.finalGather) throw Error('SPONZA_RASTER_RECEIVER_REQUIRES_FINAL_GATHER');
   if (settings.reconstructionDiagnostics && !settings.finalGather) throw Error('SPONZA_RECONSTRUCTION_REQUIRES_FINAL_GATHER');
   if (settings.localReference && !settings.reconstructionDiagnostics) throw Error('SPONZA_LOCAL_REFERENCE_REQUIRES_RECONSTRUCTION');
+  if (settings.retainedGather !== undefined && typeof settings.retainedGather !== 'boolean') throw Error('SPONZA_RETAINED_GATHER');
+  if (settings.retainedGather && (!settings.finalGather || !settings.supplementalGather)) throw Error('SPONZA_RETAINED_GATHER_REQUIRES_SUPPLEMENTAL');
   for (const [value, maximum, label] of [[settings.gatherPixelSpacing, 128, 'GATHER_SPACING'],
     [settings.gatherCapacity, 65536, 'GATHER_CAPACITY'], [settings.supplementalCapacity, 16384, 'SUPPLEMENTAL_CAPACITY'],
     [settings.supplementalWork, 67108864, 'SUPPLEMENTAL_WORK']] as const) {
@@ -120,7 +124,8 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
       maxVisibilityWorkUnits: settings.visibilityDirection === 'receiver-to-probe' ? 67_108_864 : 0,
       ...(settings.finalGather ? { finalGather: { pixelSpacing: settings.gatherPixelSpacing ?? (settings.fineGather ? 4 : 8),
         maxAnchors: settings.gatherCapacity ?? (settings.fineGather ? 65536 : 32768), raysPerAnchor: 1,
-        pathSegments: 2, maxHistory: settings.fineGather ? 256 : 64, maxBytes: 64 * MiB,
+        pathSegments: 2, maxHistory: settings.fineGather ? 256 : 64, maxBytes: (settings.retainedGather ? 96 : 64) * MiB,
+        supplementalHistoryFrames: settings.retainedGather ? 8 : 0,
         maxSupplementalAnchors: settings.supplementalGather ? settings.supplementalCapacity ?? 8192 : 0,
         maxSupplementalWorkUnits: settings.supplementalGather ? settings.supplementalWork ?? 8_388_608 : 0,
         receiver: settings.rasterReceiver ? 'raster' as const : 'world-query' as const } } : {}) };

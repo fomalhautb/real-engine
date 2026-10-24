@@ -13,7 +13,7 @@ struct FinalGatherParameters {
     rasterDy: vec4f,
     rasterDz: vec4f,
     raster: vec4u, // receiver mode, metadata rows, supplemental tile pitch, supplemental count
-    coverage: vec4u, // map tile capacity, actual tiles, scan permutation stride, reserved
+    coverage: vec4u, // map tile capacity, actual tiles, scan permutation stride, supplemental history age limit
 }
 struct FinalGatherAnchor {
     position: vec4f,
@@ -22,7 +22,7 @@ struct FinalGatherAnchor {
     versions: vec4u, // rendered frame, history, topology, material
     irradiance: vec4f, // RGB irradiance, accumulated sample updates
     state: vec4u, // valid, rendered frame, primary/area failures, shadow failures
-    moments: vec4f, // raw temporal luminance population variance, reserved zeros
+    moments: vec4f, // raw luminance population variance, retained sample age, reserved zeros
 }
 struct Ray { origin: vec4f, direction: vec4f, ignore: vec4u }
 struct Hit {
@@ -224,9 +224,14 @@ fn loadSupplementalReceivers(@builtin(global_invocation_id) id: vec3u) {
     for (var rank = 0u; rank < 8u; rank++) {
         var best = 0u;
         for (var i = 1u; i < 8u; i++) { if (support[i] > support[best]) { best = i; } }
-        var selected: Hit;
-        if (support[best] != 0u) { selected = candidates[best]; support[best] = 0u; }
-        coverageCandidates[id.x * 8u + rank] = selected;
+        if (support[best] != 0u) {
+            coverageCandidates[id.x * 8u + rank] = candidates[best];
+            support[best] = 0u;
+        } else {
+            // Publish an empty record for every exhausted rank; never reuse
+            // a previously selected candidate in the remaining output slots.
+            coverageCandidates[id.x * 8u + rank] = Hit();
+        }
     }
 }
 

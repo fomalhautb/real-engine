@@ -8,6 +8,7 @@ export interface FinalGatherOptions {
   pathSegments?: number;
   maxHistory?: number;
   normalBias?: number;
+  /** Caller-owned allocation ceiling, up to 128 MiB; enabling history never raises it automatically. */
   maxBytes?: number;
   /** The camera receiver can come from world queries or the completed raster prepass. */
   receiver?: 'world-query' | 'raster';
@@ -17,6 +18,9 @@ export interface FinalGatherOptions {
   maxSupplementalAnchors?: number;
   /** Additional traversal work per supplementary trace, separate from the primary query budget. */
   maxSupplementalWorkUnits?: number;
+  /** Maximum completed frames since a retained supplemental sample was traced.
+   * Zero disables the cache. Candidate storage is separate from per-frame ray capacity. */
+  supplementalHistoryFrames?: number;
 }
 
 export interface ResolvedFinalGatherOptions {
@@ -31,6 +35,7 @@ export interface ResolvedFinalGatherOptions {
   readonly maxReceiverBytes: number;
   readonly maxSupplementalAnchors: number;
   readonly maxSupplementalWorkUnits: number;
+  readonly supplementalHistoryFrames: number;
 }
 
 export interface FinalGatherGridPlan {
@@ -62,7 +67,7 @@ export function resolveFinalGatherOptions(options: FinalGatherOptions = {}): Res
     throw new RangeError('FINAL_GATHER_NORMAL_BIAS');
   }
   const maxBytes = boundedInteger(options.maxBytes === undefined ? 16 * 1024 * 1024 : options.maxBytes,
-    1, 64 * 1024 * 1024, 'MAX_BYTES');
+    1, 128 * 1024 * 1024, 'MAX_BYTES');
   const receiver = options.receiver === undefined ? 'world-query' : options.receiver;
   if (receiver !== 'world-query' && receiver !== 'raster') throw new RangeError('FINAL_GATHER_RECEIVER');
   const maxReceiverBytes = boundedInteger(options.maxReceiverBytes === undefined ? 128 * 1024 * 1024 : options.maxReceiverBytes,
@@ -73,11 +78,28 @@ export function resolveFinalGatherOptions(options: FinalGatherOptions = {}): Res
   const maxSupplementalWorkUnits = boundedInteger(options.maxSupplementalWorkUnits === undefined ? 0 : options.maxSupplementalWorkUnits,
     0, 67_108_864, 'MAX_SUPPLEMENTAL_WORK_UNITS');
   if (maxSupplementalAnchors && !maxSupplementalWorkUnits) throw new RangeError('FINAL_GATHER_SUPPLEMENTAL_WORK_REQUIRED');
+  const supplementalHistoryFrames = boundedInteger(options.supplementalHistoryFrames === undefined ? 0 : options.supplementalHistoryFrames,
+    0, 64, 'SUPPLEMENTAL_HISTORY_FRAMES');
+  if (supplementalHistoryFrames > 0 && !maxSupplementalAnchors) {
+    throw new RangeError('FINAL_GATHER_SUPPLEMENTAL_HISTORY_REQUIRES_COVERAGE');
+  }
   return Object.freeze({ pixelSpacing, maxAnchors, raysPerAnchor, pathSegments, maxHistory, normalBias, maxBytes, receiver,
-    maxReceiverBytes, maxSupplementalAnchors, maxSupplementalWorkUnits });
+    maxReceiverBytes, maxSupplementalAnchors, maxSupplementalWorkUnits, supplementalHistoryFrames });
 }
 
 export const FINAL_GATHER_COVERAGE_CANDIDATES = 8;
+/** Circular update window over a fixed global candidate queue. It gives each
+ * ordinal a turn within ceil(totalCandidates / updateBudget) frames when the
+ * queue stays unchanged; it does not guarantee fairness for moving candidates. */
+export function finalGatherCoverageWindow(totalCandidates: number, updateBudget: number, frame: number):
+  { start: number; count: number } {
+  boundedInteger(totalCandidates, 0, 131_072, 'COVERAGE_TOTAL_CANDIDATES');
+  boundedInteger(updateBudget, 0, 16_384, 'COVERAGE_UPDATE_BUDGET');
+  boundedInteger(frame, 0, 0xffff_ffff, 'COVERAGE_FRAME');
+  return { start: totalCandidates > 0 ? ((frame % totalCandidates) * updateBudget) % totalCandidates : 0,
+    count: Math.min(totalCandidates, updateBudget) };
+}
+
 /** Bounded tile scan with globally shared supplementary slots. Empty tiles
  * consume no selected slot; the primary grid and its ray quota are unchanged. */
 export function planFinalGatherSupplemental(width: number, height: number, spareCapacity: number, requested: number) {

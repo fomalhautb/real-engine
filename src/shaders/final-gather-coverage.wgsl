@@ -78,11 +78,18 @@ fn scanSupplementalBlocks(@builtin(local_invocation_index) lane: u32) {
 fn scatterSupplementalReceivers(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= gather.coverage.y) { return; }
     let tile = coverageTile(id.x);
+    var totalCandidates = 0u;
+    for (var rank = 0u; rank < 8u; rank++) { totalCandidates += coveragePrefix[coverageTotalBase() + rank]; }
+    // With retained history, rotate the update window through every candidate.
+    // total <= 131072 and budget <= 16384 keep the multiplication below 2^32.
+    let cycle = max(totalCandidates, 1u);
+    let begin = select(0u, ((gather.state.x % cycle) * gather.raster.w) % cycle, gather.coverage.w != 0u);
     var roundBase = 0u;
     for (var rank = 0u; rank < 8u; rank++) {
         let candidate = coverageCandidates[tile * 8u + rank];
-        let selected = roundBase + coveragePrefix[id.x * 8u + rank]
+        let ordinal = roundBase + coveragePrefix[id.x * 8u + rank]
             + coveragePrefix[coverageBlockBase() + (id.x / 128u) * 8u + rank];
+        let selected = select(ordinal, (ordinal + cycle - begin) % cycle, gather.coverage.w != 0u);
         var mapped = 0u;
         if (candidate.identity.x != 0u && selected < gather.raster.w) {
             let index = gather.viewport.z * gather.viewport.w + selected;

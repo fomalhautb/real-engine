@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { finalGatherRasterRayBasis, invertFinalGatherProjection, planFinalGatherGrid, planFinalGatherSupplemental, resolveFinalGatherOptions } from '../src/final-gather';
+import { finalGatherCoverageWindow, finalGatherRasterRayBasis, invertFinalGatherProjection,
+  planFinalGatherGrid, planFinalGatherSupplemental, resolveFinalGatherOptions } from '../src/final-gather';
 import { lookAt, multiply, perspective } from '../src/math';
 import { decodeFinalGatherDiagnostics } from '../src/final-gather-diagnostics';
 
@@ -8,7 +9,8 @@ describe('final gather CPU contract', () => {
     const defaults = resolveFinalGatherOptions();
     expect(defaults).toEqual({ pixelSpacing: 8, maxAnchors: 16_384, raysPerAnchor: 2,
       pathSegments: 1, maxHistory: 64, normalBias: 0.0001, maxBytes: 16 * 1024 * 1024,
-      receiver: 'world-query', maxReceiverBytes: 128 * 1024 * 1024, maxSupplementalAnchors: 0, maxSupplementalWorkUnits: 0 });
+      receiver: 'world-query', maxReceiverBytes: 128 * 1024 * 1024, maxSupplementalAnchors: 0,
+      maxSupplementalWorkUnits: 0, supplementalHistoryFrames: 0 });
     expect(Object.isFrozen(defaults)).toBe(true);
     expect(resolveFinalGatherOptions({ pixelSpacing: 1, normalBias: 0.01 }).normalBias).toBe(0.01);
     expect(resolveFinalGatherOptions({ pixelSpacing: 128, normalBias: 0 }).normalBias).toBe(0);
@@ -45,6 +47,53 @@ describe('final gather CPU contract', () => {
     }
   });
 
+  it('bounds optional supplemental history and requires active raster coverage', () => {
+    const coverage = { receiver: 'raster' as const, maxSupplementalAnchors: 1,
+      maxSupplementalWorkUnits: 1 };
+    expect(resolveFinalGatherOptions({ ...coverage, supplementalHistoryFrames: 64 }).supplementalHistoryFrames).toBe(64);
+    expect(resolveFinalGatherOptions({ ...coverage }).supplementalHistoryFrames).toBe(0);
+    expect(() => resolveFinalGatherOptions({ supplementalHistoryFrames: 1 }))
+      .toThrow('FINAL_GATHER_SUPPLEMENTAL_HISTORY_REQUIRES_COVERAGE');
+    for (const invalid of [-1, 0.5, 65, NaN, Infinity, null, '1', true]) {
+      expect(() => resolveFinalGatherOptions({ ...coverage, supplementalHistoryFrames: invalid as number }))
+        .toThrow('FINAL_GATHER_SUPPLEMENTAL_HISTORY_FRAMES');
+    }
+    expect(() => resolveFinalGatherOptions({ ...coverage, receiver: 'world-query', supplementalHistoryFrames: 1 }))
+      .toThrow('FINAL_GATHER_SUPPLEMENTAL_REQUIRES_RASTER');
+    expect(() => resolveFinalGatherOptions({ ...coverage, maxSupplementalWorkUnits: 0, supplementalHistoryFrames: 1 }))
+      .toThrow('FINAL_GATHER_SUPPLEMENTAL_WORK_REQUIRED');
+    expect(resolveFinalGatherOptions({ maxBytes: 128 * 1024 * 1024 }).maxBytes).toBe(128 * 1024 * 1024);
+  });
+
+  it('rotates a bounded candidate update window across a fixed queue', () => {
+    expect(finalGatherCoverageWindow(0, 0, 0)).toEqual({ start: 0, count: 0 });
+    expect(finalGatherCoverageWindow(0, 16_384, 0xffff_ffff)).toEqual({ start: 0, count: 0 });
+    expect(finalGatherCoverageWindow(7, 12, 1)).toEqual({ start: 5, count: 7 });
+    expect(finalGatherCoverageWindow(10, 4, 2)).toEqual({ start: 8, count: 4 });
+    expect(finalGatherCoverageWindow(13, 5, 0xffff_ffff)).toEqual({
+      start: ((0xffff_ffff % 13) * 5) % 13, count: 5 });
+    expect(finalGatherCoverageWindow(131_072, 16_384, 0xffff_ffff).start)
+      .toBe(((0xffff_ffff % 131_072) * 16_384) % 131_072);
+    const total = 17, budget = 5, seen = new Set<number>();
+    // A fixed queue is covered in ceil(total / budget) consecutive frames.
+    for (let frame = 0; frame < Math.ceil(total / budget); frame++) {
+      const window = finalGatherCoverageWindow(total, budget, frame);
+      expect(window.count).toBeLessThanOrEqual(budget);
+      for (let ordinal = 0; ordinal < total; ordinal++) {
+        if ((ordinal + total - window.start) % total < window.count) seen.add(ordinal);
+      }
+    }
+    expect(seen.size).toBe(total);
+    expect(finalGatherCoverageWindow(17, 0, 12)).toEqual({ start: 0, count: 0 });
+    for (const [totalCandidates, updateBudget, frame] of [
+      [-1, 1, 0], [131_073, 1, 0], [1.5, 1, 0], [1, -1, 0], [1, 16_385, 0],
+      [1, 1.5, 0], [1, 1, -1], [1, 1, 0x1_0000_0000], [1, 1, 0.5],
+      [null, 1, 0], [1, null, 0], [1, 1, null],
+    ] as const) {
+      expect(() => finalGatherCoverageWindow(totalCandidates as number, updateBudget as number, frame as number)).toThrow();
+    }
+  });
+
   it('decodes up to eight supplemental ranks in all nine neighboring tiles', () => {
     const words = new Uint32Array(8), floats = new Float32Array(words.buffer), pixel = [{ x: 0, y: 0 }];
     words.fill(0x80808080, 4); floats.set([1, 0.2, 0.3], 1);
@@ -60,12 +109,12 @@ describe('final gather CPU contract', () => {
 
   it('validates each option at its hard boundary', () => {
     expect(resolveFinalGatherOptions({ maxAnchors: 65_536, raysPerAnchor: 16,
-      maxHistory: 256, maxBytes: 64 * 1024 * 1024 }).maxAnchors).toBe(65_536);
+      maxHistory: 256, maxBytes: 128 * 1024 * 1024 }).maxAnchors).toBe(65_536);
     for (const [key, bad] of [
       ['pixelSpacing', 0], ['pixelSpacing', 129], ['maxAnchors', 0], ['maxAnchors', 65_537],
       ['raysPerAnchor', 0], ['raysPerAnchor', 17], ['maxHistory', 0], ['maxHistory', 257],
       ['pathSegments', 0], ['pathSegments', 5], ['pathSegments', 1.5],
-      ['normalBias', -1], ['normalBias', 0.011], ['maxBytes', 0], ['maxBytes', 64 * 1024 * 1024 + 1],
+      ['normalBias', -1], ['normalBias', 0.011], ['maxBytes', 0], ['maxBytes', 128 * 1024 * 1024 + 1],
       ['maxReceiverBytes', 0], ['maxReceiverBytes', 512 * 1024 * 1024 + 1],
     ] as const) {
       expect(() => resolveFinalGatherOptions({ [key]: bad })).toThrow();

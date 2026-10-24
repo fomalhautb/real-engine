@@ -42,6 +42,8 @@ export interface IntelSponzaGiOptions {
   sceneBudget?: boolean;
   visibilityDirection?: GiVisibilityDirection;
   visibilityFilter?: GiVisibilityFilter;
+  /** Isolate sun-capture ray origin from probe interpolation in A/B captures. */
+  shadowNormalBias?: number;
   /** Exact rendered warmup frame count; residency must be settled at its end. */
   warmupFrames?: number;
 }
@@ -111,6 +113,7 @@ export async function captureIntelSponzaGi(settings: IntelSponzaGiOptions = {}) 
     const giSpacing = bounds.max.map((v, i) => (v - bounds.min[i]) / giCounts[i]) as [number, number, number];
     const giOptions = { origin: bounds.min.map((v, i) => v + giSpacing[i] / 2) as [number, number, number],
       spacing: giSpacing, counts: giCounts, raysPerProbe: settings.fineGather ? 128 : 64, maxDistance: 80, normalBias: 0.03,
+      shadowNormalBias: settings.shadowNormalBias,
       skyRadiance: [0.2, 0.25, 0.35] as [number, number, number], multiBounce: false, maxBytes: 128 * MiB,
       visibilityDirection: settings.visibilityDirection ?? 'probe-to-receiver',
       visibilityFilter: settings.visibilityFilter ?? 'moment-bilinear',

@@ -2,7 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 import { evaluateGiIrradiance } from '../../src/diffuse-gi';
 import { GI_DISTANCE_CELLS } from '../../src/gi-visibility';
 import type { runDiffuseGiSkyFixture, runDiffuseGiSceneFixture,
-  runDiffuseGiOverflowFixture } from './fixtures/diffuse-gi';
+  runDiffuseGiOverflowFixture, runDiffuseGiShadowBiasFixture } from './fixtures/diffuse-gi';
 
 type SkyResult = Awaited<ReturnType<typeof runDiffuseGiSkyFixture>>;
 type SceneResult = Awaited<ReturnType<typeof runDiffuseGiSceneFixture>>;
@@ -151,6 +151,52 @@ test('query work overflow invalidates GI probes instead of publishing partial ca
   expect(result.result.probes.every(probe => !probe.valid && probe.primaryOverflows > 0)).toBe(true);
   expect(result.errors).toEqual([]);
   expect(result.afterDispose).toBe(0);
+  expect(pageErrors).toEqual([]);
+});
+
+test('GI sun-shadow bias preserves a nearby blocker independently of probe interpolation bias', async ({ page }) => {
+  test.setTimeout(120_000);
+  const pageErrors = await fixturePage(page);
+  const results = await page.evaluate(async () => {
+    const module = await import('/tests/browser/fixtures/' + 'diffuse-gi.ts') as {
+      runDiffuseGiShadowBiasFixture: typeof runDiffuseGiShadowBiasFixture;
+    };
+    return module.runDiffuseGiShadowBiasFixture();
+  });
+  const [precise, legacy, spatial] = results;
+  console.log('GI_SHADOW_BIAS_GPU_DIAGNOSTIC ' + JSON.stringify(results.map(result => ({
+    options: result.options, adapter: result.adapter, open: averageIrradiance(result.open), blocked: averageIrradiance(result.blocked),
+    clearMask: averageIrradiance(result.clearMask), opaqueMask: averageIrradiance(result.opaqueMask),
+    errors: result.errors, afterDispose: result.afterDispose,
+  }))));
+  for (const result of results) {
+    if (process.env.PLAYWRIGHT_GPU === 'hardware') expect(result.adapter.isFallbackAdapter).toBe(false);
+    if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) {
+      expect(result.adapter.vendor.toLowerCase()).toBe(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR);
+    }
+    for (const snapshot of [result.open, result.blocked, result.clearMask, result.opaqueMask, result.removed]) {
+      expect(snapshot.invalidProbes).toBe(0);
+      expect(snapshot.probes).toHaveLength(8);
+      expect(snapshot.probes.every(probe => probe.primaryOverflows === 0 && probe.shadowOverflows === 0)).toBe(true);
+    }
+    expect(averageIrradiance(result.open)[0]).toBeGreaterThan(0.1);
+    expect(maxCoefficientDifference(result.open, result.clearMask)).toBeLessThan(0.00001);
+    expect(maxCoefficientDifference(result.open, result.removed)).toBeLessThan(0.00001);
+    expect(result.errors).toEqual([]);
+    expect(result.afterDispose).toBe(0);
+  }
+  // Analytic geometry: the old 3 cm offset starts past the plate at z=7.98;
+  // the 0.1 mm offset starts at z=7.9999 and must cross it toward the sun.
+  expect(maxCoefficientDifference(legacy.open, legacy.blocked)).toBeLessThan(0.00001);
+  expect(maxCoefficientDifference(legacy.open, legacy.opaqueMask)).toBeLessThan(0.00001);
+  for (const result of [precise, spatial]) {
+    for (const blocked of [result.blocked, result.opaqueMask]) {
+      expect(Math.max(...blocked.probes.flatMap(probe => probe.coefficients.flat().map(Math.abs))))
+        .toBeLessThan(0.00001);
+    }
+    expect(maxCoefficientDifference(result.open, legacy.open)).toBeLessThan(0.00001);
+    expect(maxCoefficientDifference(result.blocked, precise.blocked)).toBeLessThan(0.00001);
+  }
   expect(pageErrors).toEqual([]);
 });
 

@@ -3,10 +3,11 @@ struct GiParameters {
     origin: vec4f, // xyz world origin, w enabled
     spacing: vec4f, // xyz spacing, w maximum ray distance
     counts: vec4u, // xyz grid dimensions, w rays per probe
-    sunDirection: vec4f, // xyz unit vector, w world-space normal bias
+    sunDirection: vec4f, // xyz unit vector, w receiver offset for spatial probe interpolation
     sunColor: vec4f, // xyz radiance; w exact integer flags: bit 0 receiver-directed support, bit 1 per-tap Chebyshev
     sky: vec4f, // xyz radiance, w low-confidence visibility weight threshold
     state: vec4u, // rendered frame, usable history frame, feedback enabled, emissive area sampling enabled
+    shadow: vec4f, // x capture-to-sun geometric-normal bias; yzw reserved
 }
 struct GiProbe {
     coefficients: array<vec4f, 9>, // RGB incoming radiance SH; first three w values store sampled RGB maxima

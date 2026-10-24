@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DIFFUSE_GI_PROBE_BYTES } from '../src/diffuse-gi';
+import { DIFFUSE_GI_PARAMETER_BYTES, DIFFUSE_GI_PROBE_BYTES } from '../src/diffuse-gi';
 import { resolveFinalGatherOptions } from '../src/final-gather';
 import { GpuFinalGather } from '../src/gpu-final-gather';
 import type { GpuWorldQuery } from '../src/gpu-world-query';
@@ -49,7 +49,7 @@ function borrowedBuffers() {
   const maxRays = 16;
   const ray = fakeBuffer('borrowed query rays', maxRays * WORLD_RAY_BYTES, GPUBufferUsage.STORAGE);
   const hit = fakeBuffer('borrowed query hits', maxRays * WORLD_HIT_BYTES, GPUBufferUsage.STORAGE);
-  const giParameters = fakeBuffer('borrowed GI parameters', 112, GPUBufferUsage.UNIFORM);
+  const giParameters = fakeBuffer('borrowed GI parameters', DIFFUSE_GI_PARAMETER_BYTES, GPUBufferUsage.UNIFORM);
   const giProbes = [0, 1].map(index => fakeBuffer(`borrowed GI probes ${index}`,
     DIFFUSE_GI_PROBE_BYTES, GPUBufferUsage.STORAGE)) as [FakeBuffer, FakeBuffer];
   const queries = {
@@ -76,6 +76,16 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe('final gather path resource ownership', () => {
   const options = resolveFinalGatherOptions({ pathSegments: 4 });
+  it('rejects an obsolete borrowed GI uniform before allocating owned buffers', async () => {
+    const device = new FakeDevice(), tracked = ledger(), borrowed = borrowedBuffers();
+    const oldParameters = fakeBuffer('obsolete GI parameters', 112, GPUBufferUsage.UNIFORM);
+    await expect(GpuFinalGather.create(device as unknown as GPUDevice, borrowed.queries,
+      oldParameters as unknown as GPUBuffer, borrowed.giProbes as unknown as [GPUBuffer, GPUBuffer],
+      options, tracked.account, options.maxBytes)).rejects.toThrow('FINAL_GATHER_BORROWED_BUFFER_LAYOUT');
+    expect(device.bufferCalls).toBe(0);
+    expect(tracked.bytes).toBe(0);
+    expect(oldParameters.destroyed).toBe(false);
+  });
   const failedAllocations = [
     [4, 'surface final gather path throughput'],
     [5, 'surface final gather immutable path segment 0'],

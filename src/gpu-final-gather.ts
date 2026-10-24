@@ -5,7 +5,7 @@ import coverageSource from './shaders/final-gather-coverage.wgsl?raw';
 import sampleSource from './shaders/final-gather-sample.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
-import { DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
+import { DIFFUSE_GI_PARAMETER_BYTES, DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, octaDecode } from './gi-visibility';
 import { planFinalGatherGrid, planFinalGatherSupplemental, resolveFinalGatherOptions, invertFinalGatherProjection, finalGatherRasterRayBasis,
   type FinalGatherGridPlan, type ResolvedFinalGatherOptions } from './final-gather';
@@ -169,7 +169,7 @@ export class GpuFinalGather {
     if (resolved.maxSupplementalWorkUnits > queries.options.maxTotalWorkUnits) throw new Error('FINAL_GATHER_SUPPLEMENTAL_WORK_BUDGET');
     if (device.limits.maxStorageBuffersPerShaderStage < 6) throw new Error('FINAL_GATHER_STORAGE_BINDING_LIMIT');
     if (!Number.isSafeInteger(maxBytesRemaining) || maxBytesRemaining < 1) throw new Error('FINAL_GATHER_MEMORY_BUDGET');
-    if (giParameterBuffer.size < 112 || !(giParameterBuffer.usage & GPUBufferUsage.UNIFORM)
+    if (giParameterBuffer.size < DIFFUSE_GI_PARAMETER_BYTES || !(giParameterBuffer.usage & GPUBufferUsage.UNIFORM)
       || giProbeBuffers[0].size !== giProbeBuffers[1].size || giProbeBuffers[0].size < DIFFUSE_GI_PROBE_BYTES
       || giProbeBuffers[0].size % DIFFUSE_GI_PROBE_BYTES !== 0
       || giProbeBuffers.some(buffer => !(buffer.usage & GPUBufferUsage.STORAGE))

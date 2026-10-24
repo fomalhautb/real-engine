@@ -37,7 +37,7 @@ fn generateShadows(@builtin(global_invocation_id) id: vec3u) {
         && dot(hit.normal.xyz, gi.sunDirection.xyz) > 0.0
         && dot(giHitGeometry(hit), gi.sunDirection.xyz) > 0.0 && any(gi.sunColor.xyz > vec3f(0.0))) {
         // Keep other triangles of this entity eligible for self-shadowing.
-        ray.origin = vec4f(hit.position.xyz + giHitGeometry(hit) * gi.sunDirection.w, 0.0001);
+        ray.origin = vec4f(hit.position.xyz + giHitGeometry(hit) * gi.shadow.x, 0.0001);
         ray.direction.w = gi.spacing.w;
     }
     rays[id.x] = ray;

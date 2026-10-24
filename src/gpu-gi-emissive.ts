@@ -1,7 +1,7 @@
 import commonSource from './shaders/diffuse-gi-common.wgsl?raw';
 import areaSource from './shaders/gi-emissive.wgsl?raw';
 import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
-import { DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
+import { DIFFUSE_GI_PARAMETER_BYTES, DIFFUSE_GI_PROBE_BYTES } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import type { GpuWorldQuery } from './gpu-world-query';
 import { WORLD_HIT_BYTES, WORLD_RAY_BYTES } from './world-query';
@@ -86,7 +86,7 @@ export class GpuGiEmissiveSampler {
       || probeCount * samplesPerProbe > rayCount) throw new Error('GI_EMISSIVE_SAMPLE_BUDGET');
     if (device.limits.maxStorageBuffersPerShaderStage < 5) throw new Error('GI_EMISSIVE_STORAGE_BINDING_LIMIT');
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > HARD_MAX_BYTES) throw new Error('GI_EMISSIVE_MEMORY_BUDGET');
-    if (giParameterBuffer.size < 112 || !(giParameterBuffer.usage & GPUBufferUsage.UNIFORM)
+    if (giParameterBuffer.size < DIFFUSE_GI_PARAMETER_BYTES || !(giParameterBuffer.usage & GPUBufferUsage.UNIFORM)
       || outputProbeBuffers.some(buffer => !(buffer.usage & GPUBufferUsage.STORAGE))
       || queries.rayBuffer.size < rayCount * WORLD_RAY_BYTES || queries.hitBuffer.size < rayCount * WORLD_HIT_BYTES) {
       throw new Error('GI_EMISSIVE_BORROWED_BUFFER_LAYOUT');

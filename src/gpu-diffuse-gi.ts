@@ -3,7 +3,7 @@ import updateSource from './shaders/diffuse-gi-update.wgsl?raw';
 import sampleSource from './shaders/diffuse-gi-sample.wgsl?raw';
 import interpolateSource from './shaders/diffuse-gi-interpolate.wgsl?raw';
 import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
-import { DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET,
+import { DIFFUSE_GI_PARAMETER_BYTES, DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET,
   giRayDirection, resolveDiffuseGiOptions, validateDiffuseGiQueryBudget, type DiffuseGiOptions, type GiVisibilityDirection } from './diffuse-gi';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, buildGiDistanceWeights } from './gi-visibility';
 import { WORLD_HIT_BYTES } from './world-query';
@@ -79,7 +79,7 @@ export class GpuDiffuseGi {
     const resolved = resolveDiffuseGiOptions(options);
     if (device.limits.maxStorageBuffersPerShaderStage < 6) throw new Error('DIFFUSE_GI_STORAGE_BINDING_LIMIT');
     validateDiffuseGiQueryBudget(resolved, queries.options);
-    const sizes = [112, resolved.rayCount * WORLD_HIT_BYTES, resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
+    const sizes = [DIFFUSE_GI_PARAMETER_BYTES, resolved.rayCount * WORLD_HIT_BYTES, resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       GI_DISTANCE_CELLS * resolved.raysPerProbe * Float32Array.BYTES_PER_ELEMENT];
@@ -97,7 +97,7 @@ export class GpuDiffuseGi {
   }
   private initializeResources(): void {
     const { device, queries, options } = this;
-    this.parameters = this.buffer('diffuse GI parameters', 112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    this.parameters = this.buffer('diffuse GI parameters', DIFFUSE_GI_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.primary = this.buffer('diffuse GI primary hits', options.rayCount * WORLD_HIT_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const probeBytes = options.probeCount * DIFFUSE_GI_PROBE_BYTES;
     this.probeBuffers = [this.buffer('diffuse GI field A', probeBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC),
@@ -242,7 +242,7 @@ export class GpuDiffuseGi {
     this.resetRequested = null;
     this.previousDependencies = { material: materialRevision, scene: sceneRevision, sun };
     this.lastHistoryFrame = this.enabled && this.multiBounce && this.historyUpdates > 0 ? this.frame : 0;
-    const data = new Float32Array(28), integers = new Uint32Array(data.buffer), o = this.options;
+    const data = new Float32Array(DIFFUSE_GI_PARAMETER_BYTES / 4), integers = new Uint32Array(data.buffer), o = this.options;
     data.set([...o.origin, this.enabled ? 1 : 0]); data.set([...o.spacing, o.maxDistance], 4);
     integers.set([...o.counts, o.raysPerProbe], 8);
     data.set([...direction, o.normalBias], 12); data.set(color, 16); data.set(o.skyRadiance, 20);
@@ -255,6 +255,7 @@ export class GpuDiffuseGi {
     integers[25] = this.lastHistoryFrame;
     integers[26] = this.lastHistoryFrame ? 1 : 0;
     integers[27] = this.emissiveSampler?.enabled ? 1 : 0;
+    data[28] = o.shadowNormalBias;
     this.device.queue.writeBuffer(this.parameters, 0, data);
     return data.byteLength + (this.enabled ? this.emissiveSampler?.update() ?? 0 : 0);
   }

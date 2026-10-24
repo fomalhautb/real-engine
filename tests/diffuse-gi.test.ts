@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET,
+  DIFFUSE_GI_PARAMETER_BYTES, DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET,
   evaluateGiIrradiance, giRayDirection, giShBasis,
   resolveDiffuseGiOptions, validateDiffuseGiQueryBudget, diffuseGiQueryParameterSlots, type DiffuseGiOptions,
 } from '../src/diffuse-gi';
@@ -25,6 +25,8 @@ describe('diffuse GI probe contract', () => {
     expect(value.rayCount).toBe(1536);
     expect(value.maxDistance).toBe(30);
     expect(value.normalBias).toBe(0.03);
+    expect(value.shadowNormalBias).toBe(0.0001);
+    expect(DIFFUSE_GI_PARAMETER_BYTES).toBe(128);
     expect(value.multiBounce).toBe(false);
     expect(value.emissiveSamplesPerProbe).toBe(0);
     expect(value.visibilityWeightThreshold).toBe(0.2);
@@ -39,7 +41,27 @@ describe('diffuse GI probe contract', () => {
   it('keeps millimetre grids valid by bounding the default normal bias', () => {
     const value = resolveDiffuseGiOptions({ ...grid, spacing: [0.001, 0.002, 0.003] });
     expect(value.normalBias).toBeCloseTo(0.00025, 12);
+    expect(value.shadowNormalBias).toBe(0.0001);
     expect(() => resolveDiffuseGiOptions({ ...grid, spacing: [0.001, 0.002, 0.003], normalBias: 0.03 })).toThrow();
+  });
+
+  it('keeps sun-shadow bias independent from spatial interpolation and validates its bound', () => {
+    for (const normalBias of [0, 0.03, 0.1]) {
+      expect(resolveDiffuseGiOptions({ ...grid, normalBias }).shadowNormalBias).toBe(0.0001);
+    }
+    for (const shadowNormalBias of [0, 0.0001, 0.03, 0.125]) {
+      const input = { ...grid, shadowNormalBias }, value = resolveDiffuseGiOptions(input);
+      input.shadowNormalBias = 0.02;
+      expect(value.shadowNormalBias).toBe(shadowNormalBias);
+      expect(value.normalBias).toBe(0.03);
+      expect(Object.isFrozen(value)).toBe(true);
+    }
+    for (const invalid of [-1, 0.125001, NaN, Infinity, null, '0.03', true]) {
+      expect(() => resolveDiffuseGiOptions({ ...grid, shadowNormalBias: invalid as number }))
+        .toThrow('DIFFUSE_GI_SHADOW_NORMAL_BIAS');
+    }
+    expect(() => resolveDiffuseGiOptions({ ...grid, spacing: [0.001, 1, 1], shadowNormalBias: 0.00026 }))
+      .toThrow('DIFFUSE_GI_SHADOW_NORMAL_BIAS');
   });
 
   it('accepts only boolean multi-bounce modes and freezes the resolved choice', () => {

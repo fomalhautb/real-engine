@@ -1,4 +1,4 @@
-import { DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET } from '../../../src/diffuse-gi';
+import { DIFFUSE_GI_PARAMETER_BYTES, DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS, DIFFUSE_GI_STATE_FLOAT_OFFSET } from '../../../src/diffuse-gi';
 import { GI_DISTANCE_CELLS } from '../../../src/gi-visibility';
 import { diffuseGiSampleSource } from '../../../src/gpu-diffuse-gi';
 import { FINAL_GATHER_ANCHOR_BYTES, FINAL_GATHER_PARAMETER_BYTES, finalGatherSampleSource } from '../../../src/gpu-final-gather';
@@ -31,7 +31,7 @@ export async function runGiReconstructionFixture() {
   const results: { label: string; actual: number[]; expected?: Vec3; upperFraction?: number }[] = [];
   const diagnostics: Diagnostic[] = [];
   try {
-    const giParameters = allocate(112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const giParameters = allocate(DIFFUSE_GI_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const probes = allocate(8 * DIFFUSE_GI_PROBE_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const gatherParameters = allocate(FINAL_GATHER_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const anchors = allocate(20 * FINAL_GATHER_ANCHOR_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -92,7 +92,7 @@ fn reconstruct() {
       { binding: 2, resource: { buffer: gatherParameters } }, { binding: 3, resource: { buffer: anchors } },
       { binding: 6, resource: { buffer: coverageMap } },
     ] });
-    const gi = new Float32Array(28), giIntegers = new Uint32Array(gi.buffer);
+    const gi = new Float32Array(DIFFUSE_GI_PARAMETER_BYTES / 4), giIntegers = new Uint32Array(gi.buffer);
     gi.set([-0.5, -0.5, -0.5, 1], 0); gi.set([1, 1, 1, 10], 4);
     giIntegers.set([2, 2, 2, 64], 8); gi[23] = 0.2; giIntegers[24] = 1;
     device.queue.writeBuffer(giParameters, 0, gi);

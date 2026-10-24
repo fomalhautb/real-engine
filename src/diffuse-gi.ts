@@ -10,7 +10,11 @@ export interface DiffuseGiOptions {
   counts: readonly [number, number, number];
   raysPerProbe?: number;
   maxDistance?: number;
+  /** Receiver offset for spatial probe interpolation, in world units. */
   normalBias?: number;
+  /** Geometric-normal offset at a captured hit before tracing toward the sun.
+   * Independent of probe interpolation; defaults to 0.0001 world units. */
+  shadowNormalBias?: number;
   skyRadiance?: readonly [number, number, number];
   /** Feed the previous completed probe field into this frame's diffuse capture. */
   multiBounce?: boolean;
@@ -39,6 +43,7 @@ export interface ResolvedDiffuseGiOptions {
   readonly raysPerProbe: number;
   readonly maxDistance: number;
   readonly normalBias: number;
+  readonly shadowNormalBias: number;
   readonly skyRadiance: readonly [number, number, number];
   readonly multiBounce: boolean;
   readonly emissiveSamplesPerProbe: number;
@@ -56,6 +61,8 @@ export interface ResolvedDiffuseGiOptions {
 export const DIFFUSE_GI_PROBE_BYTES = (9 + GI_DISTANCE_CELLS + 1) * 16;
 export const DIFFUSE_GI_PROBE_FLOATS = DIFFUSE_GI_PROBE_BYTES / 4;
 export const DIFFUSE_GI_STATE_FLOAT_OFFSET = (9 + GI_DISTANCE_CELLS) * 4;
+/** Eight vec4 lanes shared by capture, surface, reflection and area-sample shaders. */
+export const DIFFUSE_GI_PARAMETER_BYTES = 128;
 const MAX_BYTES = 128 * 1024 * 1024;
 const DEFAULT_BYTES = 32 * 1024 * 1024;
 const GOLDEN_ANGLE = 2.399963229728653;
@@ -136,6 +143,11 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   const normalBiasLimit = Math.min(...spacing) * 0.25;
   // A millimetre-scale grid must remain legal when the caller omits the bias.
   const normalBias = options.normalBias ?? Math.min(0.03, normalBiasLimit);
+  const shadowNormalBias = options.shadowNormalBias === undefined ? 0.0001 : options.shadowNormalBias;
+  if (!Number.isFinite(shadowNormalBias) || typeof shadowNormalBias !== 'number'
+    || shadowNormalBias < 0 || shadowNormalBias > normalBiasLimit) {
+    throw new RangeError('DIFFUSE_GI_SHADOW_NORMAL_BIAS');
+  }
   const maxBytes = options.maxBytes ?? DEFAULT_BYTES;
   if (!Number.isFinite(maxDistance) || maxDistance < 0.01 || maxDistance > 1000
     || !Number.isFinite(normalBias) || normalBias < 0 || normalBias > normalBiasLimit
@@ -144,7 +156,7 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   }
   if (probeCount * DIFFUSE_GI_PROBE_BYTES > maxBytes) throw new RangeError('DIFFUSE_GI_MEMORY_BUDGET');
   const finalGather = options.finalGather === undefined ? undefined : resolveFinalGatherOptions(options.finalGather);
-  return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias,
+  return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias, shadowNormalBias,
     skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, visibilityDirection, visibilityFilter,
     maxVisibilityWorkUnits, maxBytes, probeCount, rayCount, finalGather });
 }

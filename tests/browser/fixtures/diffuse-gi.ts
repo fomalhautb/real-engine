@@ -187,3 +187,38 @@ export async function runDiffuseGiOverflowFixture() {
     return { result, errors, afterDispose: renderer.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); element.remove(); }
 }
+
+/** A 2 cm gap distinguishes transport bias from probe interpolation bias.
+ * The +Z plate is back-facing to capture rays and front-facing to sun rays. */
+export async function runDiffuseGiShadowBiasFixture() {
+  const results = [];
+  for (const options of [{}, { shadowNormalBias: 0.03 }, { normalBias: 0.06 }]) {
+    const element = canvas(), { batches, blocker } = scene();
+    blocker.mesh = quad(7.98, 12, 1);
+    let renderer: Renderer | undefined;
+    try {
+      renderer = await Renderer.create(element, batches, {
+        worldQueries: { maxRays: 1024, maxTrianglesPerMesh: 2, maxInstancesPerBatch: 1 },
+        diffuseGi: { ...roomGrid, ...options },
+      });
+      renderer.setSun({ direction: sunDirection, color: sunColor });
+      const capture = async () => { renderer!.render(eye, target); return renderer!.probeDiffuseGi(); };
+      const open = await capture();
+      blocker.instances = [state(103)];
+      const blocked = await capture();
+      await renderer.setMaterial(blocker.name, { definition: { ...DEFAULT_MATERIAL_DEFINITION,
+        shading: 'unlit', doubleSided: false, alphaMode: 'mask', alphaCutoff: 0.5, baseColor: m.parameter(0) },
+        parameters: new Float32Array([0, 0, 0, 0]) });
+      const clearMask = await capture();
+      renderer.setMaterialParameters(blocker.name, new Float32Array([0, 0, 0, 1]));
+      const opaqueMask = await capture();
+      blocker.instances = [];
+      const removed = await capture();
+      const errors = [...renderer.errors], diagnostics = renderer.diagnostics().diffuseGi;
+      renderer.dispose();
+      results.push({ options, open, blocked, clearMask, opaqueMask, removed, diagnostics, adapter: renderer.info.adapterInfo,
+        errors, afterDispose: renderer.stats.ownedGpuBytes });
+    } finally { renderer?.dispose(); element.remove(); }
+  }
+  return results;
+}

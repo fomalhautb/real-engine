@@ -1,5 +1,5 @@
 import type { InstanceState, SceneBatch } from '../../../src/contracts';
-import { DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS,
+import { DIFFUSE_GI_PARAMETER_BYTES, DIFFUSE_GI_PROBE_BYTES, DIFFUSE_GI_PROBE_FLOATS,
   DIFFUSE_GI_STATE_FLOAT_OFFSET, giRayDirection } from '../../../src/diffuse-gi';
 import { createCube } from '../../../src/geometry';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, buildGiDistanceWeights,
@@ -133,8 +133,8 @@ async function sampleProductionHelper(moments: number[][], visibilityFlags = 2) 
     state[DIFFUSE_GI_STATE_FLOAT_OFFSET + 1] = 1;
     const probe = allocate(DIFFUSE_GI_PROBE_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     device.queue.writeBuffer(probe, 0, record);
-    const uniform = allocate(112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    const parameters = new Float32Array(28);
+    const uniform = allocate(DIFFUSE_GI_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const parameters = new Float32Array(DIFFUSE_GI_PARAMETER_BYTES / 4);
     parameters[3] = 1;
     parameters[19] = visibilityFlags;
     new Uint32Array(parameters.buffer).set([2, 2, 2, 64], 8);
@@ -274,13 +274,13 @@ export async function runGiUniformIrradianceFixture() {
     const probeBuffer = allocate(8 * DIFFUSE_GI_PROBE_BYTES,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     device.queue.writeBuffer(probeBuffer, 0, records);
-    const parameters = new Float32Array(28);
+    const parameters = new Float32Array(DIFFUSE_GI_PARAMETER_BYTES / 4);
     parameters.set([-0.5, -0.5, -0.5, 1], 0);
     parameters.set([1, 1, 1, 10], 4);
     new Uint32Array(parameters.buffer).set([2, 2, 2, 64], 8);
     parameters.set([...sky, 0.2], 20);
     new Uint32Array(parameters.buffer)[24] = 1;
-    const uniform = allocate(112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const uniform = allocate(DIFFUSE_GI_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     device.queue.writeBuffer(uniform, 0, parameters);
     const inputs = new Float32Array(queries.length * 8);
     queries.forEach((query, index) => {

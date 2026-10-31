@@ -14,6 +14,7 @@
     "test": "vitest run",
     "test:browser": "playwright test",
     "benchmark": "node scripts/benchmark.mjs",
+    "capability:report": "node scripts/capability-report.mjs",
     "check": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {

@@ -268,8 +268,15 @@ export async function runGeometryStreamSelectionCases() {
       caseModels: readonly Mat4[] = models) => {
       const plans = caseModels.slice(0, count).map(model => planner.plan(resident,
         { eye, near: 0.1, projectionScale, maxErrorPixels, model } satisfies GeometryStreamView));
-      const selected = plans.flatMap((plan, instanceIndex) => plan.selectedClusters.map(clusterId => ({ clusterId, instanceIndex,
-        level: directory.clusters[clusterId].level, visible: true })));
+      // Diagnostic flags have CPU meanings too: fallback marks the parents of a
+      // group that needed refinement but lacked a resident child page; root
+      // marks the always-resident coarsest clusters.
+      const roots = new Set(directory.roots);
+      const selected = plans.flatMap((plan, instanceIndex) => {
+        const fallbackParents = new Set(plan.fallbackGroups.flatMap(groupId => directory.groups[groupId].parents));
+        return plan.selectedClusters.map(clusterId => ({ clusterId, instanceIndex, level: directory.clusters[clusterId].level,
+          visible: true, fallback: fallbackParents.has(clusterId), root: roots.has(clusterId) }));
+      });
       const requests = new Map<number, number>();
       for (const plan of plans) for (const request of plan.requestedPages) {
         requests.set(request.pageId, Math.max(requests.get(request.pageId) ?? -1, request.priority));
@@ -341,7 +348,9 @@ export async function runGeometryStreamSelectionCases() {
       return { label, count, pairs: count * directory.clusters.length, orderedHash, maxErrorPixels, frustumCulling, clusters: expected.selected.length,
         indices: actual.indices, requests: actual.requestedPages.length, desiredGroups: actual.desiredGroups,
         visibleClusters: actual.selectedClusters!.filter(entry => entry.visible).length,
-        culledInstanceClusters: actual.selectedClusters!.filter(entry => entry.instanceIndex === 2 && !entry.visible).length };
+        culledInstanceClusters: actual.selectedClusters!.filter(entry => entry.instanceIndex === 2 && !entry.visible).length,
+        fallbackClusters: actual.selectedClusters!.filter(entry => entry.fallback).length,
+        rootClusters: actual.selectedClusters!.filter(entry => entry.root).length };
     };
     const rootOnly = await capture('roots-only-fine', 2, 0, false);
     for (const id of allPageIds) if (!currentPool.residentPageIds().has(id)) currentPool.enqueue(id, cache.get(id)!);
@@ -356,6 +365,10 @@ export async function runGeometryStreamSelectionCases() {
     if (intermediate === undefined) throw new Error(`GEOMETRY_SELECTION_CASES_NO_INTERMEDIATE:${coarseCount}:${fineCount}`);
     const fine = await capture('all-resident-fine', 2, 0, false, true);
     same(rootOnly.desiredGroups, fine.desiredGroups, 'DEMAND_INDEPENDENT_OF_RESIDENCY');
+    // The exact CUT comparison covers the flags; these guards keep it discriminating.
+    if (!rootOnly.fallbackClusters || !rootOnly.rootClusters || fine.fallbackClusters) {
+      throw new Error(`GEOMETRY_SELECTION_CASES_FLAGS_NOT_DISCRIMINATING:${JSON.stringify([rootOnly.fallbackClusters, rootOnly.rootClusters, fine.fallbackClusters])}`);
+    }
     const middle = await capture('all-resident-middle', 2, intermediate, false);
     const farEye: [number, number, number] = [0, 2, 1000];
     const farCount = models.slice(0, 2).reduce((sum, model) => sum + planner.plan(resident,

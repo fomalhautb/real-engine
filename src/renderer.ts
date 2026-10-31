@@ -22,6 +22,7 @@ import type { FinalGatherProbeResult } from './gpu-final-gather';
 import { DEFORMED_VERTEX_BYTES, validateMeshColors, type MeshData } from './geometry';
 import { snapshotMeshTangents } from './tangent-frame';
 import { GpuGeometryStream } from './gpu-geometry-stream';
+import type { GpuGeometryStreamSelection } from './gpu-geometry-stream-selection';
 import { GeometryStreamRuntimeBudget } from './geometry-stream-runtime-budget';
 import { GeometryStreamCapacityCoordinator, type GeometryStreamCapacityOptions, type GeometryStreamCapacityTarget } from './geometry-stream-capacity-coordinator';
 import { geometryGpuPoolLayout } from './geometry-gpu-pool-layout';
@@ -416,7 +417,8 @@ export class Renderer {
       binding, visibility: GPUShaderStage.COMPUTE,
       buffer: { type: binding === 0 ? 'uniform' : binding === 4 ? 'storage' : 'read-only-storage' },
     })) });
-    this.geometryLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4].map(binding => ({
+    // Binding 5 is the diagnostic-only paged cluster state of the residency view.
+    this.geometryLayout = this.device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5].map(binding => ({
       binding, visibility: GPUShaderStage.VERTEX,
       buffer: { type: binding === 2 ? 'uniform' : 'read-only-storage' },
     })) });
@@ -789,7 +791,7 @@ export class Renderer {
       const result = await stream.runtime.probe();
       return { frame: result.frame, indices: result.indices, triangles: result.indices / 3, overflow: result.overflow,
         occlusion: result.occlusion,
-        selectedClusters: (result.selectedClusters ?? []).filter(cluster => cluster.visible).map(({ clusterId, instanceIndex, level }) => ({ clusterId, instanceIndex, level })) };
+        selectedClusters: (result.selectedClusters ?? []).filter(cluster => cluster.visible).map(({ clusterId, instanceIndex, level, fallback, root }) => ({ clusterId, instanceIndex, level, fallback, root })) };
     }
     return this.geometryLod.probe(batchName);
   }
@@ -1054,7 +1056,7 @@ export class Renderer {
     try {
       if (scene.geometryLod) batch.geometryLod = this.geometryLod!.addBatch(scene, instances, () => batch.material.program.alphaMode === 'opaque');
       batch.render = this.device.createBindGroup({ layout: this.geometryLayout,
-        entries: [output, instances, params, uvs, batch.geometryLod?.vertices ?? this.defaultClusterVertices].map((buffer, binding) => ({ binding, resource: { buffer } })) });
+        entries: [output, instances, params, uvs, batch.geometryLod?.vertices ?? this.defaultClusterVertices, this.defaultClusterVertices].map((buffer, binding) => ({ binding, resource: { buffer } })) });
       if (scene.geometryStream) {
         const runtime = await GpuGeometryStream.create(this.device, scene, instances,
           bytes => { if (!this.disposed) this.stats.ownedGpuBytes += bytes; }, this.geometryDecoder, this.occlusion);
@@ -1068,7 +1070,8 @@ export class Renderer {
             pagedPipeline = await this.device.createComputePipelineAsync({ layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] }),
               compute: { module, entryPoint: 'main' } }); this.deformationPipelines.set(key, pagedPipeline);
           }
-          const createBindings = async (pool: GpuGeometryPagePool, vertexCount: number): Promise<StreamRenderedOwner> => {
+          const createBindings = async (pool: GpuGeometryPagePool, selection: GpuGeometryStreamSelection): Promise<StreamRenderedOwner> => {
+            const vertexCount = selection.physicalVertexCount;
             if (this.disposed) throw new Error('RENDERER_DISPOSED');
             if (Math.ceil(vertexCount * capacity / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('GEOMETRY_STREAM_DEFORMATION_BUDGET');
             let pagedOutput: GPUBuffer | undefined, pagedParams: GPUBuffer | undefined;
@@ -1078,12 +1081,12 @@ export class Renderer {
             try {
               pagedOutput = this.buffer(scene.name + ' paged shared state', vertexCount * capacity * DEFORMED_VERTEX_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
               pagedParams = this.buffer(scene.name + ' paged deformation parameters', 32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-              this.device.queue.writeBuffer(pagedParams, 16, new Uint32Array([receiverBase, 0, 0, 0]));
+              this.device.queue.writeBuffer(pagedParams, 16, new Uint32Array([receiverBase, selection.clusterCount, 0, 0]));
               owner = { output: pagedOutput, params: pagedParams, pipeline: pagedPipeline!, dispose: release,
                 compute: this.device.createBindGroup({ layout: this.computeLayout,
                   entries: [pagedParams, pool.vertices, instances, palettes, pagedOutput, morphs, scalars, tangents].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
                 render: this.device.createBindGroup({ layout: this.geometryLayout,
-                  entries: [pagedOutput, instances, pagedParams, uvs, pool.vertices].map((buffer, binding) => ({ binding, resource: { buffer } })) }) };
+                  entries: [pagedOutput, instances, pagedParams, uvs, pool.vertices, selection.clusterStates].map((buffer, binding) => ({ binding, resource: { buffer } })) }) };
             } catch (error) { failure = error; }
             // Pop synchronously before awaiting, so other frame scopes cannot nest.
             const checks = await Promise.allSettled([this.device.popErrorScope(), this.device.popErrorScope()]);
@@ -1092,8 +1095,8 @@ export class Renderer {
             if (failure || this.disposed || !owner) { release(); throw failure ?? new Error('RENDERER_DISPOSED'); }
             return owner;
           };
-          batch.stream = { runtime, bindings: await createBindings(runtime.pool, runtime.selection.physicalVertexCount),
-            prepareBindings: candidate => createBindings(candidate.pool, candidate.selection.physicalVertexCount) };
+          batch.stream = { runtime, bindings: await createBindings(runtime.pool, runtime.selection),
+            prepareBindings: candidate => createBindings(candidate.pool, candidate.selection) };
         } catch (error) { await runtime.dispose(); throw error; }
       }
       return batch;
@@ -1308,8 +1311,9 @@ export class Renderer {
       !this.geometryLod!.settings.frozen) ?? 0;
     this.frameData.set(vp); this.frameData.set(this.lastViewProjection ?? vp, 16); this.frameData.set(this.lightMatrix, 32);
     this.frameData.set([...eye, 1], 48); this.frameData.set([...this.sunDirection, 0], 52); this.frameData.set([...this.sunColor, 1], 56);
-    const debug = this.geometryLod?.settings.debug;
-    new Uint32Array(this.frameData.buffer)[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : 0;
+    const debug = this.geometryLod?.settings.debug, frameWords = new Uint32Array(this.frameData.buffer);
+    frameWords[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : debug === 'residency' ? 3 : 0;
+    frameWords[61] = Math.round((this.geometryLod?.settings.debugSplit ?? 0) * this.stats.width);
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
     this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
     for (const batch of this.batches) if (batch.stream) {

@@ -251,6 +251,38 @@ describe('GPU streamed selection ownership and failure lifecycle', () => {
     args[14] = 1;
     expect(await current.feedback()).toMatchObject({ overflow: true });
   });
+
+  it('decodes diagnostic fallback/root bits without changing the masked state and counts both draw phases', async () => {
+    const device = new FakeDevice();
+    const current = await selection(device);
+    expect(current.clusterStates).toBe(device.buffers.find(entry => entry.label === 'stream cut and visible flags'));
+    expect(current.clusterCount).toBe(directory.clusters.length);
+    current.update(1, 1, identity(), [0, 0, 4], 400);
+    current.encode(device.createCommandEncoder() as unknown as GPUCommandEncoder);
+    const args = new Uint32Array(device.buffers.find(entry => entry.label === 'stream indirect draw arguments')!.bytes);
+    args[0] = 12; args[5] = 3; args[13] = 2;
+    const selected = new Uint32Array(device.buffers.find(entry => entry.label === 'stream cut and visible flags')!.bytes);
+    // drawn+fallback+root, culled+fallback, drawn, and a stale high bit on an unselected pair.
+    selected[0] = 2 | 0x100 | 0x200; selected[1] = 1 | 0x100; selected[2] = 2; selected[3] = 0x100;
+    const feedback = await current.feedback(true);
+    expect(feedback.visibleClusters).toBe(5);
+    expect(feedback.selectedClusters).toHaveLength(3);
+    expect(feedback.selectedClusters).toMatchObject([
+      { clusterId: 0, visible: true, fallback: true, root: true },
+      { clusterId: 1, visible: false, fallback: true, root: false },
+      { clusterId: 2, visible: true, fallback: false, root: false },
+    ]);
+  });
+
+  it('accepts the residency debug view and a bounded split, rejecting other values atomically', async () => {
+    const current = await selection(new FakeDevice());
+    current.setSettings({ debug: 'residency', debugSplit: 0.5 });
+    expect(current.settings).toMatchObject({ debug: 'residency', debugSplit: 0.5 });
+    for (const invalid of [{ debug: 'pages' }, { debugSplit: -0.01 }, { debugSplit: 1.5 }, { debugSplit: NaN }]) {
+      expect(() => current.setSettings(invalid as never)).toThrow('GEOMETRY_LOD_SETTINGS');
+    }
+    expect(current.settings).toMatchObject({ debug: 'residency', debugSplit: 0.5 });
+  });
 });
 
 

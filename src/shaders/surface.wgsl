@@ -25,6 +25,9 @@ struct Parameters { vertexCount: u32, instanceCount: u32, jointCount: u32, scala
 @group(1) @binding(2) var<uniform> params: Parameters;
 @group(1) @binding(3) var<storage, read> attributes: array<f32>;
 @group(1) @binding(4) var<storage, read> clusterVertices: array<vec4u>;
+// Diagnostic-only paged cluster state per instance/cluster (low byte state,
+// bit 8 ancestor fallback, bit 9 root). Read only by the residency debug view.
+@group(1) @binding(5) var<storage, read> clusterStates: array<u32>;
 struct MaterialParameters { values: array<vec4f, 16>, textureInfo: array<vec4f, 4> }
 @group(2) @binding(0) var<uniform> materialParameters: MaterialParameters;
 @group(2) @binding(1) var materialImage0: texture_2d<f32>;
@@ -114,7 +117,8 @@ fn clusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
     let count = arrayLength(&clusterVertices);
     let identity = clusterVertices[index % count];
     var result = makeVaryings(identity.x, index / count);
-    result.clusterDebug = vec3u(identity.w, identity.z, 1u);
+    // Fully resident hierarchies have no paging: residency shows one neutral state.
+    result.clusterDebug = vec3u(select(identity.w, 0x402u, frame.debug.x == 3u), identity.z, 1u);
     result.representationToken = identity.y + 1u;
     return result;
 }
@@ -126,9 +130,26 @@ fn pagedClusterVertexMain(@builtin(vertex_index) index: u32) -> Varyings {
     let uv = bitcast<vec2f>(clusterVertices[physical * 9u + 5u].xy);
     let color = bitcast<vec4f>(clusterVertices[physical * 9u + 8u]);
     var result = geometryVaryings(vertices[index], index / params.vertexCount, uv, color);
-    result.clusterDebug = vec3u(identity.w, identity.z, 1u);
+    var debugSeed = identity.w;
+    if (frame.debug.x == 3u) {
+        // params.receiver.y is the paged directory cluster count; out-of-range
+        // reads stay diagnostic-only and never alter coverage or depth.
+        let state = (index / params.vertexCount) * params.receiver.y + identity.y;
+        debugSeed = select(0u, clusterStates[state], state < arrayLength(&clusterStates));
+    }
+    result.clusterDebug = vec3u(debugSeed, identity.z, 1u);
     result.representationToken = identity.y + 1u;
     return result;
+}
+// Residency view: blue root (always resident), green resident detail satisfying
+// the error target, orange ancestor fallback of missing child pages, red root
+// fallback, slate fully resident (unpaged) hierarchy.
+fn residencyDebugColor(state: u32) -> vec3f {
+    if ((state & 0x400u) != 0u) { return vec3f(0.36, 0.40, 0.46); }
+    let fallback = (state & 0x100u) != 0u;
+    let root = (state & 0x200u) != 0u;
+    if (fallback) { return select(vec3f(0.98, 0.46, 0.06), vec3f(0.92, 0.10, 0.12), root); }
+    return select(vec3f(0.16, 0.74, 0.34), vec3f(0.14, 0.38, 0.94), root);
 }
 fn debugColor(seed: u32) -> vec3f {
     // A fixed integer avalanche, independent of frame, dispatch and draw order.
@@ -261,9 +282,14 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     // rgba16float is the bounded scene-linear transport buffer. Exposure and
     // display transfer belong to the final resolve, after lighting and media.
     output.color = vec4f(clamp(lighting, vec3f(0.0), vec3f(65504.0)), 1.0);
-    if (input.clusterDebug.z != 0u && frame.debug.x != 0u) {
-        let seed = select(input.clusterDebug.x, input.clusterDebug.y + 17u, frame.debug.x == 2u);
-        output.color = vec4f(debugColor(seed), 1.0);
+    // frame.debug.y is the optional split column; debug colors replace only this output.
+    if (input.clusterDebug.z != 0u && frame.debug.x != 0u && input.position.x >= f32(frame.debug.y)) {
+        if (frame.debug.x == 3u) {
+            output.color = vec4f(residencyDebugColor(input.clusterDebug.x) * (0.4 + 0.6 * max(dot(geometricNormal, v), 0.0)), 1.0);
+        } else {
+            let seed = select(input.clusterDebug.x, input.clusterDebug.y + 17u, frame.debug.x == 2u);
+            output.color = vec4f(debugColor(seed), 1.0);
+        }
     }
     output.velocity = vec2f(0.0);
     if (input.current.w > 0.0001 && input.previous.w > 0.0001) {

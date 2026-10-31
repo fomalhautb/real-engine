@@ -5,18 +5,30 @@ import type { Mat4 } from './math';
 import { occlusionTestSource, type GpuOcclusion } from './gpu-occlusion';
 import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
+/** Diagnostic surface colors. They replace only the final main-view color of
+ * virtual-geometry clusters; coverage, depth, velocity, selection and lighting
+ * inputs keep the production path. residency colors paged clusters by root /
+ * resident-detail / ancestor-fallback state; fully resident hierarchies have
+ * no paging and use one neutral color. */
+export const GEOMETRY_DEBUG_VIEWS = Object.freeze(['material', 'clusters', 'levels', 'residency'] as const);
+export type GeometryDebugView = typeof GEOMETRY_DEBUG_VIEWS[number];
 export interface GeometryLodSettings {
   maxErrorPixels?: number;
   frustumCulling?: boolean;
   /** Freeze the selection camera; drawing still uses the live camera and poses. */
   frozen?: boolean;
-  debug?: 'material' | 'clusters' | 'levels';
+  debug?: GeometryDebugView;
+  /** Fraction of the viewport width [0,1] left of which material shading stays
+   * visible while a debug view is active; 0 shows the debug view everywhere. */
+  debugSplit?: number;
 }
 export interface GeometryLodProbe {
   frame: number;
   indices: number;
   triangles: number;
-  selectedClusters: { clusterId: number; instanceIndex: number; level: number }[];
+  /** fallback/root are reported for paged streams only: an ancestor kept because a
+   * finer child page was not resident, and an always-resident root cluster. */
+  selectedClusters: { clusterId: number; instanceIndex: number; level: number; fallback?: boolean; root?: boolean }[];
   overflow: boolean;
   occlusion: { deferredClusters: number; culledClusters: number; recoveredClusters: number };
 }
@@ -37,7 +49,7 @@ const MAX_PAIRS = 262_144;
 
 /** Fully resident GPU cut selection and compaction, with optional two-phase Hi-Z. */
 export class GpuGeometryLod {
-  readonly settings: Required<GeometryLodSettings> = { maxErrorPixels: 1, frustumCulling: true, frozen: false, debug: 'material' };
+  readonly settings: Required<GeometryLodSettings> = { maxErrorPixels: 1, frustumCulling: true, frozen: false, debug: 'material', debugSplit: 0 };
   private readonly entries = new Map<string, Entry>();
   private readonly buffers: GPUBuffer[] = [];
   private bytes = 0;
@@ -97,11 +109,13 @@ export class GpuGeometryLod {
     if (next.maxErrorPixels !== undefined && (!Number.isFinite(next.maxErrorPixels) || next.maxErrorPixels < 0 || next.maxErrorPixels > 10_000)
       || next.frustumCulling !== undefined && typeof next.frustumCulling !== 'boolean'
       || next.frozen !== undefined && typeof next.frozen !== 'boolean'
-      || next.debug !== undefined && !['material', 'clusters', 'levels'].includes(next.debug)) throw new Error('GEOMETRY_LOD_SETTINGS');
+      || next.debug !== undefined && !GEOMETRY_DEBUG_VIEWS.includes(next.debug)
+      || next.debugSplit !== undefined && !(Number.isFinite(next.debugSplit) && next.debugSplit >= 0 && next.debugSplit <= 1)) throw new Error('GEOMETRY_LOD_SETTINGS');
     if (next.maxErrorPixels !== undefined) this.settings.maxErrorPixels = next.maxErrorPixels;
     if (next.frustumCulling !== undefined) this.settings.frustumCulling = next.frustumCulling;
     if (next.frozen !== undefined) this.settings.frozen = next.frozen;
     if (next.debug !== undefined) this.settings.debug = next.debug;
+    if (next.debugSplit !== undefined) this.settings.debugSplit = next.debugSplit;
   }
   addBatch(scene: SceneBatch, instances: GPUBuffer, enabled: () => boolean): GeometryLodBinding {
     const hierarchy = scene.geometryLod;

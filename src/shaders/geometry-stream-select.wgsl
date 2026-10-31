@@ -15,9 +15,15 @@ struct DrawArguments { first:Arguments, recovery:Arguments }
 @group(0) @binding(2) var<storage,read> metadata:array<u32>;
 @group(0) @binding(3) var<storage,read> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read> residency:array<u32>;
-// 0 = outside cut, 1 = cut but culled, 2 = drawn, 3 = occlusion pending.
+// Low byte: 0 = outside cut, 1 = cut but culled, 2 = drawn, 3 = occlusion pending.
 // 4 = phase-local scatter pending; never survives a completed successful phase.
+// Higher bits are diagnostic-only and never change selection: every state test
+// masks them. FALLBACK marks a parent kept because a finer level was required
+// but a child page was not resident; ROOT marks an always-resident root cluster.
 @group(0) @binding(5) var<storage,read_write> selected:array<atomic<u32>>;
+const STATE_MASK=0xffu;
+const FALLBACK_BIT=0x100u;
+const ROOT_BIT=0x200u;
 @group(0) @binding(6) var<storage,read_write> requests:array<atomic<u32>>;
 @group(0) @binding(7) var<storage,read> locations:array<vec4u>;
 @group(0) @binding(8) var<storage,read> pageIndices:array<u32>;
@@ -72,7 +78,8 @@ fn initialize(@builtin(global_invocation_id) invocation:vec3u) {
     let index=invocation.x;
     if(index>=params.clusterCount*params.instanceCount){return;}
     let at=params.clusterOffset+(index%params.clusterCount)*16u;
-    atomicStore(&selected[index],metadata[at+3u]);
+    let root=metadata[at+3u];
+    atomicStore(&selected[index],root|select(0u,ROOT_BIT,root!=0u));
 }
 // One dispatch per hierarchy level, descending. At the same level, validated
 // groups have disjoint parents and children; all cross-level dependencies are
@@ -87,7 +94,7 @@ fn refine(@builtin(global_invocation_id) invocation:vec3u) {
     let base=instanceIndex*params.clusterCount;
     let parentOffset=params.edgeOffset+metadata[at+8u]; let parentCount=metadata[at+9u];
     for(var i=0u;i<parentCount;i++){
-        if(atomicLoad(&selected[base+metadata[parentOffset+i]])!=1u){return;}
+        if((atomicLoad(&selected[base+metadata[parentOffset+i]])&STATE_MASK)!=1u){return;}
     }
     let model=instances[instanceIndex].model;
     let bounds=worldBounds(vector(at),vector(at+4u),model);
@@ -100,7 +107,11 @@ fn refine(@builtin(global_invocation_id) invocation:vec3u) {
         let child=metadata[childOffset+i]; let page=metadata[params.clusterOffset+child*16u+7u];
         if(residency[page]==0u){atomicMax(&requests[page],params.level+1u);ready=false;}
     }
-    if(!ready){return;}
+    if(!ready){
+        // Parents of one group are disjoint from every other group at this level.
+        for(var i=0u;i<parentCount;i++){atomicOr(&selected[base+metadata[parentOffset+i]],FALLBACK_BIT);}
+        return;
+    }
     for(var i=0u;i<parentCount;i++){atomicStore(&selected[base+metadata[parentOffset+i]],0u);}
     for(var i=0u;i<childCount;i++){atomicStore(&selected[base+metadata[childOffset+i]],1u);}
 }
@@ -113,15 +124,15 @@ fn fail(recovery:bool) {
 fn weight(index:u32,recovery:bool)->u32 {
     if(index>=params.clusterCount*params.instanceCount){return 0u;}
     if(recovery && atomicLoad(&args.first.overflow)!=0u){return 0u;}
-    let flag=atomicLoad(&selected[index]);
-    if((recovery && flag!=3u) || (!recovery && flag!=1u)){return 0u;}
+    let flag=atomicLoad(&selected[index]); let state=flag&STATE_MASK; let bits=flag&~STATE_MASK;
+    if((recovery && state!=3u) || (!recovery && state!=1u)){return 0u;}
     let cluster=index%params.clusterCount; let instanceIndex=index/params.clusterCount;
     let at=params.clusterOffset+cluster*16u; let model=instances[instanceIndex].model;
     if(!recovery && !visible(at,model)){return 0u;}
     let bounds=worldBounds(vector(at),vector(at+4u),model);
     if(geometryOccluded(bounds.center,bounds.extent)){
-        if(recovery){atomicStore(&selected[index],1u);atomicAdd(&args.recovery.padding,1u);}
-        else {atomicStore(&selected[index],3u);atomicAdd(&args.first.padding,1u);}
+        if(recovery){atomicStore(&selected[index],1u|bits);atomicAdd(&args.recovery.padding,1u);}
+        else {atomicStore(&selected[index],3u|bits);atomicAdd(&args.first.padding,1u);}
         return 0u;
     }
     let page=metadata[at+7u]; let location=locations[cluster*2u+1u];
@@ -129,7 +140,7 @@ fn weight(index:u32,recovery:bool)->u32 {
     // also keeps every scan prefix within u32 on a broken caller contract.
     if(page>=params.pageCount || residency[page]==0u || location.y!=page
         || location.x==0u || location.x>1536u || location.x%3u!=0u){fail(recovery);return 0u;}
-    atomicStore(&selected[index],4u); return location.x;
+    atomicStore(&selected[index],4u|bits); return location.x;
 }
 // Uniform, work-efficient Blelloch scan, two values per lane. All lanes,
 // including zero-weight tail lanes, reach every barrier.
@@ -164,7 +175,8 @@ fn writeCluster(index:u32,offset:u32,recovery:bool) {
     // A failed first phase can leave flag 4 without a valid recovery prefix.
     // Do not let recovery scatter those remnants into overlapping offsets.
     if(recovery && atomicLoad(&args.first.overflow)!=0u){return;}
-    if(atomicLoad(&selected[index])!=4u){return;}
+    let flag=atomicLoad(&selected[index]);
+    if((flag&STATE_MASK)!=4u){return;}
     let cluster=index%params.clusterCount;
     let location0=locations[cluster*2u]; let location1=locations[cluster*2u+1u];
     let count=location1.x;
@@ -187,7 +199,7 @@ fn writeCluster(index:u32,offset:u32,recovery:bool) {
         if(vertex<location0.y || vertex-location0.y>=location0.z){fail(recovery);return;}
         outputIndices[start+i]=vertex+vertexBase;
     }
-    atomicStore(&selected[index],2u);
+    atomicStore(&selected[index],2u|(flag&~STATE_MASK));
     if(recovery){atomicAdd(&args.recovery.selectedCount,1u);}
     else {atomicAdd(&args.first.selectedCount,1u);}
 }

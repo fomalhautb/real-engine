@@ -296,9 +296,23 @@ export class GpuGeometryStream {
     }).catch(error => { if (current()) this.error = 'GEOMETRY_STREAM_FEEDBACK_FAILED: ' + String(error); })
       .finally(() => { if (current()) this.reading = false; });
   }
+  /** Diagnostic full-cut readback. It shares the selection's single feedback
+   * slot with the per-frame bounded readback, so it takes that slot in turn
+   * (the runtime skips its own readback meanwhile) instead of colliding with
+   * frames that keep rendering. Capacity retirement waits for it like any
+   * other outstanding feedback. */
   async probe() {
-    await this.feedbackTask; this.validateSources();
-    return this.selection.feedback(true);
+    for (let attempt = 0; this.reading; attempt++) {
+      if (attempt >= 64) throw new Error('GEOMETRY_STREAM_PROBE_BUSY');
+      await this.feedbackTask;
+    }
+    this.validateSources();
+    const selection = this.selection, epoch = this.epoch;
+    this.reading = true;
+    const task = selection.feedback(true);
+    this.feedbackTask = task.then(() => undefined, () => undefined);
+    try { return await task; }
+    finally { if (!this.disposed && this.selection === selection && this.epoch === epoch) this.reading = false; }
   }
   retry(page: number) { this.validateSources(); this.cache.retry(page); }
   diagnostics() { return { pool: this.pool.diagnostics(), cache: this.cache.diagnostics(), selection: this.selection.diagnostics(),

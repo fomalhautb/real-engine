@@ -47,7 +47,7 @@ function setup(maxRequestsPerFrame = 1) {
   const selection = {
     capacity: 1, update: vi.fn(() => 0),
     feedback: vi.fn(async (): Promise<GeometryStreamSelectionFeedback> =>
-      ({ frame: 1, requestedPages: [], desiredGroups: [], indices: 0, overflow: false, occlusion: zeroOcclusion })),
+      ({ frame: 1, requestedPages: [], desiredGroups: [], indices: 0, visibleClusters: 0, overflow: false, occlusion: zeroOcclusion })),
     diagnostics: vi.fn(() => ({})), dispose: vi.fn(), copyViewStateFrom: vi.fn(),
   };
   const device = { queue: { onSubmittedWorkDone: vi.fn(async () => {}) } } as unknown as GPUDevice;
@@ -73,7 +73,7 @@ describe('GPU geometry stream bridge lifecycle', () => {
     stream.afterSubmit();
     const nextPool = { ...pool, slotCount: 3, dispose: vi.fn() };
     const nextSelection = { ...selection, feedback: vi.fn(async (): Promise<GeometryStreamSelectionFeedback> =>
-      ({ frame: 2, requestedPages: [], desiredGroups: [{ groupId: 2, projectedError: 5 }], indices: 0, overflow: false, occlusion: zeroOcclusion })),
+      ({ frame: 2, requestedPages: [], desiredGroups: [{ groupId: 2, projectedError: 5 }], indices: 0, visibleClusters: 0, overflow: false, occlusion: zeroOcclusion })),
       dispose: vi.fn(), copyViewStateFrom: vi.fn() };
     pool.migrateResident.mockResolvedValue({ pool: nextPool, copiedPages: [0], copiedBytes: 100, peakBytes: 500 });
     mocks.selectionCreate.mockResolvedValueOnce(nextSelection);
@@ -87,7 +87,7 @@ describe('GPU geometry stream bridge lifecycle', () => {
     expect(pool.dispose).not.toHaveBeenCalled(); expect(selection.dispose).not.toHaveBeenCalled();
     expect(() => stream.prepareCapacity({ maxResidentBytes: 300, maxPeakBytes: 500 })).toThrow('CAPACITY_BUSY');
     await feedbackSettled(stream);
-    finishFeedback({ frame: 1, requestedPages: [], desiredGroups: [{ groupId: 3, projectedError: 100 }], indices: 0,
+    finishFeedback({ frame: 1, requestedPages: [], desiredGroups: [{ groupId: 3, projectedError: 100 }], indices: 0, visibleClusters: 0,
       overflow: true, occlusion: zeroOcclusion });
     await Promise.resolve(); expect(stream.diagnostics().error).toBeNull();
     finishFence(); await commit.retired;
@@ -225,7 +225,7 @@ describe('GPU geometry stream bridge lifecycle', () => {
     const { scene, device, cache, pool, selection } = setup();
     const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
     selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [{ pageId: 1, priority: 3 }],
-      desiredGroups: [{ groupId: 1, projectedError: 3 }], indices: 0, overflow: false, occlusion: zeroOcclusion });
+      desiredGroups: [{ groupId: 1, projectedError: 3 }], indices: 0, visibleClusters: 0, overflow: false, occlusion: zeroOcclusion });
     cache.request.mockImplementation(() => { throw new Error('GEOMETRY_STREAM_REQUEST_BUDGET'); });
 
     await feedbackSettled(stream);
@@ -245,7 +245,7 @@ describe('GPU geometry stream bridge lifecycle', () => {
     selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [
       { pageId: 1, priority: 3 }, { pageId: 2, priority: 2 }, { pageId: 3, priority: 1 },
     ], desiredGroups: [1, 2, 3].map(id => ({ groupId: id, projectedError: 4 - id })),
-      indices: 0, overflow: false, occlusion: zeroOcclusion });
+      indices: 0, visibleClusters: 0, overflow: false, occlusion: zeroOcclusion });
 
     for (let frame = 1; frame <= 3; frame++) {
       await feedbackSettled(stream);
@@ -261,7 +261,7 @@ describe('GPU geometry stream bridge lifecycle', () => {
     const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
     selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [],
       desiredGroups: [1, 2].map(groupId => ({ groupId, projectedError: 1 })),
-      indices: 0, overflow: false, occlusion: zeroOcclusion });
+      indices: 0, visibleClusters: 0, overflow: false, occlusion: zeroOcclusion });
     for (let frame = 1; frame <= 4; frame++) {
       await feedbackSettled(stream);
       stream.update(frame, 1, new Float32Array(16), [0, 0, 0], 1);
@@ -283,18 +283,49 @@ describe('GPU geometry stream bridge lifecycle', () => {
     const { scene, device, cache, pool, selection } = setup(1);
     const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
     selection.feedback.mockResolvedValue({ frame: 1, requestedPages: [],
-      desiredGroups: [{ groupId: 1, projectedError: 2 }], indices: 0, overflow: false, occlusion: zeroOcclusion });
+      desiredGroups: [{ groupId: 1, projectedError: 2 }], indices: 0, visibleClusters: 0, overflow: false, occlusion: zeroOcclusion });
     await feedbackSettled(stream);
     stream.update(1, 1, new Float32Array(16), [0, 0, 0], 1);
     expect(cache.setRequestWindow).toHaveBeenLastCalledWith([1]);
     pool.residentPageIds.mockReturnValue(new Set([0, 3]));
     selection.feedback.mockResolvedValue({ frame: 2, requestedPages: [],
-      desiredGroups: [{ groupId: 2, projectedError: 2 }], indices: 0, overflow: false, occlusion: zeroOcclusion });
+      desiredGroups: [{ groupId: 2, projectedError: 2 }], indices: 0, visibleClusters: 0, overflow: false, occlusion: zeroOcclusion });
     await feedbackSettled(stream);
     stream.update(2, 1, new Float32Array(16), [0, 0, 0], 1);
     expect(cache.setRequestWindow).toHaveBeenLastCalledWith([2]);
     expect(pool.retainPendingPages).toHaveBeenLastCalledWith([0, 2]);
     expect(pool.setPinnedPages).toHaveBeenLastCalledWith([0]);
+    await stream.dispose();
+  });
+
+  it('serializes diagnostic probes with per-frame feedback instead of failing frames that keep rendering', async () => {
+    const { scene, device, selection } = setup();
+    const stream = await GpuGeometryStream.create(device, scene, {} as GPUBuffer, () => {});
+    let busy = false;
+    const result = (frame: number): GeometryStreamSelectionFeedback =>
+      ({ frame, requestedPages: [], desiredGroups: [], indices: 3, visibleClusters: 1, overflow: false, occlusion: zeroOcclusion });
+    const finishes: (() => void)[] = [];
+    selection.feedback.mockImplementation((full?: boolean) => {
+      if (busy) throw new Error('GEOMETRY_STREAM_FEEDBACK_BUSY');
+      busy = true;
+      return new Promise(resolve => finishes.push(() => { busy = false; resolve(result(full ? 2 : 1)); }));
+    });
+    stream.afterSubmit();
+    const probe = stream.probe();
+    // Frames rendered while the per-frame readback and then the probe are outstanding skip feedback.
+    stream.afterSubmit();
+    finishes.shift()!();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    stream.afterSubmit(); stream.afterSubmit();
+    expect(selection.feedback).toHaveBeenCalledTimes(2);
+    expect(selection.feedback).toHaveBeenLastCalledWith(true);
+    finishes.shift()!();
+    expect((await probe).frame).toBe(2);
+    stream.afterSubmit();
+    expect(selection.feedback).toHaveBeenCalledTimes(3);
+    finishes.shift()!();
+    await (stream as unknown as { feedbackTask: Promise<void> }).feedbackTask;
+    expect(stream.diagnostics().error).toBeNull();
     await stream.dispose();
   });
 });

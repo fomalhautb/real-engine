@@ -1,7 +1,7 @@
 import source from './shaders/geometry-stream-select.wgsl?raw';
 import { packGeometryStreamSelection } from './geometry-stream-selection-data';
 import type { GpuGeometryPagePool } from './gpu-geometry-page-pool';
-import type { GeometryLodSettings } from './gpu-geometry-lod';
+import { GEOMETRY_DEBUG_VIEWS, type GeometryLodSettings } from './gpu-geometry-lod';
 import type { Mat4 } from './math';
 import type { GeometryGroupDemand } from './geometry-stream-working-set';
 import { occlusionTestSource, type GpuOcclusion } from './gpu-occlusion';
@@ -47,12 +47,20 @@ export interface GeometryStreamSelectionFeedback {
   /** Visible group demand independent of residency; used only for bounded allocation. */
   desiredGroups: GeometryGroupDemand[];
   indices: number;
+  /** GPU-counted drawn cluster/instance pairs of both occlusion phases (same bounded readback). */
+  visibleClusters: number;
   overflow: boolean;
   /** Previous-frame candidates, current-frame rejects, and recovered draws. */
   occlusion: { deferredClusters: number; culledClusters: number; recoveredClusters: number };
-  /** Present only for explicit diagnostics, never required for page scheduling. */
-  selectedClusters?: { clusterId: number; instanceIndex: number; level: number; visible: boolean }[];
+  /** Present only for explicit diagnostics, never required for page scheduling.
+   * fallback: kept as an ancestor because a finer level was required but a child
+   * page was not resident. root: an always-resident root cluster. */
+  selectedClusters?: { clusterId: number; instanceIndex: number; level: number; visible: boolean; fallback: boolean; root: boolean }[];
 }
+/** Low byte of the per-pair GPU state; higher bits are diagnostic only. */
+export const GEOMETRY_STREAM_STATE_MASK = 0xff;
+export const GEOMETRY_STREAM_FALLBACK_BIT = 0x100;
+export const GEOMETRY_STREAM_ROOT_BIT = 0x200;
 
 /** GPU-resident complete group cut, request generation, culling and physical
  * index compaction. Caller holds a pool frame lease over all resident pages
@@ -61,7 +69,10 @@ export class GpuGeometryStreamSelection {
   readonly indices: GPUBuffer;
   readonly arguments: GPUBuffer;
   readonly physicalVertexCount: number;
-  readonly settings: Required<GeometryLodSettings> = { maxErrorPixels: 1, frustumCulling: true, frozen: false, debug: 'material' };
+  /** Per instance/cluster selection state, read only by diagnostic surface views. */
+  get clusterStates(): GPUBuffer { return this.selected; }
+  get clusterCount(): number { return this.packed.directory.clusters.length; }
+  readonly settings: Required<GeometryLodSettings> = { maxErrorPixels: 1, frustumCulling: true, frozen: false, debug: 'material', debugSplit: 0 };
   private readonly packed;
   private readonly buffers: GPUBuffer[] = [];
   private readonly view: GPUBuffer;
@@ -214,8 +225,9 @@ export class GpuGeometryStreamSelection {
     if (next.maxErrorPixels !== undefined && (!Number.isFinite(next.maxErrorPixels) || next.maxErrorPixels < 0 || next.maxErrorPixels > 10000)
       || next.frustumCulling !== undefined && typeof next.frustumCulling !== 'boolean'
       || next.frozen !== undefined && typeof next.frozen !== 'boolean'
-      || next.debug !== undefined && !['material', 'clusters', 'levels'].includes(next.debug)) throw new Error('GEOMETRY_LOD_SETTINGS');
-    for (const key of ['maxErrorPixels', 'frustumCulling', 'frozen', 'debug'] as const) {
+      || next.debug !== undefined && !GEOMETRY_DEBUG_VIEWS.includes(next.debug)
+      || next.debugSplit !== undefined && !(Number.isFinite(next.debugSplit) && next.debugSplit >= 0 && next.debugSplit <= 1)) throw new Error('GEOMETRY_LOD_SETTINGS');
+    for (const key of ['maxErrorPixels', 'frustumCulling', 'frozen', 'debug', 'debugSplit'] as const) {
       if (next[key] !== undefined) Object.assign(this.settings, { [key]: next[key] });
     }
   }
@@ -302,10 +314,11 @@ export class GpuGeometryStreamSelection {
       }
       const selectedClusters = includeSelected ? [] as NonNullable<GeometryStreamSelectionFeedback['selectedClusters']> : undefined;
       if (selectedClusters) for (let i = 0; i < pairs; i++) {
-        const flag = values[16 + requestBytes / 4 + i], clusterId = i % directory.clusters.length;
-        if (flag) selectedClusters.push({ clusterId, instanceIndex: Math.floor(i / directory.clusters.length), level: directory.clusters[clusterId].level, visible: flag === 2 });
+        const flag = values[16 + requestBytes / 4 + i], state = flag & GEOMETRY_STREAM_STATE_MASK, clusterId = i % directory.clusters.length;
+        if (state) selectedClusters.push({ clusterId, instanceIndex: Math.floor(i / directory.clusters.length), level: directory.clusters[clusterId].level,
+          visible: state === 2, fallback: (flag & GEOMETRY_STREAM_FALLBACK_BIT) !== 0, root: (flag & GEOMETRY_STREAM_ROOT_BIT) !== 0 });
       }
-      return { frame, requestedPages, desiredGroups, indices: values[0] + values[8],
+      return { frame, requestedPages, desiredGroups, indices: values[0] + values[8], visibleClusters: values[5] + values[13],
         overflow: values[6] !== 0 || values[14] !== 0,
         occlusion: { deferredClusters: values[7], culledClusters: values[15], recoveredClusters: values[13] },
         selectedClusters };

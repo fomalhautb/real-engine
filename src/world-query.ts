@@ -16,6 +16,18 @@ export interface WorldQueryOptions {
   instanceAcceleration?: 'bvh' | 'linear';
   /** GPU batch candidates from a scene BVH when at least 8 batches are registered. */
   sceneAcceleration?: 'bvh' | 'linear';
+  /** 'per-batch' (default) dispatches every batch over all rays. 'shared' traverses an
+   * explicit, budgeted subset of rigid committed Opaque batches in one dispatch over a
+   * pooled two-level BVH, then resolves materials per winning batch; every other batch
+   * (Masked, deformed, mutable or over budget) keeps the per-batch path. Rays that stay
+   * within their work quota return the per-batch hit records word for word (measured on
+   * SwiftShader and Apple Metal); a ray that overflows may stop at a different candidate. */
+  staticTraversal?: 'per-batch' | 'shared';
+  /** Pooled position/node/triangle bytes for 'shared'; counted inside maxBytes. */
+  maxSharedStaticBytes?: number;
+  /** Ordering-equivalent command encoding of one query: one compute pass per dispatch
+   * (default reference) or all of a query's dispatches in one pass. */
+  dispatchEncoding?: 'pass-per-batch' | 'single-pass';
 }
 
 export interface WorldRay {
@@ -76,7 +88,8 @@ export const WORLD_HIT_BYTES = 160;
 
 const UINT32_MAX = 0xffff_ffff;
 const MAX_RAYS = 65_536;
-type NumericOptions = Required<Omit<WorldQueryOptions, 'instanceAcceleration' | 'sceneAcceleration'>>;
+type NumericOptions = Required<Omit<WorldQueryOptions,
+  'instanceAcceleration' | 'sceneAcceleration' | 'staticTraversal' | 'dispatchEncoding'>>;
 const DEFAULT_OPTIONS: NumericOptions = {
   maxRays: 1_024,
   maxBytes: 128 * 1024 * 1024,
@@ -86,6 +99,7 @@ const DEFAULT_OPTIONS: NumericOptions = {
   maxNodeVisits: 262_144,
   maxTotalWorkUnits: 16_777_216,
   maxTraceParameterSetsPerEncoder: 8,
+  maxSharedStaticBytes: 64 * 1024 * 1024,
 };
 const HARD_OPTIONS: NumericOptions = {
   maxRays: MAX_RAYS,
@@ -96,6 +110,7 @@ const HARD_OPTIONS: NumericOptions = {
   maxNodeVisits: 1_048_576,
   maxTotalWorkUnits: 67_108_864,
   maxTraceParameterSetsPerEncoder: 32,
+  maxSharedStaticBytes: 512 * 1024 * 1024,
 };
 
 function boundedInteger(value: number, label: string, min: number, max: number): number {
@@ -121,6 +136,14 @@ export function resolveWorldQueryOptions(options: WorldQueryOptions = {}): Requi
   const sceneAcceleration = options.sceneAcceleration ?? 'bvh';
   if (sceneAcceleration !== 'bvh' && sceneAcceleration !== 'linear') throw new RangeError('sceneAcceleration must be bvh or linear');
   result.sceneAcceleration = sceneAcceleration;
+  const staticTraversal = options.staticTraversal ?? 'per-batch';
+  if (staticTraversal !== 'per-batch' && staticTraversal !== 'shared') throw new RangeError('staticTraversal must be per-batch or shared');
+  result.staticTraversal = staticTraversal;
+  const dispatchEncoding = options.dispatchEncoding ?? 'pass-per-batch';
+  if (dispatchEncoding !== 'pass-per-batch' && dispatchEncoding !== 'single-pass') {
+    throw new RangeError('dispatchEncoding must be pass-per-batch or single-pass');
+  }
+  result.dispatchEncoding = dispatchEncoding;
   return result;
 }
 

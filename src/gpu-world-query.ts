@@ -4,6 +4,9 @@ import surfaceFrameSource from './shaders/surface-frame.wgsl?raw';
 import { buildBvhTopology } from './bvh-topology';
 import { buildInstanceBvhTopology, orderInstanceBounds } from './instance-bvh';
 import { GpuQuerySceneBvh } from './gpu-query-scene-bvh';
+import { GpuQuerySharedStatic, GpuQuerySharedStaticPipelines } from './gpu-query-shared-static';
+import { orderSharedLeaves, packLeafOrderedTriangles, packSharedFlags, packSharedLeaves, planSharedStaticPool,
+  SHARED_FLAG_MEMBER, type SharedStaticExclusion, type SharedStaticPlan } from './query-shared-static';
 import type { Bounds3 } from './deformation';
 import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contracts';
 import { validateMeshColors, type MeshData } from './geometry';
@@ -92,6 +95,16 @@ type QueryBatch = {
   levels: RefitLevel[];
   data: GPUBuffer; instanceTree: readonly [number, number, number, number]; instanceLevels: RefitLevel[];
   bounds: GPUBuffer; root?: RefitLevel; sortBounds: Bounds3 | null;
+  /** Rigid committed inputs can be pooled for shared static traversal. */
+  rigid: boolean; committed: boolean;
+  /** Leaf-ordered triangle words, retained only until the shared pool is built. */
+  leafTriangles?: Uint32Array<ArrayBuffer>;
+  /** Pool slot and per-parameter-slot resolve bindings when admitted to the shared pool. */
+  pool?: { index: number; resolve: GPUBindGroup[] };
+  /** Per-instance ordering boxes retained for the shared TLAS. */
+  leafBounds: readonly Bounds3[];
+  /** Whether the scene candidate tree currently contains this batch. */
+  inSceneOrder: boolean;
 };
 
 const resetSource = `
@@ -129,6 +142,10 @@ function queryProxy(scene: RenderBatch): QueryProxy | undefined {
 function proxyIdentity(proxy: QueryProxy | undefined): string {
   return proxy ? JSON.stringify([proxy.version, proxy.primitiveKey, proxy.directorySha256,
     proxy.topologyVersion, proxy.requestedError, proxy.approximateObjectSpaceError]) : '';
+}
+function sameMembers(current: Uint32Array, previous: Uint32Array | undefined): boolean {
+  return !!previous && previous.length === current.length
+    && current.every((flags, index) => (flags & SHARED_FLAG_MEMBER) === (previous[index] & SHARED_FLAG_MEMBER));
 }
 function geometryMetadata(proxy: QueryProxy | undefined): WorldHitGeometry {
   return proxy ? { kind: 'fixed-query-proxy', primitiveKey: proxy.primitiveKey,
@@ -170,6 +187,16 @@ export class GpuWorldQuery {
   private sceneBvh?: GpuQuerySceneBvh;
   private candidateBuffer!: GPUBuffer;
   private sceneDirty = true;
+  private sharedPipelines?: GpuQuerySharedStaticPipelines;
+  private sharedPool?: GpuQuerySharedStatic;
+  private sharedPlan?: SharedStaticPlan;
+  /** Trace pipeline -> material resolve pipeline compiled from the same module. */
+  private readonly resolvePipelines = new WeakMap<GPUComputePipeline, GPUComputePipeline>();
+  /** Flags last written to the GPU, and those that built the scene candidate order. */
+  private sharedUploadedFlags?: Uint32Array<ArrayBuffer>;
+  private sharedOrderFlags?: Uint32Array<ArrayBuffer>;
+  private sharedUpdates: { poolIndex: number; count: number }[] = [];
+  private sharedLastUpdate: { frame: number; batches: number; dispatches: number; uploadedBytes: number } | null = null;
   private lastReadbackQuery: { frame: number; rays: number; workUnits: number; triangleTests: number;
     maxWorkUnits: number; overflows: number } | null = null;
 
@@ -228,6 +255,7 @@ export class GpuWorldQuery {
     });
     this.readBuffer = this.buffer('world hit diagnostics', sizes[2], GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     this.resetParams = this.buffer('world query reset parameter slots', sizes[3], GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    if (this.options.staticTraversal === 'shared') this.sharedPipelines = await GpuQuerySharedStaticPipelines.create(this.device);
     if (this.options.sceneAcceleration === 'bvh') {
       this.sceneBvh = await GpuQuerySceneBvh.create(this.device,
         (label, size, usage, data) => this.buffer(label, size, usage, data), this.rayBuffer, this.hitBuffer,
@@ -255,9 +283,16 @@ export class GpuWorldQuery {
     if (this.disposed) throw new Error('WORLD_QUERY_DISPOSED');
     const code = surfaceFrameSource + '\n' + traceSource.replace('// MATERIAL_PROGRAM',
       `const MATERIAL_DOUBLE_SIDED = ${program.doubleSided};\nconst MATERIAL_UNLIT = ${program.shading === 'unlit'};\nconst MATERIAL_NORMAL_MAPPED = ${program.normalMapped};\n${program.wgsl}`);
-    return this.device.createComputePipelineAsync({ label: 'shared material world hits',
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.traceLayout, this.materialLayout] }),
-      compute: { module: await this.module(code, 'world material query'), entryPoint: 'main' } });
+    const module = await this.module(code, 'world material query');
+    const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.traceLayout, this.materialLayout] });
+    const trace = await this.device.createComputePipelineAsync({ label: 'shared material world hits',
+      layout, compute: { module, entryPoint: 'main' } });
+    if (this.sharedPipelines) {
+      // Same module and layout: a pooled winner gets the per-batch path's exact shading code.
+      this.resolvePipelines.set(trace, await this.device.createComputePipelineAsync({
+        label: 'shared static material resolve', layout, compute: { module, entryPoint: 'resolveShared' } }));
+    }
+    return trace;
   }
   addBatch(source: QuerySource): void {
     if (this.disposed || this.frame) throw new Error('WORLD_QUERY_REGISTRATION_CLOSED');
@@ -320,6 +355,9 @@ export class GpuWorldQuery {
     const levels = createLevels(topology.levels, levelOffsets);
     const instanceLevels = createLevels(instanceTopology?.levels ?? [], instanceLevelOffsets);
     const root = this.sceneBvh ? createLevels([new Uint32Array([0])], [rootOffset])[0] : undefined;
+    // Only rigid committed inputs keep a static deformation output between edits.
+    const rigid = scene.deformation.nodes.length === 0 && scene.morphTargets.length === 0;
+    const committed = scene.inputMode === 'committed';
     this.batches.push({ source, mesh, name: scene.name, capacity: scene.capacity, identity: sourceIdentity,
       proxy, proxyIdentity: proxyIdentity(proxy), geometry: geometryMetadata(proxy),
       emissiveSampling: scene.emissiveSampling,
@@ -327,7 +365,10 @@ export class GpuWorldQuery {
       vertexCount: mesh.vertexCount, vertices: mesh.vertices, indices: mesh.indices, uvs: mesh.uvs, tangents: mesh.tangents,
       colors: mesh.colors, colorOffset,
       identities, metadata: new Uint32Array(scene.capacity * 4), params, trace, levels, data, instanceTree, instanceLevels,
-      bounds, root, sortBounds: null });
+      bounds, root, sortBounds: null, rigid, committed,
+      leafTriangles: this.sharedPipelines && rigid && committed
+        ? packLeafOrderedTriangles(mesh.indices, topology.triangles, mesh.vertexCount) : undefined,
+      leafBounds: [], inSceneOrder: false });
   }
   private validateTopology(): void {
     if (this.disposed) throw new Error('WORLD_QUERY_DISPOSED');
@@ -358,15 +399,26 @@ export class GpuWorldQuery {
   updateSnapshot(frame: number, _materialRevision: number): number {
     const firstSnapshot = this.frame === 0;
     this.frame = u32(frame, 'FRAME');
-    let uploadedBytes = 0;
+    let uploadedBytes = 0, sharedBytes = 0;
     let historyChanged = false;
     this.sceneDirty = false;
+    if (firstSnapshot && this.sharedPipelines) this.buildSharedPool();
+    const pool = this.sharedPool;
+    this.sharedUpdates = [];
     for (const batch of this.batches) {
       const countChanged = batch.count !== batch.source.scene.instances.length;
       batch.dirty = firstSnapshot || countChanged || (batch.source.getDirty?.() ?? true);
       historyChanged ||= countChanged;
       batch.count = batch.source.scene.instances.length;
       if (!batch.dirty) continue;
+      if (batch.pool && pool) {
+        // Changed pooled batch: refresh its leaves now, copy positions/bounds after its refit.
+        sharedBytes += pool.writeLeaves(batch.pool.index, packSharedLeaves(this.sharedPlan!.batches[batch.pool.index],
+          batch.source.scene.instances.map(state => ({ entityId: state.entityId, generation: state.entityGeneration ?? 0 }))));
+        sharedBytes += pool.writeUpdate(batch.pool.index, batch.count);
+        this.sharedUpdates.push({ poolIndex: batch.pool.index, count: batch.count });
+        if (!batch.count) batch.leafBounds = [];
+      }
       if (this.sceneEnabled) {
         this.sceneDirty = true;
         this.device.queue.writeBuffer(batch.root!.params, 0, new Uint32Array([
@@ -388,7 +440,7 @@ export class GpuWorldQuery {
         batch.nodeCount, batch.mesh.vertexCount, batch.count, 0,
         ...batch.offsets, level.offset, level.count, 0, 0, 0,
       ]));
-      if (batch.instanceTree[3] || this.sceneEnabled) {
+      if (batch.instanceTree[3] || this.sceneEnabled || batch.pool) {
         // CPU centers only determine traversal quality. Bounds used for culling
         // come from GPU BLAS roots, including skin, Morph and wave deformation.
         const sortBounds = batch.source.getInstanceBounds?.() ?? batch.source.scene.instances.map(state => {
@@ -396,6 +448,7 @@ export class GpuWorldQuery {
           return { min: center, max: center };
         });
         if (sortBounds.length !== batch.count) throw new Error('WORLD_QUERY_INSTANCE_BOUNDS_COUNT');
+        if (batch.pool) batch.leafBounds = sortBounds;
         if (this.sceneEnabled) {
           const min: [number, number, number] = [Infinity, Infinity, Infinity];
           const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
@@ -418,17 +471,90 @@ export class GpuWorldQuery {
         ]));
       }
     }
-    if (this.sceneDirty) uploadedBytes += this.sceneBvh!.updateOrder(this.batches.map(batch => batch.sortBounds));
+    if (pool) {
+      sharedBytes += this.uploadSharedFlags();
+      // Pooled members leave the candidate tree; a membership change rebuilds its order.
+      if (this.sceneEnabled && !sameMembers(this.sharedUploadedFlags!, this.sharedOrderFlags)) this.sceneDirty = true;
+      if (this.sharedUpdates.length) sharedBytes += pool.writeOrder(this.sharedLeafOrder());
+      if (this.sharedUpdates.length) this.sharedLastUpdate = { frame: this.frame, batches: this.sharedUpdates.length,
+        dispatches: 0, uploadedBytes: sharedBytes };
+    }
+    if (this.sceneDirty) {
+      const flags = this.sharedUploadedFlags;
+      this.sharedOrderFlags = flags;
+      const order = this.batches.map((batch, index) => flags && (flags[index] & SHARED_FLAG_MEMBER) ? null : batch.sortBounds);
+      this.batches.forEach((batch, index) => { batch.inSceneOrder = order[index] !== null; });
+      uploadedBytes += this.sceneBvh!.updateOrder(order);
+    }
     if (historyChanged) this.sceneHistoryRevision = (this.sceneHistoryRevision + 1) >>> 0;
-    return uploadedBytes;
+    return uploadedBytes + sharedBytes;
+  }
+  /** Admits the deterministic first-fit subset once registration has closed. */
+  private buildSharedPool(): void {
+    if (!this.batches.length) return;
+    const slots = this.options.maxTraceParameterSetsPerEncoder;
+    const alignment = this.device.limits.minUniformBufferOffsetAlignment;
+    const stride = (bytes: number) => Math.ceil(bytes / alignment) * alignment;
+    // Winners, traversal/update parameter slots and up to 17 TLAS depth parameters.
+    const fixedBytes = this.options.maxRays * 4 + stride(32) * (slots + this.batches.length) + 17 * 16;
+    const plan = planSharedStaticPool(this.batches.map((batch, index) => ({ index, capacity: batch.capacity,
+      vertexCount: batch.vertexCount, nodeCount: batch.nodeCount, triangleCount: batch.indices.length / 3,
+      ineligible: !batch.rigid ? 'deformation' as const : !batch.committed ? 'mutable-input' as const : null })), {
+      maxBytes: Math.max(0, Math.min(this.options.maxSharedStaticBytes, this.options.maxBytes - this.bytes)),
+      maxBindingBytes: this.device.limits.maxStorageBufferBindingSize, maxBufferBytes: this.device.limits.maxBufferSize,
+      maxWorkgroupsPerDimension: this.device.limits.maxComputeWorkgroupsPerDimension,
+      batchSlots: this.batches.length, fixedBytes });
+    this.sharedPlan = plan;
+    if (plan.batches.length) {
+      const admitted = plan.batches.map(entry => this.batches[entry.index]);
+      const pool = new GpuQuerySharedStatic(this.device, this.sharedPipelines!, plan,
+        (label, size, usage, data) => this.buffer(label, size, usage, data), this.rayBuffer, this.hitBuffer,
+        this.options.maxRays, slots, this.batches.length, admitted.map(batch => ({ output: batch.source.output,
+          data: batch.data, bounds: batch.bounds, triangles: batch.leafTriangles! })));
+      this.sharedPool = pool;
+      admitted.forEach((batch, index) => {
+        const buffers = [batch.params, batch.source.output, batch.data, batch.bounds, batch.source.instances,
+          this.rayBuffer, this.hitBuffer, batch.identities, pool.winners];
+        batch.pool = { index, resolve: Array.from({ length: slots }, (_, slot) => this.device.createBindGroup({
+          layout: this.traceLayout, entries: buffers.map((buffer, binding) => ({ binding, resource: binding === 0
+            ? { buffer, offset: slot * this.traceUniformStride, size: WORLD_QUERY_TRACE_PARAMETER_BYTES } : { buffer } })) })) };
+      });
+    }
+    for (const batch of this.batches) batch.leafTriangles = undefined;
+  }
+  /** Current Opaque membership and face flags of pooled batches; non-pooled words stay zero. */
+  private sharedMembership(): Uint32Array<ArrayBuffer> {
+    const flags = new Uint32Array(this.batches.length);
+    this.batches.forEach((batch, index) => {
+      if (!batch.pool) return;
+      const program = batch.source.getMaterial().program;
+      flags[index] = packSharedFlags(program.alphaMode === 'opaque', program.doubleSided);
+    });
+    return flags;
+  }
+  private uploadSharedFlags(): number {
+    const flags = this.sharedMembership();
+    if (this.sharedUploadedFlags && flags.every((value, index) => value === this.sharedUploadedFlags![index])) return 0;
+    this.sharedUploadedFlags = flags;
+    return this.sharedPool!.writeFlags(flags);
+  }
+  private sharedLeafOrder(): Uint32Array<ArrayBuffer> {
+    const plan = this.sharedPlan!, bounds: (Bounds3 | null)[] = Array(plan.leafCount).fill(null);
+    for (const batch of this.batches) {
+      if (!batch.pool) continue;
+      const entry = plan.batches[batch.pool.index];
+      batch.leafBounds.forEach((box, slot) => { if (slot < batch.count) bounds[entry.leafBase + slot] = box; });
+    }
+    return orderSharedLeaves(plan.leafCount, bounds);
   }
   /** Discrete identity/history changes; ordinary current/previous pose motion does not advance it. */
   get historyRevision(): number { return this.sceneHistoryRevision; }
   private get sceneEnabled(): boolean { return !!this.sceneBvh && this.batches.length >= 8; }
   encodeRefit(encoder: GPUCommandEncoder, timing?: GPUComputePassTimestampWrites): void {
+    const sharedUpdates = this.sharedPool ? this.sharedUpdates : [];
     let remaining = this.batches.reduce((sum, batch) => sum + (batch.dirty
       ? (batch.count ? batch.levels.length + batch.instanceLevels.length : 0) + (this.sceneEnabled ? 1 : 0) : 0),
-    this.sceneDirty ? this.sceneBvh!.levelCount : 0);
+    (this.sceneDirty ? this.sceneBvh!.levelCount : 0) + (sharedUpdates.length ? 1 : 0));
     let first = true;
     if (!remaining && timing) {
       encoder.beginComputePass({ label: 'cached world BVH refit', timestampWrites: timing }).end();
@@ -458,6 +584,13 @@ export class GpuWorldQuery {
         encoder.copyBufferToBuffer(batch.bounds, batch.root!.offset * 32, this.sceneBvh!.boundsBuffer, index * 32, 32);
       }
     }
+    if (sharedUpdates.length) {
+      // Changed pooled batches only; a static scene pays nothing after its first frame.
+      const pass = encoder.beginComputePass({ label: 'world shared static pool update', timestampWrites: timestampForPass() });
+      const dispatches = this.sharedPool!.encodeUpdate(pass, sharedUpdates);
+      pass.end();
+      if (this.sharedLastUpdate) this.sharedLastUpdate = { ...this.sharedLastUpdate, dispatches };
+    }
     if (this.sceneDirty) this.sceneBvh!.encodeRefit(encoder, timestampForPass);
   }
   /** Encode GPU-resident rays -> hits. One encoder may vary ray count and texture
@@ -483,9 +616,13 @@ export class GpuWorldQuery {
     const budget = planWorldQueryTraceBudget(count, this.options, maxWorkUnits, partition);
     if (!count) return 0;
     const workPerRay = budget.primaryWorkPerRay;
+    // Pooled membership follows the current material, so a Masked switch can
+    // never bypass coverage; it is part of the snapshot recorded work assumes.
+    const pool = this.sharedPool, flags = pool ? this.sharedMembership() : undefined;
+    const members = this.batches.map((batch, index) => !!flags && (flags[index] & SHARED_FLAG_MEMBER) !== 0);
     const snapshot = JSON.stringify([this.frame, materialRevision,
       this.batches.map((batch, index) => [index + 1, batch.nodeCount, batch.mesh.vertexCount, batch.count,
-        ...batch.offsets, batch.topologyVersion])]);
+        ...batch.offsets, batch.topologyVersion]), flags ? Array.from(flags) : null]);
     let state = this.traceParameters.get(encoder);
     if (state && state.snapshot !== snapshot) throw new Error('WORLD_QUERY_ENCODER_SNAPSHOT_CHANGED');
     const key = JSON.stringify([count, Math.fround(textureLod), workPerRay,
@@ -500,27 +637,56 @@ export class GpuWorldQuery {
       state.slots.set(key, slot);
     }
     const parameterSlot = slot!;
+    // Resolve every pipeline before recording so a failure never leaves a pass open.
+    const active = this.batches.map((batch, index) => ({ batch, index, member: members[index] }))
+      .filter(entry => entry.batch.count > 0);
+    const resolves = new Map<number, GPUComputePipeline>();
+    for (const { batch, index, member } of active) {
+      if (!member) continue;
+      const resolve = this.resolvePipelines.get(batch.source.getPipeline());
+      if (!resolve) throw new Error('WORLD_QUERY_SHARED_RESOLVE_PIPELINE');
+      resolves.set(index, resolve);
+    }
     let uploadedBytes = 0;
     if (upload) {
       this.device.queue.writeBuffer(this.resetParams, parameterSlot * this.resetUniformStride,
         new Uint32Array([count, this.frame, materialRevision, 0]));
       uploadedBytes += 16;
     }
-    const reset = encoder.beginComputePass({ label: 'world ray reset' });
+    // A material change since the last snapshot: the encoder snapshot above already
+    // isolates recorded work, and the next snapshot rebuilds the candidate order.
+    if (pool) uploadedBytes += this.uploadSharedFlags();
+    const single = this.options.dispatchEncoding === 'single-pass';
+    let shared: GPUComputePassEncoder | undefined;
+    // WebGPU orders dispatches and their storage writes within one pass, so the
+    // single-pass encoding keeps closest-hit ordering without a pass per batch.
+    const begin = (label: string): GPUComputePassEncoder => single
+      ? (shared ??= encoder.beginComputePass({ label: 'world query trace' })) : encoder.beginComputePass({ label });
+    const end = (pass: GPUComputePassEncoder): void => { if (!single) pass.end(); };
+    const reset = begin('world ray reset');
     reset.setPipeline(this.resetPipeline); reset.setBindGroup(0, this.resetGroups[parameterSlot]);
-    reset.dispatchWorkgroups(Math.ceil(count / 64)); reset.end();
-    if (this.sceneEnabled) {
+    reset.dispatchWorkgroups(Math.ceil(count / 64)); end(reset);
+    // Pooled members are not in the candidate tree; skip it when nothing else uses it.
+    // Without a pool the per-batch path keeps its unconditional candidate pass.
+    const candidates = this.sceneEnabled && (!pool || active.some(entry => !entry.member && entry.batch.inSceneOrder));
+    if (candidates) {
       uploadedBytes += this.sceneBvh!.encodeCandidates(encoder, parameterSlot, count, workPerRay, upload,
-        partition ? budget : undefined);
+        partition ? budget : undefined, single ? begin('') : undefined);
     }
-    for (let index = 0; index < this.batches.length; index++) {
-      const batch = this.batches[index];
-      if (!batch.count) continue;
+    if (pool && active.some(entry => entry.member)) {
+      const pass = begin('world shared static traversal');
+      uploadedBytes += pool.encodeTraverse(pass, parameterSlot, count, workPerRay, upload, budget,
+        facePolicy === 'reverse-material-support');
+      end(pass);
+    }
+    for (const { batch, index, member } of active) {
       if (upload) {
         const params = new ArrayBuffer(WORLD_QUERY_TRACE_PARAMETER_BYTES);
         new Uint32Array(params).set([batch.nodeCount, batch.mesh.vertexCount, batch.count, index + 1,
           ...batch.offsets, batch.colorOffset, count, workPerRay, this.frame, batch.topologyVersion, materialRevision,
-          batch.emissiveSampling === 'triangle-area' ? 1 : 0, this.sceneEnabled ? 1 : 0, this.sceneBvh?.maskWords ?? 0]);
+          batch.emissiveSampling === 'triangle-area' ? 1 : 0,
+          // Candidate masks cover only batches in the tree; others scan their instances.
+          this.sceneEnabled && batch.inSceneOrder ? 1 : 0, this.sceneBvh?.maskWords ?? 0]);
         new Float32Array(params)[16] = textureLod;
         new Uint32Array(params).set([budget.raysPerBlock, budget.primaryRaysPerBlock, budget.supplementalWorkPerRay], 17);
         new Uint32Array(params).set(batch.instanceTree, 20);
@@ -528,12 +694,15 @@ export class GpuWorldQuery {
         this.device.queue.writeBuffer(batch.params, parameterSlot * this.traceUniformStride, params);
         uploadedBytes += WORLD_QUERY_TRACE_PARAMETER_BYTES;
       }
-      // Distinct passes provide ordering for closest-hit updates between batches.
-      const pass = encoder.beginComputePass({ label: 'world rays ' + batch.name });
-      pass.setPipeline(batch.source.getPipeline()); pass.setBindGroup(0, batch.trace[parameterSlot]);
+      // Distinct passes (or ordered dispatches in one pass) order closest-hit
+      // updates between batches. Members only resolve rays they won.
+      const pass = begin((member ? 'world shared static resolve ' : 'world rays ') + batch.name);
+      pass.setPipeline(member ? resolves.get(index)! : batch.source.getPipeline());
+      pass.setBindGroup(0, member ? batch.pool!.resolve[parameterSlot] : batch.trace[parameterSlot]);
       pass.setBindGroup(1, batch.source.getMaterial().bindGroup);
-      pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
+      pass.dispatchWorkgroups(Math.ceil(count / 64)); end(pass);
     }
+    shared?.end();
     return uploadedBytes;
   }
   async traceRays(rays: readonly WorldRay[], options: { textureLod?: number } = {}, materialRevision = 0): Promise<WorldQueryResult> {
@@ -586,8 +755,24 @@ export class GpuWorldQuery {
       sceneBvhNodes: this.sceneEnabled ? this.sceneBvh!.nodeCount : 0,
       sceneCandidateWordsPerRay: this.sceneBvh?.maskWords ?? 0,
       sceneCandidateBytes: this.candidateBuffer.size,
+      staticTraversal: this.options.staticTraversal, dispatchEncoding: this.options.dispatchEncoding,
+      sharedStatic: this.sharedStaticDiagnostics(),
       lastReadbackQuery: this.lastReadbackQuery && { ...this.lastReadbackQuery },
       refit: 'changed-batches', refitTiming: 'provided-by-caller', externalTraceTiming: false };
+  }
+  /** Admission is fixed at the first snapshot; membership is the last uploaded material state. */
+  private sharedStaticDiagnostics() {
+    const plan = this.sharedPlan;
+    if (!plan) return null;
+    const excluded: Record<SharedStaticExclusion, number> = { deformation: 0, 'mutable-input': 0,
+      'dispatch-limit': 0, 'leaf-limit': 0, 'binding-limit': 0, budget: 0 };
+    for (const entry of plan.excluded) excluded[entry.reason]++;
+    const flags = this.sharedUploadedFlags;
+    return { pooledBatches: plan.batches.length, excludedBatches: plan.excluded.length, excluded,
+      members: flags ? flags.reduce((sum, value) => sum + (value & SHARED_FLAG_MEMBER), 0) : 0,
+      leaves: plan.leafCount, tlasNodes: plan.tlasNodeCount, blasRecords: plan.nodeRecords - plan.tlasNodeCount,
+      triangles: plan.triangleCount, vertices: plan.vertexCount, bytes: { ...plan.bytes },
+      lastUpdate: this.sharedLastUpdate && { ...this.sharedLastUpdate } };
   }
   dispose(): void {
     if (this.disposed) return;

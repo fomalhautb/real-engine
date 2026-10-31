@@ -74,6 +74,46 @@ fn colorAt(vertex: u32) -> vec4f {
     return vec4f(bitcast<f32>(source[start]), bitcast<f32>(source[start + 1u]),
         bitcast<f32>(source[start + 2u]), bitcast<f32>(source[start + 3u]));
 }
+// Barycentric interpolation with explicit fused operations. Implicit contraction
+// or reassociation may differ between entry points (measured on Apple Metal),
+// so both the per-batch traversal and the pooled resolve use this fixed form.
+fn barycentric2(a: vec2f, b: vec2f, c: vec2f, w: vec3f) -> vec2f { return fma(c, vec2f(w.z), fma(b, vec2f(w.y), a * w.x)); }
+fn barycentric3(a: vec3f, b: vec3f, c: vec3f, w: vec3f) -> vec3f { return fma(c, vec3f(w.z), fma(b, vec3f(w.y), a * w.x)); }
+fn barycentric4(a: vec4f, b: vec4f, c: vec4f, w: vec3f) -> vec4f { return fma(c, vec4f(w.z), fma(b, vec4f(w.y), a * w.x)); }
+// Shared by the per-batch traversal and the pooled-traversal resolve, so a
+// winning triangle yields identical attributes on both paths. Returns false
+// when Masked coverage rejects the point (the hit is left unchanged).
+fn writeTriangleHit(hit: ptr<function, Hit>, ray: Ray, instance: u32, identity: vec4u, triangle: u32,
+    v0: u32, v1: u32, v2: u32, a: Deformed, b: Deformed, c: Deformed,
+    edge1: vec3f, edge2: vec3f, determinant: f32, distance: f32, u: f32, v: f32) -> bool {
+    let weights = vec3f(1.0 - u - v, u, v);
+    let uv = barycentric2(uvAt(v0), uvAt(v1), uvAt(v2), weights);
+    let color = barycentric4(colorAt(v0), colorAt(v1), colorAt(v2), weights);
+    let inst = instances[instance];
+    if (!evaluateCoverage(uv, params.textureLod, inst.color, inst.material.xy, color)) { return false; }
+    let surface = evaluateMaterial(uv, params.textureLod, inst.color, inst.material.xy, color);
+    let geometricNormal = surfaceUnit(cross(edge1, edge2), vec3f(0.0, 1.0, 0.0)) * select(-1.0, 1.0, determinant > 0.0);
+    let vertexNormal = barycentric3(a.normal.xyz, b.normal.xyz, c.normal.xyz, weights);
+    var normal = surfaceUnit(vertexNormal, geometricNormal);
+    normal *= select(-1.0, 1.0, dot(normal, geometricNormal) >= 0.0);
+    if (MATERIAL_NORMAL_MAPPED) {
+        let tangent = barycentric4(a.tangent, b.tangent, c.tangent, weights);
+        normal = surfaceMappedNormal(vertexNormal, geometricNormal, tangent, edge1, edge2,
+            uvAt(v1) - uvAt(v0), uvAt(v2) - uvAt(v0), surface.tangentNormal);
+    }
+    let encodedGeometry = surfaceOctEncode(geometricNormal);
+    (*hit).identity = vec4u(params.shape.w, identity.x, identity.y, triangle);
+    (*hit).metric = vec4f(distance, u, v, select(0.0, 1.0, determinant > 0.0));
+    (*hit).position = vec4f(ray.origin.xyz + distance * ray.direction.xyz, encodedGeometry.x);
+    (*hit).normal = vec4f(normal, surface.roughness);
+    (*hit).previous = vec4f(barycentric3(a.previous.xyz, b.previous.xyz, c.previous.xyz, weights), surface.metallic);
+    (*hit).baseColor = vec4f(surface.baseColor, surface.opacity);
+    (*hit).emissive = vec4f(surface.emissive, select(0.0, 1.0, MATERIAL_UNLIT));
+    (*hit).versions = vec4u(params.limits.z, identity.z, params.limits.w, params.material.x);
+    (*hit).uvInfo = vec4f(uv, params.textureLod, encodedGeometry.y);
+    (*hit).work.w = params.material.y;
+    return true;
+}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= params.limits.x) { return; }
@@ -155,34 +195,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 if (distance < ray.origin.w || distance > ray.direction.w || distance > hit.metric.x
                     // Traversal order must not change equal-distance identity:
                     // earlier batch, then lower instance slot, then BLAS order.
+                    // A pooled static hit may come from a later batch; ID order decides.
                     || (distance == hit.metric.x && hit.identity.x != 0u
-                        && (hit.identity.x != params.shape.w || instance >= winningInstance))) { continue; }
-                let weights = vec3f(1.0 - u - v, u, v);
-                let uv = uvAt(v0) * weights.x + uvAt(v1) * weights.y + uvAt(v2) * weights.z;
-                let color = colorAt(v0) * weights.x + colorAt(v1) * weights.y + colorAt(v2) * weights.z;
-                let inst = instances[instance];
-                if (!evaluateCoverage(uv, params.textureLod, inst.color, inst.material.xy, color)) { continue; }
-                let surface = evaluateMaterial(uv, params.textureLod, inst.color, inst.material.xy, color);
-                let geometricNormal = surfaceUnit(cross(edge1, edge2), vec3f(0.0, 1.0, 0.0)) * select(-1.0, 1.0, determinant > 0.0);
-                let vertexNormal = a.normal.xyz * weights.x + b.normal.xyz * weights.y + c.normal.xyz * weights.z;
-                var normal = surfaceUnit(vertexNormal, geometricNormal);
-                normal *= select(-1.0, 1.0, dot(normal, geometricNormal) >= 0.0);
-                if (MATERIAL_NORMAL_MAPPED) {
-                    let tangent = a.tangent * weights.x + b.tangent * weights.y + c.tangent * weights.z;
-                    normal = surfaceMappedNormal(vertexNormal, geometricNormal, tangent, edge1, edge2,
-                        uvAt(v1) - uvAt(v0), uvAt(v2) - uvAt(v0), surface.tangentNormal);
-                }
-                let encodedGeometry = surfaceOctEncode(geometricNormal);
-                hit.identity = vec4u(params.shape.w, identity.x, identity.y, triangle);
-                hit.metric = vec4f(distance, u, v, select(0.0, 1.0, determinant > 0.0));
-                hit.position = vec4f(ray.origin.xyz + distance * ray.direction.xyz, encodedGeometry.x);
-                hit.normal = vec4f(normal, surface.roughness);
-                hit.previous = vec4f(a.previous.xyz * weights.x + b.previous.xyz * weights.y + c.previous.xyz * weights.z, surface.metallic);
-                hit.baseColor = vec4f(surface.baseColor, surface.opacity);
-                hit.emissive = vec4f(surface.emissive, select(0.0, 1.0, MATERIAL_UNLIT));
-                hit.versions = vec4u(params.limits.z, identity.z, params.limits.w, params.material.x);
-                hit.uvInfo = vec4f(uv, params.textureLod, encodedGeometry.y);
-                hit.work.w = params.material.y;
+                        && (hit.identity.x < params.shape.w
+                            || (hit.identity.x == params.shape.w && instance >= winningInstance)))) { continue; }
+                if (!writeTriangleHit(&hit, ray, instance, identity, triangle, v0, v1, v2, a, b, c,
+                    edge1, edge2, determinant, distance, u, v)) { continue; }
                 winningInstance = instance;
             }
             if (hit.work.z != 0u) { break; }
@@ -190,5 +208,34 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
         if (hit.work.z != 0u) { break; }
     }
+    hits[id.x] = hit;
+}
+
+// Material resolve for a pooled static batch: only rays whose shared traversal
+// winner is this batch (binding 8 holds winner IDs here, not candidate masks).
+// The temporary identity carries the instance slot and leaf-order triangle;
+// distance and barycentrics come from the shared traversal.
+@compute @workgroup_size(64)
+fn resolveShared(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= params.limits.x) { return; }
+    if (batchCandidates[id.x] != params.shape.w) { return; }
+    var hit = hits[id.x];
+    if (hit.identity.x != params.shape.w) { return; }
+    let ray = rays[id.x];
+    let instance = hit.identity.y;
+    let triangle = source[params.offsets.x + hit.identity.w];
+    let v0 = source[params.offsets.y + triangle * 3u];
+    let v1 = source[params.offsets.y + triangle * 3u + 1u];
+    let v2 = source[params.offsets.y + triangle * 3u + 2u];
+    let a = vertices[instance * params.shape.y + v0];
+    let b = vertices[instance * params.shape.y + v1];
+    let c = vertices[instance * params.shape.y + v2];
+    let edge1 = b.position.xyz - a.position.xyz;
+    let edge2 = c.position.xyz - a.position.xyz;
+    let crossDirection = cross(ray.direction.xyz, edge2);
+    let determinant = dot(edge1, crossDirection);
+    // Pooled batches are Opaque, whose coverage is unconditional.
+    _ = writeTriangleHit(&hit, ray, instance, identities[instance], triangle, v0, v1, v2, a, b, c,
+        edge1, edge2, determinant, hit.metric.x, hit.metric.y, hit.metric.z);
     hits[id.x] = hit;
 }

@@ -54,7 +54,16 @@ describe('world query wire contract', () => {
       maxRays: 1024, maxBytes: 128 * 1024 * 1024, maxTrianglesPerMesh: 65536,
       maxInstancesPerBatch: 256, maxBatches: 256, maxNodeVisits: 262144, maxTotalWorkUnits: 16777216,
       maxTraceParameterSetsPerEncoder: 8, instanceAcceleration: 'bvh', sceneAcceleration: 'bvh',
+      maxSharedStaticBytes: 64 * 1024 * 1024, staticTraversal: 'per-batch', dispatchEncoding: 'pass-per-batch',
     });
+    expect(resolveWorldQueryOptions({ staticTraversal: 'shared' }).staticTraversal).toBe('shared');
+    expect(resolveWorldQueryOptions({ dispatchEncoding: 'single-pass' }).dispatchEncoding).toBe('single-pass');
+    expect(resolveWorldQueryOptions({ maxSharedStaticBytes: 512 * 1024 * 1024 }).maxSharedStaticBytes).toBe(512 * 1024 * 1024);
+    expect(() => resolveWorldQueryOptions({ staticTraversal: 'pooled' as 'shared' })).toThrow(/staticTraversal/);
+    expect(() => resolveWorldQueryOptions({ dispatchEncoding: 'one' as 'single-pass' })).toThrow(/dispatchEncoding/);
+    for (const invalid of [0, 1.5, 512 * 1024 * 1024 + 1, NaN]) {
+      expect(() => resolveWorldQueryOptions({ maxSharedStaticBytes: invalid })).toThrow(/maxSharedStaticBytes/);
+    }
     expect(resolveWorldQueryOptions({ maxRays: 2048, maxInstancesPerBatch: 16 }).maxRays).toBe(2048);
     for (const maxBatches of [1, 31, 32, 33, 256, 405, 4096]) {
       expect(resolveWorldQueryOptions({ maxBatches }).maxBatches).toBe(maxBatches);

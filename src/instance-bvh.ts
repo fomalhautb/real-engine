@@ -12,17 +12,22 @@ export interface InstanceBvhTopology {
 }
 
 const MAX_CAPACITY = 4096;
+/** Hard cap for callers that index many (batch, instance) leaves, e.g. the shared static TLAS. */
+export const MAX_FIXED_TOPOLOGY_LEAVES = 65_536;
 const INACTIVE_SLOT = 0xffff_ffff;
 
-function validCapacity(capacity: number): void {
-  if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > MAX_CAPACITY) {
-    throw new RangeError(`capacity must be an integer in [1, ${MAX_CAPACITY}]`);
+function validCapacity(capacity: number, maxCapacity: number): void {
+  if (!Number.isSafeInteger(maxCapacity) || maxCapacity < 1 || maxCapacity > MAX_FIXED_TOPOLOGY_LEAVES) {
+    throw new RangeError(`maxCapacity must be an integer in [1, ${MAX_FIXED_TOPOLOGY_LEAVES}]`);
+  }
+  if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > maxCapacity) {
+    throw new RangeError(`capacity must be an integer in [1, ${maxCapacity}]`);
   }
 }
 
 /** Build a median split over fixed order-slot ranges, independent of instance positions. */
-export function buildInstanceBvhTopology(capacity: number): InstanceBvhTopology {
-  validCapacity(capacity);
+export function buildInstanceBvhTopology(capacity: number, maxCapacity = MAX_CAPACITY): InstanceBvhTopology {
+  validCapacity(capacity, maxCapacity);
   const nodeCount = capacity * 2 - 1;
   const nodes = new Uint32Array(nodeCount * 4);
   const levels: number[][] = [];
@@ -81,8 +86,9 @@ function morton3(x: number, y: number, z: number): number {
 }
 
 /** Sort conservative world bounds by 10-bit/axis center Morton code, with slot-ID ties. */
-export function orderInstanceBounds(bounds: readonly Bounds3[], capacity: number): Uint32Array<ArrayBuffer> {
-  validCapacity(capacity);
+export function orderInstanceBounds(bounds: readonly Bounds3[], capacity: number,
+  maxCapacity = MAX_CAPACITY): Uint32Array<ArrayBuffer> {
+  validCapacity(capacity, maxCapacity);
   if (!Array.isArray(bounds) || bounds.length > capacity) {
     throw new RangeError('bounds length exceeds capacity');
   }

@@ -162,9 +162,11 @@ export class GpuQuerySceneBvh {
     }
   }
 
-  /** Clears ceil(capacity/32) mask words per ray, then bounds-tests the tree. */
+  /** Clears ceil(capacity/32) mask words per ray, then bounds-tests the tree.
+   * An open pass records the dispatch there (single-pass trace encoding). */
   encodeCandidates(encoder: GPUCommandEncoder, slot: number, count: number, workPerRay: number,
-    upload: boolean, partition?: Pick<WorldQueryTraceBudgetPlan, 'raysPerBlock' | 'primaryRaysPerBlock' | 'supplementalWorkPerRay'>): number {
+    upload: boolean, partition?: Pick<WorldQueryTraceBudgetPlan, 'raysPerBlock' | 'primaryRaysPerBlock' | 'supplementalWorkPerRay'>,
+    openPass?: GPUComputePassEncoder): number {
     integer(slot, 0, this.candidateGroups.length - 1, 'slot');
     integer(count, 0, this.maxRays, 'count');
     integer(workPerRay, 1, 1_048_576, 'workPerRay');
@@ -179,11 +181,11 @@ export class GpuQuerySceneBvh {
     if (upload) this.device.queue.writeBuffer(this.candidateParams, slot * this.parameterStride,
       new Uint32Array([count, workPerRay, 0, 0, this.capacity, this.nodeCount, this.nodeCount * 4, this.maskWords,
         partition?.raysPerBlock ?? 0, partition?.primaryRaysPerBlock ?? 0, partition?.supplementalWorkPerRay ?? 0, 0]));
-    const pass = encoder.beginComputePass({ label: 'world scene BVH candidates' });
+    const pass = openPass ?? encoder.beginComputePass({ label: 'world scene BVH candidates' });
     pass.setPipeline(this.candidatePipeline);
     pass.setBindGroup(0, this.candidateGroups[slot]);
     pass.dispatchWorkgroups(Math.ceil(count / 64));
-    pass.end();
+    if (!openPass) pass.end();
     return upload ? PARAM_BYTES : 0;
   }
 }

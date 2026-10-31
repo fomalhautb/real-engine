@@ -357,7 +357,7 @@ describe('GPU local light resources', () => {
     expect(lights.update()).toBe(options.uniformBytes + options.viewUniformBytes);
     expect(lights.update()).toBe(0);
     const handle = lights.set.add(point({ castShadows: true }));
-    lights.set.add(spot({ castShadows: true }));
+    const spotHandle = lights.set.add(spot({ castShadows: true }));
     expect(lights.update()).toBeGreaterThan(0);
     expect(lights.shadowEncodings().map(encoding => encoding.layer)).toEqual([0, 1, 2, 3, 4, 5, 6]);
     const passes: string[] = [], writes: (GPUComputePassTimestampWrites | undefined)[] = [];
@@ -369,16 +369,28 @@ describe('GPU local light resources', () => {
     const querySet = createTimestampQuerySet({ createQuerySet: () => ({}) } as unknown as GPUDevice, 8);
     lights.encodeShadows(encoder, () => { draws++; }, { querySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 });
     expect(draws).toBe(7);
-    expect(passes[0]).toBe('local light shadows begin');
-    expect(passes.at(-1)).toBe('local light shadows end');
-    // Every timed pass writes a whole pair; the unowned ends go to the reserved scratch slot 8.
+    // The span sits on the view passes; every timed pass writes a whole pair, unowned ends to the scratch slot 8.
+    expect(passes).toEqual([0, 1, 2, 3, 4, 5, 6].map(layer => 'local light shadow view ' + layer));
     expect(writes[0]).toEqual({ querySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 8 });
     expect(writes.at(-1)).toEqual({ querySet, beginningOfPassWriteIndex: 8, endOfPassWriteIndex: 5 });
     expect(writes.slice(1, -1).every(write => write === undefined)).toBe(true);
     lights.set.setEnabled(handle, false);
     lights.update();
     expect(lights.shadowEncodings().map(encoding => encoding.layer)).toEqual([6]);
+    const span = { querySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 };
+    passes.length = 0; writes.length = 0;
+    lights.encodeShadows(encoder, () => { draws++; }, span);
+    // One view owns both ends.
+    expect(passes).toEqual(['local light shadow view 6']);
+    expect(writes).toEqual([span]);
     expect(lights.diagnostics()).toMatchObject({ lights: 2, enabledLights: 1, shadowedLights: 2, reservedShadowViews: 7 });
+    // Without views one empty pass still writes the whole span.
+    lights.set.setEnabled(spotHandle, false);
+    lights.update();
+    passes.length = 0; writes.length = 0;
+    lights.encodeShadows(encoder, () => { draws++; }, span);
+    expect(passes).toEqual(['local light shadows (no views)']);
+    expect(writes).toEqual([span]);
     lights.dispose();
     lights.dispose();
     expect(ledger).toBe(0);

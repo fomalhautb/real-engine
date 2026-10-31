@@ -186,20 +186,25 @@ export class GpuLocalLights {
     return this.renderedLayers.map(layer => ({ view: this.layerViews[layer], frame: this.viewGroups[layer], layer }));
   }
 
-  /** Encode every active view with the caller's shared shadow draw; timestamps bracket all views. */
+  /** Encode every active view with the caller's shared shadow draw. The span's timestamps sit on the first and
+   * last view passes themselves: empty compute marker passes around the views read 0 ms on Apple/Metal (measured
+   * with 7 views that read 0.26-0.92 ms this way). Every timed pass writes a whole pair (unowned end to the
+   * scratch slot), since partial writes lose the device there; without views one empty pass writes the span. */
   encodeShadows(encoder: GPUCommandEncoder, draw: (pass: GPURenderPassEncoder) => void,
     timing?: GPUComputePassTimestampWrites): void {
     const encodings = this.shadowEncodings();
-    // Both marker passes write whole pairs (unowned end to the scratch slot): partial writes lose the device on Apple/Metal.
-    if (timing) encoder.beginComputePass({ label: 'local light shadows begin', timestampWrites: timestampSpanStart(timing) }).end();
-    for (const encoding of encodings) {
+    if (timing && !encodings.length) encoder.beginComputePass({ label: 'local light shadows (no views)', timestampWrites: timing }).end();
+    encodings.forEach((encoding, index) => {
+      const first = index === 0, last = index === encodings.length - 1;
+      const timestampWrites = !timing ? undefined : first && last ? timing
+        : first ? timestampSpanStart(timing) : last ? timestampSpanEnd(timing) : undefined;
       const pass = encoder.beginRenderPass({ label: 'local light shadow view ' + encoding.layer, colorAttachments: [],
-        depthStencilAttachment: { view: encoding.view, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
+        depthStencilAttachment: { view: encoding.view, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
+        ...(timestampWrites ? { timestampWrites } : {}) });
       pass.setBindGroup(0, encoding.frame);
       draw(pass);
       pass.end();
-    }
-    if (timing) encoder.beginComputePass({ label: 'local light shadows end', timestampWrites: timestampSpanEnd(timing) }).end();
+    });
     this.shadowViewsRendered = encodings.length;
   }
 

@@ -5,6 +5,7 @@ import { createCube } from './geometry';
 import { m, type MaterialDefinition } from './material';
 import { multiply, normalMatrix, scaling, translation, type Mat4 } from './math';
 import type { FogVolume } from './volumetric-fog';
+import type { LocalLightDescriptor, LocalLightHandle } from './local-lights';
 
 type Vec3 = [number, number, number];
 type Color = [number, number, number, number];
@@ -93,6 +94,8 @@ let density = 0.14;
 let sunAzimuth = 150;
 let sunElevation = 50;
 let sunIntensity = 9;
+let spotEnabled = false;
+let doorSpot: LocalLightHandle | undefined;
 let phase = 0;
 let raf = 0;
 let lastTime = performance.now();
@@ -114,6 +117,11 @@ function localMedium(): FogVolume[] {
       emission: [0, 0, 0], anisotropy: 0.3 } }];
 }
 
+// A shadowed spot outside the rear wall, left of the door and aimed at its centre: the wall cuts the cone
+// to a door-shaped shaft that crosses the colonnade medium towards the right wall.
+const DOOR_SPOT: LocalLightDescriptor = { kind: 'spot', position: [-3.5, 2.6, -8], direction: [0.667, -0.267, 0.696],
+  innerConeAngle: 0.18, outerConeAngle: 0.3, color: [0.62, 0.78, 1], intensity: 420, range: 14, castShadows: true };
+
 const options: RendererOptions = {
   antiAliasing: 'fxaa',
   sunShadow: { resolution: 2048,
@@ -121,6 +129,8 @@ const options: RendererOptions = {
     maxBytes: 16 * 1024 * 1024 },
   volumetricFog: { pixelSize: 8, slices: 64, maxViewDepth: 30, volumes: localMedium(),
     maxBytes: 128 * 1024 * 1024, temporal: { maxHistoryFrames: 16 } },
+  // One spot view; the slot and atlas stay reserved while the toggle is off, so the ledger does not change.
+  localLights: { maxLights: 2, maxShadowedLights: 1, maxShadowViews: 1, shadowResolution: 1024 },
 };
 
 function applySun(): void {
@@ -151,7 +161,9 @@ function updateUi(): void {
   $('triangles').textContent = scene.triangles.toLocaleString();
   $('frame').textContent = stats.frames.toLocaleString();
   $('status').textContent = paused ? '已暂停' : 'WEBGPU LIVE';
-  $('stage-mode').textContent = fogEnabled ? '雾已开启 · 太阳单次散射' : '雾已关闭 · PBR 与阴影保留';
+  const lights = renderer.diagnostics().localLights;
+  $('local-lights').textContent = lights ? `${lights.enabledLights} / ${lights.lights} 盏 · ${lights.renderedShadowViews} 阴影视图` : '—';
+  $('stage-mode').textContent = fogEnabled ? `雾已开启 · ${spotEnabled ? '太阳与聚光灯' : '太阳'}单次散射` : '雾已关闭 · PBR 与阴影保留';
   $<HTMLButtonElement>('pause').textContent = paused ? '继续轨迹' : '暂停轨迹';
   const adapter = renderer.info.adapterInfo;
   $('adapter').textContent = `${adapter.vendor || '未知供应商'} · ${adapter.architecture || '未知架构'}${adapter.isFallbackAdapter ? ' · 软件适配器' : ''}`;
@@ -160,8 +172,9 @@ function updateUi(): void {
 function snapshot() {
   return { page: 'volumetric-fog-demo', scene: { ...scene, batches: [batch.name] },
     camera: { eye: cameraEye(), target: [...target], phase },
-    controls: { paused, trajectory, fogEnabled, temporalEnabled, density, sunAzimuth, sunElevation, sunIntensity },
+    controls: { paused, trajectory, fogEnabled, temporalEnabled, density, sunAzimuth, sunElevation, sunIntensity, spotEnabled },
     fog: renderer?.diagnostics().volumetricFog ?? null,
+    localLights: renderer?.diagnostics().localLights ?? null,
     stats: renderer ? structuredClone(renderer.stats) : null,
     adapter: renderer?.info ?? null,
     errors: renderer ? [...renderer.errors] : [],
@@ -234,7 +247,12 @@ async function main(): Promise<void> {
     applySun();
     updateMedium();
     renderer.setVolumetricFogEnabled(fogEnabled);
+    doorSpot = renderer.addLocalLight({ ...DOOR_SPOT, enabled: spotEnabled });
     const signal = events.signal;
+    $<HTMLInputElement>('spot-enabled').addEventListener('change', event => {
+      try { spotEnabled = (event.target as HTMLInputElement).checked;
+        if (doorSpot) renderer?.setLocalLightEnabled(doorSpot, spotEnabled); render(); } catch (error) { fail(error); }
+    }, { signal });
     $<HTMLInputElement>('temporal-enabled').addEventListener('change', event => {
       try { temporalEnabled = (event.target as HTMLInputElement).checked;
         renderer?.setVolumetricFogTemporalEnabled(temporalEnabled); render(); } catch (error) { fail(error); }

@@ -29,6 +29,20 @@ test('fog colonnade exposes real HDR media, repeatable controls and bounded reso
   await page.locator('#fog-enabled').check();
   const restored = await capture();
   expect(restored.png).toEqual(on.png);
+  // The door spot shares the fog and shadow paths; its slot and atlas are reserved, so the ledger is unchanged.
+  expect(on.snapshot.localLights).toMatchObject({ lights: 1, enabledLights: 0, renderedShadowViews: 0, cameraCulling: false });
+  await page.locator('#spot-enabled').check();
+  // The toggle's own frame resets fog history through the light version.
+  const toggled = await page.evaluate(() => window.__FOG_DEMO__!.snapshot());
+  expect(toggled.fog!.history).toMatchObject({ lastResetReason: 'local-light-change', framesSinceReset: 1 });
+  const spot = await capture();
+  await writeFile(testInfo.outputPath('fog-colonnade-spot.png'), Buffer.from(spot.png.split(',')[1], 'base64'));
+  expect(spot.png).not.toEqual(on.png);
+  expect(spot.snapshot.localLights).toMatchObject({ lights: 1, enabledLights: 1, renderedShadowViews: 1 });
+  expect(spot.snapshot.stats!.ownedGpuBytes).toBe(on.snapshot.stats!.ownedGpuBytes);
+  await page.locator('#spot-enabled').uncheck();
+  const spotOff = await capture();
+  expect(spotOff.png).toEqual(on.png);
   await page.locator('#temporal-enabled').uncheck();
   const centered = await capture();
   await writeFile(testInfo.outputPath('fog-colonnade-centered.png'), Buffer.from(centered.png.split(',')[1], 'base64'));

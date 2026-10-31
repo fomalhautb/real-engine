@@ -39,7 +39,11 @@
             <label class="range"><span>强度 <output id="intensity-value" for="intensity">9.0</output></span><input id="intensity" type="range" min="0" max="16" step="0.2" value="9" /></label>
           </section>
           <section class="section">
-            <div class="section-title"><h3>镜头</h3><span>03 / CAMERA</span></div>
+            <div class="section-title"><h3>聚光灯</h3><span>03 / LOCAL</span></div>
+            <label class="toggle"><span>门洞聚光灯<small>后墙外带阴影的有界聚光灯，光柱经门洞进入雾中</small></span><input id="spot-enabled" type="checkbox" /></label>
+          </section>
+          <section class="section">
+            <div class="section-title"><h3>镜头</h3><span>04 / CAMERA</span></div>
             <label class="toggle"><span>固定轨迹<small>轻微绕行，保持光柱可见</small></span><input id="trajectory" type="checkbox" checked /></label>
             <div class="actions"><button id="pause" type="button">暂停轨迹</button><button id="step" type="button">逐帧前进</button></div>
           </section>
@@ -49,6 +53,7 @@
               <div><dt>雾网格</dt><dd id="grid">—</dd></div>
               <div><dt>Froxel</dt><dd id="froxels">—</dd></div>
               <div><dt>GPU 雾时间</dt><dd id="gpu-time">—</dd></div>
+              <div><dt>局部光</dt><dd id="local-lights">—</dd></div>
               <div><dt>GPU 采样帧</dt><dd id="gpu-frame">—</dd></div>
               <div><dt>资源账本</dt><dd id="gpu-bytes">—</dd></div>
               <div><dt>视口</dt><dd id="viewport-size">—</dd></div>
@@ -56,7 +61,7 @@
               <div><dt>帧</dt><dd id="frame">—</dd></div>
             </dl>
           </section>
-          <p class="scope">盒状局部介质、太阳单次散射与时序重建。介质 GI（GI 探针入射辐亮度与天空可见性）需同时配置 diffuseGi 与 volumetricFog.airLighting，此页未启用。此页展示局部场景，不代表完整体积照明画质或性能目标。</p>
+          <p class="scope">盒状局部介质、太阳与局部聚光灯单次散射与时序重建。介质 GI（GI 探针入射辐亮度与天空可见性）需同时配置 diffuseGi 与 volumetricFog.airLighting，此页未启用。此页展示局部场景，不代表完整体积照明画质或性能目标。</p>
           <p id="adapter" class="adapter">等待 WebGPU 适配器…</p>
         </aside>
       </main>

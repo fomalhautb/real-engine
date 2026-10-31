@@ -3,8 +3,8 @@ import type { LocalLightDescriptor } from '../../src/local-lights';
 import type {
   LocalLightPixel, LocalLightSurfacePlan, LocalLightSurfaceStep, runLocalLightContractFixture, runLocalLightSurfaceFixture,
 } from './fixtures/local-lights';
+import { brdf, dot, irradiance, normalize, sub, type Vec3 } from './local-light-oracle';
 
-type Vec3 = [number, number, number];
 type Vec4 = [number, number, number, number];
 type SurfaceResult = Awaited<ReturnType<typeof runLocalLightSurfaceFixture>>;
 test.use({ deviceScaleFactor: 1 });
@@ -18,10 +18,6 @@ const UNLIT_REGION = { min: [2.4, -3.1] as [number, number], max: [3.1, -2.4] as
 const OPTIONS = { maxLights: 8, maxShadowedLights: 2, shadowResolution: 512, maxShadowViews: 12 };
 
 // --- Independent oracle (does not import the engine) ---------------------------------------
-const dot = (a: readonly number[], b: readonly number[]) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-const sub = (a: readonly number[], b: readonly number[]): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-const normalize = (v: readonly number[]): Vec3 => { const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; };
-
 /** Pixel centre on the z = 0 receiver for the renderer's fixed π/3.2 vertical field of view. */
 function pixelWorld(pixel: LocalLightPixel): Vec3 {
   const x = (2 * (pixel.x + 0.5) / SIZE - 1) * TAN, y = (1 - 2 * (pixel.y + 0.5) / SIZE) * TAN;
@@ -29,36 +25,6 @@ function pixelWorld(pixel: LocalLightPixel): Vec3 {
 }
 function pixelAt(x: number, y: number): LocalLightPixel {
   return { x: Math.round(((x / EYE[2]) / TAN + 1) / 2 * SIZE - 0.5), y: Math.round((1 - (y / EYE[2]) / TAN) / 2 * SIZE - 0.5) };
-}
-/** E⊥ = colour × intensity × saturate(1 − (d/r)⁴)² × cone / max(d², 0.01²). */
-function irradiance(light: LocalLightDescriptor, world: Vec3): { l: Vec3; e: Vec3 } {
-  const delta = sub(light.position, world), d2 = dot(delta, delta), l = normalize(delta);
-  if (d2 >= light.range * light.range) return { l, e: [0, 0, 0] };
-  const ratio = d2 / (light.range * light.range), window = Math.min(1, Math.max(0, 1 - ratio * ratio)) ** 2;
-  let factor = window / Math.max(d2, 1e-4);
-  if (light.kind === 'spot') {
-    const axis = normalize(light.direction!), cosOuter = Math.cos(light.outerConeAngle!);
-    const t = Math.min(1, Math.max(0, (-dot(l, axis) - cosOuter) / (Math.cos(light.innerConeAngle!) - cosOuter)));
-    factor *= t * t;
-  }
-  return { l, e: light.color.map(c => c * light.intensity * factor) as Vec3 };
-}
-/** GGX/Smith-Schlick/Schlick-Fresnel direct response × n·l, the documented engine BRDF. */
-function brdf(base: readonly number[], metallic: number, roughness: number, n: Vec3, v: Vec3, l: Vec3): Vec3 {
-  const half = [l[0] + v[0], l[1] + v[1], l[2] + v[2]], hl = Math.max(Math.hypot(half[0], half[1], half[2]), 1e-5);
-  const h = half.map(value => value / hl);
-  const nv = Math.max(dot(n, v), 0.001), nl = dot(n, l) > 0 ? Math.max(dot(n, l), 0) : 0;
-  const nh = Math.max(dot(n, h), 0), vh = Math.max(dot(v, h), 0);
-  const a2 = roughness ** 4, denominator = (1 - nh * nh) + nh * nh * a2;
-  const distribution = a2 / Math.max(Math.PI * denominator * denominator, 1e-20);
-  const k = (roughness + 1) ** 2 / 8;
-  const geometry = (nv / (nv * (1 - k) + k)) * (nl / (nl * (1 - k) + k));
-  return [0, 1, 2].map(c => {
-    const f0 = 0.04 + (base[c] - 0.04) * metallic, fresnel = f0 + (1 - f0) * (1 - vh) ** 5;
-    const specular = distribution * geometry * fresnel / Math.max(4 * nv * nl, 0.001);
-    const diffuse = (1 - fresnel) * (1 - metallic) * base[c] / Math.PI;
-    return (diffuse + specular) * nl;
-  }) as Vec3;
 }
 function expectedDirect(lights: readonly LocalLightDescriptor[], receiver: { metalness: number; roughness: number },
   pixel: LocalLightPixel): Vec3 {

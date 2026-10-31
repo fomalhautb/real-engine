@@ -1,5 +1,6 @@
 :root { color-scheme: dark; font-family: 'DM Sans', system-ui, sans-serif; background: #081014; color: #e9f2f1; font-synthesis: none; }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; min-width: 320px; }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
@@ -36,7 +37,7 @@ h1, h2, h3, p { margin: 0; }
 .block-head h3 { font: 600 13px/1.3 'Space Grotesk', sans-serif; letter-spacing: .02em; }
 .block-head span, .block-head output { color: #81a6a8; font: 10px/1.2 'DM Mono', monospace; letter-spacing: .05em; }
 .block-head output { color: #9ce5d5; font-size: 13px; }
-.segmented { display: grid; grid-template-columns: repeat(3,1fr); padding: 3px; border-radius: 6px; background: #091317; border: 1px solid #2e4248; }
+.segmented { display: grid; grid-template-columns: repeat(4,1fr); padding: 3px; border-radius: 6px; background: #091317; border: 1px solid #2e4248; }
 .segmented button { min-height: 34px; border: 0; border-radius: 4px; color: #96aaad; background: transparent; font-size: 11px; }
 .segmented button.active { background: #244d4b; color: #d5fff2; box-shadow: inset 0 0 0 1px #4b837b; }
 .segmented button:hover:not(.active) { color: white; background: #192b30; }

@@ -19,9 +19,9 @@
           <canvas id="viewport" aria-label="可拖拽的几何 LOD 场景" tabindex="0"></canvas>
           <div class="stage-vignette" aria-hidden="true"></div>
           <div class="stage-heading">
-            <span class="eyebrow">RESIDENT GEOMETRY / LIVE LOD</span>
+            <span class="eyebrow" id="geometry-heading-eyebrow">RESIDENT GEOMETRY / LIVE LOD</span>
             <h1>Shape at every<br /><em>distance.</em></h1>
-            <p>一份层级。三件雕塑。相机运动时由 GPU 选择实际绘制的簇。</p>
+            <p id="geometry-heading-text">一份层级。三件雕塑。相机运动时由 GPU 选择实际绘制的簇。</p>
           </div>
           <div class="stage-foot">
             <span><i class="live-dot"></i> <span id="stage-mode">NORMAL MATERIAL</span></span>
@@ -42,8 +42,10 @@
               <button type="button" data-debug="material" class="active" aria-pressed="true">材质</button>
               <button type="button" data-debug="clusters" aria-pressed="false">簇颜色</button>
               <button type="button" data-debug="levels" aria-pressed="false">LOD 层级</button>
+              <button type="button" data-debug="residency" aria-pressed="false">页驻留</button>
             </div>
-            <p class="microcopy">簇颜色固定于 cluster ID；层级颜色显示最终被选中的 LOD。</p>
+            <p class="microcopy">簇颜色固定于 primitive 与 cluster ID（同一资产的实例同色）；层级颜色显示最终被选中的 LOD。页驻留：绿＝已驻留细节，蓝＝常驻根簇，橙＝缺子页时的祖先回退，红＝回退到根，灰＝非分页驻留几何。</p>
+            <div class="toggle-row"><label for="split"><span>左右对照</span><small>左半材质，右半调试色，同一帧</small></label><input id="split" type="checkbox" /></div>
           </section>
 
           <section class="panel-block">
@@ -51,7 +53,8 @@
             <input id="error-range" type="range" min="0" max="12" step="0.5" value="2" aria-label="最大屏幕误差像素" />
             <div class="range-labels"><span>更高细节</span><span>更少三角形</span></div>
             <div class="toggle-row"><label for="freeze"><span>冻结 LOD 视点</span><small>相机仍可移动</small></label><input id="freeze" type="checkbox" /></div>
-            <div class="toggle-row"><label for="frustum"><span>视锥剔除</span><small>仅视锥，不含遮挡剔除</small></label><input id="frustum" type="checkbox" checked /></div>
+            <div class="toggle-row"><label for="frustum"><span>视锥剔除</span><small>簇级视锥测试</small></label><input id="frustum" type="checkbox" checked /></div>
+            <div class="toggle-row" data-mode="streamed" hidden><label for="occlusion"><span>遮挡剔除</span><small>两阶段 Hi-Z，含当前帧恢复</small></label><input id="occlusion" type="checkbox" checked /></div>
           </section>
 
           <section class="panel-block">
@@ -73,18 +76,36 @@
               <div><dt>实际索引</dt><dd id="actual-indices">—</dd></div>
               <div><dt>统计帧</dt><dd id="probe-frame">—</dd></div>
               <div><dt>GPU LOD 选择</dt><dd id="gpu-lod-ms">—</dd></div>
+              <div><dt>GPU 计时合计</dt><dd id="gpu-frame-ms">—</dd></div>
               <div><dt>GPU 采样帧</dt><dd id="gpu-sample-frame">—</dd></div>
               <div><dt>CPU 提交</dt><dd id="cpu-submit-ms">—</dd></div>
+              <div><dt>rAF 间隔</dt><dd id="raf-ms">—</dd></div>
               <div><dt>视口</dt><dd id="viewport-size">—</dd></div>
               <div><dt>GPU 资源</dt><dd id="gpu-memory">—</dd></div>
             </dl>
-            <p class="source-count">源雕塑网格：<strong id="source-triangles">—</strong> 三角形 / 实例 · <strong id="source-total">—</strong> 三角形 / 三实例。上方实际值仅统计雕塑，不含地面与基座。</p>
+            <p class="source-count" data-mode="resident">源雕塑网格：<strong id="source-triangles">—</strong> 三角形 / 实例 · <strong id="source-total">—</strong> 三角形 / 三实例。上方实际值仅统计雕塑，不含地面与基座。</p>
             <p id="probe-status" class="probe-status" aria-live="polite">等待第一帧 GPU 统计…</p>
+          </section>
+
+          <section class="panel-block readout" data-mode="streamed" hidden>
+            <div class="block-head"><h3>页面流送</h3><span>RUNTIME · LIVE</span></div>
+            <dl class="metric-grid">
+              <div><dt>驻留页 / 总页</dt><dd id="stream-pages">—</dd></div>
+              <div><dt>请求 · 上传中</dt><dd id="stream-requested">—</dd></div>
+              <div><dt>预算延期组</dt><dd id="stream-deferred">—</dd></div>
+              <div><dt>祖先回退簇</dt><dd id="stream-fallback">—</dd></div>
+              <div><dt>页池 / 池上限</dt><dd id="stream-pool">—</dd></div>
+              <div><dt>独特数据 / 池</dt><dd id="stream-ratio">—</dd></div>
+              <div><dt>GPU 反馈簇 · 三角形</dt><dd id="stream-feedback">—</dd></div>
+              <div><dt>容量迁移 · 阶段</dt><dd id="stream-migrations">—</dd></div>
+              <div class="metric-feature"><dt>CPU 参考：全驻留 / 当前驻留切分三角形</dt><dd id="cpu-predicted">—</dd></div>
+            </dl>
+            <p class="source-count"><span id="stream-unique">—</span>。源三角形 <strong id="source-triangles-streamed">—</strong>。CPU 参考只统计视锥内对象的完整切分，不是 GPU 绘制结果。</p>
           </section>
 
           <section class="panel-bottom">
             <button id="export" class="export-button" type="button">导出诊断 JSON <span>↗</span></button>
-            <p class="scope-note">驻留 GPU LOD 原型，尚无流送 / 遮挡剔除。当前页仅验证可见几何选择与光栅绘制。</p>
+            <p class="scope-note" id="scope-note">驻留 GPU LOD 原型，无流送 / 遮挡剔除；流送画廊见 ?scene=streamed。当前页仅验证可见几何选择与光栅绘制。</p>
             <p class="adapter" id="adapter">等待 WebGPU 适配器…</p>
           </section>
         </aside>

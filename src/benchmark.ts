@@ -225,7 +225,7 @@ export class FoundationBenchmark {
           'Owned GPU bytes exclude driver, browser, JS, WASM, and swapchain allocations.',
           'Scenario advances exactly 1/60 simulated second per rendered frame; durationSeconds uses real wall time.',
           'This foundation scene does not validate large-scene, virtual geometry, GI, or reflection performance.',
-          'Pacing attribution names the first matching cause from the preceding frame; it is diagnostic, not a root-cause proof.'] };
+          'Pacing compares the frames before late and on-time intervals; differences show association, not cause.'] };
     } catch (error) { this.progress.phase = 'failed'; this.dispose(); throw error; }
   }
 

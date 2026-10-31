@@ -188,10 +188,10 @@ describe('BenchmarkRecorder', () => {
     expect(second.split(',')[column]).toBe('0');
   });
 
-  it('counts vsync multiples, the longest late run and the first matching cause of each late frame', () => {
+  it('counts vsync multiples, the longest late run and the evidence before late and on-time frames', () => {
     const recorder = new BenchmarkRecorder(16, 33.3);
-    // Seven frames keep the 16.7 ms pace. Frame 8 follows heavy main-thread work, 9 overlaps a long
-    // task, 10 follows a heavy GPU sample, 11 has no measured cause and 12 overlaps a long animation frame.
+    // Seven frames keep the 16.7 ms pace and frames 8-12 are late. Frame 8 follows heavy main-thread
+    // work, 9 overlaps a long task, 10 follows a heavy GPU sample and 12 overlaps a long animation frame.
     const intervals = [16.7, 16.6, 16.7, 16.7, 16.6, 16.7, 16.7, 33.5, 33.4, 33.5, 50.1, 50];
     const work = [4, 4, 4, 4, 4, 4, 20, 4, 4, 4, 4, 4];
     let elapsed = 0;
@@ -207,7 +207,11 @@ describe('BenchmarkRecorder', () => {
     expect(pacing.intervalMultiples).toEqual({ one: 7, two: 3, three: 2, fourOrMore: 0 });
     expect(pacing.overBudgetMultiples).toEqual({ one: 0, two: 3, three: 2, fourOrMore: 0 });
     expect(pacing.longestOverBudgetRun).toEqual({ frames: 5, startFrame: 8 });
-    expect(pacing.overBudgetAttribution).toEqual({ previousFrameWork: 1, longTask: 2, gpuSampled: 1, unattributed: 1 });
+    expect(pacing.late).toEqual({ frames: 5, longTaskOverlap: 2, previousGpuSampled: 1, previousGpuOverNominal: 1,
+      previousMainThreadMs: { count: 5, mean: expect.closeTo(7.7, 9), p50: 4.5, p95: 20.5, p99: 20.5, max: 20.5 } });
+    // The first frame has no preceding frame, so the on-time group has six main-thread spans.
+    expect(pacing.onTime).toEqual({ frames: 7, longTaskOverlap: 0, previousGpuSampled: 0, previousGpuOverNominal: 0,
+      previousMainThreadMs: { count: 6, mean: 4.5, p50: 4.5, p95: 4.5, p99: 4.5, max: 4.5 } });
     expect(pacing.frameWorkMs?.max).toBe(20);
     expect(pacing.callbackLatencyMs?.p50).toBe(0.5);
     expect(pacing.longTasks).toEqual({ recorded: 2, dropped: 0, longAnimationFrames: 1, totalDurationMs: 65 });

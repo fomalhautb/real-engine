@@ -26,19 +26,32 @@ export interface BenchmarkLongTask {
 
 export interface BenchmarkIntervalMultiples { one: number; two: number; three: number; fourOrMore: number }
 
+/** Evidence about the frames before a group of intervals; comparing late and on-time groups shows association, not cause. */
+export interface BenchmarkPacingGroup {
+  frames: number;
+  /** Callback latency plus main-thread frame work of the preceding frame. */
+  previousMainThreadMs: BenchmarkQuantiles | null;
+  /** Intervals that overlap a recorded long task or long animation frame. */
+  longTaskOverlap: number;
+  /** Preceding frames that have a sparse GPU sample, and those whose sample exceeds the nominal interval. */
+  previousGpuSampled: number;
+  previousGpuOverNominal: number;
+}
+
 /**
  * Frame pacing diagnostics. rAF intervals are quantized to the browser's frame clock, so each
- * interval is counted as a whole multiple of the median (nominal) interval. Each over-budget frame
- * is attributed to the first matching cause, using the preceding frame: its main-thread work
- * exceeded the nominal interval; a long task overlapped the interval; its sparse GPU sample
- * exceeded the nominal interval; otherwise unattributed (outside measured page work).
+ * interval is counted as a whole multiple of the median (nominal) interval. Late (over-budget) and
+ * on-time intervals are summarized separately so their preceding main-thread, long-task and GPU
+ * evidence can be compared. Chrome pipelines main-thread work, so a preceding span longer than one
+ * interval does not by itself make a frame late.
  */
 export interface BenchmarkPacingSummary {
   nominalIntervalMs: number;
   intervalMultiples: BenchmarkIntervalMultiples;
   overBudgetMultiples: BenchmarkIntervalMultiples;
   longestOverBudgetRun: { frames: number; startFrame: number | null };
-  overBudgetAttribution: { previousFrameWork: number; longTask: number; gpuSampled: number; unattributed: number };
+  late: BenchmarkPacingGroup;
+  onTime: BenchmarkPacingGroup;
   callbackLatencyMs: BenchmarkQuantiles | null;
   frameWorkMs: BenchmarkQuantiles | null;
   longTasks: { recorded: number; dropped: number; longAnimationFrames: number; totalDurationMs: number };
@@ -347,27 +360,35 @@ export class BenchmarkRecorder {
       }
       return false;
     };
-    const attribution = { previousFrameWork: 0, longTask: 0, gpuSampled: 0, unattributed: 0 };
+    const groups = { late: { spans: [] as number[], overlap: 0, sampled: 0, gpuOver: 0 }, onTime: { spans: [] as number[], overlap: 0, sampled: 0, gpuOver: 0 } };
     let run = 0, runStart = 0, longest = 0, longestStart: number | null = null;
     for (let index = 0; index < this.frames; index++) {
       const interval = this.get(index, FIELD.frameIntervalMs);
       const k = nominal > 0 ? Math.max(1, Math.round(interval / nominal)) : 1;
       add(all, k);
-      if (interval <= this.frameBudgetMs) { run = 0; continue; }
-      add(over, k);
-      if (run++ === 0) runStart = this.get(index, FIELD.frame);
-      if (run > longest) { longest = run; longestStart = runStart; }
-      const end = this.get(index, FIELD.elapsedMs), start = end - interval;
-      const previousWork = index === 0 ? NaN
-        : (this.get(index - 1, FIELD.callbackLatencyMs) || 0) + this.get(index - 1, FIELD.frameWorkMs);
-      if (previousWork > nominal) attribution.previousFrameWork++;
-      else if (overlapsTask(start, end)) attribution.longTask++;
-      else if (index > 0 && this.get(index - 1, FIELD.gpuTotal) > nominal) attribution.gpuSampled++;
-      else attribution.unattributed++;
+      const late = interval > this.frameBudgetMs;
+      if (late) {
+        add(over, k);
+        if (run++ === 0) runStart = this.get(index, FIELD.frame);
+        if (run > longest) { longest = run; longestStart = runStart; }
+      } else run = 0;
+      const group = late ? groups.late : groups.onTime;
+      const end = this.get(index, FIELD.elapsedMs);
+      if (overlapsTask(end - interval, end)) group.overlap++;
+      if (index === 0) continue;
+      const span = (this.get(index - 1, FIELD.callbackLatencyMs) || 0) + this.get(index - 1, FIELD.frameWorkMs);
+      if (!Number.isNaN(span)) group.spans.push(span);
+      const gpu = this.get(index - 1, FIELD.gpuTotal);
+      if (!Number.isNaN(gpu)) { group.sampled++; if (gpu > nominal) group.gpuOver++; }
     }
+    const summarize = (group: typeof groups.late, frames: number): BenchmarkPacingGroup => ({ frames,
+      previousMainThreadMs: quantiles(Float64Array.from(group.spans)), longTaskOverlap: group.overlap,
+      previousGpuSampled: group.sampled, previousGpuOverNominal: group.gpuOver });
+    const lateFrames = over.one + over.two + over.three + over.fourOrMore;
     return {
       nominalIntervalMs: nominal, intervalMultiples: all, overBudgetMultiples: over,
-      longestOverBudgetRun: { frames: longest, startFrame: longestStart }, overBudgetAttribution: attribution,
+      longestOverBudgetRun: { frames: longest, startFrame: longestStart },
+      late: summarize(groups.late, lateFrames), onTime: summarize(groups.onTime, this.frames - lateFrames),
       callbackLatencyMs: quantiles(this.present(FIELD.callbackLatencyMs)), frameWorkMs: quantiles(this.present(FIELD.frameWorkMs)),
       longTasks: { recorded: tasks.length, dropped: this.droppedLongTasks,
         longAnimationFrames: tasks.filter(task => task.kind === 'long-animation-frame').length,

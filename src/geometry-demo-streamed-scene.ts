@@ -35,6 +35,8 @@ export interface StreamedGalleryOptions {
   readonly admissionIntervalFrames?: number;
   readonly maxConcurrentMigrations?: number;
   readonly maxRequestsPerFrame?: number;
+  /** Capacity admission policy; default 'work-conserving'. */
+  readonly admission?: 'work-conserving' | 'interval';
 }
 
 export interface StreamedGalleryObject {
@@ -203,7 +205,7 @@ export class StreamedGalleryScene {
       maxPageBytes: input.maxPageBytes ?? 32768, providerLatencyMs: input.providerLatencyMs ?? 0,
       targetUniqueToPoolRatio: input.targetUniqueToPoolRatio ?? 4, shading: input.shading ?? 'lit',
       admissionIntervalFrames: input.admissionIntervalFrames ?? 30, maxConcurrentMigrations: input.maxConcurrentMigrations ?? 4,
-      maxRequestsPerFrame: input.maxRequestsPerFrame ?? 16,
+      maxRequestsPerFrame: input.maxRequestsPerFrame ?? 16, admission: input.admission ?? 'work-conserving',
     };
     if (!Number.isSafeInteger(options.objects) || options.objects < 1 || options.objects > 48) throw new RangeError('STREAMED_GALLERY_OBJECTS');
     if (!Number.isFinite(options.providerLatencyMs) || options.providerLatencyMs < 0 || options.providerLatencyMs > 1000) {
@@ -282,7 +284,7 @@ export class StreamedGalleryScene {
     });
     const runtimeBudget: GeometryStreamCapacityOptions = Object.freeze({ maxResidentBytes, maxPeakBytes,
       intervalFrames: options.admissionIntervalFrames, maxConcurrentMigrations: options.maxConcurrentMigrations,
-      maxCopyPages: 4096, maxCopyBytes: 64 * 1024 ** 2 });
+      maxCopyPages: 4096, maxCopyBytes: 64 * 1024 ** 2, admission: options.admission });
     const material: MaterialBinding | undefined = options.shading === 'identity'
       ? { definition: { ...DEFAULT_MATERIAL_DEFINITION, shading: 'unlit', baseColor: m.instanceColor } } : undefined;
     const sculptureColor = (index: number): Color => options.shading === 'identity' ? objects[index].identityColor

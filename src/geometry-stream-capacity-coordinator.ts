@@ -3,8 +3,14 @@ import type { GpuGeometryStream, PreparedGeometryStreamCapacity } from './gpu-ge
 import { GEOMETRY_GPU_VERTEX_BYTES } from './geometry-gpu-page';
 
 export interface GeometryStreamCapacityOptions extends GeometryStreamRuntimeBudgetOptions {
-  /** Default 30; admission visits at most once per this many rendered frames. */
+  /** Default 30; demand is re-evaluated at least this many rendered frames apart
+   * once the previous plan was satisfied. */
   intervalFrames?: number;
+  /** 'work-conserving' (default): a round that left admitted migrations behind
+   * (concurrency, copy budget, peak headroom or a busy frame lease) plans again
+   * as soon as one of its transactions has retired. 'interval': every round
+   * waits intervalFrames (the earlier behaviour, kept for A/B measurement). */
+  admission?: 'work-conserving' | 'interval';
   /** Future per-stream physical pool ceiling; initial gpuPool budgets remain unchanged. */
   maxPoolBytes?: number;
   /** Total vertex/index copy payload and pages reserved across ALL outstanding
@@ -39,6 +45,7 @@ function bounded(value: number | undefined, fallback: number, maximum: number) {
  * into the replacement output; physical slot addresses are never history IDs. */
 export class GeometryStreamCapacityCoordinator<T extends GeometryStreamRenderedOwner> {
   private readonly interval: number;
+  private readonly workConserving: boolean;
   private readonly copyBytes: number;
   private readonly copyPages: number;
   private readonly concurrent: number;
@@ -51,10 +58,19 @@ export class GeometryStreamCapacityCoordinator<T extends GeometryStreamRenderedO
   private migrations = 0;
   private deferred = 0;
   private peakBytes = 0;
+  /** Admitted work the last round could not launch. */
+  private backlog = false;
+  /** Transactions that have left the map, and that count at the last round. */
+  private released = 0;
+  private roundReleased = 0;
+  private earlyRounds = 0;
 
   constructor(private readonly budget: GeometryStreamRuntimeBudget,
     private readonly targets: readonly GeometryStreamCapacityTarget<T>[], options: GeometryStreamCapacityOptions) {
     this.interval = bounded(options.intervalFrames, 30, 600);
+    const admission = options.admission ?? 'work-conserving';
+    if (admission !== 'work-conserving' && admission !== 'interval') throw new Error('GEOMETRY_CAPACITY_OPTION');
+    this.workConserving = admission === 'work-conserving';
     this.copyBytes = bounded(options.maxCopyBytes, 16 * 1024 ** 2, 256 * 1024 ** 2);
     this.copyPages = bounded(options.maxCopyPages, 256, 4096);
     this.concurrent = bounded(options.maxConcurrentMigrations, 4, 16);
@@ -127,7 +143,7 @@ export class GeometryStreamCapacityCoordinator<T extends GeometryStreamRenderedO
         try { this.discard(next); } catch (cleanup) { this.fail(cleanup); }
         this.fail(error);
       } finally {
-        if (next.phase !== 'ready' && this.transactions.get(action.index) === next) this.transactions.delete(action.index);
+        if (next.phase !== 'ready' && this.transactions.get(action.index) === next) { this.transactions.delete(action.index); this.released++; }
       }
     })();
   }
@@ -156,7 +172,7 @@ export class GeometryStreamCapacityCoordinator<T extends GeometryStreamRenderedO
         transaction.phase = 'retiring'; this.migrations++;
         transaction.done = committed.retired.catch(error => { this.fail(error); }).then(() => {
           try { oldBindings.dispose(); } catch (error) { this.fail(error); }
-          if (this.transactions.get(transaction.action.index) === transaction) this.transactions.delete(transaction.action.index);
+          if (this.transactions.get(transaction.action.index) === transaction) { this.transactions.delete(transaction.action.index); this.released++; }
         });
       } catch (error) {
         try { this.discard(transaction); } catch (cleanup) { this.fail(cleanup); }
@@ -164,25 +180,30 @@ export class GeometryStreamCapacityCoordinator<T extends GeometryStreamRenderedO
       }
     }
     if (this.error || this.transactions.size >= this.concurrent) return;
-    if (frame < this.nextFrame) return;
+    // Work-conserving: leftover admitted work runs as soon as a transaction has
+    // retired; only a satisfied plan idles until the interval.
+    const early = this.workConserving && this.backlog && this.released !== this.roundReleased && frame < this.nextFrame;
+    if (frame < this.nextFrame && !early) return;
     const demands = this.targets.map(target => target.runtime.capacityDemand);
     if (demands.some(demand => demand === null)) return;
-    this.nextFrame = frame + this.interval;
+    this.nextFrame = frame + this.interval; this.roundReleased = this.released; this.backlog = false;
+    if (early) this.earlyRounds++;
+    let attempt = 0;
     try {
       const plan = this.budget.plan(demands.map(demand => demand!));
       const excluded = new Set(this.transactions.keys());
       // Busy frame leases may exclude additional streams, but cannot cause an
       // unbounded rescan. Each successful launch also consumes a concurrency slot.
-      for (let attempt = 0; attempt < 64 && !this.error && !this.disposed && this.transactions.size < this.concurrent; attempt++) {
+      for (; attempt < 64 && !this.error && !this.disposed && this.transactions.size < this.concurrent; attempt++) {
         const reserved = this.reservations(), availableBytes = this.copyBytes - reserved.copyBytes, availablePages = this.copyPages - reserved.copyPages;
-        if (availableBytes <= 0 || availablePages <= 0) { this.deferred++; break; }
+        if (availableBytes <= 0 || availablePages <= 0) { this.deferred++; this.backlog = true; break; }
         this.rootCopies.forEach((root, index) => { if (root.bytes > availableBytes || root.pages > availablePages) excluded.add(index); });
         const decision = this.budget.next(plan, this.targets.map(target => target.runtime.pool.slotCount), reserved.bytes,
           { excluded: [...excluded], growthBytes: reserved.growthBytes });
-        if (!decision.action) { if (decision.deferred) this.deferred++; break; }
+        if (!decision.action) { if (decision.deferred) { this.deferred++; this.backlog = true; } break; }
         const action = decision.action, target = this.targets[action.index], state = target.runtime.pool.diagnostics();
         excluded.add(action.index);
-        if (state.framesInFlight >= state.limits.maxFramesInFlight) { this.deferred++; continue; }
+        if (state.framesInFlight >= state.limits.maxFramesInFlight) { this.deferred++; this.backlog = true; continue; }
         const resident = target.runtime.pool.residentPageIds(), pages = [...target.runtime.pool.directory.rootPages], roots = new Set(pages);
         let bytes = this.rootCopies[action.index].bytes;
         for (const id of action.pages) if (!roots.has(id) && resident.has(id) && pages.length < availablePages) {
@@ -191,6 +212,8 @@ export class GeometryStreamCapacityCoordinator<T extends GeometryStreamRenderedO
         }
         this.prepare(action, pages, bytes);
       }
+      // Stopping on busy concurrency slots or the attempt bound may leave admitted work.
+      if (this.transactions.size >= this.concurrent || attempt >= 64) this.backlog = true;
     } catch (error) { this.fail(error); }
   }
   diagnostics() {
@@ -203,8 +226,9 @@ export class GeometryStreamCapacityCoordinator<T extends GeometryStreamRenderedO
       liveBytes, reservedBytes: reserved.bytes, accountedBytes: liveBytes + reserved.bytes, peakBytes: this.peakBytes,
       pendingGrowthBytes: reserved.growthBytes, projectedLiveBytes: liveBytes + reserved.growthBytes,
       copyReservations: { bytes: reserved.copyBytes, pages: reserved.copyPages }, inFlightMigrations: transactions.length,
-      scheduling: { maxConcurrentMigrations: this.concurrent, maxCopyBytes: this.copyBytes, maxCopyPages: this.copyPages, intervalFrames: this.interval },
-      migrations: this.migrations, deferred: this.deferred, limits: this.budget.options,
+      scheduling: { maxConcurrentMigrations: this.concurrent, maxCopyBytes: this.copyBytes, maxCopyPages: this.copyPages, intervalFrames: this.interval,
+        admission: this.workConserving ? 'work-conserving' as const : 'interval' as const },
+      migrations: this.migrations, deferred: this.deferred, earlyRounds: this.earlyRounds, backlog: this.backlog, limits: this.budget.options,
       targets: transactions.map(value => ({ index: value.action.index, slots: value.action.slots, temporary: value.action.temporary, phase: value.phase })) };
   }
   /** Active bindings remain Renderer-owned; this waits only for pending/retiring

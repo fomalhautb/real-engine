@@ -24,13 +24,14 @@ async function settle() { for (let step = 0; step < 8; step++) await Promise.res
 const near = [{ groupId: 2, projectedError: 100 }, { groupId: 0, projectedError: 50 }];
 type Bindings = { pool: object; physicalVertexCount: number; instanceHistory: object; dispose: () => void };
 
-function setup(config: { slots?: number[]; concurrent?: number; peakCopies?: number; copyBytes?: number; copyPages?: number } = {}) {
+function setup(config: { slots?: number[]; concurrent?: number; peakCopies?: number; copyBytes?: number; copyPages?: number;
+  interval?: number; admission?: 'work-conserving' | 'interval' } = {}) {
   const initial = config.slots ?? [4, 2];
   const asset = directory(), layout = geometryGpuPoolLayout(asset), inputs = initial.map(() => ({ directory: asset, capacity: 1 }));
   const reference = new GeometryStreamRuntimeBudget(inputs, { maxResidentBytes: 1e6, maxPeakBytes: 2e6 }, limits);
   const resident = initial.reduce((sum, slots, index) => sum + reference.state(index, slots).totalBytes, 0);
-  const options = { maxResidentBytes: resident, maxPeakBytes: resident + (config.peakCopies ?? 1) * reference.state(0, 2).totalBytes, intervalFrames: 1,
-    maxConcurrentMigrations: config.concurrent ?? 1, maxCopyBytes: config.copyBytes, maxCopyPages: config.copyPages };
+  const options = { maxResidentBytes: resident, maxPeakBytes: resident + (config.peakCopies ?? 1) * reference.state(0, 2).totalBytes, intervalFrames: config.interval ?? 1,
+    maxConcurrentMigrations: config.concurrent ?? 1, maxCopyBytes: config.copyBytes, maxCopyPages: config.copyPages, admission: config.admission };
   const budget = new GeometryStreamRuntimeBudget(inputs, options, limits);
   let owned = 0;
   const owner = (bytes: number) => { owned += bytes; let disposed = false; return vi.fn(() => { if (!disposed) { disposed = true; owned -= bytes; } }); };
@@ -300,6 +301,47 @@ describe('Renderer capacity transaction coordinator', () => {
     for (const value of [0, 17, 1.5, Number.NaN]) expect(() => new GeometryStreamCapacityCoordinator(s.budget,
       s.fixtures.map(f => f.target), { ...s.options, maxConcurrentMigrations: value })).toThrow('OPTION');
     await defaults.dispose(); await s.close(); expect(s.owned()).toBe(0);
+  });
+
+  it('starts the next admission round when a transaction retires instead of idling until the interval', async () => {
+    const run = async (admission: 'work-conserving' | 'interval') => {
+      const s = setup({ interval: 30, admission }), [a, b] = s.fixtures;
+      b.runtime.capacityDemand = near;
+      s.coordinator.tick(1); await settle(); s.coordinator.tick(2);
+      expect(a.runtime.pool.slotCount).toBe(2);
+      a.fences[0].resolve(); await settle();
+      let frame = 3;
+      for (; frame <= 40 && !vi.mocked(b.runtime.prepareCapacity).mock.calls.length; frame++) { s.coordinator.tick(frame); await settle(); }
+      await s.close(); expect(s.owned()).toBe(0);
+      return frame - 1;
+    };
+    // The shrink leaves B's growth behind (one concurrency slot): retirement re-plans at once.
+    expect(await run('work-conserving')).toBe(3);
+    // Interval admission re-plans only at frame 1 + 30.
+    expect(await run('interval')).toBe(31);
+  });
+
+  it('waits for the interval once a plan is satisfied and counts early rounds', async () => {
+    const s = setup({ interval: 30 }), [a, b] = s.fixtures, plan = vi.spyOn(s.budget, 'plan');
+    b.runtime.capacityDemand = near;
+    s.coordinator.tick(1); await settle(); s.coordinator.tick(2); a.fences[0].resolve(); await settle();
+    s.coordinator.tick(3); await settle(); s.coordinator.tick(4); b.fences[0].resolve(); await settle();
+    expect(b.runtime.pool.slotCount).toBe(4);
+    // B's round also filled the only slot, so its retirement re-plans once, finds nothing, and then idles.
+    s.coordinator.tick(5); expect(plan).toHaveBeenCalledTimes(3);
+    for (let frame = 6; frame < 35; frame++) s.coordinator.tick(frame);
+    expect(plan).toHaveBeenCalledTimes(3);
+    s.coordinator.tick(35); expect(plan).toHaveBeenCalledTimes(4);
+    expect(s.coordinator.diagnostics()).toMatchObject({ phase: 'idle', migrations: 2, earlyRounds: 2,
+      scheduling: { admission: 'work-conserving', intervalFrames: 30 } });
+    await s.close(); expect(s.owned()).toBe(0);
+  });
+
+  it('rejects an unknown admission policy', async () => {
+    const s = setup();
+    expect(() => new GeometryStreamCapacityCoordinator(s.budget, s.fixtures.map(f => f.target),
+      { ...s.options, admission: 'eager' as 'interval' })).toThrow('GEOMETRY_CAPACITY_OPTION');
+    await s.close();
   });
 
   it('bounds concurrent preparations and reduces a many-stream exchange in deterministic frame steps', async () => {

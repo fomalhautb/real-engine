@@ -464,7 +464,7 @@ async function start(): Promise<void> {
     streamed = await StreamedGalleryScene.create({ objects: numberParam('objects'), around: numberParam('around'), across: numberParam('across'),
       providerLatencyMs: numberParam('latency'), targetUniqueToPoolRatio: numberParam('ratio'), shading,
       admissionIntervalFrames: numberParam('interval'), maxConcurrentMigrations: numberParam('migrations'),
-      maxRequestsPerFrame: numberParam('requests') }, (done, total) => { element('status').textContent = `BUILDING ${done}/${total}`; });
+      maxRequestsPerFrame: numberParam('requests'), admission: params.get('admission') === 'interval' ? 'interval' : undefined }, (done, total) => { element('status').textContent = `BUILDING ${done}/${total}`; });
     if (disposed) return;
     planners = streamed.objects.map(object => new GeometryStreamCut(object.directory));
     created = await Renderer.create(canvas, referenceMode ? streamed.referenceBatches : streamed.batches,

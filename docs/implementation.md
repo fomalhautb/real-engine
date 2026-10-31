@@ -2,6 +2,27 @@
 
 更新日期：2026-10-31。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 资产转换、确定性 BC7 编码与大场景漫游页（2026-10-31）
+
+- **工具链**：
+  - ZIP/ZIP64 解包：逐条目校验 CRC32 并记录 SHA-256；
+  - 纯 CPU、与 worker 数无关的确定性 BC7 编码器，按材质通道实际用途加权误差；
+  - 旧格式 DDS（DXT1–5、BC4、BC5）解码与 DirectX 法线约定转换；
+  - FBX 场景经 Blender 5.2.2 转换，并按 ORCA 约定显式改写材质；
+  - 写出把几何、纹理、查询代理、UV 审计和相机路径绑定到同一来源的资产集。
+- **Bistro Exterior**：
+  - 转换结果：1,591 个 primitive、2,829,226 个三角形、132 个材质、405 张图像，相机路径共 100 s。
+  - 分页与纹理：1,402 个不透明 primitive 进入分页；纹理为 273 张 BC7 和 132 张 RGBA8 法线贴图，原生合计 3.13 GB。
+- **大场景漫游页** `/large-scene.html?set=…`：
+  - 提供最多 8 个固定关键帧，可沿资产集的相机路径漫游，并有材质、簇、层级三种视图。
+  - 在 Apple 上，Bistro Exterior（1,402 个批次）和 Sponza（401 个批次）都能加载、绘制，释放后应用持有的 GPU 字节归零。
+  - 满载时 Bistro 的 rAF 间隔为 140–200 ms，只作诊断。
+- **未完成**：
+  - 资产：Ivy 的几何（有一个 primitive 超过每 primitive 100 万三角形的上限）、Emissive Candles、Animated Knight、Bistro Interior 与 Interior_Wine 都还没有转换；Curtains 与 Trees 还没有和 Sponza 合成场景。
+  - 渲染路径：MASK/BLEND primitive 不进分页漫游；遮蔽贴图不参与着色；渲染器的 FOV 和远平面仍是固定值，Bistro 路径的 FOV 没有应用；法线贴图还没有 BC5 路径。
+  - 验收：大场景视觉验收和性能验收都没有做。
+- 详见「资产解包、转换与大场景漫游页」与 [assets.md](assets.md#local-conversions-2026-10-3031-apple-m3-max)。
+
 ## 几何流送的超额订阅画廊与工作守恒准入（2026-10-31）
 
 - **调试视图**：新增 `residency` 视图，按驻留细节、根、回退祖先和根回退分色显示；`debugSplit` 可在同一帧左右对照材质与诊断视图。调试色只替换最终颜色，选簇、剔除、阴影和查询都不变。
@@ -987,6 +1008,177 @@ SwiftShader 的同组 10 项也通过，实际适配器为 `google / swiftshader
 当前障碍包括 373 个 primitive 的 TEXCOORD_1、59 个 COLOR_0、一个 BLEND 材质、尚未解释的 KHR_lights_punctual，以及导入器顶点/索引预算；声明的单个 BIN 为 139,973,456 字节，也超过默认累计下载预算。几何 BIN、贴图及其余载荷均未下载。包内许可顶部的用途描述与后附 CC BY 4.0 全文存在表述差异，正式发布资产前需核实；本轮没有将资产放入仓库或发行包。后续仍须保真转换、材质与纹理路径、分区流送、室内外完整场景和视觉验收。
 
 进一步按同一 glTF 的实际 textureInfo 检查，所有贴图都使用 UV0，未引用 UV1，因此该固定版本的离线转换可在保留审计记录后移除未使用的 UV1；这不等于引擎普遍支持任意 UV 集。59 个带 COLOR_0 的 primitive 使用 VEC4 float accessor，尚未读取颜色数据，不能假设全白或删除。唯一 BLEND 材质为 `dirt_decal`，alpha 约 0.35、引用基础色贴图，用于 4 个 primitive / 8,140 三角形，需保真处理，不能改作 Mask。24 个灯光节点为 23 point 加 1 directional，强度均为 0；当前包可保存并报告禁用灯的元数据，但通用点光/聚光灯的路线要求仍然保留。下一批接入先验证真实顶点色并贯通共享材质路径，再处理 decal、转换与分区流送。
+
+### 资产解包、转换与大场景漫游页（2026-10-31）
+
+本小节对应九个提交：`6edb3ac`、`c3b454f`、`233dd03`、`99fb3dc`、`f0fb3dc`、`2d9d798`、`491657e`、`69fdb7a`、`69229f9`。来源、许可、哈希与转换约定另见 [assets.md](assets.md#local-conversions-2026-10-3031-apple-m3-max)。
+
+- 目标机：Apple M3 Max（30 核 GPU、36 GB 统一内存），macOS 26.6.2，Google Chrome 156，WebGPU adapter 为非 fallback 的 `apple / metal-3`。
+- 产物：转换产物和证据都在被忽略的 `artifacts/` 下，目录名带 `-mac-20261030` 或 `-mac-20261031` 后缀，不入库。
+- 计时：硬件运行时多个并行分支同时占用 GPU/CPU，文中的时间和帧间隔都只作诊断，不是基准结果。SwiftShader 用例只证明功能正确。
+- 范围：没有修改渲染器、几何流送或材质的运行时接口；漫游页只证明转换后的资产能加载、绘制和释放，不是大场景视觉验收。
+
+#### 已实现
+
+##### 归档解包与包重建
+
+- **解包。** `scripts/extract-archive.mjs` 用纯 Node 解出 ZIP/ZIP64 中选定的条目（stored 或 deflate）。
+  - 校验：逐条目检查 CRC32，并记录每个文件的 SHA-256；条目名必须安全；可选校验归档和条目的期望哈希，以及 glTF 依赖闭包。
+  - 记录：未选中的条目写进清单，不会悄悄丢弃。
+  - 发布：用硬链接发布，`manifest.json` 是完成标记。
+- **重建。**
+  - `scripts/build-gltf-query-proxies.mjs` 从已有几何包中通过哈希校验的页，按指定的对象空间误差重建固定查询代理。
+  - `scripts/audit-gltf-uv-demand.mjs` 从源文档重算每个 primitive 的 UV0 需求；与几何清单有任何偏差都拒绝。
+  - `publishDirectory` 新增可选的硬链接模式，用于多 GB 的产物。
+
+##### 确定性 BC7 编码器与旧格式 DDS 源
+
+- **编码器。** `scripts/build-texture.mjs --encoder builtin` 是纯 CPU 的 BC7 编码器。
+  - 模式：覆盖全部 8 种模式，包括 PCA 端点、refit、p-bit 和分区搜索。不透明 alpha 保持精确的 255。
+  - 确定性：在有界的 `worker_threads` 池上运行。输出字节只由源和选项决定，与 worker 数无关。
+  - mip 链：与 `buildMipChain` 逐位一致。
+  - `build.json`：记录模块哈希、每级 PSNR/RMSE/最大误差和模式直方图，不记录耗时。
+  - 解码器验证：在每种模式 16,384 个固定种子的随机块上，与 macOS ImageIO 逐位一致；结果哈希已固定，其他平台照样能跑这项检查。
+- **按材质通道加权。** `scripts/build-gltf-textures.mjs` 打包 glTF 中的所有材质图像。每张图按材质槽实际读取的通道加权：
+  - metallicRoughness 读 G/B，occlusion 读 R；
+  - base color 的 alpha 只在 MASK/BLEND 覆盖时计入；
+  - alpha 权重为零时，编码器可以只用不透明模式 0–3。
+  - 法线贴图走 RGBA8 线性参考路径；色彩空间冲突直接拒绝。
+- **旧格式 DDS。** `src/texture-bcn.ts` 解码 FourCC DDS：DXT1–5、ATI1/BC4U、ATI2/BC5U 和 32 位 RGB。
+  - 舍入：取理想调色板值，按最近值舍入到 8 位（平局向下），不做位复制。
+  - 与 ImageIO 对照：BC1–BC3 颜色逐位一致；BC3 alpha、BC4 和 BC5 与 ImageIO 的截断结果相差 0 或 1。
+  - `--normal-convention directx`：翻转法线 G 通道，只对两通道源（BC5）重建 Z，不改 alpha。
+  - 记录：`build.json` 写入 `normalMap {convention, flippedGreen, reconstructedZ, convertedRgba8Sha256}`；重新编码的 DDS 源另存为 `source-input.dds`。
+
+##### Sponza 采集脚本与资产集
+
+- **不再硬编码。** 采集脚本去掉了写死的 Edge、5173 端口和带日期的 Windows 资产目录。
+  - 服务地址：取自 `--base-url`、`SPONZA_BASE_URL` 或 `PLAYWRIGHT_PORT`，只允许回环地址。
+  - 浏览器：取自 `--channel` 或 `SPONZA_CHANNEL`；macOS 默认 chrome，Windows 默认 msedge。
+  - 资产根：取自资产集文件，或逐个根目录的参数。
+- **超时与断连。** `capture-sponza-gi.mjs` 默认最多等 3,600,000 ms（`--timeout-ms` 可调）。超时报 `SPONZA_GI_DEADLINE`，浏览器断开报 `SPONZA_GI_BROWSER_DISCONNECTED`，不会无限等待。
+- **开发服务器。** `scripts/with-dev-server.mjs` 为当前检出启动独立的 Vite 服务器（strictPort、127.0.0.1，关闭 HMR 和文件监视），在其上运行一条命令。
+- **资产集。** `scripts/write-asset-set.mjs` 校验几何、纹理、查询代理和 UV 审计描述的是同一个源，再写出 `asset-set.json`。
+  - `--camera-path` 用 `src/camera-path.ts` 的同一个解析器校验路径，复制为 `camera-path.json`，并记录 URL、哈希、样本数和时长。
+  - 复核：用新代码重建 Sponza 演示资产集，除集合自身 URL 外与原文件完全相同。
+
+##### FBX 场景经 Blender 转换
+
+- **导入。** `scripts/blender/convert-fbx-scene.py` 在 Blender 5.2.2 LTS 中以后台、出厂设置运行。
+  - 保留：自定义法线、切线、平行光。不搜索图像。
+  - 报告：每个对象/网格（含 active UV）、去重与实例展开的三角形数、包围盒、材质的贴图节点和 Principled 参数、图像、灯光，以及相机路径（采样后转到 glTF 坐标）。
+  - 导出项：按导出器实际提供的选项过滤。
+- **材质映射。** `scripts/apply-fbx-material-map.mjs --convention orca-metal-rough` 按 ORCA 约定显式改写材质：
+  - BaseColor：RGB 为颜色，alpha 为覆盖。
+  - Specular 贴图：R 为遮蔽，G 为粗糙度，B 为金属度。
+  - 法线：DirectX 约定，强度 1。
+  - Emissive：RGB。
+  - 材质名含 `.DoubleSided` 的设为双面。
+  - alpha 全为 255 的设为 OPAQUE；否则设为 MASK，阈值 0.5，与 Falcor 一致。
+  - 删除 `KHR_materials_specular`。
+  - 输出：图像以硬链接放入，许可证文件随产物保留，并写出 `conversion.json` 和 `camera-path.json`。
+
+##### 相机路径与大场景漫游页
+
+- **相机路径。** `src/camera-path.ts` 不依赖渲染器类型，提供三个函数：
+  - `parseCameraPath`：样本数不少于 2，时间严格递增，方向必须非零并会归一化，可选垂直 FOV。
+  - `sampleCameraPath`：位置用均匀 Catmull-Rom 插值，端点缺失的邻点取反射点，因此等距共线样本保持在直线上。前向和上方向用归一化线性混合，方向相反时回退到较近的样本。
+  - `cameraPathKeyframes`：给出固定视角使用的样本序号。
+- **场景加载。** `src/gltf-package-scene.ts` 把资产集读成引擎自有的批次。
+  - 读取：所有几何文件都限制字节数并校验 SHA-256；纹理集和 UV 审计的源哈希必须与几何源一致。
+  - 只有不透明的分页 primitive 成为批次。MASK/BLEND 和镜像实例放进 `omitted`，附原因和三角形数。
+  - 遮蔽贴图：引擎材质模型不读，加载器剥离后逐个报告。
+  - 材质因子：仅因 float32 舍入超过 1 的才钳回 1，并记录每处修改；超出更多则报 `GLTF_PACKAGE_FACTOR_RANGE`。
+- **漫游页。** `large-scene.html` 提供：
+  - 相机：最多 8 个固定关键帧；沿资产集相机路径连续漫游，没有路径时绕包围盒环绕。
+  - 视图：material、clusters、levels 三种，以及 LOD 误差滑块。两种调试视图按 EV 0 显示；material 视图用场景曝光，默认 EV 3。
+  - 测试接口：`window.__LARGE_SCENE__`，含 `snapshot`、`showKeyframe`、`setWalk`、`setDebug`、`run(frames, walk)` 和 `dispose`。
+  - 用法：`large-scene.html?set=/artifacts/<集合>/asset-set.json[&frames=N]`。
+
+#### 验证
+
+- **`npm run check`。** 基于 main `e63e3f4` 通过：98 个测试文件、810 项测试，构建通过。
+  - 此前一次满载的完整运行中，有 4 项在 Vitest 默认的 5 s 内超时：3 个纹理 CLI 用例，以及 `instance-bvh.test.ts` 的 4096 槽用例。单独重跑全部通过。
+  - 处理：纹理 CLI 用例每例会启动多个编码进程，现给 120 s 超时，断言未改。`instance-bvh` 未改动，在最终运行中通过。
+- **`large-scene.spec.ts`。**
+  - SwiftShader：2 项通过、1 项跳过（没有本地资产集）。
+  - 目标机硬件 + Bistro Exterior 资产集：3 项通过，用时 1.7 分钟。
+  - 目标机硬件 + Sponza 演示资产集：漫游用例 1 项通过，用时 24.9 s。
+  - 命令：`PLAYWRIGHT_PORT=5208 PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGHT_EXPECT_GPU_VENDOR=apple LARGE_SCENE_ASSET_SET=/artifacts/bistro-exterior-asset-set-mac-20261031/asset-set.json npx playwright test tests/browser/large-scene.spec.ts`。
+- **单元测试。**
+  - 新增：`camera-path.test.ts`（3 项）、`gltf-package-scene.test.ts`（2 项）、`fbx-material-map.test.ts`、`texture-bcn.test.ts`、`capture-target.test.ts`。
+  - 扩展：`texture-builtin-cli.test.ts`，加入旧格式 DDS 和 BC5 法线用例。
+
+#### 实测数据（诊断）
+
+##### Sponza GI 基线
+
+- **基线采集。** 输出在 `artifacts/sponza-gi-baseline-mac-20261030`：
+  - 直接光、单次反弹、多次反弹 3 张采集全部完成，`invalidProbes` 为 0，驻留不变；
+  - `afterDispose` 为 0；
+  - 预热 600 帧，第 235 帧首次稳定。
+- **重采。** 基于 `e63e3f4` 重采到 `artifacts/sponza-gi-baseline-mac-20261031`：3 张 PNG 与前一次逐字节相同，首次稳定帧为 239。
+- **没有逐 pass 计时。** 两次运行的 GPU 样本在每张采集内都相同，是同一帧的旧读数，而且不含 GI pass。时间戳修复（b5fd5df）之前的两次尝试都在 renderer 就绪时卡住，日志保留为 `artifacts/assets-mac-20261030/logs/sponza-gi-baseline-capture-attempt1-stalled.log` 和 `…-attempt2-stalled-prefix.log`。
+
+##### Bistro Exterior 转换与打包
+
+- **源。** `BistroExterior.fbx` 为 119,845,216 字节，SHA-256 `47199162…b3b5f195`。Blender 导入约 4 s。
+- **转换结果。**
+  - 1,296 个网格、1,591 个 primitive、1,298 个节点；
+  - 导入后 2,829,226 个三角形（发布方 README 为去重 2,799,704、实例展开 2,832,120）；
+  - 132 个材质：OPAQUE 120、MASK 12，其中 6 个双面；
+  - 405 张图像、1 盏平行光；
+  - 相机路径 2,401 帧，24 fps，共 100 s。
+- **几何。** `artifacts/bistro-exterior-group16-pages-mac-20261031`，用 `--remove-zero-area --group-size 16` 构建：
+  - 移除 19 个零面积三角形；
+  - 1,402 个不透明 primitive 分页（2,543,852 个三角形），189 个 MASK primitive 保持源路由（285,355 个三角形，12 种材质）；
+  - 89,031 个簇、11,195 页；编码 395,662,919 字节，解码 602,407,248 字节；
+  - 代理 899,696 个三角形，139,947,574 字节。
+- **纹理。** `artifacts/bistro-exterior-textures-mac-20261031`，6 个 worker、quality 2，用时 217 s：
+  - 273 张 BC7（原生 626,452,592 字节）和 132 张 RGBA8 法线（2,505,397,520 字节），原生合计 3,131,850,112 字节；
+  - BC7 相对解码后的 DXT 源：PSNR 最小 48.13 dB、平均 51.27 dB、最大 58.72 dB；按使用通道计的最大绝对误差为 28。
+
+##### 漫游页硬件运行（基于 `e63e3f4`）
+
+- **Bistro。** 结果在 `artifacts/large-scene-bistro-mac-20261031/test-results-attempt4`：
+  - 240 帧，1,402 个批次、405 个纹理源；`omitted` 189 个 primitive（285,355 个三角形），报告了 131 个未读的遮蔽输入；
+  - 漫游结束时应用持有的 GPU 字节为 915,531,608，`afterDispose` 为 0；
+  - 面板上的 rAF 间隔为 140–200 ms（满载）。
+  - 失败记录：第一次尝试报 `GLTF_UNSUPPORTED_MATERIAL: occlusion texture`，改为剥离并报告后通过。第二次尝试中 clusters/levels 截图与 material 相同，原因是自动运行结束后页面不再出帧；加入 `run()` 后，第三、四次三种视图各不相同。
+- **Sponza。** 结果在 `artifacts/large-scene-sponza-mac-20261031/test-results-attempt1`：
+  - 240 帧，401 个批次、72 个纹理源、3,738,848 个分页三角形，`omitted` 4 个 BLEND primitive（8,140 个三角形）；
+  - 1 处因子钳制：`materials[12].emissiveFactor[2]` 从 1.00000012 改为 1；
+  - 应用持有的 GPU 字节为 732,799,192，`afterDispose` 为 0。
+
+#### 未完成与失败项
+
+- **Ivy 几何。** 有一个 primitive 含 4,905,636 个三角形，超过几何构建器每 primitive 1,000,000 个三角形的上限，需要离线拆分。目前只构建了纹理。
+- **Emissive Candles。** 未转换：3 个 primitive 共 19,540,000 个三角形，10,002 个节点，buffer 648,098,592 字节，且要求 `KHR_lights_punctual`。
+- **Animated Knight。** 未转换。源只有 Alembic、FBX、USD 和 Maya，没有 glTF；蒙皮动画转换尚未开始。
+- **Bistro Interior / Interior_Wine。** 已解包，未转换；酒场景的附加材质参数尚未映射。
+- **Curtains / Trees。** 几何和纹理已构建，但没有写资产集，也没有与 Sponza 主体合成场景；Trees 只在 group 8 下能构建。
+- **MASK/BLEND 未虚拟化。** Bistro 的植被、玻璃等 189 个 primitive 和 Sponza 的 4 个 BLEND primitive 不进漫游页。
+- **遮蔽贴图不参与着色。** 引擎材质模型不读遮蔽贴图，Bistro 的遮蔽通道因此不生效。
+- **渲染器固定投影。** 垂直 FOV 固定为 π/3.2，远平面固定为 150 m；Bistro 路径的垂直 FOV 0.754 rad 没有应用。Bistro 的水平范围约 174 m × 184 m，最远处的几何可能被裁掉。
+- **没有法线调试视图。** 渲染器只提供 material、clusters、levels。
+- **纹理体积。** Bistro 的法线贴图走 RGBA8，占原生纹理字节的 80%；没有 BC5 法线路径。
+- **性能未验收。** 漫游、GI 采集和纹理构建的所有时间都是满载下的诊断值，不构成任何基准结论。
+
+#### 接口变化
+
+- **新增模块。**
+  - `src/camera-path.ts`；
+  - `src/gltf-package-scene.ts`：`loadAssetSetRoots`、`loadGltfPackageScene`、`clampMaterialFactors`；
+  - `src/texture-bcn.ts`：`decodeLegacyDds`、`convertNormalMap`；
+  - `large-scene.html`，以及 `window.__LARGE_SCENE__` 测试接口。
+- **新增脚本。** `extract-archive.mjs`、`build-gltf-query-proxies.mjs`、`audit-gltf-uv-demand.mjs`、`write-asset-set.mjs`、`with-dev-server.mjs`、`blender/convert-fbx-scene.py`、`apply-fbx-material-map.mjs`；`capture-target.mjs` 新增 `boundedCapture`。
+- **新增选项。**
+  - `build-texture.mjs`：`--encoder builtin`、`--normal-convention`；
+  - `build-gltf-textures.mjs`：接受 `.dds`，新增 `--normal-convention`。
+- **行为变化。**
+  - Sponza 采集脚本和 `tests/browser/fixtures/intel-sponza-assets.ts` 要求显式给出资产根，不再有带日期的 Windows 默认值；
+  - `vite.config.ts` 新增 `largeScene` 入口。
+- **未改动的部分。** 没有修改渲染器、几何流送或材质的运行时接口。
 
 ## 已实现的运行路径
 
@@ -2271,7 +2463,7 @@ Rapier 以独立适配器提供盒子刚体和地面碰撞、最近命中射线�
 | 渲染调度 | 依赖编译和实际执行；可选世界查询 BVH refit、GPU LOD、两阶段遮挡金字塔/恢复表面及体积雾，启用时序雾时增加重建 pass；尚无资源自动分配/别名 |
 | 材质 | 有界表达式图；PBR/Unlit、Opaque/Masked、双面、纹理与参数，基础法线贴图；无多层材质、透射或通用透明 |
 | 资源 | 固定容量批次；材质变体和纹理预算；静态 Opaque 几何有 CPU 缓存、GPU 页池、每帧上传预算、整组准入、祖先保留及默认预算内固定阴影/查询代理；尚无全应用资源预算或纹理流送 |
-| 几何/动画资产 | OBJ、glTF/GLB、蒙皮/Morph；静态 Opaque 离线簇层级、压缩页面、GPU LOD/视锥剔除/间接绘制与分簇演示，可选两阶段主视图遮挡剔除；主 Renderer 已接入分页表面和自动调度，源网格可省略时以固定代理供阴影/查询/GI，旧完整源流送仍可用；源网格可省略批次拒绝 Masked，仍缺动态形变简化或大型流送联合验收 |
+| 几何/动画资产 | OBJ、glTF/GLB、蒙皮/Morph；静态 Opaque 离线簇层级、压缩页面、GPU LOD/视锥剔除/间接绘制与分簇演示，可选两阶段主视图遮挡剔除；主 Renderer 已接入分页表面和自动调度，源网格可省略时以固定代理供阴影/查询/GI，旧完整源流送仍可用；源网格可省略批次拒绝 Masked；离线工具可校验解包 ZIP、确定性编码 BC7、经 Blender 转换 FBX 并写出资产集，`/large-scene.html` 能加载 Bistro Exterior 与 Sponza 资产集（MASK/BLEND 不进分页，遮蔽贴图不参与着色）；仍缺动态形变简化或大型流送联合验收 |
 | 光照 | 可更新的单方向太阳光、直接光与阴影；共享形变世界查询上的固定探针漫反射 GI、可选跨帧反馈、可选变化驱动的有界探针更新和实验性屏幕 Final Gather；新增有界单段镜面/粗糙世界反射，以及可选的反射时间重建与屏幕空间补充（L05 粗糙档与 D02 粗糙波瓣响应未达标）；仍无完整 GI；联合验收中 L01 稳态与 L04 漏光未通过 |
 | 体积雾 | 主视图有界 GPU 高度雾和最多 64 个局部盒/球体积，太阳共享阴影的单次散射、可选三维历史重投影（可选遮挡体局部历史拒绝）、平方深度切片积分与全分辨率深度 HDR 合成；反射沿共享世界介质另行积分；可选 GI 探针空气光照与天空可见性；无点/聚光灯、透明介质路径、自阴影或多散射 |
 | 物理 | 地面、盒子刚体、最近命中射线与球形重叠查询；无角色控制器、ragdoll、布料或破坏 |

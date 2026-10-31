@@ -48,6 +48,50 @@ The five Intel add-ons have completed downloads and independent local SHA-256 re
 
 The first four Intel add-ons contain glTF, FBX and USD variants. Animated Knight contains Alembic, FBX, USD and Maya data, with no glTF entry; its animation conversion remains pending. All five preserve the same `credits_license.txt`, SHA-256 `3f981e31f8de04f3754e63d7c259a0a78f71db8f01b5155c58cac52fb79cc2b9`. That file includes specific use and credit notices before the CC BY 4.0 text. Preserve the complete notice with derived assets; the CC0 statement above applies only to the two small fixtures.
 
-Bistro is the original ORCA source referenced by the [Bevy large-scenes example](https://github.com/bevyengine/bevy/tree/main/examples/large_scenes/bistro), not the separately processed glTF linked from Discord. Its completed archive, SHA-256 record and ZIP inspection are in `artifacts/large-scenes-downloads/bistro-orca/`. The directory contains 642 files, including three FBX scenes, 622 DDS textures, an HDR environment and two Falcor `.pyscene` files; declared unpacked size is 1,719,121,581 bytes. Model payload extraction, full entry CRC checks and conversion remain pending. The archive preserves `LICENSE.txt` (CC BY 4.0) and `README.txt` with Amazon Lumberyard / ORCA credit instructions; see the [original release](https://developer.nvidia.com/orca/amazon-lumberyard-bistro).
+Bistro is the original ORCA source referenced by the [Bevy large-scenes example](https://github.com/bevyengine/bevy/tree/main/examples/large_scenes/bistro), not the separately processed glTF linked from Discord. Its completed archive, SHA-256 record and ZIP inspection are in `artifacts/large-scenes-downloads/bistro-orca/`. The directory contains 642 files, including three FBX scenes, 622 DDS textures, an HDR environment and two Falcor `.pyscene` files; declared unpacked size is 1,719,121,581 bytes. On 2026-10-30 all 642 files were extracted with `scripts/extract-archive.mjs`, which checks every entry's CRC32 and records each file's SHA-256 in the extraction manifest; conversion status is under [Local conversions](#local-conversions-2026-10-3031-apple-m3-max). The archive preserves `LICENSE.txt` (CC BY 4.0) and `README.txt` with Amazon Lumberyard / ORCA credit instructions; see the [original release](https://developer.nvidia.com/orca/amazon-lumberyard-bistro).
 
 Its README distinguishes unique from instance-expanded triangle counts: interior 1,044,183 / 1,046,609; interior with wine 935,853 / 1,293,691; exterior 2,799,704 / 2,832,120. These are publisher counts, not this engine's measured draw or residency counts. Conversion must preserve opacity, the packed occlusion/roughness/metalness texture channels, DirectX normal-map convention, emissive materials, and the additional wine-scene material parameters. Download completion is not material, animation, lighting or scene acceptance.
+
+## Local conversions (2026-10-30/31, Apple M3 Max)
+
+Converted payloads and evidence live in ignored `artifacts/` directories with a `-mac-20261030` or `-mac-20261031` suffix. A directory is complete once its `manifest.json` exists and is never rewritten. Every derived directory keeps the source license files. None of these bytes are committed.
+
+Tools: `scripts/extract-archive.mjs` (verified ZIP extraction), `scripts/build-gltf-geometry.mjs` (geometry pages), `scripts/build-gltf-textures.mjs --encoder builtin` (deterministic BC7, normal maps on the RGBA8 linear path), `scripts/audit-gltf-uv-demand.mjs`, `scripts/write-asset-set.mjs` (binds the packages of one source, optionally with a camera path), and for FBX scenes `scripts/blender/convert-fbx-scene.py` followed by `scripts/apply-fbx-material-map.mjs`.
+
+**Intel Sponza main.** `Main_sponza.zip` (3,987,608,266 bytes, SHA-256 `b8bb853884ab1566b3beb35666bd09882a4e0dc16661e4684e103792cf0229b9`): 84 files extracted. Every derived package is bound to `NewSponza_Main_glTF_003.gltf`, SHA-256 `e04c4c540c74bdddcbd3f590a85c14119bfd5839702246a23b3a737c0cce2400`.
+
+**Intel add-ons.** The counts below come from the glTF audits and count accessor triangles.
+
+| Package | Primitives | Triangles | Status |
+| --- | ---: | ---: | --- |
+| Curtains | 43 | 1,997,366 | Geometry pages (group 16) and 8 textures built. |
+| Trees | 4 | 2,023,747 | The group-16 build stopped at `GEOMETRY_QUERY_PROXY_TRIANGLE_BUDGET`; group-8 pages and 4 textures built. `TEXCOORD_1` is present but unused. |
+| Ivy | 2 | 5,065,558 | Textures only. One primitive has 4,905,636 triangles, above the geometry builder's limit of 1,000,000 triangles per primitive. |
+| Emissive Candles | 3 | 19,540,000 | Not converted: 10,002 nodes, 648,098,592 declared buffer bytes, `KHR_lights_punctual` required. |
+
+Animated Knight was not converted.
+
+**Bistro Exterior.** Source: `BistroExterior.fbx`, 119,845,216 bytes, SHA-256 `471991629c7e35a88338c48f3565390ad19cc5d1d7c7e067fc2a60b4f3b5f195`.
+
+- *Import.* Blender 5.2.2 LTS imports it in background mode with factory settings (`blender -b --factory-startup -Y --python scripts/blender/convert-fbx-scene.py -- --input <fbx> --output <new dir>`). The import keeps the authored custom normals, exports tangents and the directional light, and does not search for images. The FBX camera animation is written separately as `camera-path.json`: 2,401 frames at 24 fps (100 s), glTF axes.
+- *Material map.* `scripts/apply-fbx-material-map.mjs --convention orca-metal-rough` rewrites the materials explicitly:
+  - BaseColor RGB, with alpha as coverage.
+  - Specular texture: R occlusion, G roughness, B metalness.
+  - Normal maps use the DirectX convention; their green channel is flipped when the textures are built.
+  - Emissive RGB.
+  - Names ending in `.DoubleSided` become double-sided.
+  - A material is OPAQUE when all base-color alpha is 255. Otherwise it is MASK with Falcor's cutoff of 0.5.
+  - It removes `KHR_materials_specular`, which Blender writes.
+- *Output.* `scene.gltf` (1,930,569 bytes, SHA-256 `a3ef4278af68b35f17706b3b84bd151ad79a9c6e4b9bee7f3b548ab35a9be107`) and `scene.bin` (179,130,372 bytes, SHA-256 `18fac23b3c66ce395ed0383734a4fd5c29848001e3cc92b0a92817bfee2956c3`).
+- *Counts.*
+  - 1,296 meshes, 1,591 primitives and 1,298 nodes.
+  - 2,829,226 imported triangles. The README gives 2,799,704 unique and 2,832,120 instance-expanded; those are publisher counts.
+  - 132 materials: 120 OPAQUE and 12 MASK, 6 of them double-sided.
+  - 405 images and one directional light.
+- *Packages.* The geometry build used `--remove-zero-area`, which removed 19 triangles. It pages 1,402 opaque primitives (2,543,852 triangles). The 189 MASK primitives (285,355 triangles) stay source-routed and are not virtualized. Textures: 273 BC7 images and 132 RGBA8 normal maps.
+- *Not carried over.* `conversion.json` records what the engine does not use:
+  - `TEXCOORD_1`.
+  - The occlusion channel. The engine material model does not read occlusion textures, so the scene loader strips them and reports each one.
+  - Two fully cut-out MASK materials: `MASTER_Glass_Dirty_MASKED` and `Paris_LiquorBottle_01_Labels`.
+
+`BistroInterior.fbx` and `BistroInterior_Wine.fbx` are extracted but not converted. The wine scene's additional material parameters are still unmapped.

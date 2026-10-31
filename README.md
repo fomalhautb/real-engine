@@ -56,9 +56,13 @@ npm run dev
 
 `/geometry.html` 展示 GPU 自动 LOD：正常材质、稳定簇颜色和 LOD 层级三种视图，支持误差调整、固定相机轨迹、暂停逐帧、冻结选择视点和按 H 隐藏界面。雕塑的实际簇/三角形数量来自限频 GPU 读回，并标注采样帧。当前模型为 5,120 三角形的程序雕塑，三个实例共享层级；这是正确性与可视化原型，不是最终大规模场景或性能成绩。
 
+`/geometry.html?scene=streamed` 是超额订阅的流送画廊：默认 24 个程序化雕塑，唯一几何数据约为几何池的 4 倍。新增驻留视图，用颜色区分驻留细节、根和回退祖先；可以分屏对照材质视图，切换 walk/zoom/orbit/turn/teleport 固定轨迹，并实时显示驻留页、回退簇与迁移次数。画廊只证明流送的覆盖与恢复行为，不代表 Sponza 等真实资产的规模或性能。
+
+`/large-scene.html?set=/artifacts/<集合>/asset-set.json` 加载离线工具写出的资产集（几何页、纹理、查询代理和可选相机路径），提供固定关键帧、沿相机路径漫游，以及材质、簇、层级三种视图。资产集由 `scripts/write-asset-set.mjs` 生成，转换产物不入库，来源与转换约定见 [assets.md](docs/assets.md)。MASK/BLEND primitive 不进分页漫游，遮蔽贴图不参与着色；此页不是大场景视觉验收。
+
 ## 验证
 
-`/reflection.html` 展示世界空间反射：镜子中的彩色实体位于相机身后，可切换反射、粗糙度、薄雾、暂停和逐帧。代码通过 `RendererOptions.reflections` 配置采样/距离/内存预算，要求同时配置 `worldQueries`；`setReflectionsEnabled` 切换，`probeReflections` 显式读回有限锚点。反射命中复用材质、Mask 与共享形变，配置 GI 时借用世界探针，配置雾时沿实际反射方向积分世界介质。当前仅单段反射，有限采样与空间重建仍有画质限制，不代表阶段 2 完成，详见[世界空间反射](docs/implementation.md#世界空间反射)。
+`/reflection.html` 展示世界空间反射：镜子中的彩色实体位于相机身后，可切换反射、粗糙度、薄雾、暂停和逐帧。代码通过 `RendererOptions.reflections` 配置采样/距离/内存预算，要求同时配置 `worldQueries`；`setReflectionsEnabled` 切换，`probeReflections` 显式读回有限锚点。反射命中复用材质、Mask 与共享形变，配置 GI 时借用世界探针，配置雾时沿实际反射方向积分世界介质。可选的 `temporal` 与 `screenTrace` 分别开启时间重建和屏幕空间补充。当前仅单段反射，粗糙档误差与稳定性、粗糙波瓣内的响应时间仍未达标，有限采样与空间重建仍有画质限制，不代表阶段 2 完成，详见[世界空间反射](docs/implementation.md#世界空间反射)。
 
 `/gi.html` 展示世界空间漫反射 GI：红蓝墙面和发光条通过真实场景查询照亮白色物体，可切换单次/跨帧多次反弹（演示默认多次）、开关 GI、改变墙色及太阳参数、暂停逐帧、按 H 隐藏面板。引擎的 `diffuseGi.multiBounce` 默认 `false`，运行时用 `setDiffuseGiMultiBounce(boolean)` 切换，`invalidateDiffuseGiHistory()` 可显式丢弃旧反馈。探针使用 8×8 八面体方向距离矩和低置信度平滑权重；`visibilityWeightThreshold` 默认 0.2、设 0 可关闭额外曲线。固定网格仍每帧全量更新；无镜面反弹、时域平均、自动布点或探针流送。关闭 GI 时没有旧常量环境补光。
 

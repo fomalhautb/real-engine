@@ -5,7 +5,7 @@ import { cp, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { resolve, extname, sep } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { platform, release, arch, cpus, totalmem } from 'node:os';
+import { platform, release, arch, cpus, totalmem, loadavg } from 'node:os';
 
 const args = process.argv.slice(2), options = {}, settings = { channel: 'chrome', repeats: 3, headed: false, software: false,
   highPerformanceGpu: false, expectVendor: null, caffeinate: false };
@@ -86,7 +86,10 @@ const metadata = { commit: git(['rev-parse', 'HEAD']), dirty: status !== '', sta
 const probe = (file, probeArgs) => {
   try { return execFileSync(file, probeArgs, { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; }
 };
-const darwinPower = () => ({ observedAt: new Date().toISOString(), battery: probe('pmset', ['-g', 'batt']), thermal: probe('pmset', ['-g', 'therm']) });
+// 1, 5 and 15 minute load averages show contention from other host work; Windows reports none.
+const hostLoad = () => platform() === 'win32' ? null : loadavg().map(value => Math.round(value * 100) / 100);
+const darwinPower = () => ({ observedAt: new Date().toISOString(), loadAverage: hostLoad(),
+  battery: probe('pmset', ['-g', 'batt']), thermal: probe('pmset', ['-g', 'therm']) });
 if (platform() === 'darwin') {
   let gpus = null;
   try {
@@ -189,9 +192,10 @@ try {
           const progress = await page.evaluate(() => window.__REAL_BENCHMARK__.progress());
           const metrics = cdp ? await cdp.send('Performance.getMetrics') : null;
           const memory = metrics ? Object.fromEntries(metrics.metrics.filter(metric => ['JSHeapUsedSize', 'JSHeapTotalSize', 'Nodes', 'Documents', 'JSEventListeners'].includes(metric.name)).map(metric => [metric.name, metric.value])) : null;
-          hostSamples.push({ observedAt: new Date().toISOString(), progress, memory });
+          const loadAverage = hostLoad();
+          hostSamples.push({ observedAt: new Date().toISOString(), progress, memory, loadAverage });
           await writeFile(resolve(directory, `run-${repetition}-progress.json`), JSON.stringify(hostSamples, null, 2) + '\n');
-          console.log('BENCHMARK_PROGRESS ' + JSON.stringify({ repetition, ...progress, memory }));
+          console.log('BENCHMARK_PROGRESS ' + JSON.stringify({ repetition, ...progress, memory, loadAverage }));
         } catch (error) { console.log('BENCHMARK_OBSERVATION ' + String(error)); }
         finally { sampling = false; }
       }, 15000);

@@ -16,6 +16,7 @@ import { resolveWorldQueryOptions, type WorldQueryOptions, type WorldRay, type W
 import { GpuGeometryLod, type GeometryLodBinding, type GeometryLodSettings, type GeometryLodProbe } from './gpu-geometry-lod';
 import { GpuDiffuseGi, diffuseGiSampleSource, diffuseGiFinalGatherSampleSource, type DiffuseGiProbeResult } from './gpu-diffuse-gi';
 import { resolveDiffuseGiOptions, validateDiffuseGiQueryBudget, type DiffuseGiOptions, type GiVisibilityDirection } from './diffuse-gi';
+import type { DiffuseGiUpdateOptions } from './gi-probe-schedule';
 import { resolveSunShadowOptions, sunShadowProjection, type SunShadowOptions, type ResolvedSunShadowOptions } from './sun-shadow';
 import type { FinalGatherProbeResult } from './gpu-final-gather';
 import { DEFORMED_VERTEX_BYTES, validateMeshColors, type MeshData } from './geometry';
@@ -68,6 +69,8 @@ type Batch = {
   /** Reused [start, end) slot ranges, bounded to 16 writes per input stream. */
   uploadRanges: number[];
   material: GpuMaterial; materialPipelines: MaterialPipelines; materialRequest: number;
+  /** Parameter edits of this batch; GI change sets attribute material updates by it. */
+  materialVersion: number;
   textureInputs: readonly (MaterialTextureAsset | undefined)[];
   textureUvSpan: number; textureBounds?: Bounds3;
 };
@@ -725,6 +728,7 @@ export class Renderer {
     const batch = this.batches.find(item => item.scene.name === batchName);
     if (!batch) throw new Error('BATCH_NOT_FOUND: ' + batchName);
     this.materialResources.updateParameters(batch.material, values);
+    batch.materialVersion++;
     this.materialRevision++;
   }
 
@@ -866,6 +870,19 @@ export class Renderer {
     this.diffuseGi.setFinalGatherEnabled(enabled);
   }
   /** Explicit reset for discontinuities outside the scene/material identity contracts. */
+  /** Switch the GI probe capture policy at runtime; the next frame recaptures the grid. */
+  setDiffuseGiUpdate(update: DiffuseGiUpdateOptions | undefined): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    this.diffuseGi.setUpdatePolicy(update);
+  }
+  /** Report a lighting/content change the scene snapshot cannot see (for
+   * example a local light): a world region marks nearby probes, none is global. */
+  markDiffuseGiDirty(region?: Bounds3): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
+    this.diffuseGi.markDirty(region);
+  }
   invalidateDiffuseGiHistory(): void {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
@@ -1003,7 +1020,7 @@ export class Renderer {
     const material = await this.prepareMaterial(scene.material);
     const instanceData = new Float32Array(capacity * 56);
     const batch: Batch = {
-      ...material, materialRequest: 0, sourceId: this.batches.length + 1, receiverBase,
+      ...material, materialRequest: 0, materialVersion: 0, sourceId: this.batches.length + 1, receiverBase,
       textureInputs: scene.material?.textures?.slice() ?? [], textureUvSpan, textureBounds,
       scene, mesh, rest, indices, params, instances, palettes, output, scalars, program, pipeline, morphBounds, bounds: new Map(), tangentData,
       compute: this.device.createBindGroup({ layout: this.computeLayout,
@@ -1278,6 +1295,10 @@ export class Renderer {
       this.device.queue.writeBuffer(batch.stream.bindings.params, 0, new Uint32Array([batch.stream.runtime.selection.physicalVertexCount, count, 0, 0]));
       this.stats.uploadedBytes += 16;
     }
+    this.diffuseGi?.observeScene(this.batches.map(batch => ({ key: batch, instances: batch.scene.instances,
+      committed: batch.scene.inputMode === 'committed', bounds: batch.bounds, material: batch.material,
+      materialBinding: batch.material.bindGroup, materialVersion: batch.materialVersion,
+      topologyVersion: batch.scene.queryIdentity?.topologyVersion ?? 0 })), this.stats.frames + 1, eye, vp);
     this.stats.uploadedBytes += this.diffuseGi?.update(this.stats.frames + 1, this.sunDirection, this.sunColor,
       this.materialRevision, this.worldQueries!.historyRevision) ?? 0;
     this.stats.uploadedBytes += this.diffuseGi?.updateFinalGather(this.stats.frames + 1, this.stats.width, this.stats.height,

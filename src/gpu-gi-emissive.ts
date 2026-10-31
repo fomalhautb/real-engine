@@ -59,6 +59,8 @@ export class GpuGiEmissiveSampler {
   private disposed = false;
   private updated = false;
   private currentRayCount = 0;
+  /** Probes captured by the current GI update; samples are indexed by slot. */
+  private scheduledProbes = 0;
   private samples!: GPUBuffer;
   private parameters!: GPUBuffer;
   private clearPipeline!: GPUComputePipeline;
@@ -74,7 +76,7 @@ export class GpuGiEmissiveSampler {
   get queryRayCount(): number { return this.currentRayCount; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, giParameterBuffer: GPUBuffer,
-    outputProbeBuffers: [GPUBuffer, GPUBuffer], rayCount: number, samplesPerProbe: number,
+    outputProbeBuffers: [GPUBuffer, GPUBuffer], schedule: GPUBuffer, rayCount: number, samplesPerProbe: number,
     account: (bytes: number) => void, maxBytes = DEFAULT_MAX_BYTES): Promise<GpuGiEmissiveSampler> {
     const probeCount = outputProbeBuffers[0].size / DIFFUSE_GI_PROBE_BYTES;
     if (!Number.isSafeInteger(probeCount) || probeCount < 1 || probeCount > 512
@@ -88,17 +90,18 @@ export class GpuGiEmissiveSampler {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > HARD_MAX_BYTES) throw new Error('GI_EMISSIVE_MEMORY_BUDGET');
     if (giParameterBuffer.size < DIFFUSE_GI_PARAMETER_BYTES || !(giParameterBuffer.usage & GPUBufferUsage.UNIFORM)
       || outputProbeBuffers.some(buffer => !(buffer.usage & GPUBufferUsage.STORAGE))
+      || !(schedule.usage & GPUBufferUsage.STORAGE) || schedule.size < probeCount * 4
       || queries.rayBuffer.size < rayCount * WORLD_RAY_BYTES || queries.hitBuffer.size < rayCount * WORLD_HIT_BYTES) {
       throw new Error('GI_EMISSIVE_BORROWED_BUFFER_LAYOUT');
     }
     const result = new GpuGiEmissiveSampler(device, queries, giParameterBuffer,
-      outputProbeBuffers, rayCount, samplesPerProbe, probeCount, account, maxBytes);
+      outputProbeBuffers, schedule, rayCount, samplesPerProbe, probeCount, account, maxBytes);
     try { await result.initialize(); return result; }
     catch (error) { result.dispose(); throw error; }
   }
   private constructor(private readonly device: GPUDevice, private readonly queries: GpuWorldQuery,
     private readonly giParameterBuffer: GPUBuffer, private readonly outputProbeBuffers: [GPUBuffer, GPUBuffer],
-    private readonly rayCount: number, private readonly samplesPerProbe: number, private readonly probeCount: number,
+    private readonly schedule: GPUBuffer, private readonly rayCount: number, private readonly samplesPerProbe: number, private readonly probeCount: number,
     private readonly account: (bytes: number) => void, private readonly maxBytes: number) {}
 
   private assertAlive(): void { if (this.disposed) throw new Error('GI_EMISSIVE_DISPOSED'); }
@@ -140,6 +143,7 @@ export class GpuGiEmissiveSampler {
       layout: this.integratePipeline.getBindGroupLayout(0), entries: [
         { binding: 1, resource: { buffer: this.parameters } }, { binding: 6, resource: { buffer: this.samples } },
         { binding: 7, resource: { buffer: this.queries.hitBuffer } }, { binding: 8, resource: { buffer } },
+        { binding: 9, resource: { buffer: this.schedule } },
       ],
     }));
   }
@@ -181,7 +185,7 @@ export class GpuGiEmissiveSampler {
         { binding: 0, resource: { buffer: this.giParameterBuffer } }, { binding: 1, resource: { buffer: parameters } },
         { binding: 2, resource: { buffer: output } }, { binding: 3, resource: { buffer: indices } },
         { binding: 4, resource: { buffer: identities } }, { binding: 5, resource: { buffer: this.queries.rayBuffer } },
-        { binding: 6, resource: { buffer: this.samples } },
+        { binding: 6, resource: { buffer: this.samples } }, { binding: 9, resource: { buffer: this.schedule } },
       ] });
       this.batches.push({ scene, mesh, proxy, proxyIdentity: proxyIdentity(proxy),
         vertices: mesh.vertices, indices: mesh.indices, vertexCount: mesh.vertexCount,
@@ -193,8 +197,12 @@ export class GpuGiEmissiveSampler {
       throw error;
     }
   }
-  update(): number {
+  /** scheduledProbes: slots captured by this GI update, 1..probeCount. */
+  update(scheduledProbes = this.probeCount): number {
     this.assertAlive();
+    if (!Number.isSafeInteger(scheduledProbes) || scheduledProbes < 1 || scheduledProbes > this.probeCount) {
+      throw new Error('GI_EMISSIVE_SCHEDULE');
+    }
     // Validate the complete snapshot before publishing any queue writes.
     for (const batch of this.batches) {
       const { scene } = batch;
@@ -213,14 +221,15 @@ export class GpuGiEmissiveSampler {
       }
     }
     this.updated = true;
+    this.scheduledProbes = scheduledProbes;
     let blockCount = 0;
     this.batches.forEach((batch, index) => {
       batch.count = batch.scene.instances.length;
       if (batch.count) blockCount = index + 1;
     });
-    this.currentRayCount = blockCount * this.probeCount * this.samplesPerProbe;
+    this.currentRayCount = blockCount * scheduledProbes * this.samplesPerProbe;
     this.device.queue.writeBuffer(this.parameters, 0, new Uint32Array([
-      blockCount, 0, 0, 0, this.currentRayCount, this.probeCount, this.samplesPerProbe, 0,
+      blockCount, 0, 0, 0, this.currentRayCount, scheduledProbes, this.samplesPerProbe, 0,
     ]));
     let uploaded = PARAMETER_BYTES;
     this.batches.forEach((batch, index) => {
@@ -232,7 +241,7 @@ export class GpuGiEmissiveSampler {
       }
       this.device.queue.writeBuffer(batch.parameters, 0, new Uint32Array([
         batch.vertexCount, batch.indexCount / 3, batch.count, batch.sourceId,
-        this.currentRayCount, this.probeCount, this.samplesPerProbe, index * this.probeCount * this.samplesPerProbe,
+        this.currentRayCount, scheduledProbes, this.samplesPerProbe, index * scheduledProbes * this.samplesPerProbe,
       ]));
       uploaded += PARAMETER_BYTES;
     });
@@ -252,22 +261,24 @@ export class GpuGiEmissiveSampler {
     dispatch('clear GI emissive sample blocks', this.clearPipeline, this.clearGroup, this.currentRayCount);
     for (const batch of this.batches) if (batch.count) {
       dispatch('sample deformed GI emissive triangles', this.generatePipeline, batch.group,
-        this.probeCount * this.samplesPerProbe);
+        this.scheduledProbes * this.samplesPerProbe);
     }
     const uploaded = this.queries.encodeTrace(encoder, this.currentRayCount, 0, materialRevision);
-    dispatch('integrate GI emissive solid angle', this.integratePipeline, this.integrateGroups[outputIndex], this.probeCount);
+    dispatch('integrate GI emissive solid angle', this.integratePipeline, this.integrateGroups[outputIndex], this.scheduledProbes);
     return uploaded;
   }
+  private get slots(): number { return this.updated ? this.scheduledProbes : this.probeCount; }
   diagnostics() {
     return { enabled: this.enabled, emitterCount: this.emitterCount,
       activeEmitterCount: this.batches.filter(batch => batch.count > 0).length,
       samplesPerProbePerEmitter: this.samplesPerProbe,
       sampleCapacity: this.batches.length * this.probeCount * this.samplesPerProbe,
-      samplesPerUpdate: this.batches.filter(batch => batch.count > 0).length * this.probeCount * this.samplesPerProbe,
-      activeSamplesPerUpdate: this.batches.filter(batch => batch.count > 0).length * this.probeCount * this.samplesPerProbe,
+      samplesPerUpdate: this.batches.filter(batch => batch.count > 0).length * this.slots * this.samplesPerProbe,
+      activeSamplesPerUpdate: this.batches.filter(batch => batch.count > 0).length * this.slots * this.samplesPerProbe,
       queryRaysPerUpdate: this.currentRayCount, queryRayCapacity: this.rayCount,
       inactiveBlockRaysPerUpdate: this.currentRayCount
-        - this.batches.filter(batch => batch.count > 0).length * this.probeCount * this.samplesPerProbe,
+        - this.batches.filter(batch => batch.count > 0).length * this.slots * this.samplesPerProbe,
+      scheduledProbesPerUpdate: this.slots,
       maxWorkUnitsPerUpdate: this.currentRayCount ? this.queries.options.maxTotalWorkUnits : 0,
       ownedGpuBytes: this.bytes, maxBytes: this.maxBytes, representation: 'triangle-area-to-radiance-SH9',
       coverage: 'shared-world-query', geometry: 'shared-current-deformation',

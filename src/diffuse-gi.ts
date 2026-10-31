@@ -2,6 +2,7 @@
 import { GI_DISTANCE_CELLS } from './gi-visibility';
 import { resolveFinalGatherOptions, type FinalGatherOptions, type ResolvedFinalGatherOptions } from './final-gather';
 import type { WorldQueryOptions } from './world-query';
+import { resolveDiffuseGiUpdateOptions, type DiffuseGiUpdateOptions, type ResolvedDiffuseGiUpdateOptions } from './gi-probe-schedule';
 export type GiVisibilityDirection = 'probe-to-receiver' | 'receiver-to-probe';
 export type GiVisibilityFilter = 'moment-bilinear' | 'per-tap-chebyshev-bilinear';
 export interface DiffuseGiOptions {
@@ -34,6 +35,9 @@ export interface DiffuseGiOptions {
   maxBytes?: number;
   /** Optional bounded diffuse path segments at visible surfaces, ahead of the world probe cache. */
   finalGather?: FinalGatherOptions;
+  /** Probe capture policy. Default 'full' recaptures the grid on every update;
+   * 'scheduled' captures a bounded, change-driven subset with explicit staleness. */
+  update?: DiffuseGiUpdateOptions;
 }
 
 export interface ResolvedDiffuseGiOptions {
@@ -55,6 +59,7 @@ export interface ResolvedDiffuseGiOptions {
   readonly probeCount: number;
   readonly rayCount: number;
   readonly finalGather?: ResolvedFinalGatherOptions;
+  readonly update: ResolvedDiffuseGiUpdateOptions;
 }
 
 /** 9 RGB SH vec4s, one depth-moment vec4 per octahedral cell, and 1 metadata vec4. */
@@ -156,9 +161,10 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   }
   if (probeCount * DIFFUSE_GI_PROBE_BYTES > maxBytes) throw new RangeError('DIFFUSE_GI_MEMORY_BUDGET');
   const finalGather = options.finalGather === undefined ? undefined : resolveFinalGatherOptions(options.finalGather);
+  const update = resolveDiffuseGiUpdateOptions(options.update, probeCount);
   return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias, shadowNormalBias,
     skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, visibilityDirection, visibilityFilter,
-    maxVisibilityWorkUnits, maxBytes, probeCount, rayCount, finalGather });
+    maxVisibilityWorkUnits, maxBytes, probeCount, rayCount, finalGather, update });
 }
 
 /** Conservative slots for all configured GI modes, including a later support

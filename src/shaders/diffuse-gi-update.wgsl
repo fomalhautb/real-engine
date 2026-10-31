@@ -12,25 +12,40 @@ struct Hit {
 @group(0) @binding(4) var<storage, read_write> probes: array<GiProbe>;
 @group(0) @binding(5) var<storage, read> giProbes: array<GiProbe>;
 @group(0) @binding(6) var<storage, read> distanceWeights: array<f32>;
+// Probe captured by each slot of this update. A full update is the identity.
+@group(0) @binding(7) var<storage, read> schedule: array<u32>;
 
 // GI_INTERPOLATE
 
 fn giHitGeometry(hit: Hit) -> vec3f {
     return surfaceOctDecode(vec2f(hit.position.w, hit.uvInfo.w));
 }
+fn giScheduledProbes() -> u32 { return u32(gi.shadow.y); }
+// Feedback ignores captures older than the latest global light change.
+fn giFeedbackCaptureFloor() -> u32 {
+    let age = u32(gi.shadow.z);
+    return select(0u, gi.state.x - age, gi.state.x > age);
+}
+
+// Scheduled updates first copy the previous field. Republish every carried
+// probe under this field frame; captured slots overwrite their own records.
+@compute @workgroup_size(64)
+fn restamp(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= gi.counts.x * gi.counts.y * gi.counts.z) { return; }
+    probes[id.x].state.y = gi.state.x;
+}
 
 @compute @workgroup_size(64)
 fn generate(@builtin(global_invocation_id) id: vec3u) {
-    let count = gi.counts.x * gi.counts.y * gi.counts.z;
-    if (id.x >= count * gi.counts.w) { return; }
-    let coordinate = giCoordinate(id.x / gi.counts.w, gi.counts.xyz);
+    if (id.x >= giScheduledProbes() * gi.counts.w) { return; }
+    let coordinate = giCoordinate(schedule[id.x / gi.counts.w], gi.counts.xyz);
     let origin = gi.origin.xyz + vec3f(coordinate) * gi.spacing.xyz;
     rays[id.x] = Ray(vec4f(origin, 0.0001), vec4f(giDirection(id.x % gi.counts.w, gi.counts.w), gi.spacing.w), vec4u(0u));
 }
 
 @compute @workgroup_size(64)
 fn generateShadows(@builtin(global_invocation_id) id: vec3u) {
-    if (id.x >= gi.counts.x * gi.counts.y * gi.counts.z * gi.counts.w) { return; }
+    if (id.x >= giScheduledProbes() * gi.counts.w) { return; }
     let hit = primary[id.x];
     var ray = Ray(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(gi.sunDirection.xyz, 0.0), vec4u(0u));
     if (hit.identity.x != 0u && hit.work.z == 0u && hit.emissive.w == 0.0
@@ -45,7 +60,8 @@ fn generateShadows(@builtin(global_invocation_id) id: vec3u) {
 
 @compute @workgroup_size(64)
 fn integrate(@builtin(global_invocation_id) id: vec3u) {
-    if (id.x >= gi.counts.x * gi.counts.y * gi.counts.z) { return; }
+    if (id.x >= giScheduledProbes()) { return; }
+    let probe = schedule[id.x];
     var coefficients: array<vec4f, 9>;
     var primaryOverflows = 0u;
     var shadowOverflows = 0u;
@@ -73,7 +89,8 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
                     * gi.sunColor.xyz * nl * visible;
                 if (gi.state.z != 0u) {
                     radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)
-                        * giSampleSurfaceIrradiance(hit.position.xyz, hit.normal.xyz, giHitGeometry(hit), gi.state.y);
+                        * giSampleSurfaceIrradianceSince(hit.position.xyz, hit.normal.xyz, giHitGeometry(hit), gi.state.y,
+                            giFeedbackCaptureFloor());
                 }
             }
         }
@@ -89,38 +106,41 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     coefficients[1].w = maximum.y;
     coefficients[2].w = maximum.z;
     for (var coefficient = 0u; coefficient < 9u; coefficient++) {
-        probes[id.x].coefficients[coefficient] = coefficients[coefficient];
+        probes[probe].coefficients[coefficient] = coefficients[coefficient];
     }
-    probes[id.x].state = vec4u(select(0u, 1u, primaryOverflows + shadowOverflows == 0u), gi.state.x, primaryOverflows, shadowOverflows);
-    probes[id.x].moments[0].w = 0.0;
-    probes[id.x].moments[1].w = 0.0;
+    // Overflow counts are at most 256 rays each, so both fit one word.
+    probes[probe].state = vec4u(select(0u, 1u, primaryOverflows + shadowOverflows == 0u), gi.state.x,
+        primaryOverflows | (shadowOverflows << 16u), gi.state.x);
+    probes[probe].moments[0].w = 0.0;
+    probes[probe].moments[1].w = 0.0;
 }
 
 // One invocation per probe owns validity and the failure count. This pass is
 // ordered before per-texel integration, so no texel races to publish validity.
 @compute @workgroup_size(64)
 fn validateVisibility(@builtin(global_invocation_id) id: vec3u) {
-    if (id.x >= gi.counts.x * gi.counts.y * gi.counts.z) { return; }
+    if (id.x >= giScheduledProbes()) { return; }
+    let probe = schedule[id.x];
     var failures = 0u;
     for (var i = 0u; i < gi.counts.w; i++) {
         failures += select(0u, 1u, shadows[id.x * gi.counts.w + i].work.z != 0u);
     }
-    probes[id.x].moments[1].w = f32(failures);
-    if (failures != 0u) { probes[id.x].state.x = 0u; }
+    probes[probe].moments[1].w = f32(failures);
+    if (failures != 0u) { probes[probe].state.x = 0u; }
 }
 
 // Separate texel invocations avoid a large private GiProbe copy, and all surface
 // and feedback reads see this map only after the complete pass has finished.
 @compute @workgroup_size(64)
 fn integrateVisibility(@builtin(global_invocation_id) id: vec3u) {
-    let probeCount = gi.counts.x * gi.counts.y * gi.counts.z;
-    if (id.x >= probeCount * GI_DISTANCE_CELLS) { return; }
-    let probeIndex = id.x / GI_DISTANCE_CELLS;
+    if (id.x >= giScheduledProbes() * GI_DISTANCE_CELLS) { return; }
+    let slot = id.x / GI_DISTANCE_CELLS;
+    let probeIndex = schedule[slot];
     let cell = id.x % GI_DISTANCE_CELLS;
     var moments = vec2f(0.0);
     var total = 0.0;
     for (var i = 0u; i < gi.counts.w; i++) {
-        let index = probeIndex * gi.counts.w + i;
+        let index = slot * gi.counts.w + i;
         var distance = gi.spacing.w;
         if ((u32(gi.sunColor.w) & 1u) != 0u) {
             if (shadows[index].identity.x != 0u) { distance = shadows[index].metric.x; }

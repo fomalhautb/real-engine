@@ -7,12 +7,17 @@ struct GiParameters {
     sunColor: vec4f, // xyz radiance; w exact integer flags: bit 0 receiver-directed support, bit 1 per-tap Chebyshev
     sky: vec4f, // xyz radiance, w low-confidence visibility weight threshold
     state: vec4u, // rendered frame, usable history frame, feedback enabled, emissive area sampling enabled
-    shadow: vec4f, // x capture-to-sun geometric-normal bias; yzw reserved
+    // x capture-to-sun geometric-normal bias; y probes captured by this update;
+    // z feedback capture-floor age in updates (both exact f32 integers); w reserved
+    shadow: vec4f,
 }
 struct GiProbe {
     coefficients: array<vec4f, 9>, // RGB incoming radiance SH; first three w values store sampled RGB maxima
     moments: array<vec4f, GI_DISTANCE_CELLS>, // mean distance, squared distance, weight; 0.w emissive failures, 1.w support failures
-    state: vec4u, // valid, frame, primary overflows, shadow overflows
+    // valid, published field frame, primary | shadow overflows << 16, capture frame.
+    // Scheduled updates carry unscheduled probes into each new field unchanged
+    // except for the field frame; the capture frame keeps their actual age.
+    state: vec4u,
 }
 fn giDirection(index: u32, count: u32) -> vec3f {
     let y = 1.0 - 2.0 * (f32(index) + 0.5) / f32(count);

@@ -8,7 +8,7 @@ struct Hit {
 }
 struct AreaParameters {
     shape: vec4u, // generation: vertices, triangles, active instances, source ID; integration: source count
-    limits: vec4u, // used block ray count, probe count, samples per probe/source, source block offset
+    limits: vec4u, // used block ray count, captured probe slots, samples per probe/source, source block offset
 }
 struct AreaSample {
     expected: vec4u, // source, entity, generation, original triangle
@@ -24,6 +24,8 @@ struct AreaSample {
 @group(0) @binding(6) var<storage, read_write> samples: array<AreaSample>;
 @group(0) @binding(7) var<storage, read> hits: array<Hit>;
 @group(0) @binding(8) var<storage, read_write> probes: array<GiProbe>;
+// Probe captured by each slot of this GI update (identity for a full update).
+@group(0) @binding(9) var<storage, read> schedule: array<u32>;
 
 fn areaHash(value: u32) -> u32 {
     var v = value;
@@ -48,7 +50,8 @@ fn clear(@builtin(global_invocation_id) id: vec3u) {
 @compute @workgroup_size(64)
 fn generate(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= area.limits.y * area.limits.z || area.shape.z == 0u) { return; }
-    let probe = id.x / area.limits.z;
+    // Seeds use the probe index, so a probe's samples do not depend on its slot.
+    let probe = schedule[id.x / area.limits.z];
     let sample = id.x % area.limits.z;
     let output = area.limits.w + id.x;
     let seed = areaHash(probe ^ (area.shape.w * 0x9e3779b9u));
@@ -94,9 +97,10 @@ fn generate(@builtin(global_invocation_id) id: vec3u) {
 @compute @workgroup_size(64)
 fn integrate(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= area.limits.y) { return; }
+    let probe = schedule[id.x];
     var coefficients: array<vec3f, 9>;
-    let retainedMaximum = vec3f(probes[id.x].coefficients[0].w, probes[id.x].coefficients[1].w,
-        probes[id.x].coefficients[2].w);
+    let retainedMaximum = vec3f(probes[probe].coefficients[0].w, probes[probe].coefficients[1].w,
+        probes[probe].coefficients[2].w);
     var emittedMaximum = vec3f(0.0);
     var failures = 0u;
     for (var source = 0u; source < area.shape.x; source++) {
@@ -126,17 +130,17 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     // At most 256 samples per probe and coefficient magnitudes below 1e35,
     // so the sum stays finite. Keep visibility moments from the sphere rays.
     for (var coefficient = 0u; coefficient < 9u; coefficient++) {
-        probes[id.x].coefficients[coefficient] += vec4f(coefficients[coefficient], 0.0);
+        probes[probe].coefficients[coefficient] += vec4f(coefficients[coefficient], 0.0);
     }
     // Both retained reflection/sky and explicitly sampled emission can arrive
     // from the same direction. Their sum needs an additive upper bound.
     // Each component is bounded to 65504; their combined bound is at most 131008.
     let maximum = retainedMaximum + emittedMaximum;
-    probes[id.x].coefficients[0].w = maximum.x;
-    probes[id.x].coefficients[1].w = maximum.y;
-    probes[id.x].coefficients[2].w = maximum.z;
+    probes[probe].coefficients[0].w = maximum.x;
+    probes[probe].coefficients[1].w = maximum.y;
+    probes[probe].coefficients[2].w = maximum.z;
     if (failures != 0u) {
-        probes[id.x].state.x = 0u;
-        probes[id.x].moments[0].w = f32(failures);
+        probes[probe].state.x = 0u;
+        probes[probe].moments[0].w = f32(failures);
     }
 }

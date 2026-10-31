@@ -41,6 +41,13 @@ fn giVisibility(index: u32, direction: vec3f, distance: f32) -> f32 {
 }
 
 fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: vec3f, expectedFrame: u32) -> vec3f {
+    return giSampleSurfaceIrradianceSince(position, normal, geometricNormal, expectedFrame, 0u);
+}
+
+// captureFloor additionally rejects probes captured before that frame; feedback
+// uses it so a global light change never re-injects energy from older captures.
+fn giSampleSurfaceIrradianceSince(position: vec3f, normal: vec3f, geometricNormal: vec3f, expectedFrame: u32,
+    captureFloor: u32) -> vec3f {
     if (gi.origin.w == 0.0) { return vec3f(0.0); }
     let biased = position + geometricNormal * gi.sunDirection.w;
     let grid = (biased - gi.origin.xyz) / gi.spacing.xyz;
@@ -61,7 +68,8 @@ fn giSampleSurfaceIrradiance(position: vec3f, normal: vec3f, geometricNormal: ve
         let trilinear = select(vec3f(1.0) - fraction, fraction, offset == vec3u(1u));
         let spatialWeight = trilinear.x * trilinear.y * trilinear.z;
         peakSpatialWeight = max(peakSpatialWeight, spatialWeight);
-        if (giProbes[index].state.x == 0u || giProbes[index].state.y != expectedFrame) { continue; }
+        if (giProbes[index].state.x == 0u || giProbes[index].state.y != expectedFrame
+            || giProbes[index].state.w < captureFloor) { continue; }
         let probePosition = gi.origin.xyz + vec3f(coordinate) * gi.spacing.xyz;
         let delta = biased - probePosition;
         let distance = length(delta);

@@ -14,6 +14,10 @@ import { GpuFinalGather, finalGatherSampleSource, type FinalGatherProbeResult } 
 import type { RasterReceiverBindings } from './surface-receivers';
 import type { Mat4 } from './math';
 import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
+import type { Bounds3 } from './deformation';
+import { GiProbeScheduler, resolveDiffuseGiUpdateOptions, type DiffuseGiUpdateOptions, type GiSchedulePlan,
+  type ResolvedDiffuseGiUpdateOptions } from './gi-probe-schedule';
+import { GiSceneObserver, type GiObservedBatch } from './gi-scene-changes';
 
 const constants = `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`;
 const giCommon = commonSource.replace('// GI_DISTANCE_CONSTANTS', constants);
@@ -23,8 +27,12 @@ export const diffuseGiFinalGatherSampleSource = diffuseGiSampleSource + '\n' + f
 export interface DiffuseGiProbeResult {
   frame: number;
   invalidProbes: number;
-  probes: { coefficients: number[][]; moments: number[][]; maxRadiance: number[]; valid: boolean; primaryOverflows: number; shadowOverflows: number; emissiveOverflows: number; visibilityOverflows: number }[];
+  /** captureFrame is the update that last captured the probe; scheduled
+   * updates carry older captures into the published field `frame`. */
+  probes: { coefficients: number[][]; moments: number[][]; maxRadiance: number[]; valid: boolean; primaryOverflows: number; shadowOverflows: number; emissiveOverflows: number; visibilityOverflows: number; captureFrame: number }[];
 }
+/** Largest exact f32 integer used for update-count lanes in the GI uniform. */
+const EXACT_F32_INTEGER = 16_777_216;
 
 /** Fixed world-space probes with optional cross-frame diffuse transport. Each
  * complete update reads the preceding field and writes a separate buffer. */
@@ -48,6 +56,23 @@ export class GpuDiffuseGi {
   private integrate!: GPUComputePipeline;
   private integrateVisibility!: GPUComputePipeline;
   private validateVisibility!: GPUComputePipeline;
+  private restamp!: GPUComputePipeline;
+  private schedule!: GPUBuffer;
+  private readonly scheduler: GiProbeScheduler;
+  private observer?: GiSceneObserver;
+  private updatePolicy: ResolvedDiffuseGiUpdateOptions;
+  private plan?: GiSchedulePlan;
+  private lastCapturedProbes = 0;
+  /** Completed updates since the last full refresh; feedback needs one. */
+  private fieldUpdates = 0;
+  /** Feedback rejects probes captured before the latest global light change. */
+  private feedbackFloorFrame = 0;
+  private externalGlobalChange = false;
+  private observedFrame = 0;
+  private observedMaterialChanges = 0;
+  private observedInstanceChanges = 0;
+  private readonly changeTotals = { observations: 0, transform: 0, instance: 0, material: 0, topology: 0, external: 0,
+    globalLight: 0, globalFallback: 0 };
   private bytes = 0;
   private frame = 0;
   private pending = false;
@@ -78,12 +103,13 @@ export class GpuDiffuseGi {
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: DiffuseGiOptions,
     account: (bytes: number) => void): Promise<GpuDiffuseGi> {
     const resolved = resolveDiffuseGiOptions(options);
-    if (device.limits.maxStorageBuffersPerShaderStage < 6) throw new Error('DIFFUSE_GI_STORAGE_BINDING_LIMIT');
+    if (device.limits.maxStorageBuffersPerShaderStage < 7) throw new Error('DIFFUSE_GI_STORAGE_BINDING_LIMIT');
     validateDiffuseGiQueryBudget(resolved, queries.options);
     const sizes = [DIFFUSE_GI_PARAMETER_BYTES, resolved.rayCount * WORLD_HIT_BYTES, resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
       resolved.probeCount * DIFFUSE_GI_PROBE_BYTES,
-      GI_DISTANCE_CELLS * resolved.raysPerProbe * Float32Array.BYTES_PER_ELEMENT];
+      GI_DISTANCE_CELLS * resolved.raysPerProbe * Float32Array.BYTES_PER_ELEMENT,
+      resolved.probeCount * Uint32Array.BYTES_PER_ELEMENT];
     if (sizes.some(size => size > Math.min(device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize))
       || sizes.reduce((a, b) => a + b, 0) > resolved.maxBytes) throw new Error('DIFFUSE_GI_MEMORY_BUDGET');
     const result = new GpuDiffuseGi(device, queries, resolved, account);
@@ -95,27 +121,35 @@ export class GpuDiffuseGi {
     this.options = options;
     this.multiBounce = options.multiBounce;
     this.visibilityDirection = options.visibilityDirection;
+    this.updatePolicy = options.update;
+    this.scheduler = new GiProbeScheduler(options, options.update);
+    if (this.updatePolicy.mode === 'scheduled') this.observer = new GiSceneObserver();
   }
   private initializeResources(): void {
     const { device, queries, options } = this;
     this.parameters = this.buffer('diffuse GI parameters', DIFFUSE_GI_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.primary = this.buffer('diffuse GI primary hits', options.rayCount * WORLD_HIT_BYTES, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const probeBytes = options.probeCount * DIFFUSE_GI_PROBE_BYTES;
-    this.probeBuffers = [this.buffer('diffuse GI field A', probeBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC),
-      this.buffer('diffuse GI field B', probeBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC)];
+    // COPY_DST: a scheduled update first carries the previous field forward.
+    const fieldUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+    this.probeBuffers = [this.buffer('diffuse GI field A', probeBytes, fieldUsage),
+      this.buffer('diffuse GI field B', probeBytes, fieldUsage)];
+    this.schedule = this.buffer('diffuse GI capture schedule', options.probeCount * Uint32Array.BYTES_PER_ELEMENT,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    device.queue.writeBuffer(this.schedule, 0, Uint32Array.from({ length: options.probeCount }, (_, index) => index));
     this.readback = this.buffer('diffuse GI diagnostics', probeBytes, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
     const weights = buildGiDistanceWeights(Array.from({ length: options.raysPerProbe }, (_, index) =>
       giRayDirection(index, options.raysPerProbe)));
     this.distanceWeights = this.buffer('diffuse GI octahedral capture weights', weights.byteLength,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     device.queue.writeBuffer(this.distanceWeights, 0, weights);
-    this.computeLayout = device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5, 6].map(binding => ({
+    this.computeLayout = device.createBindGroupLayout({ entries: [0, 1, 2, 3, 4, 5, 6, 7].map(binding => ({
       binding, visibility: GPUShaderStage.COMPUTE,
       buffer: { type: binding === 0 ? 'uniform' : binding === 1 || binding === 4 ? 'storage' : 'read-only-storage' },
     })) });
     this.computeGroups = this.probeBuffers.map((output, index) => device.createBindGroup({ layout: this.computeLayout,
-      entries: [this.parameters, queries.rayBuffer, this.primary, queries.hitBuffer, output, this.probeBuffers[1 - index], this.distanceWeights]
-        .map((buffer, binding) => ({ binding, resource: { buffer } })) }));
+      entries: [this.parameters, queries.rayBuffer, this.primary, queries.hitBuffer, output, this.probeBuffers[1 - index],
+        this.distanceWeights, this.schedule].map((buffer, binding) => ({ binding, resource: { buffer } })) }));
     this.surfaceLayoutEntries = [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
@@ -140,12 +174,12 @@ export class GpuDiffuseGi {
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `diffuse GI:${error.lineNum}: ${error.message}`).join('\n'));
     const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
-    [this.generate, this.generateShadows, this.integrate, this.integrateVisibility, this.validateVisibility] = await Promise.all(
-      ['generate', 'generateShadows', 'integrate', 'integrateVisibility', 'validateVisibility'].map(entryPoint =>
+    [this.generate, this.generateShadows, this.integrate, this.integrateVisibility, this.validateVisibility, this.restamp] = await Promise.all(
+      ['generate', 'generateShadows', 'integrate', 'integrateVisibility', 'validateVisibility', 'restamp'].map(entryPoint =>
       this.device.createComputePipelineAsync({ label: 'diffuse GI ' + entryPoint, layout, compute: { module, entryPoint } })));
     if (this.options.emissiveSamplesPerProbe) {
       this.emissiveSampler = await GpuGiEmissiveSampler.create(this.device, this.queries, this.parameters,
-        this.probeBuffers, this.options.rayCount, this.options.emissiveSamplesPerProbe, bytes => {
+        this.probeBuffers, this.schedule, this.options.rayCount, this.options.emissiveSamplesPerProbe, bytes => {
           this.bytes += bytes; this.account(bytes);
         }, this.options.maxBytes - this.bytes);
       this.checkMemoryBudget();
@@ -230,19 +264,81 @@ export class GpuDiffuseGi {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
     this.resetRequested = 'explicit';
   }
+  /** Replace the capture policy at runtime; the next update recaptures the grid. */
+  setUpdatePolicy(update: DiffuseGiUpdateOptions | undefined): void {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    const resolved = resolveDiffuseGiUpdateOptions(update, this.options.probeCount);
+    this.scheduler.setOptions(resolved);
+    this.updatePolicy = resolved;
+    // The first scheduled observation is a baseline; the full refresh covers it.
+    this.observer = resolved.mode === 'scheduled' ? new GiSceneObserver() : undefined;
+    this.resetRequested = 'update-policy-changed';
+  }
+  get updateOptions(): ResolvedDiffuseGiUpdateOptions { return this.updatePolicy; }
+  /** Engine-side change set for scheduled updates: call once per frame after
+   * instance bounds are current and before update(). Full updates ignore it. */
+  observeScene(batches: readonly GiObservedBatch[], frame: number, eye: readonly [number, number, number],
+    viewProjection?: ArrayLike<number>): void {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    this.scheduler.setView({ eye, viewProjection });
+    if (!this.observer) return;
+    const changes = this.observer.observe(batches);
+    this.changeTotals.observations++;
+    this.observedFrame = frame;
+    this.observedMaterialChanges = 0; this.observedInstanceChanges = 0;
+    for (const change of changes) {
+      this.scheduler.markRegion(change.region, change.reason);
+      this.changeTotals[change.reason === 'light' ? 'external' : change.reason]++;
+      if (change.reason === 'material') this.observedMaterialChanges++;
+      else this.observedInstanceChanges++;
+    }
+  }
+  /** Lighting or content changed outside the observed scene snapshot, e.g. a
+   * local light. A region marks nearby probes; no region is a global light change. */
+  markDirty(region?: Bounds3): void {
+    if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
+    if (!region) { this.externalGlobalChange = true; return; }
+    if (this.updatePolicy.mode === 'scheduled') {
+      this.scheduler.markRegion(region, 'external');
+      this.changeTotals.external++;
+    }
+  }
   update(frame: number, direction: readonly number[], color: readonly number[], materialRevision: number, sceneRevision: number): number {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
     const sun = [...direction, ...color], previous = this.previousDependencies;
-    const reset = this.resetRequested ?? (previous && (
-      previous.material !== materialRevision ? 'material-changed' : previous.scene !== sceneRevision ? 'scene-discontinuity'
-        : sun.some((value, i) => value !== previous.sun[i]) ? 'sun-changed' : null));
+    const materialChanged = !!previous && previous.material !== materialRevision;
+    const sceneChanged = !!previous && previous.scene !== sceneRevision;
+    const sunChanged = !!previous && sun.some((value, i) => value !== previous.sun[i]);
+    const hard = this.resetRequested;
+    const reset = hard ?? (materialChanged ? 'material-changed' : sceneChanged ? 'scene-discontinuity'
+      : sunChanged ? 'sun-changed' : this.externalGlobalChange ? 'external-change' : null);
     if (reset) {
       this.historyUpdates = 0;
       this.historyResetReason = reset;
     }
+    const external = this.externalGlobalChange;
     this.resetRequested = null;
+    this.externalGlobalChange = false;
     this.previousDependencies = { material: materialRevision, scene: sceneRevision, sun };
-    this.lastHistoryFrame = this.enabled && this.multiBounce && this.historyUpdates > 0 ? this.frame : 0;
+    const scheduled = this.updatePolicy.mode === 'scheduled';
+    if (hard) { this.scheduler.requestFullRefresh(hard); this.fieldUpdates = 0; }
+    if (scheduled && !hard) {
+      // A global light change dirties every probe but rejects nothing: the
+      // published field stays usable within its staleness bound.
+      if (sunChanged || external) {
+        this.scheduler.markAll('light', frame); this.feedbackFloorFrame = frame; this.changeTotals.globalLight++;
+      }
+      // Changes the observer could not attribute fall back to the whole grid.
+      const observed = this.observedFrame === frame;
+      if ((materialChanged && !(observed && this.observedMaterialChanges))
+        || (sceneChanged && !(observed && this.observedInstanceChanges))) {
+        this.scheduler.markAll('external', frame); this.changeTotals.globalFallback++;
+      }
+    }
+    this.plan = this.enabled ? this.scheduler.plan(frame) : undefined;
+    const slots = this.plan?.count ?? this.options.probeCount;
+    const history = scheduled ? this.fieldUpdates : this.historyUpdates;
+    this.lastHistoryFrame = this.enabled && this.multiBounce && history > 0 ? this.frame : 0;
     const data = new Float32Array(DIFFUSE_GI_PARAMETER_BYTES / 4), integers = new Uint32Array(data.buffer), o = this.options;
     data.set([...o.origin, this.enabled ? 1 : 0]); data.set([...o.spacing, o.maxDistance], 4);
     integers.set([...o.counts, o.raysPerProbe], 8);
@@ -257,25 +353,44 @@ export class GpuDiffuseGi {
     integers[26] = this.lastHistoryFrame ? 1 : 0;
     integers[27] = this.emissiveSampler?.enabled ? 1 : 0;
     data[28] = o.shadowNormalBias;
+    data[29] = slots;
+    data[30] = scheduled ? Math.min(frame - this.feedbackFloorFrame, EXACT_F32_INTEGER) : Math.min(frame, EXACT_F32_INTEGER);
     this.device.queue.writeBuffer(this.parameters, 0, data);
-    return data.byteLength + (this.enabled ? this.emissiveSampler?.update() ?? 0 : 0);
+    let uploaded = data.byteLength;
+    if (this.plan) {
+      this.device.queue.writeBuffer(this.schedule, 0, this.plan.probes);
+      uploaded += this.plan.probes.byteLength;
+    }
+    return uploaded + (this.enabled ? this.emissiveSampler?.update(slots) ?? 0 : 0);
   }
   encode(encoder: GPUCommandEncoder, frame: number, materialRevision: number, timing?: GPUComputePassTimestampWrites): number {
     if (this.disposed) throw new Error('DIFFUSE_GI_DISPOSED');
     if (!this.enabled) { encoder.beginComputePass({ label: 'disabled diffuse GI', timestampWrites: timing }).end(); return 0; }
-    const count = this.options.rayCount;
+    const plan = this.plan;
+    if (!plan || plan.frame !== frame) throw new Error('DIFFUSE_GI_SCHEDULE_MISSING');
+    const slots = plan.count;
+    const count = slots * this.options.raysPerProbe;
     const outputIndex = 1 - this.currentIndex;
+    // One span: the first pass (carry or generate) writes its beginning, the last its end.
+    let begin = timestampSpanStart(timing);
     const dispatch = (label: string, pipeline: GPUComputePipeline, count: number, timestampWrites?: GPUComputePassTimestampWrites) => {
       const pass = encoder.beginComputePass({ label, timestampWrites });
       pass.setPipeline(pipeline); pass.setBindGroup(0, this.computeGroups[outputIndex]);
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     };
-    dispatch('generate world-space GI rays', this.generate, count, timestampSpanStart(timing));
+    if (slots < this.options.probeCount) {
+      // Carry every probe forward, then overwrite only the captured slots.
+      const field = this.probeBuffers[this.currentIndex];
+      encoder.copyBufferToBuffer(field, 0, this.probeBuffers[outputIndex], 0, field.size);
+      dispatch('carry scheduled GI field', this.restamp, this.options.probeCount, begin);
+      begin = undefined;
+    }
+    dispatch('generate world-space GI rays', this.generate, count, begin);
     let uploaded = this.queries.encodeTrace(encoder, count, 0, materialRevision);
     encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.primary, 0, count * WORLD_HIT_BYTES);
     dispatch('generate GI sun visibility rays', this.generateShadows, count);
     this.queries.encodeTrace(encoder, count, 0, materialRevision);
-    dispatch('integrate world-space GI radiance', this.integrate, this.options.probeCount);
+    dispatch('integrate world-space GI radiance', this.integrate, slots);
     uploaded += this.emissiveSampler?.encode(encoder, outputIndex, materialRevision) ?? 0;
     if (this.visibilityDirection === 'receiver-to-probe') {
       // Radiance, sun and emissive consumers are complete. Reuse only the shared
@@ -283,10 +398,14 @@ export class GpuDiffuseGi {
       dispatch('generate receiver-directed GI support rays', this.generate, count);
       uploaded += this.queries.encodeTrace(encoder, count, 0, materialRevision,
         this.options.maxVisibilityWorkUnits, undefined, 'reverse-material-support');
-      dispatch('validate receiver-directed GI support', this.validateVisibility, this.options.probeCount);
+      dispatch('validate receiver-directed GI support', this.validateVisibility, slots);
     }
-    dispatch('integrate GI directional visibility', this.integrateVisibility, this.options.probeCount * GI_DISTANCE_CELLS,
+    dispatch('integrate GI directional visibility', this.integrateVisibility, slots * GI_DISTANCE_CELLS,
       timestampSpanEnd(timing));
+    this.scheduler.commit(plan);
+    this.plan = undefined;
+    this.lastCapturedProbes = slots;
+    this.fieldUpdates++;
     this.frame = frame;
     this.currentIndex = outputIndex;
     this.historyUpdates = this.multiBounce ? this.historyUpdates + 1 : 1;
@@ -319,9 +438,11 @@ export class GpuDiffuseGi {
             || emissiveOverflows > this.options.raysPerProbe
             || !Number.isInteger(visibilityOverflows) || visibilityOverflows < 0
             || visibilityOverflows > this.options.raysPerProbe) throw new Error('DIFFUSE_GI_NONFINITE');
+          const captureFrame = u32[state + 3];
+          if (captureFrame > frame || (u32[state] === 1 && captureFrame === 0)) throw new Error('DIFFUSE_GI_CAPTURE_FRAME');
           probes.push({ coefficients, moments, maxRadiance, valid: u32[state] === 1,
-            primaryOverflows: u32[state + 2], shadowOverflows: u32[state + 3],
-            emissiveOverflows, visibilityOverflows });
+            primaryOverflows: u32[state + 2] & 0xffff, shadowOverflows: u32[state + 2] >>> 16,
+            emissiveOverflows, visibilityOverflows, captureFrame });
         }
         return { frame, probes, invalidProbes: probes.filter(probe => !probe.valid).length };
       } finally { this.readback.unmap(); }
@@ -330,11 +451,20 @@ export class GpuDiffuseGi {
   diagnostics() {
     const emissive = this.emissiveSampler?.diagnostics();
     const gather = this.finalGather?.diagnostics();
-    const supportRays = this.visibilityDirection === 'receiver-to-probe' ? this.options.rayCount : 0;
+    const scheduled = this.updatePolicy.mode === 'scheduled';
+    const capturedProbes = this.lastCapturedProbes || this.options.probeCount;
+    const capturedRays = capturedProbes * this.options.raysPerProbe;
+    const supportRays = this.visibilityDirection === 'receiver-to-probe' ? capturedRays : 0;
     return { enabled: this.enabled, frame: this.frame, options: this.options, ownedGpuBytes: this.bytes,
       multiBounce: this.multiBounce, historyUpdates: this.historyUpdates, lastHistoryFrame: this.lastHistoryFrame,
       historyResetReason: this.historyResetReason, transport: this.multiBounce ? 'cross-frame-diffuse-feedback' : 'single-diffuse-bounce',
-      capture: 'diffuse-and-emissive', update: 'full-grid-every-frame', representation: 'radiance-SH9',
+      capture: 'diffuse-and-emissive', update: scheduled ? 'change-driven-bounded' : 'full-grid-every-frame',
+      representation: 'radiance-SH9',
+      // Every published probe was captured within maxStalenessUpdates GI updates.
+      schedule: { ...this.scheduler.diagnostics(), capturedProbesLastUpdate: this.lastCapturedProbes,
+        capturedRaysLastUpdate: this.lastCapturedProbes * this.options.raysPerProbe,
+        fieldUpdatesSinceFullRefresh: this.fieldUpdates, feedbackCaptureFloorFrame: scheduled ? this.feedbackFloorFrame : 0,
+        changes: { ...this.changeTotals }, sceneObservation: scheduled ? 'renderer-instance-bounds-and-material-identity' : 'not-used' },
       visibility: 'octahedral-distance-moments', visibilityResolution: GI_DISTANCE_RESOLUTION,
       visibilityCapture: 'normalized-cosine-power-32', distanceCaptureSamplesPerUpdate: GI_DISTANCE_CELLS * this.options.rayCount,
       visibilityFilter: this.options.visibilityFilter,
@@ -350,7 +480,7 @@ export class GpuDiffuseGi {
         inactiveBlockRaysPerUpdate: this.enabled ? emissive.inactiveBlockRaysPerUpdate : 0,
         queryRaysPerUpdate: this.enabled ? emissive.queryRaysPerUpdate : 0,
         maxWorkUnitsPerUpdate: this.enabled ? emissive.maxWorkUnitsPerUpdate : 0 } : null,
-      queriesPerUpdate: this.enabled ? this.options.rayCount * 2 + supportRays + (this.emissiveSampler?.queryRayCount ?? 0)
+      queriesPerUpdate: this.enabled ? capturedRays * 2 + supportRays + (this.emissiveSampler?.queryRayCount ?? 0)
         + (gather?.queryRaysPerUpdate ?? 0) : 0,
       maxWorkUnitsPerUpdate: this.enabled ? this.queries.options.maxTotalWorkUnits
         * (this.emissiveSampler?.queryRayCount ? 3 : 2) + (supportRays ? this.options.maxVisibilityWorkUnits : 0)

@@ -1,16 +1,15 @@
-import { chromium } from '@playwright/test';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { assetSetRoots, captureBaseUrl, captureChannel, launchCaptureBrowser, requireAssetRoots } from './capture-target.mjs';
 
 // Local, already-built Intel Sponza assets only. This capture does not fetch,
 // rebuild, or accept unhashed geometry pages/proxies. Coarse proxies are not a
 // visibility reference; use --query-root with --source-raster for exact LOD0
 // topology comparisons. Four BLEND primitives remain explicitly omitted.
+// Asset roots come from --asset-set (or SPONZA_ASSET_SET) and/or per-root flags;
+// the dev server from --base-url, SPONZA_BASE_URL or PLAYWRIGHT_PORT; the browser
+// from --channel or SPONZA_CHANNEL (chrome on macOS, msedge on Windows).
 const defaults = {
-  geometryRoot: '/artifacts/sponza-group16-pages-20261022/',
-  textureGpuRoot: '/artifacts/sponza-textures-gpu-20261020/',
-  textureReferenceRoot: '/artifacts/sponza-textures-reference-20261020/',
-  uvAuditUrl: '/artifacts/sponza-uv-demand-20261020.json',
   output: 'artifacts/sponza-gi-capture',
   exposureEV: 3,
   anisotropy: 8,
@@ -19,7 +18,7 @@ const defaults = {
 const valueFlags = new Map([
   ['--geometry-root', 'geometryRoot'], ['--query-root', 'queryRoot'], ['--output', 'output'],
   ['--texture-gpu-root', 'textureGpuRoot'], ['--texture-reference-root', 'textureReferenceRoot'],
-  ['--uv-audit', 'uvAuditUrl'],
+  ['--uv-audit', 'uvAuditUrl'], ['--asset-set', 'assetSet'], ['--base-url', 'baseUrl'], ['--channel', 'channel'],
   ['--anisotropy', 'anisotropy'],
   ['--warmup-frames', 'warmupFrames'],
   ['--gather-spacing', 'gatherPixelSpacing'], ['--gather-capacity', 'gatherCapacity'],
@@ -50,6 +49,10 @@ for (let i = 2; i < process.argv.length; i++) {
   } else if (switches.has(flag)) options[switches.get(flag)] = true;
   else throw Error(`SPONZA_GI_ARGUMENT:${flag}`);
 }
+for (const [key, value] of Object.entries(await assetSetRoots(options.assetSet))) options[key] ??= value;
+requireAssetRoots(options, 'SPONZA_GI');
+options.baseUrl = captureBaseUrl(options.baseUrl);
+options.channel = captureChannel(options.channel);
 for (const key of ['geometryRoot', 'queryRoot', 'textureGpuRoot', 'textureReferenceRoot']) {
   if (options[key] !== undefined && (!options[key].startsWith('/') || options[key].startsWith('//') || !options[key].endsWith('/')))
     throw Error(`SPONZA_GI_LOCAL_ROOT:${key}`);
@@ -100,14 +103,14 @@ if (!Number.isSafeInteger(options.warmupFrames) || options.warmupFrames < 90 || 
   throw Error('SPONZA_GI_WARMUP_FRAMES');
 
 await mkdir(options.output, { recursive: true });
-const browser = await chromium.launch({ channel: 'msedge', headless: true, args: ['--force-high-performance-gpu'] });
+const browser = await launchCaptureBrowser(options.channel);
 try {
   const page = await browser.newPage({ viewport: { width: 1320, height: 800 } });
   page.setDefaultTimeout(600000);
   const pageErrors = [];
   page.on('pageerror', error => { pageErrors.push(error.message); console.log('PAGE_ERROR ' + error.message); });
   page.on('console', message => { if (message.text().startsWith('SPONZA_PROGRESS')) console.log(message.text()); });
-  await page.goto('http://127.0.0.1:5173/');
+  await page.goto(options.baseUrl + '/');
   await page.waitForFunction(() => window.__REAL_ENGINE__);
   const result = await page.evaluate(async settings => {
     window.__REAL_ENGINE__.pause(true);

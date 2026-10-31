@@ -30,6 +30,8 @@ async function checked(url: string, bytes: number, sha?: string, signal?: AbortS
 }
 const json = async (url: string, limit: number) => JSON.parse(new TextDecoder().decode(await checked(url, limit)));
 
+/** Server paths of already-built local packages. There are no built-in dated
+ * defaults: capture scripts resolve them from an asset-set file or flags. */
 export interface IntelSponzaAssetOptions {
   geometryRoot?: string;
   queryRoot?: string;
@@ -44,10 +46,10 @@ export interface IntelSponzaAssetOptions {
  * transforms, material conversion and explicit BLEND exclusions stay identical. */
 export async function loadIntelSponzaAssets(settings: IntelSponzaAssetOptions = {},
   progress: (phase: string, data?: unknown) => void = () => {}) {
-  const root = settings.geometryRoot ?? '/artifacts/sponza-group16-pages-20261022/';
-  const textureGpuRoot = settings.textureGpuRoot ?? '/artifacts/sponza-textures-gpu-20261020/';
-  const textureReferenceRoot = settings.textureReferenceRoot ?? '/artifacts/sponza-textures-reference-20261020/';
-  const uvAuditUrl = settings.uvAuditUrl ?? '/artifacts/sponza-uv-demand-20261020.json';
+  const missing = (['geometryRoot', 'textureGpuRoot', 'textureReferenceRoot', 'uvAuditUrl'] as const).filter(key => !settings[key]);
+  if (missing.length) throw Error('SPONZA_ASSET_ROOTS_REQUIRED: ' + missing.join(','));
+  const root = settings.geometryRoot!, textureGpuRoot = settings.textureGpuRoot!;
+  const textureReferenceRoot = settings.textureReferenceRoot!, uvAuditUrl = settings.uvAuditUrl!;
   if (settings.sourceRaster && !settings.queryRoot) throw Error('SPONZA_SOURCE_RASTER_REQUIRES_FINE_QUERY');
   const manifest = await json(root + 'manifest.json', 32 * MiB);
   const queryManifest = settings.queryRoot ? await json(settings.queryRoot + 'manifest.json', 32 * MiB) : null;
@@ -69,12 +71,15 @@ export async function loadIntelSponzaAssets(settings: IntelSponzaAssetOptions = 
   });
   const textureManifest = await json(textureGpuRoot + 'manifest.json', MiB);
   const images = new Map(), sources: TextureStreamSource[] = [];
+  let referenceNormals = 0;
   for (const entry of textureManifest.images) {
     const reference = entry.roles.includes('normal:linear');
+    if (reference) referenceNormals++;
     const source = await loadTextureStreamSource((reference ? textureReferenceRoot : textureGpuRoot) + `image-${entry.image}/manifest.json`);
     images.set(entry.image, source.fallback); sources.push(source);
   }
-  progress('textures-ready', { count: sources.length, referenceNormals: 23 });
+  if (referenceNormals !== 23) throw Error('SPONZA_REFERENCE_NORMAL_COUNT');
+  progress('textures-ready', { count: sources.length, referenceNormals });
   const materials = createGltfMaterialLibrary(doc, { images });
   const uvAudit = await json(uvAuditUrl, MiB);
   if (uvAudit.sourceSha256 !== manifest.source.sha256) throw Error('SPONZA_UV_SOURCE_MISMATCH');

@@ -1,13 +1,16 @@
-import { chromium } from '@playwright/test';
 import { mkdir, readFile, writeFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { captureBaseUrl, captureChannel, launchCaptureBrowser } from './capture-target.mjs';
 
 // Explicit local diagnostic entry point. The caller supplies a bounded case
 // manifest extracted from a prior capture; no downloads or asset builds occur.
+// The dev server and browser come from SPONZA_BASE_URL / PLAYWRIGHT_PORT and
+// SPONZA_CHANNEL (chrome on macOS, msedge on Windows), as in the other captures.
 const [inputPath, output] = process.argv.slice(2);
 if (!inputPath || !output || process.argv.length !== 4) {
   throw Error('Usage: node scripts/capture-sponza-anchor-reference.mjs input.json output-directory');
 }
+const baseUrl = captureBaseUrl(undefined), channel = captureChannel(undefined);
 if ((await stat(inputPath)).size > 2 * 1024 ** 2) throw Error('SPONZA_REFERENCE_INPUT_BYTES');
 const input = JSON.parse(await readFile(inputPath, 'utf8'));
 // Fail malformed links before launching a browser (including its default demo
@@ -27,7 +30,7 @@ if (input.visibilityLinks !== undefined) {
   }
 }
 await mkdir(output, { recursive: true });
-const browser = await chromium.launch({ channel: 'msedge', headless: true, args: ['--force-high-performance-gpu'] });
+const browser = await launchCaptureBrowser(channel);
 try {
   const page = await browser.newPage({ viewport: { width: 1320, height: 800 }, deviceScaleFactor: 1 });
   page.setDefaultTimeout(600000);
@@ -43,7 +46,7 @@ try {
         batch: event.data.batch, seed: event.data.seed, samplesPerCase: event.data.samplesPerCase }));
     } else console.log(text);
   });
-  await page.goto('http://127.0.0.1:5173/');
+  await page.goto(baseUrl + '/');
   await page.waitForFunction(() => window.__REAL_ENGINE__);
   const result = await page.evaluate(async input => {
     window.__REAL_ENGINE__.pause(true); window.__REAL_ENGINE__.dispose();

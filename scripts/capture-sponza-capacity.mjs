@@ -1,17 +1,15 @@
-import { chromium } from '@playwright/test';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { assetSetRoots, captureBaseUrl, captureChannel, launchCaptureBrowser, requireAssetRoots } from './capture-target.mjs';
 
 // Explicit hardware correctness run against already-built, local hashed assets.
 // No source assets are downloaded or rebuilt, and this is not an FPS benchmark.
-const options = { geometryRoot: '/artifacts/sponza-group16-pages-20261022/',
-  textureGpuRoot: '/artifacts/sponza-textures-gpu-20261020/',
-  textureReferenceRoot: '/artifacts/sponza-textures-reference-20261020/',
-  uvAuditUrl: '/artifacts/sponza-uv-demand-20261020.json', anisotropy: 8,
+const options = { anisotropy: 8,
   output: 'artifacts/sponza-capacity-capture', settleFrames: 1200, travelFrames: 48, stableFrames: 24,
   intervalFrames: 2, maxConcurrentMigrations: 4, growthOrder: 'large-first', maxErrorPixels: 2, exposureEV: 3, timeoutMs: 1800000 };
 const flags = new Map([['--geometry-root', 'geometryRoot'], ['--query-root', 'queryRoot'], ['--output', 'output'],
   ['--texture-gpu-root', 'textureGpuRoot'], ['--texture-reference-root', 'textureReferenceRoot'], ['--uv-audit', 'uvAuditUrl'],
+  ['--asset-set', 'assetSet'], ['--base-url', 'baseUrl'], ['--channel', 'channel'],
   ['--resident-mib', 'residentMiB'], ['--peak-mib', 'peakMiB'], ['--settle-frames', 'settleFrames'],
   ['--travel-frames', 'travelFrames'], ['--stable-frames', 'stableFrames'], ['--interval-frames', 'intervalFrames'], ['--concurrent-migrations', 'maxConcurrentMigrations'],
   ['--growth-order', 'growthOrder'],
@@ -20,8 +18,11 @@ if (process.argv.includes('--help')) {
   console.log('Usage: node scripts/capture-sponza-capacity.mjs [--output artifacts/name] [--resident-mib N --peak-mib N]\n'
     + '  --settle-frames 1200 --travel-frames 48 --stable-frames 24 --interval-frames 2 --concurrent-migrations 4 --lod-error 2\n'
     + '  --growth-order large-first|small-first (same-code ordering comparison; default large-first)\n'
+    + '  --asset-set artifacts/<set>/asset-set.json (or SPONZA_ASSET_SET) and/or\n'
     + '  --geometry-root /local/path/ --texture-gpu-root /local/path/ --texture-reference-root /local/path/ --uv-audit /local/file.json\n'
-    + 'Requires an existing Vite server at http://127.0.0.1:5173. Runs Edge with the high-performance hardware adapter.\n'
+    + '  --base-url http://127.0.0.1:PORT (default SPONZA_BASE_URL or PLAYWRIGHT_PORT, else 5173) --channel chrome|msedge|chromium\n'
+    + 'Requires an existing Vite server at the base URL. Runs the channel (default chrome on macOS, msedge on Windows)\n'
+    + 'with the high-performance hardware adapter.\n'
     + 'Default live budget equals original quarter-page pools plus ALL selection and current/previous output allocations.\n'
     + 'Default peak adds the largest planned route candidate plus one slot. JSON reports exact bytes; these are not total VRAM limits.');
   process.exit(0);
@@ -31,6 +32,10 @@ for (let i = 2; i < process.argv.length; i++) {
   if (!key || !value || value.startsWith('--')) throw Error('SPONZA_CAPACITY_ARGUMENT: ' + flag);
   options[key] = value;
 }
+for (const [key, value] of Object.entries(await assetSetRoots(options.assetSet))) options[key] ??= value;
+requireAssetRoots(options, 'SPONZA_CAPACITY');
+options.baseUrl = captureBaseUrl(options.baseUrl);
+options.channel = captureChannel(options.channel);
 for (const key of ['geometryRoot', 'queryRoot', 'textureGpuRoot', 'textureReferenceRoot']) if (options[key] !== undefined
   && (!options[key].startsWith('/') || options[key].startsWith('//') || !options[key].endsWith('/'))) throw Error('SPONZA_CAPACITY_LOCAL_ROOT: ' + key);
 if (!options.uvAuditUrl.startsWith('/') || options.uvAuditUrl.startsWith('//')) throw Error('SPONZA_CAPACITY_LOCAL_UV_AUDIT');
@@ -48,7 +53,7 @@ for (const [key, minimum, maximum, integral] of [['residentMiB', 0.000001, 8192,
 if (options.stableFrames < 2 * options.intervalFrames || options.settleFrames < options.stableFrames) throw Error('SPONZA_CAPACITY_SETTLE_WINDOW');
 if (options.peakMiB !== undefined && options.residentMiB !== undefined && options.peakMiB < options.residentMiB) throw Error('SPONZA_CAPACITY_PEAK_LESS_THAN_LIVE');
 await mkdir(options.output, { recursive: true });
-const browser = await chromium.launch({ channel: 'msedge', headless: true, args: ['--force-high-performance-gpu'] });
+const browser = await launchCaptureBrowser(options.channel);
 const pageErrors = [], progress = [], savedCaptures = [];
 let deadline;
 try {
@@ -67,7 +72,7 @@ try {
     const { png, ...metadata } = capture;
     savedCaptures.push({ ...metadata, file });
   });
-  await page.goto('http://127.0.0.1:5173/');
+  await page.goto(options.baseUrl + '/');
   await page.waitForFunction(() => window.__REAL_ENGINE__);
   const result = await Promise.race([page.evaluate(async settings => {
     window.__REAL_ENGINE__.pause(true); window.__REAL_ENGINE__.dispose();

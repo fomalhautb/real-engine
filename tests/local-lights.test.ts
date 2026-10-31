@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   LOCAL_LIGHT_HEADER_FLOATS, LOCAL_LIGHT_LIMITS, LOCAL_LIGHT_RECORD_FLOATS, LOCAL_SHADOW_BORDER_TEXELS,
-  LocalLightSet, localLightConeFactor, localLightIrradiance, localLightRangeWindow, localLightShadowFrustum,
+  LocalLightSet, localLightChangeRegions, localLightConeFactor, localLightIrradiance, localLightRangeWindow, localLightShadowFrustum,
   localLightShadowViewCount, resolveLocalLightOptions, validateLocalLight, type LocalLightDescriptor, type LocalLightVec3,
 } from '../src/local-lights';
 import { FOG_LOCAL_LIGHTS_HOOK, GpuLocalLights, localLightsShaderSource } from '../src/gpu-local-lights';
@@ -259,6 +259,42 @@ describe('local light set', () => {
     expect(() => set.update(handle, { kind: 'spot' })).toThrow('INVALID_LOCAL_LIGHT: direction');
     expect(() => set.update(handle, { outerConeAngle: 0.3 })).toThrow('point lights have no cone');
     expect(set.update(handle, { kind: 'spot', direction: [1, 0, 0] }).outerConeAngle).toBeCloseTo(Math.PI / 4, 15);
+  });
+
+  it('reports the range boxes of added, changed, moved, disabled and removed lights', () => {
+    const set = new LocalLightSet();
+    const boxAt = (center: LocalLightVec3, range: number) => ({ min: center.map(value => value - range), max: center.map(value => value + range) });
+    const a = set.add(point()), b = set.add(spot());
+    const empty = set.list();
+    expect(localLightChangeRegions([], empty)).toEqual([boxAt([0, 2, 0], 10), boxAt([0, 3, 0], 8)]);
+    expect(localLightChangeRegions(empty, set.list())).toEqual([]);
+    // In place: one box, not the same box twice.
+    let before = set.list();
+    set.update(a, { intensity: 8 });
+    expect(localLightChangeRegions(before, set.list())).toEqual([boxAt([0, 2, 0], 10)]);
+    before = set.list();
+    set.update(b, { position: [4, 3, 0] });
+    expect(localLightChangeRegions(before, set.list())).toEqual([boxAt([0, 3, 0], 8), boxAt([4, 3, 0], 8)]);
+    before = set.list();
+    set.setEnabled(a, false);
+    expect(localLightChangeRegions(before, set.list())).toEqual([boxAt([0, 2, 0], 10)]);
+    // A disabled light shades nothing: editing it changes no region until it is enabled again.
+    before = set.list();
+    set.update(a, { intensity: 2 });
+    expect(localLightChangeRegions(before, set.list())).toEqual([]);
+    before = set.list();
+    set.setEnabled(a, true);
+    expect(localLightChangeRegions(before, set.list())).toEqual([boxAt([0, 2, 0], 10)]);
+    // A reused slot has a new generation, so its successor reports even in the same slot; one box when they coincide.
+    before = set.list();
+    set.remove(b);
+    const c = set.add(spot({ position: [4, 3, 0] }));
+    expect(c.id).toBe(b.id);
+    expect(localLightChangeRegions(before, set.list())).toEqual([boxAt([4, 3, 0], 8)]);
+    before = set.list();
+    set.remove(c);
+    set.add(point({ position: [-4, 1, 0], range: 2 }));
+    expect(localLightChangeRegions(before, set.list())).toEqual([boxAt([4, 3, 0], 8), boxAt([-4, 1, 0], 2)]);
   });
 
   it('budgets shadowed lights and atlas views, including disabled reservations', () => {

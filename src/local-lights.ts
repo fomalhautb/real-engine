@@ -319,7 +319,8 @@ export interface PackedLocalLights {
 }
 
 /** World bounds of every light whose shading differs between two snapshots: the range-sphere box before and
- * after each added, removed or re-versioned light. Disabled lights shade nothing, so they contribute no box. */
+ * after each added, removed or re-versioned light. Disabled lights shade nothing, so they contribute no box.
+ * An in-place change (same position and range) reports its box once. */
 export function localLightChangeRegions(before: readonly ResolvedLocalLight[], after: readonly ResolvedLocalLight[]): Bounds3[] {
   const box = (light: ResolvedLocalLight): Bounds3 => ({
     min: [light.position[0] - light.range, light.position[1] - light.range, light.position[2] - light.range],
@@ -328,9 +329,13 @@ export function localLightChangeRegions(before: readonly ResolvedLocalLight[], a
   const same = (a: ResolvedLocalLight | undefined, b: ResolvedLocalLight | undefined) =>
     !!a && !!b && a.handle.generation === b.handle.generation && a.version === b.version;
   const previous = new Map(before.map(light => [key(light), light])), next = new Map(after.map(light => [key(light), light]));
-  const regions: Bounds3[] = [];
-  for (const light of before) if (light.enabled && !same(light, next.get(key(light)))) regions.push(box(light));
-  for (const light of after) if (light.enabled && !same(previous.get(key(light)), light)) regions.push(box(light));
+  const regions: Bounds3[] = [], seen = new Set<string>();
+  const push = (light: ResolvedLocalLight) => {
+    const region = box(light), id = [...region.min, ...region.max].join();
+    if (!seen.has(id)) { seen.add(id); regions.push(region); }
+  };
+  for (const light of before) if (light.enabled && !same(light, next.get(key(light)))) push(light);
+  for (const light of after) if (light.enabled && !same(previous.get(key(light)), light)) push(light);
   return regions;
 }
 

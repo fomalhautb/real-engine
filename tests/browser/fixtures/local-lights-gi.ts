@@ -98,10 +98,28 @@ export async function runLocalLightGiProbeFixture(plan: LocalLightGiProbePlan) {
     plate.instances = [];
     const shadowedRestored = await capture();
     const lightDiagnostics = renderer.diagnostics().localLights;
+    // Scheduled policy: a light change marks the probes its range box reaches (renderer.markDiffuseGiDirty(region)),
+    // rejects no history, and bounded recaptures converge to the new light.
+    renderer.setDiffuseGiUpdate({ mode: 'scheduled' });
+    const schedule = () => {
+      const gi = renderer!.diagnostics().diffuseGi!;
+      return { resetReason: gi.historyResetReason, pending: gi.schedule.pendingDirtyProbes, totals: gi.schedule.totals,
+        external: gi.schedule.changes.external, dirtyLastUpdate: gi.schedule.lastPlan?.dirtyProbes ?? 0 };
+    };
+    const settle = async () => {
+      let frames = 0;
+      do { renderer!.render(plan.eye, plan.target); frames++; } while (schedule().pending > 0 && frames < 64);
+      return { ...(await capture()), schedule: schedule(), frames };
+    };
+    const scheduledBase = await settle();
+    renderer.updateLocalLight(handle, { intensity: plan.light.intensity * 2 });
+    renderer.render(plan.eye, plan.target);
+    const scheduledFirst = schedule();
+    const scheduledDoubled = await settle();
     const errors = [...renderer.errors], adapter = renderer.info.adapterInfo;
     renderer.dispose();
     return { dark, unshadowed, giOffLit, giOffDark, shadowedOpen, shadowedPlate, shadowedRestored, lightDiagnostics,
-      errors, adapter, afterDispose: renderer.stats.ownedGpuBytes };
+      scheduledBase, scheduledFirst, scheduledDoubled, errors, adapter, afterDispose: renderer.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); element.remove(); }
 }
 

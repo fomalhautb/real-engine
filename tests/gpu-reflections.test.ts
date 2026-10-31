@@ -3,6 +3,8 @@ import { GpuReflections, type ReflectionUpdate } from '../src/gpu-reflections';
 import type { GpuWorldQuery } from '../src/gpu-world-query';
 import type { GpuDiffuseGi } from '../src/gpu-diffuse-gi';
 import type { GpuVolumetricFog } from '../src/gpu-volumetric-fog';
+import type { GpuLocalLights } from '../src/gpu-local-lights';
+import { resolveLocalLightOptions } from '../src/local-lights';
 
 type FakeBuffer = { label: string; destroyed: boolean; destroy(): void };
 
@@ -288,6 +290,38 @@ describe('GPU reflection history', () => {
     const untimed = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query, {}, tracked.account);
     expect(() => untimed.setTemporalEnabled(true)).toThrow('REFLECTIONS_TEMPORAL_NOT_CONFIGURED');
     untimed.dispose();
+  });
+
+  it('resets history on every local light set revision and binds the light group to the integrate pass', async () => {
+    const device = new FakeDevice(), tracked = ledger(), { query } = borrowed();
+    let revision = 4;
+    const lightGroup = { label: 'local lights' };
+    const lights = { get revision() { return revision; }, options: resolveLocalLightOptions({}),
+      bindGroup: () => lightGroup } as unknown as GpuLocalLights;
+    const reflections = await GpuReflections.create(device as unknown as GPUDevice, query, { temporal: {} }, tracked.account,
+      undefined, undefined, undefined, lights);
+    try {
+      let index = 0;
+      const step = () => {
+        index++;
+        reflections.update({ ...frame, frame: index, viewProjection: identityMatrix,
+          previousViewProjection: index > 1 ? identityMatrix : undefined, sceneMotion: false, historyRevision: 0 });
+        const groups: unknown[] = [];
+        const encoder = { beginComputePass: () => ({ setPipeline() {}, setBindGroup(_index: number, group: unknown) { groups.push(group); },
+          dispatchWorkgroups() {}, end() {} }), copyBufferToBuffer() {} } as unknown as GPUCommandEncoder;
+        reflections.encode(encoder);
+        return { history: reflections.diagnostics().temporal, groups };
+      };
+      expect(step().history).toMatchObject({ framesSinceReset: 1, lastResetReason: 'initial' });
+      expect(step().history).toMatchObject({ framesSinceReset: 2, lastResetReason: 'initial' });
+      revision = 5;
+      const changed = step();
+      expect(changed.history).toMatchObject({ valid: true, framesSinceReset: 1, lastResetReason: 'local-light-change' });
+      expect(changed.groups).toContain(lightGroup);
+      expect(step().history).toMatchObject({ framesSinceReset: 2, lastResetReason: 'local-light-change' });
+      expect(reflections.diagnostics().localLights).toBe(true);
+    } finally { reflections.dispose(); }
+    expect(tracked.bytes).toBe(0);
   });
 });
 

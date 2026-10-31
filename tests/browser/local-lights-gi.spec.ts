@@ -169,8 +169,26 @@ test('an off-screen point light reaches world GI probes with exact SH and atlas 
     }
   }
   expect(result.lightDiagnostics).toMatchObject({ cameraCulling: false, shadowedLights: 1, renderedShadowViews: 6 });
+
+  // Scheduled GI: the in-place intensity change reports one range box; every probe is within reach of it.
+  const base = result.scheduledBase.schedule, first = result.scheduledFirst;
+  expect(result.scheduledBase.resetReason).toBe('update-policy-changed');
+  expect(base.pending).toBe(0);
+  const scheduledBaseError = compareProbes(result.scheduledBase.probes, expectedProbes(giPlan, false), 'scheduled baseline');
+  expect(first.resetReason).toBe('update-policy-changed');
+  expect(first.external - base.external).toBe(1);
+  expect(first.totals.regionMarks - base.totals.regionMarks).toBe(1);
+  expect(first.totals.markedProbes - base.totals.markedProbes).toBe(8);
+  expect(first.totals.globalMarks).toBe(base.totals.globalMarks);
+  expect(first.totals.fullRefreshes).toBe(base.totals.fullRefreshes);
+  expect(first.dirtyLastUpdate).toBeGreaterThan(0);
+  const doubled = { ...giPlan, light: { ...giLight, intensity: 2 * giLight.intensity } };
+  expect(result.scheduledDoubled.schedule.pending).toBe(0);
+  expect(result.scheduledDoubled.resetReason).toBe('update-policy-changed');
+  const scheduledError = compareProbes(result.scheduledDoubled.probes, expectedProbes(doubled, false), 'scheduled after doubling');
   expect(result.afterDispose).toBe(0);
   console.log('LOCAL_LIGHTS_GI_DIAGNOSTIC ' + JSON.stringify({ adapter: result.adapter, unshadowedError, openError, plateError,
+    scheduledBaseError, scheduledError, scheduledFrames: 1 + result.scheduledDoubled.frames,
     shadowedRays, plateRays, litRays: lit.length, hdr: { dark: result.dark.hdr, lit: result.unshadowed.hdr } }));
 });
 

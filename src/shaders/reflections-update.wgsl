@@ -107,6 +107,8 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     var failures = select(0u, 1u, reflectionFailed(camera));
     var sum = vec3f(0.0);
     var weightSum = 0.0; var distanceSum = 0.0; var motionSum = vec3f(0.0); var dominant = 0.0;
+    var movedSum = 0.0; var hitWeight = 0.0; var hitDistance = 0.0;
+    let footprint = reflectionLobeTangent(camera.normal.w);
     var screenCounts = vec4u(0u);
     result.reflected = vec4u(0u, 0u, 0u, 0xffffffffu);
     for (var sampleIndex = 0u; sampleIndex < reflection.settings.z; sampleIndex++) {
@@ -135,14 +137,24 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
         // Reflected-hit statistics drive parallax reprojection and history checks.
         let lobe = dot(sample.weight.xyz, vec3f(0.2126, 0.7152, 0.0722));
         weightSum += lobe; distanceSum += lobe * distance;
-        if (hit.identity.x != 0u) { motionSum += lobe * reflectionHitMotion(hit); }
+        if (hit.identity.x != 0u) {
+            let moved = reflectionHitMotion(hit);
+            motionSum += lobe * moved;
+            // Content that moved by more than a quarter of the lobe footprint at
+            // its distance changed what this sample integrates.
+            movedSum += select(0.0, lobe, length(moved) > 0.25 * distance * footprint + 1e-4);
+            hitWeight += lobe; hitDistance += lobe * distance;
+        }
         if (lobe > dominant) { dominant = lobe; result.reflected = vec4u(hit.identity.xyz, sampleIndex); }
     }
     let raw = clamp(sum, vec3f(0.0), vec3f(65504.0));
     let meanDistance = select(reflection.eye.w, distanceSum / weightSum, weightSum > 0.0);
     result.raw = vec4f(raw, meanDistance);
     result.radiance = vec4f(raw, 1.0);
-    result.motion = vec4f(select(vec3f(0.0), motionSum / weightSum, weightSum > 0.0), weightSum);
+    // Distance of reflected content with detail: misses see the smooth sky.
+    result.unfiltered = vec4f(raw, select(meanDistance, hitDistance / hitWeight, hitWeight > 0.0));
+    result.motion = vec4f(select(vec3f(0.0), motionSum / weightSum, weightSum > 0.0),
+        select(0.0, movedSum / weightSum, weightSum > 0.0));
     result.state = vec4u(select(0u, 1u, camera.identity.x != 0u && camera.emissive.w == 0.0 && failures == 0u), reflection.state.x, failures,
         min(screenCounts.x, 255u) | (min(screenCounts.y, 255u) << 8u) | (min(screenCounts.z, 255u) << 16u) | (min(screenCounts.w, 255u) << 24u));
     anchors[id.x] = result;

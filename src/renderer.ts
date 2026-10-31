@@ -849,6 +849,13 @@ export class Renderer {
     if (!this.reflections) throw new Error('REFLECTIONS_DISABLED');
     this.reflections.setScreenTraceEnabled(enabled);
   }
+
+  /** Toggle a configured reflection spatial filter; history is unaffected. */
+  setReflectionsSpatialFilterEnabled(enabled: boolean): void {
+    if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    if (!this.reflections) throw new Error('REFLECTIONS_DISABLED');
+    this.reflections.setSpatialFilterEnabled(enabled);
+  }
   async probeReflections(indices: readonly number[]): Promise<ReflectionProbeResult> {
     if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
     if (!this.reflections) throw new Error('REFLECTIONS_DISABLED');

@@ -1,18 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { reflectionHash, reflectionHistoryLimit, reflectionSampleCoordinates, reflectionSampleRotation,
+import { readFileSync } from 'node:fs';
+import { REFLECTION_FILTER_BYTES_PER_ANCHOR, REFLECTION_REBUILD_FRAMES, reflectionFilterRadius, reflectionHash,
+  reflectionHistoryLimit, reflectionLobeTangent, reflectionSampleCoordinates, reflectionSampleRotation,
   reflectionVirtualPoint, resolveReflectionsOptions } from '../src/reflections';
 
 describe('reflection temporal contracts', () => {
   it('resolves bounded history options and keeps the deterministic path when omitted', () => {
     expect(resolveReflectionsOptions().temporal).toBeUndefined();
+    // The lobe-motion response and the stationary cap are opt-in: defaults keep the previous contract.
     expect(resolveReflectionsOptions({ temporal: {} }).temporal).toEqual({ maxHistoryFrames: 32, minHistoryFrames: 8,
-      clampSigma: 1.5, parallaxRoughness: 0.35 });
+      clampSigma: 1.5, parallaxRoughness: 0.35, lobeMotionResponse: 0, stationaryHistoryFrames: undefined });
     expect(resolveReflectionsOptions({ temporal: { maxHistoryFrames: 4 } }).temporal?.minHistoryFrames).toBe(4);
-    const resolved = resolveReflectionsOptions({ temporal: { maxHistoryFrames: 128, minHistoryFrames: 1, clampSigma: 8, parallaxRoughness: 1 } });
+    const resolved = resolveReflectionsOptions({ temporal: { maxHistoryFrames: 128, minHistoryFrames: 1, clampSigma: 8, parallaxRoughness: 1,
+      lobeMotionResponse: 1, stationaryHistoryFrames: 128 } });
     expect(Object.isFrozen(resolved.temporal)).toBe(true);
     expect(resolveReflectionsOptions(resolved).temporal).toEqual(resolved.temporal);
     for (const temporal of [{ maxHistoryFrames: 1 }, { maxHistoryFrames: 129 }, { maxHistoryFrames: 8, minHistoryFrames: 9 },
-      { minHistoryFrames: 0 }, { clampSigma: 0.2 }, { clampSigma: Number.NaN }, { parallaxRoughness: -0.1 }, { maxHistoryFrames: 2.5 }]) {
+      { minHistoryFrames: 0 }, { clampSigma: 0.2 }, { clampSigma: Number.NaN }, { parallaxRoughness: -0.1 }, { maxHistoryFrames: 2.5 },
+      { lobeMotionResponse: -0.01 }, { lobeMotionResponse: 1.5 }, { lobeMotionResponse: Number.NaN },
+      { stationaryHistoryFrames: 1 }, { stationaryHistoryFrames: 129 }, { stationaryHistoryFrames: 64.5 }]) {
       expect(() => resolveReflectionsOptions({ temporal })).toThrow(RangeError);
     }
     expect(() => resolveReflectionsOptions({ temporal: null as never })).toThrow('REFLECTIONS_TEMPORAL');
@@ -32,6 +38,51 @@ describe('reflection temporal contracts', () => {
     expect(() => resolveReflectionsOptions({ screenTrace: [] as never })).toThrow('REFLECTIONS_SCREEN_TRACE');
   });
 
+  it('resolves the bounded spatial filter only when configured', () => {
+    expect(resolveReflectionsOptions().spatialFilter).toBeUndefined();
+    expect(resolveReflectionsOptions({ spatialFilter: {} }).spatialFilter).toEqual({ iterations: 4, footprint: 0.3 });
+    const resolved = resolveReflectionsOptions({ spatialFilter: { iterations: 5, footprint: 2 } });
+    expect(Object.isFrozen(resolved.spatialFilter)).toBe(true);
+    expect(resolveReflectionsOptions(resolved).spatialFilter).toEqual(resolved.spatialFilter);
+    for (const spatialFilter of [{ iterations: 0 }, { iterations: 6 }, { iterations: 2.5 }, { footprint: 0.04 }, { footprint: 2.1 },
+      { footprint: Number.NaN }]) {
+      expect(() => resolveReflectionsOptions({ spatialFilter })).toThrow(RangeError);
+    }
+    expect(() => resolveReflectionsOptions({ spatialFilter: [] as never })).toThrow('REFLECTIONS_SPATIAL_FILTER');
+    // 64-byte guide plus two 16-byte radiance records per anchor.
+    expect(REFLECTION_FILTER_BYTES_PER_ANCHOR).toBe(96);
+  });
+
+  it('scales the filter kernel with the reflected lobe and keeps mirror-like kernels below a millimetre per metre', () => {
+    expect(reflectionLobeTangent(0)).toBe(0);
+    expect(reflectionLobeTangent(0.3)).toBeCloseTo(Math.tan(2 * Math.atan(0.09)), 12);
+    // The lobe angle is capped at 1.2 rad for the roughest receivers.
+    expect(reflectionLobeTangent(1)).toBeCloseTo(Math.tan(1.2), 12);
+    let previous = 0;
+    for (let roughness = 0; roughness <= 1; roughness += 0.05) {
+      const tangent = reflectionLobeTangent(Math.min(roughness, 1));
+      expect(tangent).toBeGreaterThanOrEqual(previous);
+      previous = tangent;
+    }
+    // d = footprint tan(theta) D V / (D + V), saturating at footprint tan(theta) V for distant content.
+    expect(reflectionFilterRadius(0.3, 5, 3, 0.3)).toBeCloseTo(0.3 * reflectionLobeTangent(0.3) * 15 / 8, 12);
+    expect(reflectionFilterRadius(0.7, 1e6, 2, 0.3)).toBeCloseTo(0.3 * reflectionLobeTangent(0.7) * 2, 5);
+    expect(reflectionFilterRadius(0.5, 0, 3, 0.3)).toBe(0);
+    expect(reflectionFilterRadius(0.045, 20, 20, 0.3) / 20).toBeLessThan(1e-3);
+    expect(() => reflectionFilterRadius(0.5, -1, 3, 0.3)).toThrow('REFLECTIONS_DISTANCE');
+    expect(() => reflectionFilterRadius(0.5, 1, 3, 3)).toThrow('REFLECTIONS_FILTER_FOOTPRINT');
+    expect(() => reflectionLobeTangent(-0.1)).toThrow('REFLECTIONS_ROUGHNESS');
+  });
+
+  it('keeps the WGSL lobe tangent, rebuild length and stationary cap in step with the CPU contract', () => {
+    const common = readFileSync(new URL('../src/shaders/reflections-common.wgsl', import.meta.url), 'utf8');
+    const temporal = readFileSync(new URL('../src/shaders/reflections-temporal.wgsl', import.meta.url), 'utf8');
+    expect(common).toContain('return tan(min(2.0 * atan(roughness * roughness), 1.2));');
+    expect(temporal).toContain(`const REFLECTION_REBUILD_FRAMES = ${REFLECTION_REBUILD_FRAMES}u;`);
+    // The stationary cap only applies to verified-stationary anchors of a static scene.
+    expect(temporal).toContain('mode == REFLECTION_MODE_STATIONARY\n            && reflection.temporalState.w == 0u');
+  });
+
   it('ramps the history cap from mirror-like to rough reflections', () => {
     const temporal = resolveReflectionsOptions({ temporal: { minHistoryFrames: 8, maxHistoryFrames: 32 } }).temporal!;
     expect(reflectionHistoryLimit(0, temporal)).toBe(8);
@@ -46,6 +97,13 @@ describe('reflection temporal contracts', () => {
       previous = limit;
     }
     expect(() => reflectionHistoryLimit(1.5, temporal)).toThrow('REFLECTIONS_ROUGHNESS');
+    // Without a stationary cap the stationary path uses the same ramp.
+    expect(reflectionHistoryLimit(0.045, temporal, true)).toBe(8);
+    const stationary = resolveReflectionsOptions({ temporal: { minHistoryFrames: 8, maxHistoryFrames: 32, stationaryHistoryFrames: 64 } }).temporal!;
+    for (const roughness of [0, 0.045, 0.3, 0.7, 1]) {
+      expect(reflectionHistoryLimit(roughness, stationary, true)).toBe(64);
+      expect(reflectionHistoryLimit(roughness, stationary)).toBe(reflectionHistoryLimit(roughness, temporal));
+    }
   });
 
   it('rotates the stratified GGX set per anchor and frame with exact integer wrapping', () => {

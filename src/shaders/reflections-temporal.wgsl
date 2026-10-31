@@ -3,7 +3,7 @@
 // material parameters or inconsistent reflected-hit distances.
 struct ReflectionHistory {
     identity: vec4u, // batch, entity, generation, frame
-    versions: vec4u, // history version, topology version, valid, reserved
+    versions: vec4u, // history version, topology version, valid, rebuilt frames left
     position: vec4f, // receiver xyz, w mean reflected distance
     normal: vec4f, // receiver geometric normal, w roughness
     material: vec4f, // base color, metallic
@@ -12,6 +12,9 @@ struct ReflectionHistory {
 @group(0) @binding(9) var<storage, read> historyIn: array<ReflectionHistory>;
 @group(0) @binding(10) var<storage, read_write> historyOut: array<ReflectionHistory>;
 
+// Frames, including the response frame, in which a history rebuilt after a lobe
+// change adds the spatial reconstruction instead of the anchor's own estimate.
+const REFLECTION_REBUILD_FRAMES = 4u;
 const REFLECTION_MODE_NONE = 0u;
 const REFLECTION_MODE_STATIONARY = 1u;
 const REFLECTION_MODE_SURFACE = 2u;
@@ -30,6 +33,28 @@ fn reflectionHistoryLimit(roughness: f32) -> f32 {
     let t = clamp((roughness - 0.1) / 0.4, 0.0, 1.0);
     // floor(x + 0.5) matches the CPU Math.round contract for positive caps.
     return max(1.0, floor(reflection.temporal.x + (reflection.temporal.y - reflection.temporal.x) * t * t * (3.0 - 2.0 * t) + 0.5));
+}
+
+// This frame's estimate rebuilt from compatible anchors of the 5x5 neighbourhood
+// within the reconstruction footprint, its effective anchor count, and the
+// footprint-weighted fraction of their lobe weight whose reflected hit moved.
+struct ReflectionRebuild { radiance: vec3f, count: f32, moved: f32 }
+
+fn reflectionRebuild(index: u32) -> ReflectionRebuild {
+    let center = reflectionAnchorGuide(index, reflection.spatial.z);
+    let cell = vec2i(i32(index % reflection.viewport.z), i32(index / reflection.viewport.z));
+    var sum = vec3f(0.0); var total = 0.0; var square = 0.0; var moved = 0.0;
+    for (var tap = 0u; tap < 25u; tap++) {
+        let coordinate = cell + vec2i(i32(tap % 5u) - 2, i32(tap / 5u) - 2);
+        if (any(coordinate < vec2i(0)) || any(coordinate >= vec2i(reflection.viewport.zw))) { continue; }
+        let other = u32(coordinate.y) * reflection.viewport.z + u32(coordinate.x);
+        let weight = reflectionGuideWeight(center, reflectionAnchorGuide(other, 0.0));
+        if (weight <= 0.0) { continue; }
+        sum += anchors[other].raw.xyz * weight; total += weight; square += weight * weight;
+        moved += anchors[other].motion.w * weight;
+    }
+    // The anchor itself always contributes with weight one.
+    return ReflectionRebuild(sum / total, total * total / square, moved / total);
 }
 
 fn reflectionPreviousPixel(world: vec3f) -> vec3f {
@@ -109,6 +134,9 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
     var chosen = ReflectionCandidate(vec3f(0.0), 0.0, 0.0, 0u);
     var mode = REFLECTION_MODE_NONE;
     var rejected = 0u;
+    // Frames left in which a history rebuilt after a lobe change still adds the
+    // spatial reconstruction (stationary records only).
+    var young = 0u;
     if (reflection.temporalState.y != 0u) {
         let receiverMotion = reflectionHitMotion(hit);
         let receiverPrevious = hit.position.xyz + receiverMotion;
@@ -125,7 +153,10 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
                 && abs(record.position.w - current.raw.w) > 0.05 + current.raw.w * (0.1 + roughness)) {
                 reason = REFLECTION_REJECT_DISTANCE;
             }
-            if (reason == 0u) { chosen = ReflectionCandidate(record.radiance.xyz, record.radiance.w, 1.0, 0u); mode = REFLECTION_MODE_STATIONARY; }
+            if (reason == 0u) {
+                chosen = ReflectionCandidate(record.radiance.xyz, record.radiance.w, 1.0, 0u);
+                mode = REFLECTION_MODE_STATIONARY; young = record.versions.w;
+            }
             rejected = reason;
         } else {
             // Surface motion: where this receiver point was. Reflected-hit
@@ -159,13 +190,38 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
     var count = 1.0;
     var resolved = raw;
     var clamped = 0u;
+    var response = 0.0;
+    // This frame's sample and its weight in frames: the anchor's own estimate, or
+    // the reconstruction from compatible neighbours, worth their effective count.
+    var sample = raw;
+    var sampleWeight = 1.0;
+    // A stationary or reprojected history exists; the response below may blend
+    // into an empty one, which then has nothing to clamp.
+    let found = chosen.weight > 0.0;
+    if (reflection.spatial.y > 0.0 && reflection.temporalState.y != 0u) {
+        let rebuilt = reflectionRebuild(id.x);
+        response = smoothstep(0.0, reflection.spatial.y, rebuilt.moved);
+        if (response > 0.0) {
+            // Reflected content moved inside the lobe: the history keeps 1 - response
+            // of its weight (none when rejected or missing) and the sample moves
+            // toward the reconstruction; a mostly replaced lobe keeps adding the
+            // reconstruction for REFLECTION_REBUILD_FRAMES frames in all.
+            chosen.count = select(0.0, chosen.count * (1.0 - response), chosen.weight > 0.0);
+            chosen.weight = 1.0;
+            sample = mix(raw, rebuilt.radiance, response);
+            sampleWeight = mix(1.0, rebuilt.count, response);
+            young = select(0u, REFLECTION_REBUILD_FRAMES - 1u, response >= 0.5);
+        } else if (young > 0u) {
+            sample = rebuilt.radiance; sampleWeight = rebuilt.count; young -= 1u;
+        }
+    } else { young = 0u; }
     if (chosen.weight > 0.0) {
         var history = chosen.radiance;
         // Motion anywhere, a moving camera or a partially rejected footprint can
         // expose stale reflected content: clamp history to this frame's
         // compatible 3x3 anchor neighborhood before blending.
-        if (reflection.temporalState.z != 0u || reflection.temporalState.w != 0u || chosen.rejected != 0u
-            || any(current.motion.xyz != vec3f(0.0))) {
+        if (found && (reflection.temporalState.z != 0u || reflection.temporalState.w != 0u || chosen.rejected != 0u
+            || any(current.motion.xyz != vec3f(0.0)))) {
             let cell = vec2i(i32(id.x % reflection.viewport.z), i32(id.x / reflection.viewport.z));
             var mean = vec3f(0.0); var square = vec3f(0.0); var samples = 0.0;
             for (var neighbor = 0u; neighbor < 9u; neighbor++) {
@@ -188,13 +244,18 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
             clamped = select(0u, 1u, any(bounded != history));
             history = bounded;
         }
-        count = min(chosen.count + 1.0, reflectionHistoryLimit(roughness));
-        resolved = mix(history, raw, 1.0 / count);
-    } else if (reflection.temporalState.y != 0u) { mode = REFLECTION_MODE_REJECTED; }
+        // Verified-static anchors of a static scene may use the stationary cap at any roughness.
+        let stationaryCap = reflection.spatialState.z != 0u && mode == REFLECTION_MODE_STATIONARY
+            && reflection.temporalState.w == 0u;
+        count = min(chosen.count + sampleWeight, select(reflectionHistoryLimit(roughness), f32(reflection.spatialState.z), stationaryCap));
+        resolved = mix(history, sample, min(sampleWeight / count, 1.0));
+    }
+    if (mode == REFLECTION_MODE_NONE && reflection.temporalState.y != 0u) { mode = REFLECTION_MODE_REJECTED; }
     resolved = clamp(resolved, vec3f(0.0), vec3f(65504.0));
-    historyOut[id.x] = ReflectionHistory(vec4u(hit.identity.xyz, reflection.state.x), vec4u(hit.versions.yz, 1u, 0u),
+    historyOut[id.x] = ReflectionHistory(vec4u(hit.identity.xyz, reflection.state.x), vec4u(hit.versions.yz, 1u, young),
         vec4f(hit.position.xyz, current.raw.w), vec4f(geometry, roughness), vec4f(hit.baseColor.xyz, hit.previous.w),
         vec4f(resolved, count));
     anchors[id.x].radiance = vec4f(resolved, count);
-    anchors[id.x].temporal = vec4u(mode, rejected, clamped, 0u);
+    anchors[id.x].unfiltered = vec4f(resolved, current.unfiltered.w);
+    anchors[id.x].temporal = vec4u(mode, rejected, clamped, bitcast<u32>(response));
 }

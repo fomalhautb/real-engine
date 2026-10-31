@@ -12,6 +12,21 @@ export interface ReflectionTemporalOptions {
    * and falls back to surface motion; at or above it only surface motion is
    * used. 0 disables the parallax candidate; 0..1. */
   readonly parallaxRoughness?: number;
+  /** Opt-in response to reflected content that moved inside the lobe. Each sample
+   * whose reflected hit moved farther than a quarter of the lobe footprint at its
+   * distance counts as moved. With s = smoothstep(0, lobeMotionResponse, F) for the
+   * footprint-weighted moved fraction F of compatible neighbouring anchors, the
+   * history keeps 1 - s of its weight and the frame adds a 5x5 reconstruction of
+   * this frame's estimates (REFLECTION_RECONSTRUCTION_FOOTPRINT) weighted by its
+   * effective anchor count; for s >= 0.5 the stationary history keeps adding it for
+   * REFLECTION_REBUILD_FRAMES frames in all. Global resets keep their contract
+   * (count 1, first frame equals the estimate). 0 disables; 0..1. */
+  readonly lobeMotionResponse?: number;
+  /** History cap, at any roughness, of anchors on the stationary path (static
+   * camera and no scene motion, same receiver at the same grid position); 2..128.
+   * Omitted keeps the min..max roughness ramp there too. Moving views and scene
+   * motion always use the ramp. */
+  readonly stationaryHistoryFrames?: number;
 }
 
 export interface ResolvedReflectionTemporalOptions {
@@ -19,7 +34,38 @@ export interface ResolvedReflectionTemporalOptions {
   readonly minHistoryFrames: number;
   readonly clampSigma: number;
   readonly parallaxRoughness: number;
+  readonly lobeMotionResponse: number;
+  /** undefined: the stationary path uses the roughness ramp. */
+  readonly stationaryHistoryFrames: number | undefined;
 }
+
+/** Opt-in edge-aware à-trous filter over the anchor grid for display. The temporal
+ * history stays unfiltered; only the radiance used by surfaces is replaced. */
+export interface ReflectionSpatialFilterOptions {
+  /** À-trous levels with steps of 1, 2, 4, ... anchor cells, 3x3 taps each; 1..5. */
+  readonly iterations?: number;
+  /** World-space kernel radius as a fraction of the reflected-lobe footprint
+   * projected back onto the receiver (see reflectionFilterRadius, evaluated with the
+   * BSDF-weighted mean distance of this frame's reflected hits; misses see the sky
+   * and are excluded); 0.05..2. Below one anchor spacing an anchor keeps its value. */
+  readonly footprint?: number;
+}
+
+export interface ResolvedReflectionSpatialFilterOptions {
+  readonly iterations: number;
+  readonly footprint: number;
+}
+
+/** Footprint fraction (see reflectionFilterRadius) of the 5x5 reconstruction that
+ * replaces a history whose lobe content moved (lobeMotionResponse). */
+export const REFLECTION_RECONSTRUCTION_FOOTPRINT = 0.3;
+
+/** Frames, including the response frame, in which a history whose lobe content was
+ * mostly replaced adds that reconstruction, weighted by its effective anchor count. */
+export const REFLECTION_REBUILD_FRAMES = 4;
+
+/** Per-anchor filter scratch: 64-byte guide plus two 16-byte radiance ping-pong records. */
+export const REFLECTION_FILTER_BYTES_PER_ANCHOR = 96;
 
 /** Opt-in short screen-space supplement over owned copies of the previous
  * frame's scene-linear HDR and depth (counted in maxBytes). A world-query sample
@@ -69,6 +115,8 @@ export interface ReflectionsOptions {
   readonly temporal?: ReflectionTemporalOptions;
   /** Near-contact screen-space detail; world queries remain the source of every sample. */
   readonly screenTrace?: ReflectionScreenTraceOptions;
+  /** Edge-aware spatial filter for rough receivers; scratch memory is counted in maxBytes. */
+  readonly spatialFilter?: ReflectionSpatialFilterOptions;
 }
 
 export interface ResolvedReflectionsOptions {
@@ -87,6 +135,8 @@ export interface ResolvedReflectionsOptions {
   readonly temporal: ResolvedReflectionTemporalOptions | undefined;
   /** Undefined when the screen-space supplement is not configured. */
   readonly screenTrace: ResolvedReflectionScreenTraceOptions | undefined;
+  /** Undefined when the spatial filter is not configured. */
+  readonly spatialFilter: ResolvedReflectionSpatialFilterOptions | undefined;
 }
 
 export interface ReflectionGridPlan {
@@ -148,6 +198,16 @@ export function resolveReflectionsOptions(options: ReflectionsOptions = {}): Res
     textureLod: boundedNumber(options.textureLod === undefined ? 0 : options.textureLod, 0, 16, 'TEXTURE_LOD'),
     temporal: resolveTemporal(options.temporal),
     screenTrace: resolveScreenTrace(options.screenTrace),
+    spatialFilter: resolveSpatialFilter(options.spatialFilter),
+  });
+}
+
+function resolveSpatialFilter(filter: ReflectionSpatialFilterOptions | undefined): ResolvedReflectionSpatialFilterOptions | undefined {
+  if (filter === undefined) return undefined;
+  if (!filter || typeof filter !== 'object' || Array.isArray(filter)) throw new RangeError('REFLECTIONS_SPATIAL_FILTER');
+  return Object.freeze({
+    iterations: boundedInteger(filter.iterations ?? 4, 1, 5, 'FILTER_ITERATIONS'),
+    footprint: boundedNumber(filter.footprint ?? 0.3, 0.05, 2, 'FILTER_FOOTPRINT'),
   });
 }
 
@@ -173,15 +233,43 @@ function resolveTemporal(temporal: ReflectionTemporalOptions | undefined): Resol
       'MIN_HISTORY_FRAMES'),
     clampSigma: boundedNumber(temporal.clampSigma ?? 1.5, 0.25, 8, 'CLAMP_SIGMA'),
     parallaxRoughness: boundedNumber(temporal.parallaxRoughness ?? 0.35, 0, 1, 'PARALLAX_ROUGHNESS'),
+    lobeMotionResponse: boundedNumber(temporal.lobeMotionResponse ?? 0, 0, 1, 'LOBE_MOTION_RESPONSE'),
+    stationaryHistoryFrames: temporal.stationaryHistoryFrames === undefined ? undefined
+      : boundedInteger(temporal.stationaryHistoryFrames, 2, 128, 'STATIONARY_HISTORY_FRAMES'),
   });
 }
 
-/** Roughness-aware history cap; WGSL `reflectionHistoryLimit` uses the same ramp. */
-export function reflectionHistoryLimit(roughness: number, temporal: ResolvedReflectionTemporalOptions): number {
+/** Roughness-aware history cap; WGSL `reflectionHistoryLimit` uses the same ramp.
+ * `stationary` selects the stationary-path cap, stationaryHistoryFrames when set. */
+export function reflectionHistoryLimit(roughness: number, temporal: ResolvedReflectionTemporalOptions,
+  stationary = false): number {
   boundedNumber(roughness, 0, 1, 'ROUGHNESS');
+  if (stationary && temporal.stationaryHistoryFrames !== undefined) return temporal.stationaryHistoryFrames;
   const t = Math.min(1, Math.max(0, (roughness - 0.1) / 0.4));
   const ramp = t * t * (3 - 2 * t);
   return Math.max(1, Math.round(temporal.minHistoryFrames + (temporal.maxHistoryFrames - temporal.minHistoryFrames) * ramp));
+}
+
+/** Tangent of the reflected GGX lobe's median angle, about twice the half-vector's
+ * median angle atan(alpha) with alpha = roughness^2, capped at 1.2 rad. WGSL
+ * `reflectionLobeTangent` uses the same expression. */
+export function reflectionLobeTangent(roughness: number): number {
+  boundedNumber(roughness, 0, 1, 'ROUGHNESS');
+  return Math.tan(Math.min(2 * Math.atan(roughness * roughness), 1.2));
+}
+
+/** World-space receiver distance over which the reflected lobe footprint moves by
+ * `footprint` of its own radius. Moving the receiver by d moves the mirror point
+ * on content at reflected distance D by about d (1 + D / V) for view distance V,
+ * while the lobe covers D tan(theta) there, so d = footprint tan(theta) D V / (D + V).
+ * Distant content (D >> V) saturates at footprint tan(theta) V. */
+export function reflectionFilterRadius(roughness: number, reflectedDistance: number, viewDistance: number,
+  footprint: number): number {
+  boundedNumber(reflectedDistance, 0, 1e6, 'DISTANCE');
+  boundedNumber(viewDistance, 0, 1e6, 'DISTANCE');
+  boundedNumber(footprint, 0, 2, 'FILTER_FOOTPRINT');
+  const sum = reflectedDistance + viewDistance;
+  return sum > 0 ? footprint * reflectionLobeTangent(roughness) * reflectedDistance * viewDistance / sum : 0;
 }
 
 /** 32-bit integer avalanche shared with WGSL `reflectionHash`. */

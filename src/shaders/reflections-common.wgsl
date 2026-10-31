@@ -15,6 +15,8 @@ struct ReflectionParameters {
     temporalState: vec4u, // active, history valid, camera moved, scene motion
     screen: vec4f, // screen-trace maximum distance, thickness, distance tolerance, edge fade
     screenState: vec4u, // active, march steps, capture width, capture height
+    spatial: vec4f, // spatial-filter footprint, lobe-motion response (0: off), reconstruction footprint, reserved
+    spatialState: vec4u, // spatial filter active, levels, stationary history cap (0: roughness ramp), reserved
 }
 struct ReflectionHit {
     identity: vec4u, metric: vec4f, position: vec4f, normal: vec4f,
@@ -23,13 +25,17 @@ struct ReflectionHit {
 }
 // state: valid, frame, failed queries, packed screen-trace sample counts
 // (accepted | off-screen << 8 | unresolved << 16 | disagreeing << 24).
-// radiance: resolved rgb and effective history count. raw: this frame's rgb and
-// weighted mean reflected distance. motion: weighted reflected-hit motion
-// (previous - current) and total BSDF weight. reflected: dominant sample's
-// batch/entity/generation/sample. temporal: mode, rejection bits, clamp flag.
+// radiance: resolved rgb used by surfaces and effective history count. raw: this
+// frame's rgb and weighted mean reflected distance. motion: weighted reflected-hit
+// motion (previous - current) and the BSDF-weighted fraction of samples whose hit
+// moved by more than a quarter of the lobe footprint. reflected: dominant sample's
+// batch/entity/generation/sample. temporal: mode, rejection bits, clamp flag,
+// lobe-motion response blend (f32 bits). unfiltered: resolved rgb before the
+// spatial filter; w is the BSDF-weighted mean distance of reflected hits (misses
+// excluded) until the filter replaces it by its world kernel radius.
 struct ReflectionAnchor {
     hit: ReflectionHit, radiance: vec4f, state: vec4u,
-    raw: vec4f, motion: vec4f, reflected: vec4u, temporal: vec4u,
+    raw: vec4f, motion: vec4f, reflected: vec4u, temporal: vec4u, unfiltered: vec4f,
 }
 struct ReflectionSample { direction: vec4f, weight: vec4f }
 fn reflectionGeometry(hit: ReflectionHit) -> vec3f {
@@ -42,4 +48,8 @@ fn reflectionHitMotion(hit: ReflectionHit) -> vec3f {
     let delta = hit.previous.xyz - hit.position.xyz;
     let extent = max(max(abs(hit.position.x), abs(hit.position.y)), max(abs(hit.position.z), hit.metric.x));
     return select(delta, vec3f(0.0), all(abs(delta) <= vec3f(1e-5 * (1.0 + extent))));
+}
+// Tangent of the reflected GGX lobe's median half-angle (CPU reflectionLobeTangent).
+fn reflectionLobeTangent(roughness: f32) -> f32 {
+    return tan(min(2.0 * atan(roughness * roughness), 1.2));
 }

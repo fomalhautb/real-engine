@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { GpuReflections, type ReflectionUpdate } from '../src/gpu-reflections';
+import { GpuReflections, REFLECTION_ANCHOR_BYTES, REFLECTION_PARAMETER_BYTES, type ReflectionUpdate } from '../src/gpu-reflections';
 import type { GpuWorldQuery } from '../src/gpu-world-query';
 import type { GpuDiffuseGi } from '../src/gpu-diffuse-gi';
 import type { GpuVolumetricFog } from '../src/gpu-volumetric-fog';
@@ -25,6 +25,8 @@ class FakeDevice {
     return created as unknown as GPUTexture;
   };
   readonly writes: { label: string; bytes: number }[] = [];
+  /** Copies of the most recent data written to each labelled buffer. */
+  readonly payloads = new Map<string, ArrayBuffer>();
   bufferCalls = 0;
   bindGroupCalls = 0;
   failBufferCall = -1;
@@ -55,6 +57,7 @@ class FakeDevice {
   createSampler = () => ({});
   queue = { writeBuffer: (target: FakeBuffer, _offset: number, data: ArrayBufferView) => {
     this.writes.push({ label: target.label, bytes: data.byteLength });
+    this.payloads.set(target.label, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
   } };
 }
 
@@ -197,8 +200,9 @@ describe('GPU reflections ownership and preflight', () => {
       expect(device.writes).toHaveLength(0);
       expect(() => reflections.setEnabled(1 as unknown as boolean)).toThrow('REFLECTIONS_ENABLED');
       reflections.setEnabled(false);
-      expect(reflections.update(frame)).toBe(304);
-      expect(device.writes).toEqual([{ label: 'reflection parameters', bytes: 304 }]);
+      expect(REFLECTION_PARAMETER_BYTES).toBe(336);
+      expect(reflections.update(frame)).toBe(REFLECTION_PARAMETER_BYTES);
+      expect(device.writes).toEqual([{ label: 'reflection parameters', bytes: REFLECTION_PARAMETER_BYTES }]);
       let passes = 0, dispatches = 0;
       const encoder = { beginComputePass: ({ label }: { label: string }) => {
         expect(label).toBe('reflections disabled'); passes++;
@@ -284,7 +288,7 @@ describe('GPU reflection history', () => {
       reflections.setTemporalEnabled(true);
       expect(step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1, width: 40 }).history)
         .toMatchObject({ active: true, framesSinceReset: 1, lastResetReason: 'temporal-toggle' });
-      expect(device.writes.every(write => write.bytes === 304)).toBe(true);
+      expect(device.writes.every(write => write.bytes === REFLECTION_PARAMETER_BYTES)).toBe(true);
     } finally { reflections.dispose(); }
     expect(tracked.bytes).toBe(0);
     const untimed = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query, {}, tracked.account);
@@ -320,6 +324,81 @@ describe('GPU reflection history', () => {
       expect(changed.groups).toContain(lightGroup);
       expect(step().history).toMatchObject({ framesSinceReset: 2, lastResetReason: 'local-light-change' });
       expect(reflections.diagnostics().localLights).toBe(true);
+    } finally { reflections.dispose(); }
+    expect(tracked.bytes).toBe(0);
+  });
+});
+
+describe('GPU reflection spatial filter', () => {
+  it('owns budgeted filter scratch only when configured and rejects a budget without room for it', async () => {
+    expect(REFLECTION_ANCHOR_BYTES).toBe(272);
+    const device = new FakeDevice(), tracked = ledger();
+    const plain = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query, { temporal: {} }, tracked.account);
+    const plainBytes = tracked.bytes;
+    expect(plain.spatialFilterConfigured).toBe(false);
+    expect(plain.diagnostics().spatialFilter).toMatchObject({ configured: false, active: false, scratchBytes: 0, bytesPerAnchor: 0 });
+    expect(() => plain.setSpatialFilterEnabled(true)).toThrow('REFLECTIONS_SPATIAL_FILTER_NOT_CONFIGURED');
+    plain.dispose();
+    const filtered = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query,
+      { temporal: {}, spatialFilter: { iterations: 3 } }, tracked.account);
+    try {
+      const labels = device.buffers.filter(item => item.label.startsWith('reflection filter') && !item.destroyed).map(item => item.label);
+      expect(labels).toEqual(['reflection filter guides', 'reflection filter radiance A', 'reflection filter radiance B', 'reflection filter levels']);
+      // Four anchors: 64 B guides and two 16 B radiance records each, plus one 256 B uniform slot per level.
+      expect(tracked.bytes - plainBytes).toBe(4 * 96 + 3 * 256);
+      expect(filtered.diagnostics().spatialFilter).toEqual({ configured: true, enabled: true, active: false, iterations: 3,
+        footprint: 0.3, scratchBytes: 4 * 96 + 3 * 256, bytesPerAnchor: 96 });
+      // Level uniforms are written once: step 1, 2, 4 and the last-level flag on level 2 only.
+      const levels = new Uint32Array(device.payloads.get('reflection filter levels')!);
+      expect([0, 1, 2].map(level => Array.from(levels.subarray(level * 64, level * 64 + 2)))).toEqual([[1, 0], [2, 0], [4, 1]]);
+      expect(() => filtered.setSpatialFilterEnabled(1 as never)).toThrow('REFLECTIONS_SPATIAL_FILTER_ENABLED');
+    } finally { filtered.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    const tight = new FakeDevice(), balance = ledger();
+    await expect(GpuReflections.create(tight as unknown as GPUDevice, borrowed().query,
+      { maxBytes: plainBytes + 4 * 96, temporal: {}, spatialFilter: {} }, balance.account)).rejects.toThrow('REFLECTIONS_MEMORY_BUDGET');
+    expect(tight.buffers).toHaveLength(0);
+    expect(balance.bytes).toBe(0);
+  });
+
+  it('filters after the history, never resets it on toggle and writes the opt-in parameters', async () => {
+    const device = new FakeDevice(), tracked = ledger(), { query } = borrowed();
+    const reflections = await GpuReflections.create(device as unknown as GPUDevice, query,
+      { temporal: { lobeMotionResponse: 0.25, stationaryHistoryFrames: 64 }, spatialFilter: { iterations: 2, footprint: 0.4 } }, tracked.account);
+    try {
+      let index = 0;
+      const step = () => {
+        index++;
+        reflections.update({ ...frame, frame: index, viewProjection: identityMatrix,
+          previousViewProjection: index > 1 ? identityMatrix : undefined, sceneMotion: false, historyRevision: 0 });
+        const { encoder, labels } = fakeEncoder();
+        reflections.encode(encoder);
+        const parameters = device.payloads.get('reflection parameters')!;
+        return { labels, history: reflections.diagnostics().temporal,
+          spatial: Array.from(new Float32Array(parameters, 76 * 4, 3)), state: Array.from(new Uint32Array(parameters, 80 * 4, 3)) };
+      };
+      const first = step();
+      expect(first.labels.slice(-4)).toEqual(['reflections temporal', 'reflections filterPrepare',
+        'reflections filterLevelPass', 'reflections filterLevelPass']);
+      expect(first.spatial.map(value => Math.fround(value))).toEqual([Math.fround(0.4), 0.25, Math.fround(0.3)]);
+      expect(first.state).toEqual([1, 2, 64]);
+      expect(reflections.diagnostics().spatialFilter).toMatchObject({ active: true, iterations: 2, footprint: 0.4 });
+      expect(reflections.diagnostics().temporal).toMatchObject({ lobeMotionResponse: 0.25, stationaryHistoryFrames: 64 });
+      reflections.setSpatialFilterEnabled(false);
+      const off = step();
+      expect(off.labels.at(-1)).toBe('reflections temporal');
+      expect(off.labels.some(label => label.startsWith('reflections filter'))).toBe(false);
+      expect(off.state[0]).toBe(0);
+      // The filter only replaces displayed radiance: toggling it keeps the history.
+      expect(off.history).toMatchObject({ valid: true, framesSinceReset: 2, lastResetReason: 'initial' });
+      reflections.setSpatialFilterEnabled(true);
+      expect(step().history).toMatchObject({ framesSinceReset: 3, lastResetReason: 'initial' });
+      // Without active history the response is off; the filter still runs on the single-frame estimate.
+      reflections.setTemporalEnabled(false);
+      const single = step();
+      expect(single.labels.slice(-4)).toEqual(['reflections integrate', 'reflections filterPrepare', 'reflections filterLevelPass',
+        'reflections filterLevelPass']);
+      expect(single.spatial[1]).toBe(0);
     } finally { reflections.dispose(); }
     expect(tracked.bytes).toBe(0);
   });
@@ -369,7 +448,7 @@ describe('GPU reflection screen-space supplement', () => {
       expect(copies).toHaveLength(copied);
       expect(() => reflections.resize(0, 24, hdr, depth)).toThrow('REFLECTIONS_SCREEN_SIZE');
       expect(() => reflections.setScreenTraceEnabled(1 as never)).toThrow('REFLECTIONS_SCREEN_TRACE_ENABLED');
-      expect(device.writes.every(write => write.bytes === 304)).toBe(true);
+      expect(device.writes.every(write => write.bytes === REFLECTION_PARAMETER_BYTES)).toBe(true);
     } finally { reflections.dispose(); }
     expect(tracked.bytes).toBe(0);
     expect(device.textures.every(texture => texture.destroyed)).toBe(true);

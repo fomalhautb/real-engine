@@ -5,7 +5,8 @@ import { DEFAULT_MATERIAL_DEFINITION, m } from '../../../src/material';
 import { PhysicsWorld } from '../../../src/physics';
 import { Renderer } from '../../../src/renderer';
 import type { WorldRay } from '../../../src/world-query';
-import { instance, quad } from './reflections-temporal';
+import type { ReflectionsOptions } from '../../../src/reflections';
+import { instance, quad, reflectionQualityOptions } from './reflections-temporal';
 
 export const DYNAMIC_SIZE = 64;
 export const DYNAMIC_EYE: [number, number, number] = [0, 0, 3];
@@ -52,13 +53,14 @@ function intersectsFrustum(center: readonly number[], radius: number): boolean {
     && Math.abs(center[1] - DYNAMIC_EYE[1]) <= slope * depth + pad;
 }
 
-type Stage = { label: string; roughness: number; reason: string; frames: { valid: boolean[]; position: number[][]; radiance: number[][]; raw: number[][];
-  count: number[]; mode: string[]; rejected: number[]; clamped: boolean[]; reason: string | undefined }[] };
+type Stage = { label: string; roughness: number; reason: string; frames: { valid: boolean[]; position: number[][]; radiance: number[][];
+  unfiltered: number[][]; raw: number[][]; count: number[]; mode: string[]; rejected: number[]; clamped: boolean[]; response: number[];
+  reason: string | undefined }[] };
 
 /** D02: a skinned character and Rapier rigid bodies behind the camera plus a
  * moving object beside the mirror, none inside the camera frustum; then
  * response curves for discrete changes seen in smooth and rough mirrors. */
-export async function runReflectionsDynamicFixture(options: { motionFrames: number; probeEvery: number }) {
+export async function runReflectionsDynamicFixture(options: { motionFrames: number; probeEvery: number; reflections?: ReflectionsOptions }) {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = `position:fixed;left:0;top:0;width:${DYNAMIC_SIZE}px;height:${DYNAMIC_SIZE}px`;
   document.body.appendChild(canvas);
@@ -85,8 +87,8 @@ export async function runReflectionsDynamicFixture(options: { motionFrames: numb
     DYNAMIC_IDS.boxes.forEach((id, index) => physics.createBox(id, starts[index], BOX_HALF));
     renderer = await Renderer.create(canvas, [mirror, character, boxes, side, probe], { antiAliasing: 'none',
       worldQueries: { maxRays: DYNAMIC_SIZE * DYNAMIC_SIZE * 4 },
-      reflections: { pixelSpacing: 1, maxAnchors: DYNAMIC_SIZE * DYNAMIC_SIZE, samplesPerAnchor: 4, maxDistance: 20,
-        maxBytes: 16 * 1024 * 1024, skyRadiance: SKY, temporal: { minHistoryFrames: 8, maxHistoryFrames: 32 } } });
+      reflections: reflectionQualityOptions({ pixelSpacing: 1, maxAnchors: DYNAMIC_SIZE * DYNAMIC_SIZE, samplesPerAnchor: 4, maxDistance: 20,
+        maxBytes: 16 * 1024 * 1024, skyRadiance: SKY, temporal: { minHistoryFrames: 8, maxHistoryFrames: 32 } }, options.reflections) });
     const active = renderer;
     active.setSun({ direction: [0, 0, 1], color: [0, 0, 0] });
     const grid: number[] = [];
@@ -109,7 +111,8 @@ export async function runReflectionsDynamicFixture(options: { motionFrames: numb
       const traced = await active.traceRays(result.anchors.map(anchor => mirrorRay(anchor.position, anchor.normal)));
       motion.push({ frame: result.frame, anchors: result.anchors.map((anchor, i) => ({
         index: anchor.index, valid: anchor.valid, entity: anchor.reflectedIdentity[0] ? anchor.reflectedIdentity[1] : 0,
-        expected: traced.hits[i]?.entityId ?? 0, radiance: anchor.radiance, raw: anchor.rawRadiance, count: anchor.historyCount,
+        expected: traced.hits[i]?.entityId ?? 0, radiance: anchor.radiance, unfiltered: anchor.unfilteredRadiance,
+        raw: anchor.rawRadiance, count: anchor.historyCount,
         mode: anchor.historyMode, rejected: anchor.rejectedHistory, clamped: anchor.historyClamped })),
         boxPositions: poses.map(pose => [...pose.position]),
         inFrustum: { character: intersectsFrustum([characterX, -0.5, 6.2], 1.8),
@@ -131,7 +134,8 @@ export async function runReflectionsDynamicFixture(options: { motionFrames: numb
         active.render(DYNAMIC_EYE, TARGET);
         const result = await active.probeReflections(center);
         stage.frames.push({ valid: result.anchors.map(anchor => anchor.valid), position: result.anchors.map(anchor => anchor.position),
-          radiance: result.anchors.map(anchor => anchor.radiance), raw: result.anchors.map(anchor => anchor.rawRadiance),
+          radiance: result.anchors.map(anchor => anchor.radiance), unfiltered: result.anchors.map(anchor => anchor.unfilteredRadiance),
+          raw: result.anchors.map(anchor => anchor.rawRadiance), response: result.anchors.map(anchor => anchor.historyResponse),
           count: result.anchors.map(anchor => anchor.historyCount), mode: result.anchors.map(anchor => anchor.historyMode),
           rejected: result.anchors.map(anchor => anchor.rejectedHistory), clamped: result.anchors.map(anchor => anchor.historyClamped),
           reason: active.diagnostics().reflections?.temporal.lastResetReason });

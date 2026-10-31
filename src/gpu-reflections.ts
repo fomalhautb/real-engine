@@ -2,6 +2,8 @@ import common from './shaders/reflections-common.wgsl?raw';
 import updateSource from './shaders/reflections-update.wgsl?raw';
 import temporalSource from './shaders/reflections-temporal.wgsl?raw';
 import screenSource from './shaders/reflections-screen.wgsl?raw';
+import guideSource from './shaders/reflections-guide.wgsl?raw';
+import filterSource from './shaders/reflections-filter.wgsl?raw';
 import sampleSource from './shaders/reflections-sample.wgsl?raw';
 import surfaceFrame from './shaders/surface-frame.wgsl?raw';
 import surfaceBrdf from './shaders/surface-brdf.wgsl?raw';
@@ -11,8 +13,8 @@ import { reflectionFogShaderSource, type GpuVolumetricFog } from './gpu-volumetr
 import { FOG_LOCAL_LIGHTS_HOOK, localLightsShaderSource, type GpuLocalLights } from './gpu-local-lights';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import { lookAt } from './math';
-import { planReflectionGrid, REFLECTION_SCREEN_BYTES_PER_PIXEL, resolveReflectionsOptions, type ReflectionsOptions,
-  type ReflectionGridPlan } from './reflections';
+import { planReflectionGrid, REFLECTION_FILTER_BYTES_PER_ANCHOR, REFLECTION_RECONSTRUCTION_FOOTPRINT, REFLECTION_SCREEN_BYTES_PER_PIXEL, resolveReflectionsOptions,
+  type ReflectionsOptions, type ReflectionGridPlan } from './reflections';
 import type { GpuWorldQuery } from './gpu-world-query';
 import type { GpuDiffuseGi } from './gpu-diffuse-gi';
 import { diffuseGiQueryParameterSlots } from './diffuse-gi';
@@ -20,12 +22,15 @@ import { WORLD_HIT_BYTES } from './world-query';
 import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 export const reflectionSurfaceSource = common + '\n' + sampleSource;
-export const REFLECTION_PARAMETER_BYTES = 304;
-export const REFLECTION_ANCHOR_BYTES = 256;
+export const REFLECTION_PARAMETER_BYTES = 336;
+export const REFLECTION_ANCHOR_BYTES = 272;
 export const REFLECTION_HISTORY_BYTES = 96;
 const PARAMETER_BYTES = REFLECTION_PARAMETER_BYTES, ANCHOR_BYTES = REFLECTION_ANCHOR_BYTES;
 const SAMPLE_BYTES = 32, PROBE_LIMIT = 1024, ANCHOR_WORDS = ANCHOR_BYTES / 4;
-type Entry = 'generateCamera' | 'generateReflections' | 'generateShadows' | 'integrate' | 'temporal';
+/** Filter guide record; the two radiance ping-pong records are 16 bytes each. */
+const FILTER_GUIDE_BYTES = 64, FILTER_RADIANCE_BYTES = 16, FILTER_LEVEL_STRIDE = 256;
+type Entry = 'generateCamera' | 'generateReflections' | 'generateShadows' | 'integrate' | 'temporal'
+  | 'filterPrepare' | 'filterLevelPass';
 export type ReflectionHistoryMode = 'none' | 'stationary' | 'surface' | 'parallax' | 'rejected';
 /** Why the screen-space supplement is or is not used this frame. */
 export type ReflectionScreenState = 'not-configured' | 'disabled' | 'awaiting-resize' | 'over-budget'
@@ -50,12 +55,23 @@ export interface ReflectionUpdate {
 }
 export interface ReflectionProbeAnchor {
   index: number; identity: number[]; position: number[]; normal: number[];
-  /** Resolved radiance used by the surface pass (temporal output when active). */
+  /** Resolved radiance used by the surface pass (temporal output, then the spatial filter, when active). */
   radiance: number[];
+  /** Resolved radiance before the spatial filter: the temporal output, or this
+   * frame's estimate without history. Equals `radiance` when the filter is inactive. */
+  unfilteredRadiance: number[];
+  /** World-space radius of the spatial-filter kernel at this anchor; 0 when not filtered. */
+  filterRadius: number;
   /** This frame's estimate before history. */
   rawRadiance: number[];
   valid: boolean; failedQueries: number;
   historyCount: number; historyMode: ReflectionHistoryMode; rejectedHistory: number; historyClamped: boolean;
+  /** Weight of the spatial reconstruction blended into the history after moved
+   * reflected content (temporal.lobeMotionResponse); 0 when not configured. */
+  historyResponse: number;
+  /** BSDF-weighted fraction of this frame's samples whose reflected hit moved by
+   * more than a quarter of the lobe footprint. */
+  movedLobeFraction: number;
   meanReflectedDistance: number;
   /** Dominant reflected sample: [batch, entity, generation]; batch 0 is a miss. */
   reflectedIdentity: number[]; reflectedSample: number | null;
@@ -100,7 +116,7 @@ export class GpuReflections {
   private previous?: { frame: number; width: number; height: number; spacing: number; viewProjection: Float32Array;
     materialRevision: number; light: number[]; lights: number; media: number; historyRevision: number };
   private pipelines!: Record<Entry, GPUComputePipeline>;
-  private groups!: Record<Exclude<Entry, 'integrate' | 'temporal'>, GPUBindGroup>;
+  private groups!: Record<Exclude<Entry, 'integrate' | 'temporal' | 'filterPrepare' | 'filterLevelPass'>, GPUBindGroup>;
   private integrateGroups: GPUBindGroup[] = [];
   private temporalGroups: GPUBindGroup[] = [];
   private fogGroup?: GPUBindGroup;
@@ -116,11 +132,16 @@ export class GpuReflections {
   private screenState: ReflectionScreenState;
   private screenActive = false;
   private currentViewProjection?: Float32Array;
+  private filterEnabled: boolean;
+  private filterActive = false;
+  private filterBytes = 0;
+  private filterGroups: { prepare?: GPUBindGroup; levels: GPUBindGroup[] } = { levels: [] };
 
   get surfaceParameters(): GPUBuffer { return this.parameters; }
   get surfaceAnchors(): GPUBuffer { return this.anchors; }
   get temporalConfigured(): boolean { return !!this.options.temporal; }
   get screenTraceConfigured(): boolean { return !!this.options.screenTrace; }
+  get spatialFilterConfigured(): boolean { return !!this.options.spatialFilter; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: ReflectionsOptions,
     account: (bytes: number) => void, gi?: GpuDiffuseGi, fog?: GpuVolumetricFog, shadow?: GPUTexture,
@@ -142,6 +163,7 @@ export class GpuReflections {
     private shadow?: GPUTexture, private localLights?: GpuLocalLights) {
     this.options = options; this.temporalEnabled = !!options.temporal; this.screenEnabled = !!options.screenTrace;
     this.screenState = options.screenTrace ? 'awaiting-resize' : 'not-configured';
+    this.filterEnabled = !!options.spatialFilter;
   }
   private assertAlive(): void { if (this.disposed) throw new Error('REFLECTIONS_DISPOSED'); }
   private buffer(label: string, size: number, usage: GPUBufferUsageFlags): GPUBuffer {
@@ -155,11 +177,15 @@ export class GpuReflections {
   private async initialize(): Promise<void> {
     const cap = this.capacity, rays = cap * this.options.samplesPerAnchor;
     const historySize = this.options.temporal ? cap * REFLECTION_HISTORY_BYTES : 0;
+    const filter = this.options.spatialFilter;
+    const filterSizes = filter ? [cap * FILTER_GUIDE_BYTES, cap * FILTER_RADIANCE_BYTES, cap * FILTER_RADIANCE_BYTES,
+      filter.iterations * FILTER_LEVEL_STRIDE] : [];
     const sizes = [PARAMETER_BYTES, cap * WORLD_HIT_BYTES, rays * WORLD_HIT_BYTES,
       rays * SAMPLE_BYTES, cap * ANCHOR_BYTES, Math.min(cap, PROBE_LIMIT) * ANCHOR_BYTES];
     const placeholder = this.options.screenTrace ? REFLECTION_SCREEN_BYTES_PER_PIXEL : 0;
-    if (sizes.reduce((a, b) => a + b, 0) + 2 * historySize + placeholder > this.options.maxBytes) throw new Error('REFLECTIONS_MEMORY_BUDGET');
-    if ([...sizes, historySize].some(size => size > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize))) throw new Error('REFLECTIONS_BUFFER_LIMIT');
+    if (sizes.reduce((a, b) => a + b, 0) + 2 * historySize + filterSizes.reduce((a, b) => a + b, 0) + placeholder
+      > this.options.maxBytes) throw new Error('REFLECTIONS_MEMORY_BUDGET');
+    if ([...sizes, historySize, ...filterSizes].some(size => size > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize))) throw new Error('REFLECTIONS_BUFFER_LIMIT');
     if (Math.ceil(rays / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('REFLECTIONS_DISPATCH_LIMIT');
     this.parameters = this.buffer('reflection parameters', sizes[0], GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.cameraHits = this.buffer('reflection camera hits', sizes[1], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -171,6 +197,13 @@ export class GpuReflections {
       this.history = [0, 1].map(index => this.buffer('reflection reprojected history ' + index, historySize, GPUBufferUsage.STORAGE));
       this.historyBytes = 2 * historySize;
     }
+    const filterBuffers = filter ? {
+      guides: this.buffer('reflection filter guides', filterSizes[0], GPUBufferUsage.STORAGE),
+      ping: [this.buffer('reflection filter radiance A', filterSizes[1], GPUBufferUsage.STORAGE),
+        this.buffer('reflection filter radiance B', filterSizes[2], GPUBufferUsage.STORAGE)],
+      levels: this.buffer('reflection filter levels', filterSizes[3], GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST),
+    } : undefined;
+    this.filterBytes = filterSizes.reduce((a, b) => a + b, 0);
     const giSource = this.gi ? giCommon.replace('// GI_DISTANCE_CONSTANTS',
       `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`)
       + '\n@group(0) @binding(7) var<uniform> gi: GiParameters;\n@group(0) @binding(8) var<storage, read> giProbes: array<GiProbe>;\n'
@@ -187,12 +220,13 @@ export class GpuReflections {
         + '-sample.direction.xyz, hit.baseColor.xyz, hit.previous.w, hit.normal.w);' : '');
     const module = this.device.createShaderModule({ label: 'world-space reflections',
       code: surfaceFrame + '\n' + surfaceBrdf + '\n' + common + '\n' + update
-        .replace('// REFLECTION_SCREEN_SAMPLE', this.options.screenTrace ? SCREEN_SAMPLE : '') + '\n' + fogSource
-        + (this.options.temporal ? '\n' + temporalSource : '') + (this.options.screenTrace ? '\n' + screenSource : '') });
+        .replace('// REFLECTION_SCREEN_SAMPLE', this.options.screenTrace ? SCREEN_SAMPLE : '') + '\n' + fogSource + '\n' + guideSource
+        + (this.options.temporal ? '\n' + temporalSource : '') + (this.options.screenTrace ? '\n' + screenSource : '')
+        + (filter ? '\n' + filterSource : '') });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `reflections:${error.lineNum}: ${error.message}`).join('\n'));
     const names: Entry[] = ['generateCamera', 'generateReflections', 'generateShadows', 'integrate',
-      ...(this.options.temporal ? ['temporal' as const] : [])];
+      ...(this.options.temporal ? ['temporal' as const] : []), ...(filter ? ['filterPrepare' as const, 'filterLevelPass' as const] : [])];
     const pipelines = await Promise.all(names.map(entryPoint => this.device.createComputePipelineAsync({
       label: 'reflections ' + entryPoint, layout: 'auto', compute: { module, entryPoint } })));
     this.pipelines = Object.fromEntries(names.map((name, index) => [name, pipelines[index]])) as Record<Entry, GPUComputePipeline>;
@@ -214,6 +248,25 @@ export class GpuReflections {
     // Group i writes history[i] from history[1 - i].
     if (this.options.temporal) this.temporalGroups = [0, 1].map(index => this.bind(p.temporal,
       [[0, this.parameters], [6, this.anchors], [9, this.history[1 - index]], [10, this.history[index]]]));
+    if (filter && filterBuffers) {
+      // Level k reads ping[k % 2] and writes ping[(k + 1) % 2]; the last level writes the anchors.
+      const levels = new Uint32Array(filter.iterations * FILTER_LEVEL_STRIDE / 4);
+      for (let level = 0; level < filter.iterations; level++) {
+        levels.set([1 << level, Number(level === filter.iterations - 1), level, 0], level * FILTER_LEVEL_STRIDE / 4);
+      }
+      this.device.queue.writeBuffer(filterBuffers.levels, 0, levels);
+      const { guides, ping } = filterBuffers;
+      this.filterGroups = {
+        prepare: this.bind(p.filterPrepare, [[0, this.parameters], [6, this.anchors], [13, guides], [15, ping[0]]]),
+        levels: Array.from({ length: filter.iterations }, (_, level) => this.device.createBindGroup({
+          layout: p.filterLevelPass.getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: this.parameters } }, { binding: 6, resource: { buffer: this.anchors } },
+            { binding: 13, resource: { buffer: guides } }, { binding: 14, resource: { buffer: ping[level % 2] } },
+            { binding: 15, resource: { buffer: ping[(level + 1) % 2] } },
+            { binding: 16, resource: { buffer: filterBuffers.levels, offset: level * FILTER_LEVEL_STRIDE, size: 16 } },
+          ] })),
+      };
+    }
   }
   private createIntegrateGroups(): void {
     const pipeline = this.pipelines.integrate;
@@ -275,6 +328,13 @@ export class GpuReflections {
     this.assertAlive(); if (typeof enabled !== 'boolean') throw new Error('REFLECTIONS_ENABLED');
     if (enabled !== this.enabled) this.invalidateHistory('reflections-toggle');
     this.enabled = enabled;
+  }
+  /** Runtime switch for a configured spatial filter. It only changes the displayed
+   * radiance, never the history, so toggling it resets nothing. */
+  setSpatialFilterEnabled(enabled: boolean): void {
+    this.assertAlive(); if (typeof enabled !== 'boolean') throw new Error('REFLECTIONS_SPATIAL_FILTER_ENABLED');
+    if (enabled && !this.options.spatialFilter) throw new Error('REFLECTIONS_SPATIAL_FILTER_NOT_CONFIGURED');
+    this.filterEnabled = enabled;
   }
   /** Runtime switch for configured history; disabled uses the fixed sample set. */
   setTemporalEnabled(enabled: boolean): void {
@@ -368,6 +428,10 @@ export class GpuReflections {
       data.set([screen.maxDistance, screen.thickness, screen.distanceTolerance, screen.edgeFade], 68);
       uints.set([Number(this.screenActive), screen.steps, this.screenSize[0], this.screenSize[1]], 72);
     }
+    const filter = this.options.spatialFilter;
+    this.filterActive = !!filter && this.filterEnabled && this.enabled;
+    data.set([filter?.footprint ?? 0, this.temporalActive ? temporal!.lobeMotionResponse : 0, REFLECTION_RECONSTRUCTION_FOOTPRINT, 0], 76);
+    uints.set([Number(this.filterActive), filter?.iterations ?? 0, temporal?.stationaryHistoryFrames ?? 0, 0], 80);
     this.device.queue.writeBuffer(this.parameters, 0, data);
     this.grid = grid; this.frame = input.frame; this.materialRevision = input.materialRevision;
     return PARAMETER_BYTES;
@@ -394,12 +458,19 @@ export class GpuReflections {
     encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.secondaryHits, 0, grid.rayCount * WORLD_HIT_BYTES);
     dispatch('generateShadows', grid.rayCount, this.groups.generateShadows);
     uploaded += this.queries.encodeTrace(encoder, grid.rayCount, this.options.textureLod, this.materialRevision);
-    // The span ends on the last encoded pass: temporal history when active.
+    // The span ends on the last encoded pass: the last filter level, else the
+    // temporal history, else integration.
+    const levels = this.filterActive ? this.filterGroups.levels : [];
     dispatch('integrate', grid.anchorCount, this.integrateGroups[this.gi?.lightingIndex ?? 0],
-      this.temporalActive ? undefined : timestampSpanEnd(timing));
+      this.temporalActive || levels.length ? undefined : timestampSpanEnd(timing));
     if (this.temporalActive) {
-      dispatch('temporal', grid.anchorCount, this.temporalGroups[this.historyIndex], timestampSpanEnd(timing));
+      dispatch('temporal', grid.anchorCount, this.temporalGroups[this.historyIndex], levels.length ? undefined : timestampSpanEnd(timing));
       this.historyIndex = 1 - this.historyIndex; this.historyValid = true; this.historyFrames++;
+    }
+    if (levels.length) {
+      dispatch('filterPrepare', grid.anchorCount, this.filterGroups.prepare!);
+      levels.forEach((group, level) => dispatch('filterLevelPass', grid.anchorCount, group,
+        level === levels.length - 1 ? timestampSpanEnd(timing) : undefined));
     }
     this.encodedFrame = this.frame; return uploaded;
   }
@@ -424,14 +495,17 @@ export class GpuReflections {
         if (uints[base + 45] !== frame) throw new Error('REFLECTIONS_FRAME_MISMATCH');
         const radiance = Array.from(floats.subarray(base + 40, base + 43));
         const rawRadiance = Array.from(floats.subarray(base + 48, base + 51));
-        if ([...radiance, ...rawRadiance].some(value => !Number.isFinite(value) || value < 0 || value > 65504)) throw new Error('REFLECTIONS_INVALID_RADIANCE');
+        const unfilteredRadiance = Array.from(floats.subarray(base + 64, base + 67));
+        if ([...radiance, ...rawRadiance, ...unfilteredRadiance].some(value => !Number.isFinite(value) || value < 0 || value > 65504)) throw new Error('REFLECTIONS_INVALID_RADIANCE');
         const mode = MODES[uints[base + 60]];
         if (!mode) throw new Error('REFLECTIONS_INVALID_HISTORY_MODE');
         return { index, identity: Array.from(uints.subarray(base, base + 4)), position: Array.from(floats.subarray(base + 8, base + 11)),
-          normal: Array.from(floats.subarray(base + 12, base + 15)), radiance, rawRadiance,
+          normal: Array.from(floats.subarray(base + 12, base + 15)), radiance, unfilteredRadiance,
+          filterRadius: this.filterActive ? floats[base + 67] : 0, rawRadiance,
           valid: uints[base + 44] === 1, failedQueries: uints[base + 46],
           historyCount: this.temporalActive ? floats[base + 43] : 1, historyMode: this.temporalActive ? mode : 'none',
           rejectedHistory: this.temporalActive ? uints[base + 61] : 0, historyClamped: this.temporalActive && uints[base + 62] === 1,
+          historyResponse: this.temporalActive ? floats[base + 63] : 0, movedLobeFraction: floats[base + 55],
           meanReflectedDistance: floats[base + 51],
           reflectedIdentity: Array.from(uints.subarray(base + 56, base + 59)),
           reflectedSample: uints[base + 59] === 0xffff_ffff ? null : uints[base + 59],
@@ -447,10 +521,15 @@ export class GpuReflections {
       temporal: { configured: !!this.options.temporal, enabled: this.temporalEnabled, active: this.temporalActive,
         valid: this.temporalActive && this.historyValid, framesSinceReset: this.historyFrames,
         lastResetReason: this.resetReason, historyBytes: this.historyBytes,
-        minHistoryFrames: this.options.temporal?.minHistoryFrames ?? 0, maxHistoryFrames: this.options.temporal?.maxHistoryFrames ?? 0 },
+        minHistoryFrames: this.options.temporal?.minHistoryFrames ?? 0, maxHistoryFrames: this.options.temporal?.maxHistoryFrames ?? 0,
+        lobeMotionResponse: this.options.temporal?.lobeMotionResponse ?? 0,
+        stationaryHistoryFrames: this.options.temporal?.stationaryHistoryFrames ?? null },
       screenTrace: { configured: !!this.options.screenTrace, enabled: this.screenEnabled, active: this.screenActive,
         state: this.screenState, captureBytes: this.screenBytes, width: this.screenSize[0], height: this.screenSize[1],
-        maxDistance: this.options.screenTrace?.maxDistance ?? 0, steps: this.options.screenTrace?.steps ?? 0 } };
+        maxDistance: this.options.screenTrace?.maxDistance ?? 0, steps: this.options.screenTrace?.steps ?? 0 },
+      spatialFilter: { configured: !!this.options.spatialFilter, enabled: this.filterEnabled, active: this.filterActive,
+        iterations: this.options.spatialFilter?.iterations ?? 0, footprint: this.options.spatialFilter?.footprint ?? 0,
+        scratchBytes: this.filterBytes, bytesPerAnchor: this.options.spatialFilter ? REFLECTION_FILTER_BYTES_PER_ANCHOR : 0 } };
   }
   dispose(): void {
     if (this.disposed) return; this.disposed = true;

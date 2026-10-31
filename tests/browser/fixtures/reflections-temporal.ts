@@ -3,6 +3,7 @@ import type { MeshData } from '../../../src/geometry';
 import { multiply, normalMatrix, scaling, translation } from '../../../src/math';
 import { DEFAULT_MATERIAL_DEFINITION, m } from '../../../src/material';
 import { Renderer } from '../../../src/renderer';
+import type { ReflectionsOptions } from '../../../src/reflections';
 
 export const LADDER_SIZE = 48;
 export const LADDER_EYE: [number, number, number] = [0, 0, 3];
@@ -53,8 +54,15 @@ export function ladderRois(): { strip: number; pixels: { x: number; y: number }[
   });
 }
 
+/** Base reflection options with optional quality overrides; temporal fields merge. */
+export function reflectionQualityOptions(base: ReflectionsOptions, overrides?: ReflectionsOptions): ReflectionsOptions {
+  if (!overrides) return base;
+  return { ...base, ...overrides, temporal: base.temporal || overrides.temporal
+    ? { ...base.temporal, ...overrides.temporal } : undefined };
+}
+
 /** Static roughness ladder: fixed samples, exact accumulation steps, then 120 measured frames. */
-export async function runReflectionsLadderFixture(options: { warmup: number; measured: number }) {
+export async function runReflectionsLadderFixture(options: { warmup: number; measured: number; reflections?: ReflectionsOptions }) {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = `position:fixed;left:0;top:0;width:${LADDER_SIZE}px;height:${LADDER_SIZE}px`;
   document.body.appendChild(canvas);
@@ -72,8 +80,8 @@ export async function runReflectionsLadderFixture(options: { warmup: number; mea
   try {
     renderer = await Renderer.create(canvas, [mirror, bars], { antiAliasing: 'none',
       worldQueries: { maxRays: LADDER_SIZE * LADDER_SIZE * 4 },
-      reflections: { pixelSpacing: 1, maxAnchors: LADDER_SIZE * LADDER_SIZE, samplesPerAnchor: 4, maxDistance: 20,
-        maxBytes: 16 * 1024 * 1024, skyRadiance: LADDER_SKY, temporal: { minHistoryFrames: 8, maxHistoryFrames: 32 } } });
+      reflections: reflectionQualityOptions({ pixelSpacing: 1, maxAnchors: LADDER_SIZE * LADDER_SIZE, samplesPerAnchor: 4, maxDistance: 20,
+        maxBytes: 16 * 1024 * 1024, skyRadiance: LADDER_SKY, temporal: { minHistoryFrames: 8, maxHistoryFrames: 32 } }, options.reflections) });
     const active = renderer;
     active.setSun({ direction: [0, 0, 1], color: [0, 0, 0] });
     const rois = ladderRois();
@@ -109,7 +117,7 @@ export async function runReflectionsLadderFixture(options: { warmup: number; mea
 /** Camera strafes vertically over the ladder: reflections slide across the
  * mirror at a different screen velocity than the surface itself. */
 export async function runReflectionsParallaxFixture(options: { parallaxRoughness: number | null; settle: number;
-  frames: number; step: number }) {
+  frames: number; step: number; reflections?: ReflectionsOptions }) {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = `position:fixed;left:0;top:0;width:${LADDER_SIZE}px;height:${LADDER_SIZE}px`;
   document.body.appendChild(canvas);
@@ -129,10 +137,12 @@ export async function runReflectionsParallaxFixture(options: { parallaxRoughness
   try {
     const temporal = options.parallaxRoughness === null ? undefined
       : { minHistoryFrames: 8, maxHistoryFrames: 32, parallaxRoughness: options.parallaxRoughness };
+    const overrides = options.reflections && options.parallaxRoughness === null
+      ? { ...options.reflections, temporal: undefined } : options.reflections;
     renderer = await Renderer.create(canvas, [mirror, bars], { antiAliasing: 'none',
       worldQueries: { maxRays: LADDER_SIZE * LADDER_SIZE * 4 },
-      reflections: { pixelSpacing: 1, maxAnchors: LADDER_SIZE * LADDER_SIZE, samplesPerAnchor: 4, maxDistance: 20,
-        maxBytes: 16 * 1024 * 1024, skyRadiance: LADDER_SKY, temporal } });
+      reflections: reflectionQualityOptions({ pixelSpacing: 1, maxAnchors: LADDER_SIZE * LADDER_SIZE, samplesPerAnchor: 4, maxDistance: 20,
+        maxBytes: 16 * 1024 * 1024, skyRadiance: LADDER_SKY, temporal }, overrides) });
     const active = renderer;
     active.setSun({ direction: [0, 0, 1], color: [0, 0, 0] });
     const rois = ladderRois();
@@ -146,7 +156,7 @@ export async function runReflectionsParallaxFixture(options: { parallaxRoughness
       active.render(eyeAt(y), [0, y, 0]);
       const probe = await active.probeReflections(anchors);
       frames.push({ eye: eyeAt(y), anchors: probe.anchors.map(anchor => ({ position: anchor.position, normal: anchor.normal,
-        valid: anchor.valid, radiance: anchor.radiance, raw: anchor.rawRadiance, mode: anchor.historyMode,
+        valid: anchor.valid, radiance: anchor.radiance, unfiltered: anchor.unfilteredRadiance, raw: anchor.rawRadiance, mode: anchor.historyMode,
         count: anchor.historyCount, clamped: anchor.historyClamped, rejected: anchor.rejectedHistory })) });
     }
     const diagnostics = active.diagnostics().reflections;

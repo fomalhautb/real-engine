@@ -266,6 +266,29 @@ export interface CpuTraceResult {
 }
 
 /** Shared triangle test: returns null when rejected; distance interval and ties are the caller's job. */
+// float32 fma: the product of two float32 values is exact in float64.
+const fma32 = (a: number, b: number, c: number): number => f(a * b + c);
+/** Watertight-test ray shear (axes kx, ky, kz and factors Sx, Sy, Sz), as rayShear() in the kernels. */
+export function cpuRayShear(direction: V3): { axes: V3; factors: V3 } {
+  const magnitude = direction.map(Math.abs);
+  const kz = magnitude[0] >= magnitude[1] && magnitude[0] >= magnitude[2] ? 0 : magnitude[1] >= magnitude[2] ? 1 : 2;
+  let kx = (kz + 1) % 3, ky = (kx + 1) % 3;
+  if (direction[kz] < 0) [kx, ky] = [ky, kx];
+  return { axes: [kx, ky, kz], factors: [f(direction[kx] / direction[kz]), f(direction[ky] / direction[kz]), f(1 / direction[kz])] };
+}
+let lastShearDirection: V3 | null = null, lastShear: { axes: V3; factors: V3 } | null = null;
+function shearPoint(shear: { axes: V3; factors: V3 }, p: V3): V3 {
+  const z = p[shear.axes[2]];
+  return [fma32(-shear.factors[0], z, p[shear.axes[0]]), fma32(-shear.factors[1], z, p[shear.axes[1]]), f(shear.factors[2] * z)];
+}
+const precedes = (p: V3, q: V3): boolean => p[0] < q[0] || (p[0] === q[0] && (p[1] < q[1] || (p[1] === q[1] && p[2] < q[2])));
+/** Edge function evaluated from the endpoint first in sheared order, so a shared edge is exactly antisymmetric. */
+function edgeFunction(p: V3, q: V3): number {
+  return precedes(q, p) ? -fma32(p[0], q[1], -f(p[1] * q[0])) : fma32(q[0], p[1], -f(q[1] * p[0]));
+}
+
+/** Face and degenerate rejection by the Moller-Trumbore determinant; inside test,
+ * distance and barycentrics by the watertight crossing of watertightTriangle(). */
 export function cpuIntersectTriangle(ray: CpuRay, a: V3, b: V3, c: V3, doubleSided: boolean, reversed: boolean):
   { distance: number; u: number; v: number; determinant: number } | null {
   const edge1 = sub(b, a), edge2 = sub(c, a);
@@ -274,13 +297,17 @@ export function cpuIntersectTriangle(ray: CpuRay, a: V3, b: V3, c: V3, doubleSid
   const epsilon = Math.max(1e-30, f(f(length(edge1) * length(edge2)) * f(1e-7)));
   const rejectedFace = reversed ? determinant > 0 : determinant < 0;
   if (Math.abs(determinant) <= epsilon || (!doubleSided && rejectedFace)) return null;
-  const delta = sub(ray.origin, a);
-  const u = f(dot(delta, crossDirection) / determinant);
-  if (u < 0 || u > 1) return null;
-  const crossDelta = cross(delta, edge1);
-  const v = f(dot(ray.direction, crossDelta) / determinant);
-  if (v < 0 || f(u + v) > 1) return null;
-  return { distance: f(dot(edge2, crossDelta) / determinant), u, v, determinant };
+  // Callers test many triangles per ray: keep the last ray's shear (by direction identity).
+  if (lastShearDirection !== ray.direction) { lastShear = cpuRayShear(ray.direction); lastShearDirection = ray.direction; }
+  const shear = lastShear!;
+  const sa = shearPoint(shear, sub(a, ray.origin)), sb = shearPoint(shear, sub(b, ray.origin)), sc = shearPoint(shear, sub(c, ray.origin));
+  const weightA = edgeFunction(sb, sc), weightB = edgeFunction(sc, sa), weightC = edgeFunction(sa, sb);
+  if ((weightA < 0 || weightB < 0 || weightC < 0) && (weightA > 0 || weightB > 0 || weightC > 0)) return null;
+  const det = f(f(weightA + weightB) + weightC);
+  if (det === 0) return null;
+  const inverse = f(1 / det);
+  return { distance: f(fma32(weightA, sa[2], fma32(weightB, sb[2], f(weightC * sc[2]))) * inverse),
+    u: f(weightB * inverse), v: f(weightC * inverse), determinant };
 }
 
 export function cpuIntersectBox(ray: CpuRay, low: V3, high: V3, closest: number): boolean {

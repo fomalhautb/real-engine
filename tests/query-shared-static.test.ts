@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildBvhTopology, type BvhTopology } from '../src/bvh-topology';
 import { buildInstanceBvhTopology } from '../src/instance-bvh';
 import {
-  buildCpuSharedPool, nearestTriangleCpu, orderSharedLeaves, packLeafOrderedTriangles, packSharedFlags, packSharedLeaves,
+  buildCpuSharedPool, cpuIntersectTriangle, nearestTriangleCpu, orderSharedLeaves, packLeafOrderedTriangles, packSharedFlags, packSharedLeaves,
   planSharedStaticPool, sharedTopologyWords, traceSharedPoolCpu, SHARED_FLAG_DOUBLE_SIDED, SHARED_FLAG_MEMBER,
   SHARED_LEAF_WORDS, SHARED_MAX_LEAVES, SHARED_NODE_BYTES, SHARED_POSITION_BYTES, SHARED_TRIANGLE_BYTES,
   type CpuRay, type CpuReferenceTriangle, type SharedStaticCandidate, type SharedStaticLimits,
@@ -284,5 +284,90 @@ describe('shared static CPU traversal reference', () => {
     expect(pool.nodes[7]).toBe(0);
     expect(traceSharedPoolCpu(pool, { origin: [0, 0, -5], direction: [0, 0, 1], tMin: 0, tMax: f(1e30) }, 1e9))
       .toEqual({ hit: null, workUnits: 1, triangleTests: 0, overflow: false });
+  });
+});
+
+describe('watertight ray-triangle crossing', () => {
+  // Seeded LCG so failures reproduce.
+  const lcg = (seed: number) => () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+  const add = (a: V3, b: V3, scale = 1): V3 => [a[0] + b[0] * scale, a[1] + b[1] * scale, a[2] + b[2] * scale];
+  const unit = (a: V3): V3 => { const length = Math.hypot(...a); return [f(a[0] / length), f(a[1] / length), f(a[2] / length)]; };
+  const frame = (next: () => number) => {
+    const axisU = unit([next() - 0.5, next() - 0.5, next() - 0.5]);
+    const axisV = unit([axisU[1] - axisU[2], axisU[2] - axisU[0], axisU[0] - axisU[1]]);
+    return { axisU, axisV, normal: unit([axisU[1] * axisV[2] - axisU[2] * axisV[1], axisU[2] * axisV[0] - axisU[0] * axisV[2],
+      axisU[0] * axisV[1] - axisU[1] * axisV[0]]) };
+  };
+
+  it('never lets a ray through the shared edge of two triangles with different base vertices', () => {
+    const next = lcg(91);
+    let rays = 0, both = 0;
+    for (let quad = 0; quad < 400; quad++) {
+      const center: V3 = [(next() - 0.5) * 100, (next() - 0.5) * 100, (next() - 0.5) * 20];
+      const size = 0.01 + next() * 2, { axisU, axisV, normal } = frame(next);
+      const corner = (x: number, y: number): V3 => add(add(center, axisU, x * size), axisV, y * size).map(f) as V3;
+      const p = [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)];
+      for (let sample = 0; sample < 20; sample++) {
+        // A float32 target on the shared diagonal p0-p2; the triangles start at different vertices.
+        const t = next(), target = [0, 1, 2].map(axis => f(p[0][axis] + (p[2][axis] - p[0][axis]) * t)) as V3;
+        const direction = unit([next() - 0.5, next() - 0.5, next() - 0.5]), distance = 1 + next() * 15;
+        const ray: CpuRay = { origin: target.map((value, axis) => f(value - direction[axis] * distance)) as V3, direction, tMin: 0, tMax: 64 };
+        const first = cpuIntersectTriangle(ray, p[0], p[1], p[2], true, false);
+        const second = cpuIntersectTriangle(ray, p[2], p[3], p[0], true, false);
+        expect(first ?? second, `quad ${quad} sample ${sample}`).not.toBeNull();
+        for (const hit of [first, second]) {
+          if (!hit) continue;
+          expect(hit.u).toBeGreaterThanOrEqual(0); expect(hit.v).toBeGreaterThanOrEqual(0);
+          expect(hit.u + hit.v).toBeLessThanOrEqual(1 + 1e-6);
+          // float32 targets sit up to an ulp off the plane; grazing rays stretch that along the ray.
+          const cosine = Math.abs(normal[0] * direction[0] + normal[1] * direction[1] + normal[2] * direction[2]);
+          expect(Math.abs(hit.distance - distance)).toBeLessThan(2e-5 * (100 + distance) / cosine);
+        }
+        if (first && second) both++;
+        rays++;
+      }
+    }
+    expect(rays).toBe(8000);
+    expect(both).toBeLessThan(rays); // Mostly exactly one side: no tolerance band thickens edges.
+  });
+
+  it('closes every vertex of a triangle fan, exactly on the vertex and from arbitrary directions', () => {
+    const next = lcg(7);
+    for (let fan = 0; fan < 200; fan++) {
+      const center: V3 = [f((next() - 0.5) * 100), f((next() - 0.5) * 100), f((next() - 0.5) * 20)];
+      const sides = 3 + Math.floor(next() * 6), radius = 0.02 + next();
+      const { axisU, axisV } = frame(next);
+      const ring = Array.from({ length: sides }, (_, i) => {
+        const angle = (i + next() * 0.5) / sides * Math.PI * 2;
+        return add(add(center, axisU, Math.cos(angle) * radius), axisV, Math.sin(angle) * radius).map(f) as V3;
+      });
+      // Rotate each triangle's vertex order so shared edges appear in different roles.
+      const triangles = ring.map((_, i) => [center, ring[i], ring[(i + 1) % sides]]).map((tri, i) => [0, 1, 2].map(k => tri[(k + i) % 3]));
+      const hits = (ray: CpuRay) => triangles.filter(([a, b, c]) => cpuIntersectTriangle(ray, a, b, c, true, false)).length;
+      // Exactly through the shared vertex: an axis ray whose other coordinates equal the vertex's.
+      for (const axis of [0, 1, 2]) {
+        const direction: V3 = [0, 0, 0]; direction[axis] = next() < 0.5 ? -1 : 1;
+        const origin = [...center] as V3; origin[axis] = f(center[axis] - direction[axis] * 5);
+        expect(hits({ origin, direction, tMin: 0, tMax: 64 }), `fan ${fan} axis ${axis}`).toBe(sides);
+      }
+      for (let sample = 0; sample < 20; sample++) {
+        const direction = unit([next() - 0.5, next() - 0.5, next() - 0.5]), distance = 1 + next() * 15;
+        const origin = center.map((value, axis) => f(value - direction[axis] * distance)) as V3;
+        expect(hits({ origin, direction, tMin: 0, tMax: 64 }), `fan ${fan} sample ${sample}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('still rejects rays a small fraction of the triangle outside its edges', () => {
+    const a: V3 = [-30.15, 10.35, 2], b: V3 = [-29.45, 10.35, 2], c: V3 = [-29.45, 11.05, 2];
+    const down: V3 = [0, 0, -1];
+    const at = (x: number, y: number): CpuRay => ({ origin: [f(x), f(y), 7], direction: down, tMin: 0, tMax: 16 });
+    expect(cpuIntersectTriangle(at(-29.8, 10.35 + 1e-4), a, b, c, true, false)).not.toBeNull();
+    expect(cpuIntersectTriangle(at(-29.8, 10.35 - 1e-4), a, b, c, true, false)).toBeNull();
+    expect(cpuIntersectTriangle(at(-29.45 + 1e-4, 10.7), a, b, c, true, false)).toBeNull();
+    expect(cpuIntersectTriangle(at(-29.8 - 1e-4, 10.35 + 0.35), a, b, c, true, false)).toBeNull();
+    // Exactly on an edge and a vertex counts as inside.
+    expect(cpuIntersectTriangle(at(-29.8, 10.35), a, b, c, true, false)).not.toBeNull();
+    expect(cpuIntersectTriangle(at(-29.45, 10.35), a, b, c, true, false)).not.toBeNull();
   });
 });

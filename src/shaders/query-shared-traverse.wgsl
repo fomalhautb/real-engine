@@ -27,6 +27,48 @@ struct Params {
 // Winning batch ID (1-based) or zero for the per-batch material resolve.
 @group(0) @binding(7) var<storage, read_write> winners: array<u32>;
 
+// Watertight ray/triangle crossing (Woop, Benthin and Wald 2013). The ray is
+// sheared onto +z once per ray. Each edge function is evaluated from the endpoint
+// that comes first in sheared (x, y, z) order, with explicit fma, so two triangles
+// sharing an edge (even across split seam vertices, which share positions but not
+// IDs) compute exactly opposite values whatever contraction a backend applies; zero
+// (on an edge or vertex) counts as inside: no ray passes between triangles that
+// share vertices. Strict Moller-Trumbore edge tests let 213 of 405 quad-diagonal
+// rays through on apple/metal-3. Same function as query-trace.wgsl, so both paths agree bit for bit.
+struct RayShear { axes: vec3u, factors: vec3f }
+fn rayShear(direction: vec3f) -> RayShear {
+    let magnitude = abs(direction);
+    var kz = 2u;
+    if (magnitude.x >= magnitude.y && magnitude.x >= magnitude.z) { kz = 0u; } else if (magnitude.y >= magnitude.z) { kz = 1u; }
+    var kx = (kz + 1u) % 3u;
+    var ky = (kx + 1u) % 3u;
+    if (direction[kz] < 0.0) { let swap = kx; kx = ky; ky = swap; }
+    return RayShear(vec3u(kx, ky, kz), vec3f(direction[kx] / direction[kz], direction[ky] / direction[kz], 1.0 / direction[kz]));
+}
+fn shearPoint(shear: RayShear, p: vec3f) -> vec3f {
+    let z = p[shear.axes.z];
+    return vec3f(fma(-shear.factors.x, z, p[shear.axes.x]), fma(-shear.factors.y, z, p[shear.axes.y]), shear.factors.z * z);
+}
+fn precedes(p: vec3f, q: vec3f) -> bool {
+    return p.x < q.x || (p.x == q.x && (p.y < q.y || (p.y == q.y && p.z < q.z)));
+}
+fn edgeFunction(p: vec3f, q: vec3f) -> f32 {
+    if (precedes(q, p)) { return -fma(p.x, q.y, -(p.y * q.x)); }
+    return fma(q.x, p.y, -(q.y * p.x));
+}
+fn watertightTriangle(shear: RayShear, a: vec3f, b: vec3f, c: vec3f) -> vec4f {
+    let sa = shearPoint(shear, a);
+    let sb = shearPoint(shear, b);
+    let sc = shearPoint(shear, c);
+    let weightA = edgeFunction(sb, sc);
+    let weightB = edgeFunction(sc, sa);
+    let weightC = edgeFunction(sa, sb);
+    if ((weightA < 0.0 || weightB < 0.0 || weightC < 0.0) && (weightA > 0.0 || weightB > 0.0 || weightC > 0.0)) { return vec4f(0.0); }
+    let det = weightA + weightB + weightC;
+    if (det == 0.0) { return vec4f(0.0); }
+    let inverse = 1.0 / det;
+    return vec4f(fma(weightA, sa.z, fma(weightB, sb.z, weightC * sc.z)) * inverse, weightB * inverse, weightC * inverse, det);
+}
 fn intersectsBox(ray: Ray, low: vec3f, high: vec3f, closest: f32) -> bool {
     var near = ray.origin.w;
     var far = closest;
@@ -56,6 +98,7 @@ fn traverse(@builtin(global_invocation_id) id: vec3u) {
     var hit = hits[id.x];
     if (hit.work.z != 0u) { return; }
     if (ray.direction.w < ray.origin.w) { return; }
+    let shear = rayShear(ray.direction.xyz);
     var workLimit = params.dispatch.y;
     if (params.budget.x != 0u) {
         var localRay = id.x;
@@ -126,13 +169,11 @@ fn traverse(@builtin(global_invocation_id) id: vec3u) {
                 let epsilon = max(1e-30, length(edge1) * length(edge2) * 1e-7);
                 let rejectedFace = select((determinant < 0.0), (determinant > 0.0), reversed);
                 if (abs(determinant) <= epsilon || (!doubleSided && rejectedFace)) { continue; }
-                let delta = ray.origin.xyz - a;
-                let u = dot(delta, crossDirection) / determinant;
-                if (u < 0.0 || u > 1.0) { continue; }
-                let crossDelta = cross(delta, edge1);
-                let v = dot(ray.direction.xyz, crossDelta) / determinant;
-                if (v < 0.0 || u + v > 1.0) { continue; }
-                let distance = dot(edge2, crossDelta) / determinant;
+                let crossing = watertightTriangle(shear, a - ray.origin.xyz, b - ray.origin.xyz, c - ray.origin.xyz);
+                if (crossing.w == 0.0) { continue; }
+                let distance = crossing.x;
+                let u = crossing.y;
+                let v = crossing.z;
                 // A prior pass never writes pooled batches; only batch order decides its ties.
                 let priorWins = !found && hit.identity.x != 0u && hit.identity.x - 1u < batch;
                 let tieRejected = distance == closest && (priorWins || (found

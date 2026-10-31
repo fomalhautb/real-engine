@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 import type { LocalLightDescriptor } from '../../src/local-lights';
-import type { LocalLightFogPlan, runLocalLightFogFixture } from './fixtures/local-lights-fog';
+import type { LocalLightAirPlan, LocalLightFogPlan, runLocalLightAirFixture, runLocalLightFogFixture } from './fixtures/local-lights-fog';
 import { dot, henyeyGreenstein, irradiance, normalize, type Vec3 } from './local-light-oracle';
 
 test.use({ deviceScaleFactor: 1 });
@@ -200,4 +200,58 @@ test('local lights scatter in froxel fog with HG phase, atlas shadow and history
   console.log('LOCAL_LIGHTS_FOG_DIAGNOSTIC ' + JSON.stringify({ adapter: result.adapter, summary, shadowCells, litCells, spotCells,
     shadowedReset: result.shadowed.fog.resetReason, darkReset: result.dark.fog, timings: result.diagnostics.timings,
     counts: [...new Set(result.lit.sources.map(cell => cell.count))] }));
+});
+
+test('local light fog scattering adds to GI air lighting in one fog module, beside reflected fog', async ({ page }) => {
+  test.setTimeout(180_000);
+  const pageErrors: string[] = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  await page.goto('/?trees=1');
+  await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
+  await expect(page.locator('#error')).toBeHidden();
+  // Empty scene: every GI ray reaches the sky, so the air term cannot depend on the local light.
+  const airPlan: LocalLightAirPlan = {
+    size: 32, eye: [0, 0, 3], target: [0, 0, 0],
+    medium: { extinction: 0.3, albedo: [0.8, 0.8, 0.8], emission: [0, 0, 0], anisotropy: 0 },
+    grid: { origin: [-4.5, -4.5, -2.5], spacing: [3, 3, 3], counts: [4, 4, 4], raysPerProbe: 64, maxDistance: 20, skyRadiance: [0.2, 0.5, 1] },
+    light: { kind: 'point', position: [0.3, 0.2, -1], color: [1, 0.9, 0.8], intensity: 6, range: 4, castShadows: true },
+    pixels: [{ x: 16, y: 16 }, { x: 18, y: 14 }, { x: 12, y: 20 }, { x: 24, y: 8 }],
+  };
+  const result = await page.evaluate(async input => {
+    window.__REAL_ENGINE__!.pause(true);
+    window.__REAL_ENGINE__!.dispose();
+    const fixture = await import('/tests/browser/fixtures/' + 'local-lights-fog.ts') as { runLocalLightAirFixture: typeof runLocalLightAirFixture };
+    return fixture.runLocalLightAirFixture(input);
+  }, airPlan);
+  const { air, plain } = result;
+  expect(air.errors).toEqual([]);
+  expect(plain.errors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+  if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) expect(air.adapter.vendor.toLowerCase()).toBe(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR);
+  expect(air.diagnostics.fog).toMatchObject({ airLighting: { configured: true },
+    localLightScattering: 'froxel-block-light-list-shadowed-single-scattering' });
+  expect(plain.diagnostics.fog!.airLighting).toBeNull();
+  for (const variant of [air, plain]) {
+    expect(variant.diagnostics.localLights).toMatchObject({ enabledLights: 1, renderedShadowViews: 6, cameraCulling: false });
+    expect(variant.diagnostics.reflections).toMatchObject({ localLights: true });
+    expect(variant.afterDispose).toBe(0);
+  }
+  let worst = 0;
+  airPlan.pixels.forEach((pixel, index) => {
+    const label = `pixel ${pixel.x},${pixel.y}`;
+    // No light and no air: exactly dark. With air lighting the sky term is present before the light.
+    expect(plain.dark[index].slice(0, 3), label).toEqual([0, 0, 0]);
+    for (let c = 0; c < 3; c++) {
+      expect(air.dark[index][c], `${label}:${c} air term`).toBeGreaterThan(1e-3);
+      const withAir = air.lit[index][c] - air.dark[index][c], alone = plain.lit[index][c] - plain.dark[index][c];
+      expect(alone, `${label}:${c} local light`).toBeGreaterThan(1e-3);
+      // Additive: half-float rounding of each probe (<= 2^-11 relative) bounds the difference of differences.
+      const error = Math.abs(withAir - alone), bound = 2e-3 * alone + 1e-3 * (air.lit[index][c] + air.dark[index][c]) + 1e-5;
+      expect(error, `${label}:${c} local light with ${withAir} alone ${alone}`).toBeLessThanOrEqual(bound);
+      worst = Math.max(worst, error / bound);
+    }
+    expect(Math.abs(air.lit[index][3] - plain.lit[index][3]), `${label} transmittance`).toBeLessThanOrEqual(1e-4);
+  });
+  console.log('LOCAL_LIGHTS_AIR_DIAGNOSTIC ' + JSON.stringify({ adapter: air.adapter, worst,
+    air: { dark: air.dark, lit: air.lit }, plain: { dark: plain.dark, lit: plain.lit } }));
 });

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GpuVolumetricFog } from '../src/gpu-volumetric-fog';
 import { createTimestampQuerySet } from '../src/gpu-timestamp-span';
 import { identity } from '../src/math';
+import { resolveLocalLightOptions } from '../src/local-lights';
 
 type FakeBuffer = { label: string; destroyed: boolean; destroy(): void };
 type FakeTexture = { label: string; destroyed: boolean; createView(): object; destroy(): void };
@@ -441,5 +442,33 @@ describe('GPU volumetric fog air lighting and local history rejection', () => {
       expect(global.diagnostics().history).toMatchObject({ occluderRejection: 'global', occluderRegions: null });
     } finally { global.dispose(); }
     expect(tracked.bytes).toBe(0);
+  });
+
+  it('resets globally on caster changes while shadowed local lights render, and on every light version', async () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const lights = { options: resolveLocalLightOptions({ maxLights: 2, maxShadowedLights: 1 }), computeLayout: {},
+      bindGroup: () => ({}), activeShadowViews: 1 };
+    const fog = await GpuVolumetricFog.create(device as unknown as GPUDevice,
+      { pixelSize: 8, slices: 8, temporal: { occluderRejection: 'local' } }, tracked.account, undefined, lights as never);
+    try {
+      resize(fog, 16, 16);
+      const frame = (sceneChanged: boolean, lightRevision = 1) => {
+        fog.update([0, 1, 5], [0, 1, 0], Math.PI / 3, 0.1, 100, [0, 1, 0], [1, 1, 1], sun as never, view,
+          { cameraCut: false, materialRevision: 1, shadowResolution: 512, lightRevision, sceneChanged,
+            changedBounds: sceneChanged ? [{ min: [0, 0, 0], max: [1, 1, 1] }] : [] });
+        fog.afterSubmit();
+        return { ...fog.diagnostics().history };
+      };
+      frame(false); frame(false);
+      // Perspective local shadow views are outside the sun-space regions: a localizable change still resets every cell.
+      expect(frame(true)).toMatchObject({ framesSinceReset: 1, lastResetReason: 'scene-change' });
+      lights.activeShadowViews = 0;
+      expect(frame(false).framesSinceReset).toBe(2);
+      expect(frame(true)).toMatchObject({ framesSinceReset: 3, lastResetReason: 'scene-change' });
+      expect(frame(false, 2)).toMatchObject({ framesSinceReset: 1, lastResetReason: 'local-light-change' });
+      expect(frame(false, 2).framesSinceReset).toBe(2);
+    } finally { fog.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    expect(allDestroyed(device)).toBe(true);
   });
 });

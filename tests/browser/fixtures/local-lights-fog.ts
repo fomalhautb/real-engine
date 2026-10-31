@@ -91,3 +91,48 @@ export async function runLocalLightFogFixture(plan: LocalLightFogPlan) {
     return { dark, lit, settled, shadowed, shadowedAgain, pointOff, spotDouble, diagnostics, errors, adapter, afterDispose: renderer.stats.ownedGpuBytes };
   } finally { renderer?.dispose(); canvas.remove(); }
 }
+
+export interface LocalLightAirPlan {
+  size: number;
+  eye: Vec3;
+  target: Vec3;
+  medium: { extinction: number; albedo: Vec3; emission: Vec3; anisotropy: number };
+  grid: { origin: Vec3; spacing: Vec3; counts: Vec3; raysPerProbe: number; maxDistance: number; skyRadiance: Vec3 };
+  light: LocalLightDescriptor;
+  pixels: { x: number; y: number }[];
+}
+
+/** One renderer per variant (GI air lighting on/off), each also compiling reflected fog: split fog before and after the light. */
+export async function runLocalLightAirFixture(plan: LocalLightAirPlan) {
+  const variant = async (air: boolean) => {
+    const canvas = document.createElement('canvas');
+    canvas.style.cssText = `position:fixed;left:0;top:0;width:${plan.size}px;height:${plan.size}px`;
+    document.body.appendChild(canvas);
+    let renderer: Renderer | undefined;
+    try {
+      renderer = await Renderer.create(canvas, [], { antiAliasing: 'none', worldQueries: { maxRays: 4096 }, diffuseGi: plan.grid,
+        reflections: { pixelSpacing: 1, maxAnchors: 1024, samplesPerAnchor: 4, maxDistance: 20, maxBytes: 16 * 1024 * 1024 },
+        volumetricFog: { pixelSize: 4, slices: 32, maxViewDepth: 8, maxFroxels: 16 * 16 * 32, maxBytes: 4 * 1024 * 1024,
+          ...(air ? { airLighting: {} } : {}) },
+        localLights: { maxLights: 2, maxShadowedLights: 1, maxShadowViews: 6, shadowResolution: 256 } });
+      const active = renderer;
+      active.setSun({ direction: [0, 1, 0], color: [0, 0, 0] });
+      active.setVolumetricFogMedia({ global: { coefficients: plan.medium } });
+      active.setVolumetricFogDebugView('scattering-transmittance');
+      const light = active.addLocalLight({ ...plan.light, enabled: false });
+      const capture = async (frames: number) => {
+        for (let i = 0; i < frames; i++) active.render(plan.eye, plan.target);
+        return active.probeHdr(plan.pixels);
+      };
+      const dark = await capture(4);
+      active.setLocalLightEnabled(light, true);
+      const lit = await capture(1);
+      const diagnostics = { localLights: active.diagnostics().localLights, fog: active.diagnostics().volumetricFog,
+        reflections: active.diagnostics().reflections };
+      const errors = [...active.errors], adapter = active.info.adapterInfo;
+      active.dispose();
+      return { dark, lit, diagnostics, errors, adapter, afterDispose: active.stats.ownedGpuBytes };
+    } finally { renderer?.dispose(); canvas.remove(); }
+  };
+  return { air: await variant(true), plain: await variant(false) };
+}

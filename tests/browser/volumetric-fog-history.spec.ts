@@ -2,6 +2,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, test } from '@playwright/test';
 import type { runFogHistoryAcceptanceFixture } from './fixtures/volumetric-fog-history';
+import type { runLocalLightFogResponseFixture } from './fixtures/local-lights-fog-response';
 import {
   HISTORY_BOX, HISTORY_BOX_PIXEL, HISTORY_GHOST_PIXEL, HISTORY_LATTICE, HISTORY_MAX_FRAMES, HISTORY_MEDIUM, HISTORY_MOVED_BOX_PIXEL,
   HISTORY_PIXELS, HISTORY_SHAFT_PIXEL, HISTORY_SUN,
@@ -172,9 +173,98 @@ test('F02/F03: local fog history rejection around moving casters, door response,
     reason: local.extra!.teleportHistory.lastResetReason }, mediaErrors, adapter: local.adapter }));
 });
 
-test('F03: moving spotlight and short flash response curves', async () => {
-  // Local-light in-scattering belongs to the parallel lights stream and is not in this branch. The
-  // door test above records the same first-frame residual and T90 curves for the sun; a local-light
-  // change will reuse that harness once the lights stream exposes its fog hook and light versions.
-  test.skip(true, 'blocked on the lights stream: no local-light fog scattering in this branch');
+test('F03: moving spotlight and short flash response curves', async ({ page }) => {
+  // Local-light direct changes (benchmarks.md: T90 <= 100 ms at 60 Hz, saved ghost area and brightness curves,
+  // flashes judged on their own frames, not only the settled end state). Red scattering of the 8x8 lattice.
+  test.setTimeout(300_000);
+  const pageErrors: string[] = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  await page.goto('/?trees=1');
+  await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
+  await expect(page.locator('#error')).toBeHidden();
+  const result = await page.evaluate(async () => {
+    window.__REAL_ENGINE__!.pause(true);
+    window.__REAL_ENGINE__!.dispose();
+    const fixture = await import('/tests/browser/fixtures/' + 'local-lights-fog-response.ts') as {
+      runLocalLightFogResponseFixture: typeof runLocalLightFogResponseFixture };
+    return fixture.runLocalLightFogResponseFixture();
+  });
+  type Frame = { values: number[]; reason: string | null; framesSinceReset: number };
+  const at = (x: number, y: number) => HISTORY_LATTICE.findIndex(pixel => pixel.x === x && pixel.y === y);
+  const rows = [20, 28, 36, 44], beamA = rows.map(y => at(12, y)), beamB = rows.map(y => at(52, y));
+  const { litA, litB, litA2, litA3, shadowedA } = result;
+  const peakA = Math.max(...litA.values), peakB = Math.max(...litB.values);
+  // The beams are disjoint: each set is well lit by its own beam and exactly dark under the other.
+  for (const index of beamA) { expect(litA.values[index]).toBeGreaterThan(0.25 * peakA); expect(litB.values[index]).toBeLessThanOrEqual(1e-6); }
+  for (const index of beamB) { expect(litB.values[index]).toBeGreaterThan(0.25 * peakB); expect(litA.values[index]).toBeLessThanOrEqual(1e-6); }
+  /** Frames until every pixel of the set completed 90 % of its change (1 = the first changed frame). */
+  const t90 = (curve: Frame[], set: number[], before: Frame, after: Frame) => curve.findIndex(frame => set.every(index =>
+    Math.abs(frame.values[index] - after.values[index]) <= 0.1 * Math.abs(before.values[index] - after.values[index]))) + 1;
+  /** Pixels lit above 2 % of the peak where the settled state is dark (below 1 %). */
+  const ghostArea = (frame: Frame, settled: Frame, peak: number) =>
+    frame.values.filter((value, index) => settled.values[index] < 0.01 * peak && value > 0.02 * peak).length;
+  const ratios = (curve: Frame[], set: number[], reference: Frame) => curve.map(frame => set.map(index => frame.values[index] / reference.values[index]));
+
+  // Jump A -> B: the light version resets history; the old beam is gone and the new one complete on the first frame.
+  expect(result.jumpCurve[0]).toMatchObject({ reason: 'local-light-change', framesSinceReset: 1 });
+  const jumpResidual = Math.max(...beamA.map(index => result.jumpCurve[0].values[index] / litA.values[index]));
+  const jumpT90 = t90(result.jumpCurve, beamB, litA, litB);
+  const jumpGhostArea = Math.max(...result.jumpCurve.map(frame => ghostArea(frame, litB, peakB)));
+  expect(jumpResidual, 'old beam on the first moved frame').toBeLessThanOrEqual(0.02);
+  expect(jumpT90, 'new beam T90 frames').toBeGreaterThan(0);
+  expect(jumpT90, 'new beam T90 frames').toBeLessThanOrEqual(6);
+  expect(jumpGhostArea, 'jump ghost area').toBe(0);
+
+  // Sweep at 5 cm per frame: each frame matches a temporal-off renderer at the same light position (no trail).
+  const sweepGhost = Math.max(...result.sweep.map(frame => Math.max(...frame.on.map((value, index) => Math.abs(value - frame.off[index]))))) / peakA;
+  const sweepGhostArea = Math.max(...result.sweep.map(frame => frame.on.filter((value, index) => Math.abs(value - frame.off[index]) > 0.02 * peakA).length));
+  for (const frame of result.sweep) expect(frame).toMatchObject({ reason: 'local-light-change', framesSinceReset: 1 });
+  expect(sweepGhost, 'sweep trail').toBeLessThanOrEqual(0.02);
+  expect(sweepGhostArea, 'sweep ghost area').toBe(0);
+  const settledRatio = Math.max(...beamA.map(index => Math.abs(litA2.values[index] / litA.values[index] - 1)));
+  expect(settledRatio, 'back at A after the sweep').toBeLessThanOrEqual(0.02);
+
+  // Short flashes from a dark field: full on their own frames, no residue afterwards.
+  expect(Math.max(...result.dark.values)).toBeLessThanOrEqual(1e-6);
+  const flashFrames = [result.flash1, ...result.flash2];
+  const flashResponse = Math.min(...flashFrames.flatMap(frame => beamA.map(index => frame.values[index] / litA2.values[index])));
+  const after = [...result.afterFlash1, ...result.afterFlash2];
+  const flashResidual = Math.max(...after.flatMap(frame => frame.values)) / peakA;
+  const flashGhostArea = Math.max(...after.map(frame => ghostArea(frame, result.dark, peakA)));
+  expect(result.flash1).toMatchObject({ reason: 'local-light-change', framesSinceReset: 1 });
+  expect(result.afterFlash1[0]).toMatchObject({ reason: 'local-light-change', framesSinceReset: 1 });
+  expect(flashResponse, 'flash frames reach 90 % of the settled beam').toBeGreaterThanOrEqual(0.9);
+  expect(flashResidual, 'after-flash residue').toBeLessThanOrEqual(0.02);
+  expect(flashGhostArea, 'after-flash ghost area').toBe(0);
+
+  // A caster enters the shadowed beam under local rejection: shadowed local lights force a global reset.
+  expect(result.enterCurve[0]).toMatchObject({ reason: 'scene-change', framesSinceReset: 1 });
+  expect(result.leaveCurve[0]).toMatchObject({ reason: 'scene-change', framesSinceReset: 1 });
+  for (const index of beamA) expect(litA3.values[index] - shadowedA.values[index]).toBeGreaterThan(0.5 * litA3.values[index]);
+  const enterResidual = Math.max(...beamA.map(index => Math.abs(result.enterCurve[0].values[index] - shadowedA.values[index])
+    / (litA3.values[index] - shadowedA.values[index])));
+  const enterT90 = t90(result.enterCurve, beamA, litA3, shadowedA), leaveT90 = t90(result.leaveCurve, beamA, shadowedA, result.settledAgain);
+  expect(enterResidual, 'stale light on the first shadowed frame').toBeLessThanOrEqual(0.02);
+  expect(enterT90, 'shadow T90 frames').toBeGreaterThan(0);
+  expect(enterT90, 'shadow T90 frames').toBeLessThanOrEqual(6);
+  expect(leaveT90, 'unshadow T90 frames').toBeGreaterThan(0);
+  expect(leaveT90, 'unshadow T90 frames').toBeLessThanOrEqual(6);
+
+  expect(result.localLights).toMatchObject({ lights: 1, shadowedLights: 1, cameraCulling: false });
+  expect(result.errors).toEqual([]);
+  expect(result.afterDispose).toBe(0);
+  expect(result.twinAfterDispose).toBe(0);
+  expect(pageErrors).toEqual([]);
+  if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) {
+    expect(result.adapter.vendor.toLowerCase()).toContain(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR.toLowerCase());
+  }
+  console.log('FOG_LOCAL_LIGHT_RESPONSE ' + JSON.stringify({
+    jump: { residual: jumpResidual, t90: jumpT90, ghostArea: jumpGhostArea,
+      oldBeam: ratios(result.jumpCurve, beamA, litA), newBeam: ratios(result.jumpCurve, beamB, litB) },
+    sweep: { ghost: sweepGhost, ghostArea: sweepGhostArea, frames: result.sweep.length, settledRatio },
+    flash: { response: flashResponse, residual: flashResidual, ghostArea: flashGhostArea,
+      flashFrames: flashFrames.map(frame => beamA.map(index => frame.values[index] / litA2.values[index])),
+      after: after.map(frame => Math.max(...frame.values) / peakA) },
+    caster: { enterResidual, enterT90, leaveT90, enter: ratios(result.enterCurve, beamA, litA3), leave: ratios(result.leaveCurve, beamA, litA3) },
+    peaks: { a: peakA, b: peakB }, adapter: result.adapter }));
 });

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const STATUSES = ['pass', 'fail', 'unsupported', 'partial', 'untested'];
 const GATE_RESULTS = ['met', 'unmet', 'partly-measured', 'not-measured'];
+const EVIDENCE_KINDS = ['functional', 'quality', 'long-run', 'diagnostic-timing', 'acceptance-timing'];
 const ROW_FIELDS = ['id', 'kind', 'subsystem', 'priority', 'phase', 'basis', 'inputScale', 'correctnessReference', 'qualityGate',
   'performanceBudget', 'compatibleCombinations', 'gateResults', 'unsupportedCapabilities', 'status', 'statusReason', 'targetEvidence',
   'historicalEvidence', 'limitations'];
@@ -90,6 +91,7 @@ export function validateMatrix(matrix, { benchmarks, roadmap, fileExists }) {
     if (record.scope === 'target' && record.adapter !== target) fail(`evidence ${key}: target evidence must come from ${target}`);
     if (record.scope === 'historical' && record.adapter === target) fail(`evidence ${key}: historical evidence must not use the target adapter`);
     if (record.scope !== 'target' && record.scope !== 'historical') fail(`evidence ${key}: scope must be target or historical`);
+    if (!EVIDENCE_KINDS.includes(record.kind)) fail(`evidence ${key}: kind must be one of ${EVIDENCE_KINDS.join(', ')}`);
   }
   const references = new Set([...Object.keys(matrix.references ?? {}), 'functional']);
   for (const row of rows) {
@@ -125,7 +127,8 @@ export function summarizeMatrix(matrix) {
   const count = rows => Object.fromEntries(STATUSES.map(status => [status, rows.filter(row => row.status === status).length]));
   const phases = [...new Set(matrix.rows.map(row => row.phase))].sort();
   return {
-    version: matrix.version, frozen: matrix.frozen, evidenceAsOf: matrix.evidenceAsOf, target: matrix.targetHardware.adapter,
+    version: matrix.version, frozen: matrix.frozen, evidenceAsOf: matrix.evidenceAsOf, evidenceMain: matrix.evidenceMain ?? null,
+    target: matrix.targetHardware.adapter,
     total: count(matrix.rows),
     byPhase: Object.fromEntries(phases.map(phase => [phase, count(matrix.rows.filter(row => row.phase === phase))])),
     p0: count(matrix.rows.filter(row => row.priority === 'P0')),
@@ -134,7 +137,7 @@ export function summarizeMatrix(matrix) {
 }
 
 function markdownReport(summary) {
-  const header = `能力矩阵 v${summary.version}（冻结 ${summary.frozen}，证据截至 ${summary.evidenceAsOf}，目标 ${summary.target}）`;
+  const header = `能力矩阵 v${summary.version}（冻结 ${summary.frozen}，证据截至 ${summary.evidenceAsOf}${summary.evidenceMain ? `（main ${summary.evidenceMain}）` : ''}，目标 ${summary.target}）`;
   const totals = STATUSES.map(status => `${status} ${summary.total[status]}`).join('，');
   const lines = [header, '', '合计：' + totals, '', '| ID | 阶段 | 优先级 | 状态 | 依据 |', '| --- | --- | --- | --- | --- |'];
   for (const row of summary.rows) lines.push(`| ${row.id} | ${row.phase} | ${row.priority} | ${row.status} | ${row.reason.replaceAll('|', '\\|')} |`);

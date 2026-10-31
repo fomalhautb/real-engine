@@ -47,6 +47,10 @@ describe('capability matrix', () => {
     const relabelled = copy();
     relabelled.evidence['hist-nvidia-stability-20261014'].adapter = 'apple / metal-3';
     expect(validateMatrix(relabelled, docs)).toContain('evidence hist-nvidia-stability-20261014: historical evidence must not use the target adapter');
+    const untyped = copy();
+    untyped.evidence['apple-benchmark-diagnostic-20261031'].kind = 'timing';
+    expect(validateMatrix(untyped, docs)).toContain(
+      'evidence apple-benchmark-diagnostic-20261031: kind must be one of functional, quality, long-run, diagnostic-timing, acceptance-timing');
   });
 
   it('refuses a pass or a measured result that the evidence does not support', () => {
@@ -57,8 +61,12 @@ describe('capability matrix', () => {
     row(unsupported, 'G02').gateResults = { functional: 'met' };
     expect(validateMatrix(unsupported, docs)).toContain('G02: functional=met has no target evidence');
     const hidden = copy();
-    row(hidden, 'G03').gateResults = { functional: 'partly-measured' };
-    expect(validateMatrix(hidden, docs)).toContain('G03: status fail does not match derived partial');
+    const failing = hidden.rows.find(entry => entry.status === 'fail' && !entry.unsupportedCapabilities.length)!;
+    failing.gateResults = Object.fromEntries(Object.entries(failing.gateResults).map(([gate, result]) => [gate, result === 'unmet' ? 'partly-measured' : result]));
+    expect(validateMatrix(hidden, docs)).toContain(`${failing.id}: status fail does not match derived partial`);
+    const unmet = copy();
+    row(unmet, 'F01').gateResults = { ...row(unmet, 'F01').gateResults, functional: 'unmet' };
+    expect(validateMatrix(unmet, docs)).toContain('F01: status partial does not match derived fail');
   });
 
   it('needs uncontended acceptance timing before a row with a budget can pass', () => {

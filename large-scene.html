@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0f12" />
+    <title>Real Engine — Large scene walkthrough</title>
+    <style>
+      :root { color-scheme: dark; --bg: #0b0f12; --panel: rgba(12, 17, 21, 0.86); --line: rgba(255, 255, 255, 0.12); --text: #e8ecef; --muted: #8b979f; --accent: #f2b45c; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+      #viewport { position: fixed; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+      .panel { position: fixed; top: 12px; right: 12px; width: min(340px, calc(100% - 24px)); max-height: calc(100% - 24px); overflow: auto;
+        background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; backdrop-filter: blur(8px); }
+      .panel h1 { font-size: 14px; margin: 0 0 2px; letter-spacing: 0.04em; }
+      .panel p { margin: 0 0 8px; color: var(--muted); }
+      .row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; align-items: center; }
+      button, select { background: #1a2329; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font: inherit; cursor: pointer; }
+      button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+      label { color: var(--muted); }
+      dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 8px 0 0; }
+      dt { color: var(--muted); } dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; }
+      #status { color: var(--accent); }
+      #error { white-space: pre-wrap; color: #ff8f80; margin-top: 8px; }
+      body.ui-hidden .panel { display: none; }
+    </style>
+  </head>
+  <body>
+    <canvas id="viewport" aria-label="Large scene viewport" tabindex="0"></canvas>
+    <aside class="panel" aria-label="Large scene controls">
+      <h1>LARGE SCENE / WALKTHROUGH</h1>
+      <p>离线构建的资产集（几何分页 + 纹理流）。<code>?set=/artifacts/…/asset-set.json</code></p>
+      <div id="status" role="status">WAITING FOR ASSET SET</div>
+      <div class="row" id="keyframes" aria-label="固定相机关键帧"></div>
+      <div class="row">
+        <button id="walk" aria-pressed="false">连续漫游</button>
+        <label for="debug">视图</label>
+        <select id="debug">
+          <option value="material">material</option>
+          <option value="clusters">clusters</option>
+          <option value="levels">levels</option>
+        </select>
+      </div>
+      <div class="row">
+        <label for="lod-error">LOD 误差</label>
+        <input id="lod-error" type="range" min="0.5" max="8" step="0.5" value="2" />
+        <span id="lod-error-value">2 px</span>
+      </div>
+      <dl>
+        <dt>adapter</dt><dd id="adapter">—</dd>
+        <dt>batches</dt><dd id="batches">—</dd>
+        <dt>paged triangles</dt><dd id="triangles">—</dd>
+        <dt>omitted</dt><dd id="omitted">—</dd>
+        <dt>frame</dt><dd id="frame">—</dd>
+        <dt>CPU frame interval</dt><dd id="interval">—</dd>
+        <dt>owned GPU memory</dt><dd id="memory">—</dd>
+        <dt>camera time</dt><dd id="time">—</dd>
+      </dl>
+      <p style="margin-top:8px">H 隐藏界面 · 帧间隔为浏览器 rAF 间隔，仅供诊断，不是基准结果。</p>
+      <div id="error" role="alert" hidden></div>
+    </aside>
+    <script type="module" src="/src/large-scene-demo.ts"></script>
+  </body>
+</html>

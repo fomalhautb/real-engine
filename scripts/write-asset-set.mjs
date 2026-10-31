@@ -4,17 +4,20 @@
 // source document (and the same geometry package where that applies). Capture
 // scripts and the large-scene demo read the server roots from it.
 //   node scripts/write-asset-set.mjs --name intel-sponza-main --geometry dir --textures dir
-//     [--query dir] [--uv file.json] [--license file] --output new-directory
+//     [--query dir] [--uv file.json] [--license file] [--camera-path file.json] --output new-directory
+// A camera path (format real-engine-camera-path: samples of position, forward
+// and up in glTF space) is copied into the set as camera-path.json.
 import { createHash } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { exists, publishDirectory, removeOwnTemporary } from './asset-output.mjs';
+import { parseCameraPath } from '../src/camera-path.ts';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const FLAGS = { '--name': 'name', '--geometry': 'geometry', '--textures': 'textures', '--query': 'query', '--uv': 'uv',
-  '--license': 'license', '--output': 'output', '--artifacts-root': 'artifactsRoot' };
+  '--license': 'license', '--output': 'output', '--artifacts-root': 'artifactsRoot', '--camera-path': 'cameraPath' };
 
 const options = {};
 for (let i = 2; i < process.argv.length; i++) {
@@ -65,7 +68,21 @@ if (options.uv) {
   roots.uvAuditUrl = await serverPath(options.uv, false);
   packages.uvAudit = { url: roots.uvAuditUrl, sha256: sha256(bytes), summary: uv.summary, geometryChecked: Boolean(uv.geometryCheck) };
 }
+let cameraPath = null;
+if (options.cameraPath) {
+  // The same validation the demo applies when it loads the path.
+  const bytes = await readFile(resolve(options.cameraPath));
+  let path;
+  try { path = parseCameraPath(JSON.parse(bytes.toString('utf8'))); } catch (error) { throw Error('ASSET_SET_CAMERA_PATH: ' + error.message); }
+  cameraPath = { bytes, samples: path.samples.length, duration: path.duration };
+}
 await mkdir(dirname(output), { recursive: true });
+if (cameraPath) {
+  // The set directory does not exist yet: resolve its parent, then append its name.
+  const inside = relative(artifacts, join(await realpath(dirname(output)), basename(output)));
+  if (!inside || inside.startsWith('..') || inside.split(sep).includes('..')) throw Error('ASSET_SET_OUTSIDE_ARTIFACTS: ' + output);
+  roots.cameraPathUrl = '/artifacts/' + inside.split(sep).join('/') + '/camera-path.json';
+}
 const temporary = await mkdtemp(join(dirname(output), `.${basename(output)}.tmp-`));
 try {
   let license = null;
@@ -73,6 +90,10 @@ try {
     const bytes = await readFile(resolve(options.license));
     await copyFile(resolve(options.license), join(temporary, basename(options.license)));
     license = { file: basename(options.license), bytes: bytes.length, sha256: sha256(bytes) };
+  }
+  if (cameraPath) {
+    await writeFile(join(temporary, 'camera-path.json'), cameraPath.bytes, { flag: 'wx' });
+    packages.cameraPath = { url: roots.cameraPathUrl, sha256: sha256(cameraPath.bytes), samples: cameraPath.samples, durationSeconds: cameraPath.duration };
   }
   const set = { version: 1, format: 'real-engine-asset-set', name: options.name,
     source: { file: geometry.json.source.file, bytes: geometry.json.source.bytes, sha256: sourceSha256 },

@@ -2,6 +2,13 @@
 
 更新日期：2026-10-31。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 世界查询共享遍历、水密测试与距离场决策（2026-10-31）
+
+- **共享静态遍历**：新增可选项 `WorldQueryOptions.staticTraversal: 'shared'`。刚体且输入已提交的静态批次放进同一棵两级 BVH，用一次派发完成遍历。未超出工作配额的光线，命中记录与逐批次路径逐字相同：Apple 上比较 192 组，0 处不一致。默认仍是逐批次，renderer 尚未启用共享路径。
+- **性能（诊断）**：在两个合成的 405 批场景中（32,768 条光线），共享路径的 GPU 时间分别是逐批次的 0.223 和 0.086。测量时 GPU 有并发负载，Sponza 上尚未测量。
+- **水密测试**：三角形测试改为 Woop–Benthin–Wald 水密测试，修复了 Apple 上的共享边漏检，见下一节。
+- **BVH 与距离场的选型**：结论是距离场不进入 `src`。测试代码中的稠密无符号距离场单次查询快 6.5–11 倍，但有三个问题：8.7%–32.5% 的光线假命中；不返回命中身份和材质；显存随场景体积增长，0.125 m 网格已占 76 MiB。复审条件见「世界空间查询基础」中的决策记录。
+
 ## GI 变化驱动更新与联合动态验收（2026-10-31）
 
 新增可选的变化驱动探针更新 `DiffuseGiOptions.update: { mode: 'scheduled' }`；默认仍是每次 GI 更新都重采整个网格的 `'full'`。同时新增：
@@ -40,7 +47,11 @@
 
 **Apple 全量回归分诊（诊断）。** 时间戳修复后，完整浏览器回归在目标机上 138 项中 131 项通过，用时 2.3 分钟，没有卡死。失败的 7 项在硬件上重跑 2/2 复现，在 SwiftShader 上全部通过，分属三类问题：
 
-- 世界查询（未修复）：射线恰好落在两个三角形的共享边上时，两侧三角形都判为未命中，偏移 ±0.01 后两种 adapter 都能命中。初步判断是三角形边测试在 Metal 舍入下不封闭。涉及 `world-query.spec.ts:17` 的两种配置和 `world-query-capacity.spec.ts:51`。
+- 世界查询（已修复）：
+  - 现象：射线恰好落在两个三角形的共享边上时，两侧三角形都判为未命中；偏移 ±0.01 后，两种 adapter 都能命中。修复前，405 条正对四边形对角线的射线中，有 213 条两侧都未命中。
+  - 原因：Möller–Trumbore 的严格边测试在 Metal 的 FMA 收缩下不封闭。
+  - 修复：两个遍历着色器和 CPU 参考都改用 Woop–Benthin–Wald 水密测试，每条边按剪切后坐标的固定顺序求值，使相邻三角形在共享边上得到严格相反的值。
+  - 结果：`world-query.spec.ts:17` 的两种配置和 `world-query-capacity.spec.ts:51` 在目标机上已通过。
 - 光栅接收点（已绕开）：
   - 根因：在目标机上，片元着色器把 `pack2x16snorm`、`pack2x16unorm`、`pack4x8snorm` 或 `pack4x8unorm` 的结果写到整数输出 x 以外的分量时，整个 `vec4u` 会被清零或打乱。接收点把两个法线写在 `rgba32uint` 目标的 z/w 分量，所以读回为零，法线解码为 (0,0,1)。
   - 对照：计算阶段的打包、`pack2x16float`、任意分量上的 bitcast 都正常；SwiftShader 上全部正常。
@@ -49,7 +60,13 @@
   - 结果：`raster-receivers.spec.ts:5`、`gi-filter-boundary.spec.ts:11`、`gi-supplemental.spec.ts:40` 在目标机上已通过。
 - 流式与常驻路径（待定）：在 Apple 上有一个 HDR 采样相差约 0.03，而测试要求两条路径逐位一致。尚未判定这是缺陷还是测试假设。涉及 `geometry-stream-renderer.spec.ts:4`。
 
-合入设备恢复与打包修复后，main 上的完整回归在目标机上 144 项中 139 项通过、1 项跳过（依赖局部灯）。其余 4 项失败就是上面的世界查询 3 项和流式路径 1 项。这些问题解决之前，相应能力在目标机上不算通过。
+合入设备恢复与打包修复后，main 上的完整回归在目标机上 144 项中 139 项通过、1 项跳过（依赖局部灯）。其余 4 项失败就是上面的世界查询 3 项和流式路径 1 项。
+
+再合入 GI 缓存更新、世界查询共享遍历与水密测试后，完整回归共 152 项：149 项通过、1 项跳过、2 项失败（日志 `artifacts/main-integration-20261030/apple-full-gi-query-7dd05a6.log`）。
+
+- `volumetric-fog-shadow.spec.ts:5`：GI 探针诊断新增了 `captureFrame` 字段。默认 `full` 策略每帧都重新捕获，测试却拿前后两帧的整个探针对象做相等比较，于是只差在这个字段上；辐亮度系数完全一致，渲染行为没有变化。测试已改为比较时去掉该字段，并断言第二帧在有介质时重新捕获了全部探针。修正后在目标机与 SwiftShader 上单独重跑均通过。
+- 剩余 1 项是上面的流式路径。这个问题解决之前，流式路径在目标机上不算通过。
+- SwiftShader 上定向运行 GI、世界查询、雾空气光照与反射等 9 个 spec：19 项通过、1 项跳过。
 
 **体积雾。** 新增可选的 GI 空气光照和遮挡体局部历史拒绝，详见「线性 HDR、输出与光照基础」中的体积雾小节。F01–F04 的自动化用例在目标机和 SwiftShader 上均通过。F05 的 1080p 扫描显示，默认预算靠把网格降到 14 像素/格保持在 64 MiB 以内；8 像素/格、64 层并开启时序历史需要 158.2 MiB，**未满足 64 MiB 预算**。局部灯散射、移动聚光灯和短闪光尚未支持。
 
@@ -1172,6 +1189,209 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供光照直接消�
 首轮本地完整浏览器运行有 1 项切线模块初始化失败，其余 70 项通过；同期第二次 CPU 检查有 1 项离线 CLI 目录重命名 `EPERM`。随后串行运行的完整检查及浏览器回归通过，但没有据此确认两个偶发失败的根因或宣布它们已永久修复。原失败日志分别保留于 `artifacts/scene-bvh-browser-release-native-20261019.log` 与 `artifacts/scene-bvh-check-release-20261019.log`。旧实例提交 `41afdbc` 的[远程 run 39234201870](https://github.com/fomalhautb/real-engine/actions/runs/39234201870) 仍有 1 项平局测试失败；修正后的跨批次 BVH 提交 `d7c94d8` 的[远程 run 39267473217](https://github.com/fomalhautb/real-engine/actions/runs/39267473217) 已完成且全部作业成功，包含 CPU 和 Linux 浏览器。本轮没有新增硬件帧时间/吞吐基准，也不改变 GI 接触区质量目标未通过的状态。
 
 提交 `63f2bd8` 已通过本地及远程 TypeScript、176 项 CPU 单元测试、生产构建，以及 [远程 Linux 软件 GPU 的 14 项浏览器回归](https://github.com/fomalhautb/real-engine/actions/runs/38509599939)。GPU 查询覆盖离屏静态/刚体、独立蒙皮＋Morph、重排/删除/generation 复用、Mask 洞口、双面、前帧位置、多层 refit、闭区间命中、Unlit HDR 材质即时修改和预算错误；无 GPU 验证错误，释放后账本归零。这是该提交的功能证据，未测查询吞吐。后续本地硬件与基础压力场景的 30 分钟运行另见本文末节；此前被中止的运行不计为通过。
+
+### 共享静态遍历、水密三角形测试与距离场对照（2026-10-31）
+
+本小节对应三个提交：`32f150c`（可选的共享静态遍历）、`76da1ea`（共享边水密三角形测试）和 `7dd05a6`（追踪 pass 计时与测试内的距离场实验）。硬件数据来自目标机 Apple M3 Max（Chrome 156，`apple / metal-3`）；测量时多个并行分支同时占用 GPU，计时**只作诊断，不作性能验收**。SwiftShader 结果只证明功能正确。
+
+### 共享静态遍历（`staticTraversal: 'shared'`，可选）
+
+**做了什么。** 逐批次路径（默认）中，每个批次对所有光线各派发一次。405 批时一次查询需要 405 次追踪派发；10-25 的 NVIDIA Sponza 剖析中，逐批次 pass 约占查询时间的 98.6%。共享路径把一组明确的静态批次放进同一棵两级 BVH，用一次派发完成遍历：
+
+- 顶层（TLAS）每个（批次，实例槽）一个叶，拓扑固定，在 GPU 上 refit。
+- 底层（BLAS）节点、按叶序排列的三角形，以及逐位相同的位置副本，都放在池化缓冲中。池只按脏批次更新。
+- 遍历把每条光线的获胜叶写入 winners 缓冲。之后每个成员批次用原追踪模块的 resolve 入口，为它赢下的光线计算材质、覆盖与身份。
+- 非成员批次仍走原逐批次路径。成员批次离开场景候选树；没有非成员需要候选树时，跳过这一 pass。
+
+**接口（全部可选，默认值保持原行为）。**
+
+- `WorldQueryOptions.staticTraversal?: 'per-batch' | 'shared'`，默认 `'per-batch'`。
+- `WorldQueryOptions.maxSharedStaticBytes?: number`，默认 64 MiB，上限 512 MiB，计入 `maxBytes`。
+- `WorldQueryOptions.dispatchEncoding?: 'pass-per-batch' | 'single-pass'`，默认 `'pass-per-batch'`。`'single-pass'` 把一次查询的全部派发录在同一个计算 pass 中，执行顺序不变。
+- `GpuWorldQuery.encodeTrace(..., facePolicy, timing?)` 新增可选的最后一个参数 `timing?: GPUComputePassTimestampWrites`，见下一节。
+- 诊断新增 `staticTraversal`、`dispatchEncoding`、`sharedStatic`。`sharedStatic` 包括 `pooledBatches`、`excludedBatches`、按原因的 `excluded`、`members`、`leaves`、`tlasNodes`、`triangles`，以及 `bytes`（nodes / triangles / positions / leaves / topology / fixed / total）。
+
+Renderer 目前没有启用共享路径。GI、反射等消费者仍走默认的逐批次路径，只受下面水密修复的影响。
+
+**准入与成员资格。**
+
+- 注册关闭后的第一次快照中，按确定的首次适配顺序准入一次。
+- 只有刚体（不形变）且输入已提交（`committed`）的批次可以准入。排除原因有 `deformation`、`mutable-input`、`dispatch-limit`、`leaf-limit`（65,536 叶）、`binding-limit`（任一池缓冲超过 `maxStorageBufferBindingSize` 或 `maxBufferSize`）和 `budget`。
+- 每次追踪按当前材质重新判定成员：只有当前为 Opaque 的已准入批次才是成员，所以切换到 Masked 的批次会回到逐批次路径，覆盖测试不会被绕过。双面标志也取当前材质的值。
+
+**语义。**
+
+- 未超出工作配额的光线，返回的 160 字节命中记录与逐批次路径**逐字相同**。比较时排除第 36–38 字（工作量、测试数、溢出），因为这几项是遍历统计，两条路径本来就不同。
+- 超出配额的光线可能停在不同的候选上。溢出照常报告，但两条路径的溢出记录不可比较。
+- 重心插值改用显式 `fma`：在 Apple Metal 上，隐式收缩在不同入口点之间最多相差 12 ulp。
+
+**Apple 上的一致性。**
+
+- 测试为 `world-query-shared.spec.ts`，每组 1504 条光线，共比较 192 组：
+  - 8 个阶段：initial、steady、moved、deleted、restored、switch-masked-unsnapshotted、switch-masked、switch-opaque-double。
+  - 6 个分支：linear-reference、per-batch、per-batch-single-pass、shared、shared-linear-scene、shared-single-pass。
+  - 4 种配置：material、reverse-support、紧预算 tight、partition。
+- 结果：0 处不一致，271,148 条可比较记录逐字相同。只要参考或被测分支中有一侧溢出，这条光线就不参与比较，另行计数。
+- initial 阶段 material 配置下，1504 条光线的总工作量：线性参考 116,323 单位 / 9,865 次三角形测试，逐批次 50,476 / 9,865，共享 50,696 / 9,946。
+
+**显存。** 两个 405 批合成场景的池分别为 1,829,480 B 和 13,553,420 B，其中第二个场景的位置副本占 7,464,960 B。整个查询自有的 GPU 显存分别从 15.07 MiB 增至 16.82 MiB、从 27.19 MiB 增至 40.12 MiB。
+
+### 共享边水密三角形测试（提交 `76da1ea`）
+
+**问题。** Apple 全量回归分诊发现，射线恰好落在两个三角形的共享边上时，两侧都判为未命中。在修复前的代码上，405 条正对两三角形四边形对角线中点的射线中，有 213 条两侧都未命中（`edge-crack-probe-apple.log`）。原因是 Möller–Trumbore 的严格边测试在 Metal 的 FMA 收缩下不封闭。SwiftShader 上没有复现。
+
+**修复。** 两个遍历着色器（`query-trace.wgsl` 与 `query-shared-traverse.wgsl`）改用同一份 Woop–Benthin–Wald 水密测试，两者逐位一致：
+
+- 按方向绝对值最大的轴选 kz（并列时依次取 x、y、z），kx、ky 循环；方向在 kz 上为负时交换 kx/ky。剪切系数为 dx/dz、dy/dz、1/dz。
+- 顶点先减去光线原点，再剪切。三个边函数都用显式 `fma` 计算，每条边按剪切后坐标的字典序（x、y、z）从较小端点开始求值。这样相邻三角形对共享边得到的值严格互为相反数；接缝处位置相同、ID 不同的顶点也一样。早先按顶点 ID 排序的尝试，在接缝和跨网格 ID 重复时会失效。
+- 边函数为 0 视为在内。符号混合即拒绝，行列式为 0 也拒绝。
+- 正反面策略和退化三角形判定仍用原来的 MT 行列式，面语义不变。
+- CPU 参考 `cpuIntersectTriangle` 同步改为同一算法，并导出 `cpuRayShear`。它用 f64 计算后舍入到 f32 来模拟 `fma`，极少数情况下会有双重舍入差异，因此不要求与 GPU 逐位一致。
+
+**回归测试。**
+
+- `tests/query-shared-static.test.ts` 新增 3 项：
+  - 400 个四边形 × 20 条落在共享对角线上的射线，基准顶点、位置、朝向和方向都随机，不允许两侧同时未命中。
+  - 200 个三角扇，轮换顶点角色，射线穿过共享顶点。
+  - 距边 1e-4 的外侧射线必须未命中。
+- 浏览器用例 `world-query-watertight.spec.ts`：
+  - 场景为 8 个网格，每个 72 个三角形，带复制的接缝列、交替的对角线和轮换的顶点顺序；4 个轴对齐，4 个任意旋转。
+  - 共 10,480 条射线：恰在顶点上 448 条，顶点附近 240 条，恰在边上 5184 条，边附近 4608 条。
+  - 逐批次和共享两个分支都要求 0 未命中、0 命中错批、0 溢出、0 不一致。
+
+**修复前后（Apple，三个失败用例）。** 修复前的证据为 `world-query-apple-run2.log`（10 通过 / 3 失败），与 main 全量回归中这三项的失败相同（main `e63e3f4` 上为 139/144）。修复后的数据在 `e63e3f4` 之上测得，见 `world-query-apple-rebase-e63e3f4.log`。
+
+| 用例 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `world-query.spec.ts:17`（small batch） | 失败：`expect(received).not.toBeNull()`，Expected a world-space ray hit，得到 null | 通过，1.1 s |
+| `world-query.spec.ts:17`（instance BVH） | 失败，原因同上 | 通过，675 ms |
+| `world-query-capacity.spec.ts:51` | 失败：Expected an authored capacity hit，得到 null | 通过，1.8 s |
+
+### 追踪计时与 Apple 时间戳的观察
+
+`encodeTrace` 的可选 `timing` 覆盖这次追踪自己的 pass：
+
+- 逐批次编码时，reset pass 用 `timestampSpanStart` 写开始端，最后一个批次 pass 用 `timestampSpanEnd` 写结束端。两个 pass 都写完整的一对时间戳，符合 main `b5fd5df` 的规则。
+- 单 pass 编码时，计时放在唯一的那个 pass 上。
+- 不传 `timing` 时没有任何时间戳写入。
+
+单元测试检查了这三种情况。
+
+**观察（对其他分支的计时方法也有影响）。**
+
+- 在 `apple / metal-3` 上，在被测工作前后另加计时 pass 不能框住被测工作。无论计时 pass 是空的，还是写入被测分支的命中缓冲，四次查询都只测到 0–1 个量化单位。时间戳必须放在被测 pass 本身上。
+- 不加 `--enable-webgpu-developer-features` 时，Chrome 把时间戳量化到 65.536 µs。
+- 证据见 `benchmark-smoke-apple.log` 与 `benchmark-smoke2-apple.log`。
+
+### 405 批配对计时（Apple，诊断）
+
+**方法。**
+
+- 用例 `world-query-shared-benchmark.spec.ts` 只在硬件上运行，并只在硬件上额外加 `--enable-webgpu-developer-features`。
+- 两个合成场景各 405 批，每批是约 1.5 m 的随机三角形汤，8 种网格轮换使用，实例随机分布在 48 × 48 × 12 m 的体积中：
+  - `rocks-405x2x32`：每批 2 个实例，每个 32 个三角形，共 25,920 个三角形实例。
+  - `rocks-405x1x512`：每批 1 个实例，每个 512 个三角形，共 207,360 个三角形。
+- 光线模仿 GI：原点在同一体积内随机，方向均匀，tMax 16 m。
+- 四个 BVH 分支：A = 逐批次 + 每批一个 pass，A1 = 逐批次 + 单 pass，B = 共享 + 每批一个 pass，B1 = 共享 + 单 pass。另有两个距离场分支，见下一节。
+- 计时前先比较各分支的命中记录：两个场景都是 0 处不一致、0 溢出，分别命中 5715 条和 11,427 条（32,768 条光线中）。
+- 每轮按回文顺序（ABBA）执行，2 轮预热，12 轮计时。每个分支在一个 command buffer 中连续编码 4 次查询；时间戳一对放在第一次查询上，一对放在最后一次查询上，取首尾差除以 4。
+- 比值按同一轮配对计算，再取中位数和四分位。
+
+| 32,768 条光线，单次查询 GPU 中位数 [p25, p75] | `rocks-405x2x32` | `rocks-405x1x512` |
+| --- | ---: | ---: |
+| A 逐批次 | 14.136 ms [14.007, 14.219] | 56.870 ms [56.701, 57.310] |
+| A1 逐批次 + 单 pass | 14.174 ms | 56.583 ms |
+| B 共享 | 3.155 ms [3.069, 3.188] | 4.921 ms [4.808, 5.053] |
+| B1 共享 + 单 pass | 3.183 ms [3.083, 3.251] | 4.911 ms [4.888, 4.975] |
+| 配对 B/A | **0.223** [0.219, 0.227] | **0.086** [0.085, 0.088] |
+| 配对 A1/A、B1/B | 1.001、1.003 | 1.000、0.997 |
+| 每条光线工作量 A → B | 548.2 → 109.5 单位 | 120.8 → 116.9 单位 |
+
+- **4096 条光线：** 第一个场景 A 11.541 ms、B 1.789 ms、B1 1.775 ms，B/A 为 0.155 [0.153, 0.157]；第二个场景 A 45.373 ms、B 2.957 ms、B1 2.917 ms，B/A 为 0.066 [0.064, 0.066]。
+- **单 pass 编码：** GPU 时间不变，配对比为 0.988–1.004，可见在这台机器上 pass 边界不是瓶颈。CPU 编码时间下降：32,768 条光线时，第一个场景 A 0.80 → A1 0.43 ms、B 0.98 → B1 0.53 ms。CPU 编码时间受浏览器 `performance.now()` 精度限制，只是近似值。
+- **Refit：**
+  - 首次快照（全部批次）：A 25.2 ms、B 18.3 ms、B1 16.8 ms（第一个场景）；第二个场景 16.6–19.6 ms。
+  - 只移动一个实例：A 0.049 / 0.067 ms，B 0.131 / 0.135 ms，B1 0.084 / 0.131 ms。B 多出的部分是池与 TLAS 的更新。
+  - 没有改动时：0.089 / 0.063 ms。
+- **推断（未单独测量）：** 用两种光线数线性外推，B 中与光线数无关的部分约为 1.6–2.7 ms，很可能来自 405 次串行 resolve 派发。压紧 resolve 是下一个优化点，尚未实现。
+
+### BVH 与距离场：决策记录
+
+**问题。** GI final gather、反射、太阳可见性等世界查询，需要在大量静态批次上以有界成本求最近命中。是否应该用距离场替代或补充 BVH，以换取更低的遍历与更新成本？
+
+**候选。**
+
+- A：现有的逐批次 BVH（基线）。
+- B：共享静态遍历（可选）。
+- C：最小的稠密无符号距离场实验，只存在于测试代码 `tests/browser/fixtures/query-sdf.ts`：
+  - 每格存一个 f32 距离，用位模式做 `atomicMin` 写入，带宽 4 个体素。
+  - 每个三角形一个工作组，在带宽扩展的包围盒内用精确的点–三角形距离（Ericson）写入。
+  - 编辑后只清除并重写受影响的区域。
+  - 用球面追踪求交，在存储缓冲上手工做三线性插值，最多 256 步，距离小于 0.75 体素即算命中。
+  - 网格超过绑定或缓冲上限时抛出 `UDF_GRID_BUDGET`。
+  - 场景是三角形汤，没有内外之分，所以只能用无符号场。
+
+**测量（同一组 32,768 条光线，以 A 的精确命中为参照）。**
+
+| 指标 | 0.25 m 网格 | 0.125 m 网格 |
+| --- | ---: | ---: |
+| 网格尺寸 / 显存 | 207–209 × 208 × 64 / 10.5–10.6 MiB | 406–409 × 407–408 × 120 / 75.6–76.4 MiB |
+| 单次查询 GPU（两个场景） | 0.081 / 0.074 ms | 0.477 / 0.450 ms |
+| 与 B1 的配对比 | 0.026 / 0.015 | 0.153 / 0.092 |
+| 完整构建 | 2.7–5.2 / 14.1–14.5 ms | 3.8–4.2 / 14.2–14.5 ms |
+| 移动一个实例后的区域更新 | 0.098–0.103 / 0.068–0.070 ms | 0.089–0.092 / 0.063–0.066 ms |
+| 假命中（距离场命中、BVH 未命中） | 10,655 / 4501 | **7114 / 2839** |
+| 漏命中（BVH 命中、距离场未命中） | 0 / 0 | 0 / 0 |
+| 两者都命中时的距离绝对误差，中位数 / p90 / p99 | 0.556 / 6.25 / 12.8 m；0.454 / 2.92 / 11.3 m | 0.145 / 4.06 / 11.4 m；0.286 / 1.08 / 9.67 m |
+
+- **6.25 cm 网格被拒绝：** 两个场景分别需要 597,287,460 B 和 606,607,616 B。设备用的是默认 limits（单绑定 128 MiB、单缓冲 256 MiB）。即使请求更高的 limits，约 600 MB 的单场景网格也远超查询的显存预算量级。
+- **步数：** 平均 11–25 步，p99 23–41，最多 56 步，没有光线耗尽 256 步。
+- **工作量：** 完整构建要做 2040 万–2.34 亿次点–三角形距离计算。区域更新涉及 3–19 个批次，11.4 万–78.7 万次计算。
+- **误差的形态：** 带符号平均误差为负（−0.75 到 −1.86 m），即距离场常在加厚的近邻表面上提前命中。只看原点处首个采样不小于 2 倍阈值的光线，结果基本相同，所以假命中并非因为原点本来就在带宽内。
+- **阈值扫描（0.125 m 网格，不计时）：** 没有一个阈值能让假命中和漏命中同时降到 1% 以下。
+  - 0.25 体素：第一个场景漏命中 3819 条，占真实命中的 67%；第二个场景漏命中 1188 条，假命中 376 条。
+  - 0.5 体素：漏命中 144 / 24 条，假命中 3681 / 1662 条，第二个场景误差中位数 0.171 m、p90 0.722 m。
+  - 1 体素：漏命中为 0，假命中 9056 / 3636 条。
+- **能力：** 距离场不返回批次 / 实体身份、材质、UV 或法线。GI 和反射需要的命中材质，只能再查一次 BVH 才能得到。
+
+**选择。**
+
+- BVH 仍是唯一的生产路径。B 作为可选项保留，它是下一步 Sponza 测量的对象；在 Sponza 上测量之前，默认值保持为 A。
+- C 不进入 `src`。实验代码只保留在测试 fixture 中，供复审时复现。
+- 理由：C 的单次查询比 B1 快 6.5–11 倍，区域更新与 BVH 单批 refit 成本相当（0.06–0.10 ms 对 0.05–0.14 ms）。但它是近似的可见性探测：假命中占全部光线的 8.7%–32.5%；没有命中身份；显存随场景体积按立方增长，0.125 m 已用 76 MiB，6.25 cm 已不可行。
+
+**复审条件（满足任一条即重新评估）。**
+
+1. 共享路径在 Sponza 上实测（包括压紧 resolve 之后）仍超出查询时间预算，并且存在只需要可见性、不需要材质身份的消费者。
+2. 某个消费者（例如远场天空或太阳可见性）书面接受至少 1 个体素的几何误差，并给出误差预算。
+3. 稀疏、带符号的 brick 表示（针对封闭网格）在 64 MiB 以内达到 6.25 cm 或更细的分辨率，并且在同一组光线上，假命中率和漏命中率都低于约定的界限（例如各低于 1%）。
+4. 动态内容的比例上升，使 BVH refit 与池更新的成本明显超过距离场的区域更新。
+
+这里的合成三角形汤对无符号场近乎最坏：大量小三角形穿插在同一体素中。Sponza 这类建筑场景的误差形态可能不同，但没有测量过，不能据此推断。
+
+### 验证命令与结果
+
+均在 `PLAYWRIGHT_PORT=5204` 下运行。证据在 `/Users/manyujiang/Documents/real-engine/artifacts/query-shared-20261030/`，没有提交。
+
+- `npm run check`（变基到 `e63e3f4` 后）：**89 个文件 / 769 项**测试通过，类型检查和构建都通过（`check-rebase-e63e3f4.log`）。
+- SwiftShader，变基后：`npx playwright test tests/browser/world-query.spec.ts tests/browser/world-query-capacity.spec.ts tests/browser/world-query-shared.spec.ts tests/browser/world-query-watertight.spec.ts tests/browser/world-query-shared-benchmark.spec.ts`，**7 项通过、1 项跳过**（计时用例只在硬件上运行），用时 39.5 s（`world-query-swiftshader-rebase-e63e3f4.log`）。
+- SwiftShader，水密提交时：`world-query*.spec.ts` 加上 `diffuse-gi`、`gi-final-gather`、`reflections`，共 **23 项通过**，用时 2.9 min（`watertight-swiftshader.log`）。
+- Apple，变基后：`PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGHT_EXPECT_GPU_VENDOR=apple npx playwright test tests/browser/world-query.spec.ts tests/browser/world-query-capacity.spec.ts tests/browser/world-query-watertight.spec.ts tests/browser/world-query-shared.spec.ts`，**7 项通过**，用时 11.7 s。
+- Apple，变基后，查询的其余消费者：`world-query-bounds`、`world-query-face-policy`、`world-query-instances`、`world-query-parameters`、`world-query-scene`、`diffuse-gi`、`gi-final-gather`、`reflections`，共 **18 项通过**，用时 20.2 s（`query-consumers-apple-rebase-e63e3f4.log`）。
+- Apple 计时：`npx playwright test tests/browser/world-query-shared-benchmark.spec.ts`（同上的硬件环境变量），**1 项通过**，用时 44.4 s（`benchmark-apple-run1.log`，摘要在 `benchmark-apple-run1-summary.txt`）。这次运行在变基前的基线 `b5fd5df` 上。`b5fd5df` 到 `e63e3f4` 之间，main 没有改动查询相关的源码。
+
+### 失败、限制与未完成
+
+- **Sponza 未测量。** 共享路径在 Sponza 上没有任何计时或画质数据。renderer 也没有启用它，不能声称 Sponza 的查询变快了。
+- **resolve 派发**仍是每个成员批次一次，串行执行。压紧 resolve 尚未实现。
+- **溢出光线**在两条路径上可能停在不同的候选上，溢出统计不可互比。
+- **准入**只在第一次快照时进行一次。后续的形变或输入方式变化不会重新准入。池里的位置是一份额外副本。
+- **计时**是在争用下测得的诊断数据，不是验收数据。安静窗口下的复测尚未进行。
+- **早期失败证据保留：**
+  - 第一次 Apple 运行在 main 修复时间戳问题之前丢失了设备：`world-query-apple-run1-device-lost.log` 和 `test-results-hw-run1-device-lost/`。
+  - 最先尝试的容差方案已撤回，改用水密测试，它的 SwiftShader 运行中止：`edge-tolerance-swiftshader-aborted.log`。
+  - 显式 fma 之前的 Apple 一致性失败：`parity-apple.log`。
+- **距离场实验的局限：** 网格稠密且无符号，手工三线性插值，没有试过 3D 纹理采样，区域更新只测了移动一个实例的情形。
 
 ## 世界空间漫反射 GI
 

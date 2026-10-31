@@ -30,6 +30,6 @@ fn gatherDiagnosticSurfaceFragment(input: Varyings, @builtin(front_facing) front
     let sample = rasterSurface(input, front);
     if (!sample.covered) { discard; }
     return GatherDiagnosticOutput(vec4u(bitcast<vec3u>(input.world), input.surfaceIdentity.x),
-        vec4u(pack2x16snorm(surfaceOctEncode(sample.shadingNormal)),
-            pack2x16snorm(surfaceOctEncode(sample.geometryNormal)), input.surfaceIdentity.y, input.representationToken));
+        vec4u(surfacePackSnorm2x16(surfaceOctEncode(sample.shadingNormal)),
+            surfacePackSnorm2x16(surfaceOctEncode(sample.geometryNormal)), input.surfaceIdentity.y, input.representationToken));
 }

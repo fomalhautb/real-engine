@@ -16,6 +16,13 @@ fn surfaceOctDecode(encoded: vec2f) -> vec3f {
     if (n.z < 0.0) { n = vec3f((vec2f(1.0) - abs(n.yx)) * select(vec2f(-1.0), vec2f(1.0), n.xy >= vec2f(0.0)), n.z); }
     return surfaceUnit(n, vec3f(0.0, 0.0, 1.0));
 }
+// pack2x16snorm with integer ops, using WGSL's rounding: floor(0.5 + 32767 * clamp(e, -1, 1)).
+// On Apple Metal (Chrome 156, macOS 26.6), a pack*norm builtin outside lane x of an
+// integer fragment output zeroes or scrambles that output. tests/wgsl-pack-guard.test.ts.
+fn surfacePackSnorm2x16(value: vec2f) -> u32 {
+    let q = vec2i(floor(clamp(value, vec2f(-1.0), vec2f(1.0)) * 32767.0 + 0.5));
+    return (bitcast<u32>(q.x) & 0xffffu) | (bitcast<u32>(q.y) << 16u);
+}
 fn surfaceMappedNormal(vertexNormal: vec3f, geometryNormal: vec3f, authoredTangent: vec4f,
     edge1: vec3f, edge2: vec3f, uv1: vec2f, uv2: vec2f, tangentNormal: vec3f) -> vec3f {
     let n = surfaceUnit(vertexNormal, geometryNormal);

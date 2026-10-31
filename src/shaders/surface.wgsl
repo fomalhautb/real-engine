@@ -235,7 +235,7 @@ fn receiverFragment(input: Varyings, @builtin(front_facing) front: bool) -> Rece
     // Fragment position.w is 1/clip.w, not interpolated device depth.
     return ReceiverOutput(vec4f(input.previousWorld, 1.0 / input.position.w),
         vec4u(input.receiverRow + 1u, input.representationToken,
-            pack2x16snorm(surfaceOctEncode(sample.shadingNormal)), pack2x16snorm(surfaceOctEncode(sample.geometryNormal))));
+            surfacePackSnorm2x16(surfaceOctEncode(sample.shadingNormal)), surfacePackSnorm2x16(surfaceOctEncode(sample.geometryNormal))));
 }
 struct FragmentOutput { @location(0) color: vec4f, @location(1) velocity: vec2f }
 @fragment

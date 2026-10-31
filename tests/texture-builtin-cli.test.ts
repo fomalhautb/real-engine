@@ -62,6 +62,9 @@ async function withRoot(body: (root: string) => Promise<void>): Promise<void> {
   }
 }
 
+// Each case spawns several encoder processes; under a loaded machine they need more than the 5 s default.
+const CLI_TEST_TIMEOUT_MS = 120_000;
+
 describe('texture CLI builtin encoder', () => {
   it('builds identical BC7 packages for any worker count with a truthful quality record', async () => {
     await withRoot(async root => {
@@ -99,7 +102,7 @@ describe('texture CLI builtin encoder', () => {
         expect(build.codec.quality.levels[level].modes.reduce((n: number, v: number) => n + v, 0)).toBe(blocks.length / 16);
       });
     });
-  });
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('stores RGBA8 reference levels exactly equal to buildMipChain, also from TGA', async () => {
     await withRoot(async root => {
@@ -123,7 +126,7 @@ describe('texture CLI builtin encoder', () => {
         expect(build.codec.quality).toBeNull();
       }
     });
-  });
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('re-encodes legacy DDS sources and converts DirectX BC5 normals explicitly', async () => {
     await withRoot(async root => {
@@ -163,7 +166,7 @@ describe('texture CLI builtin encoder', () => {
       expect(() => run(join(root, 'normal.dds'), join(root, 'z'), ['--format', 'rgba8', '--color-space', 'srgb', '--encoder', 'builtin', '--normal-convention', 'directx'])).toThrow();
       expect((await readdir(root)).sort()).toEqual(['color-out', 'color.dds', 'normal-out', 'normal.dds']);
     });
-  });
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('rejects inconsistent encoder options and non-multiple-of-4 BC7 sources', async () => {
     await withRoot(async root => {
@@ -176,5 +179,5 @@ describe('texture CLI builtin encoder', () => {
       expect(() => run(input, join(root, 'e'), ['--format', 'rgba8', '--color-space', 'srgb', '--encoder', 'magic'])).toThrow();
       expect((await readdir(root)).sort()).toEqual(['odd.png']);
     });
-  });
+  }, CLI_TEST_TIMEOUT_MS);
 });

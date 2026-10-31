@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#12171a" />
+    <title>Real Engine — Joint GI dynamics</title>
+  </head>
+  <body>
+    <div class="gi-app" id="gi-app">
+      <header class="topbar">
+        <a class="brand" href="./"><span class="brand-mark">r.</span> REAL ENGINE</a>
+        <span class="topbar-label">JOINT DYNAMICS / L01–L04 · T01</span>
+        <span class="live" id="status" role="status">INITIALIZING WEBGPU</span>
+      </header>
+      <main class="layout">
+        <section class="stage" aria-label="GI 联合动态验收场景">
+          <canvas id="viewport" aria-label="两间相通房间与漏光测试箱" tabindex="0"></canvas>
+          <div class="stage-shade" aria-hidden="true"></div>
+          <div class="stage-heading">
+            <span class="eyebrow">ACCEPTANCE SCENE / DYNAMIC GI</span>
+            <h1>Change the room,<br /><em>watch the light follow.</em></h1>
+            <p>天窗阳光照亮 A 室，经门洞传入只有发光板的 B 室。开关灯、开关门、移动发光板，观察 GI 响应。</p>
+          </div>
+          <div class="stage-label"><span class="live-dot"></span><span id="stage-mode">—</span></div>
+          <div id="error" class="error-panel" role="alert" hidden></div>
+        </section>
+        <aside class="panel" aria-label="联合验收控制与诊断">
+          <section class="panel-section">
+            <div class="section-title"><h3>场景与相机</h3><span>01 / VIEW</span></div>
+            <div class="button-row" role="group" aria-label="场景">
+              <button type="button" data-scene="rooms">两间房（L01–L03, T01）</button>
+              <button type="button" data-scene="leak">漏光箱（L04）</button>
+            </div>
+            <div class="button-row" role="group" aria-label="相机" id="cameras"></div>
+          </section>
+          <section class="panel-section">
+            <div class="section-title"><h3>事件</h3><span>02 / EVENTS</span></div>
+            <div class="button-row">
+              <button id="sun" type="button">太阳 开/关</button>
+              <button id="panel" type="button">发光板 开/关</button>
+              <button id="door" type="button">门 开/关</button>
+            </div>
+            <div class="button-row">
+              <button id="panel-move" type="button">移动发光板</button>
+              <button id="foreground" type="button">移走/放回前景</button>
+              <button id="mover" type="button">快速穿越</button>
+            </div>
+          </section>
+          <section class="panel-section">
+            <div class="section-title"><h3>GI 更新</h3><span>03 / CACHE</span></div>
+            <label class="switch-row" for="scheduled"><span><strong>变化驱动的有界更新</strong><small>关闭时每帧重采整个探针网格</small></span><input id="scheduled" type="checkbox" checked /></label>
+            <label class="switch-row" for="gi-enabled"><span><strong>启用漫反射 GI</strong><small>关闭时只有直接光</small></span><input id="gi-enabled" type="checkbox" checked /></label>
+          </section>
+          <section class="panel-section metrics">
+            <div class="section-title"><h3>缓存诊断</h3><span>CPU · NO READBACK</span></div>
+            <dl>
+              <div><dt>本次采样探针</dt><dd id="captured">—</dd></div>
+              <div><dt>最大陈旧（更新数）</dt><dd id="max-age">—</dd></div>
+              <div><dt>待收敛 / 未刷新脏探针</dt><dd id="pending">—</dd></div>
+              <div><dt>每次更新查询</dt><dd id="queries">—</dd></div>
+              <div><dt>GPU GI（争用，仅诊断）</dt><dd id="gpu-gi-ms">—</dd></div>
+              <div><dt>帧</dt><dd id="frame">—</dd></div>
+            </dl>
+          </section>
+          <div class="panel-footer"><small id="adapter">等待 WebGPU 适配器…</small></div>
+        </aside>
+      </main>
+    </div>
+    <script type="module" src="/src/gi-joint-demo.ts"></script>
+  </body>
+</html>

@@ -10,10 +10,18 @@ function buffer(label: string): FakeBuffer {
   return { label, destroyed: false, destroy() { this.destroyed = true; } };
 }
 
+type FakeTexture = { label: string; size: number[]; destroyed: boolean; destroy(): void; createView(): object };
+
 class FakeDevice {
   limits = { maxStorageBuffersPerShaderStage: 7, maxBufferSize: 128 * 1024 * 1024,
-    maxStorageBufferBindingSize: 128 * 1024 * 1024, maxComputeWorkgroupsPerDimension: 65_535 };
+    maxStorageBufferBindingSize: 128 * 1024 * 1024, maxComputeWorkgroupsPerDimension: 65_535, maxTextureDimension2D: 8192 };
   readonly buffers: FakeBuffer[] = [];
+  readonly textures: FakeTexture[] = [];
+  createTexture = ({ label, size }: { label: string; size: number[] }): GPUTexture => {
+    const created: FakeTexture = { label, size, destroyed: false, destroy() { this.destroyed = true; }, createView: () => ({}) };
+    this.textures.push(created);
+    return created as unknown as GPUTexture;
+  };
   readonly writes: { label: string; bytes: number }[] = [];
   bufferCalls = 0;
   bindGroupCalls = 0;
@@ -187,8 +195,8 @@ describe('GPU reflections ownership and preflight', () => {
       expect(device.writes).toHaveLength(0);
       expect(() => reflections.setEnabled(1 as unknown as boolean)).toThrow('REFLECTIONS_ENABLED');
       reflections.setEnabled(false);
-      expect(reflections.update(frame)).toBe(272);
-      expect(device.writes).toEqual([{ label: 'reflection parameters', bytes: 272 }]);
+      expect(reflections.update(frame)).toBe(304);
+      expect(device.writes).toEqual([{ label: 'reflection parameters', bytes: 304 }]);
       let passes = 0, dispatches = 0;
       const encoder = { beginComputePass: ({ label }: { label: string }) => {
         expect(label).toBe('reflections disabled'); passes++;
@@ -274,7 +282,7 @@ describe('GPU reflection history', () => {
       reflections.setTemporalEnabled(true);
       expect(step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1, width: 40 }).history)
         .toMatchObject({ active: true, framesSinceReset: 1, lastResetReason: 'temporal-toggle' });
-      expect(device.writes.every(write => write.bytes === 272)).toBe(true);
+      expect(device.writes.every(write => write.bytes === 304)).toBe(true);
     } finally { reflections.dispose(); }
     expect(tracked.bytes).toBe(0);
     const untimed = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query, {}, tracked.account);
@@ -283,3 +291,60 @@ describe('GPU reflection history', () => {
   });
 });
 
+describe('GPU reflection screen-space supplement', () => {
+  beforeEach(() => vi.stubGlobal('GPUTextureUsage', { TEXTURE_BINDING: 4, COPY_DST: 2 }));
+
+  it('owns budgeted previous-frame copies, names every inactive state and stays world-only over budget', async () => {
+    const device = new FakeDevice(), tracked = ledger(), { query } = borrowed();
+    const reflections = await GpuReflections.create(device as unknown as GPUDevice, query, { screenTrace: {} }, tracked.account);
+    const hdr = { label: 'renderer HDR' } as unknown as GPUTexture, depth = { label: 'renderer depth' } as unknown as GPUTexture;
+    const copies: unknown[][] = [];
+    const encoder = { copyTextureToTexture: (...args: unknown[]) => { copies.push(args); } } as unknown as GPUCommandEncoder;
+    const step = (patch: Partial<ReflectionUpdate>) => {
+      reflections.update({ ...frame, viewProjection: identityMatrix, ...patch });
+      return reflections.diagnostics().screenTrace;
+    };
+    try {
+      expect(device.textures.map(texture => texture.label)).toEqual(['reflection previous HDR', 'reflection previous depth']);
+      expect(reflections.screenTraceConfigured).toBe(true);
+      expect(reflections.diagnostics().screenTrace).toMatchObject({ configured: true, enabled: true, active: false,
+        state: 'awaiting-resize', captureBytes: 12, maxDistance: 1.5, steps: 12 });
+      const before = tracked.bytes;
+      expect(step({ frame: 1 }).state).toBe('awaiting-resize');
+      reflections.resize(32, 24, hdr, depth);
+      expect(tracked.bytes - before).toBe(32 * 24 * 12 - 12);
+      expect(device.textures.slice(0, 2).every(texture => texture.destroyed)).toBe(true);
+      expect(step({ frame: 2 }).state).toBe('awaiting-capture');
+      reflections.encodeCapture(encoder);
+      expect(copies.map(args => [(args[0] as { texture: unknown }).texture, args[2]])).toEqual([[hdr, [32, 24]], [depth, [32, 24]]]);
+      expect(step({ frame: 3, previousViewProjection: identityMatrix })).toMatchObject({ state: 'active', active: true });
+      reflections.encodeCapture(encoder);
+      expect(step({ frame: 4, viewProjection: moved, previousViewProjection: moved }).state).toBe('camera-cut');
+      reflections.encodeCapture(encoder);
+      expect(step({ frame: 5, viewProjection: moved }).state).toBe('camera-cut');
+      reflections.setScreenTraceEnabled(false);
+      expect(step({ frame: 6 })).toMatchObject({ state: 'disabled', active: false });
+      reflections.setScreenTraceEnabled(true);
+      expect(step({ frame: 7, width: 40 }).state).toBe('awaiting-resize');
+      // 2048^2 copies (48 MiB) exceed the default 32 MiB reflection budget.
+      reflections.resize(2048, 2048, hdr, depth);
+      expect(reflections.diagnostics().screenTrace).toMatchObject({ captureBytes: 12, width: 1, height: 1 });
+      expect(step({ frame: 8 }).state).toBe('over-budget');
+      const copied = copies.length;
+      reflections.encodeCapture(encoder);
+      expect(copies).toHaveLength(copied);
+      expect(() => reflections.resize(0, 24, hdr, depth)).toThrow('REFLECTIONS_SCREEN_SIZE');
+      expect(() => reflections.setScreenTraceEnabled(1 as never)).toThrow('REFLECTIONS_SCREEN_TRACE_ENABLED');
+      expect(device.writes.every(write => write.bytes === 304)).toBe(true);
+    } finally { reflections.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    expect(device.textures.every(texture => texture.destroyed)).toBe(true);
+    const plain = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query, {}, tracked.account);
+    expect(() => plain.setScreenTraceEnabled(true)).toThrow('REFLECTIONS_SCREEN_TRACE_NOT_CONFIGURED');
+    expect(plain.diagnostics().screenTrace).toMatchObject({ configured: false, state: 'not-configured' });
+    plain.resize(32, 24, hdr, depth);
+    expect(device.textures).toHaveLength(6);
+    plain.dispose();
+    expect(tracked.bytes).toBe(0);
+  });
+});

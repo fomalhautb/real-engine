@@ -1,6 +1,7 @@
 import common from './shaders/reflections-common.wgsl?raw';
 import updateSource from './shaders/reflections-update.wgsl?raw';
 import temporalSource from './shaders/reflections-temporal.wgsl?raw';
+import screenSource from './shaders/reflections-screen.wgsl?raw';
 import sampleSource from './shaders/reflections-sample.wgsl?raw';
 import surfaceFrame from './shaders/surface-frame.wgsl?raw';
 import surfaceBrdf from './shaders/surface-brdf.wgsl?raw';
@@ -9,7 +10,8 @@ import giInterpolate from './shaders/diffuse-gi-interpolate.wgsl?raw';
 import { reflectionFogShaderSource, type GpuVolumetricFog } from './gpu-volumetric-fog';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import { lookAt } from './math';
-import { planReflectionGrid, resolveReflectionsOptions, type ReflectionsOptions, type ReflectionGridPlan } from './reflections';
+import { planReflectionGrid, REFLECTION_SCREEN_BYTES_PER_PIXEL, resolveReflectionsOptions, type ReflectionsOptions,
+  type ReflectionGridPlan } from './reflections';
 import type { GpuWorldQuery } from './gpu-world-query';
 import type { GpuDiffuseGi } from './gpu-diffuse-gi';
 import { diffuseGiQueryParameterSlots } from './diffuse-gi';
@@ -17,13 +19,20 @@ import { WORLD_HIT_BYTES } from './world-query';
 import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 export const reflectionSurfaceSource = common + '\n' + sampleSource;
-export const REFLECTION_PARAMETER_BYTES = 272;
+export const REFLECTION_PARAMETER_BYTES = 304;
 export const REFLECTION_ANCHOR_BYTES = 256;
 export const REFLECTION_HISTORY_BYTES = 96;
 const PARAMETER_BYTES = REFLECTION_PARAMETER_BYTES, ANCHOR_BYTES = REFLECTION_ANCHOR_BYTES;
 const SAMPLE_BYTES = 32, PROBE_LIMIT = 1024, ANCHOR_WORDS = ANCHOR_BYTES / 4;
 type Entry = 'generateCamera' | 'generateReflections' | 'generateShadows' | 'integrate' | 'temporal';
 export type ReflectionHistoryMode = 'none' | 'stationary' | 'surface' | 'parallax' | 'rejected';
+/** Why the screen-space supplement is or is not used this frame. */
+export type ReflectionScreenState = 'not-configured' | 'disabled' | 'awaiting-resize' | 'over-budget'
+  | 'awaiting-capture' | 'camera-cut' | 'active';
+const SCREEN_SAMPLE = `let screen = reflectionScreenTrace(camera.position.xyz + reflectionGeometry(camera) * reflection.limits.x,
+            sample.direction.xyz, hit, distance);
+        if (screen.reason < 4u) { screenCounts[screen.reason] += 1u; }
+        incoming = mix(incoming, screen.color, screen.confidence);`;
 const MODES: readonly ReflectionHistoryMode[] = ['none', 'stationary', 'surface', 'parallax', 'rejected'];
 export interface ReflectionUpdate {
   frame: number; materialRevision: number; width: number; height: number;
@@ -49,6 +58,9 @@ export interface ReflectionProbeAnchor {
   meanReflectedDistance: number;
   /** Dominant reflected sample: [batch, entity, generation]; batch 0 is a miss. */
   reflectedIdentity: number[]; reflectedSample: number | null;
+  /** Screen-trace outcomes of this anchor's samples; the rest were skipped (sky,
+   * beyond range, metallic or moving hit, or the supplement inactive). */
+  screen: { accepted: number; offscreen: number; unresolved: number; disagree: number };
 }
 export interface ReflectionProbeResult { frame: number; anchors: ReflectionProbeAnchor[] }
 
@@ -92,10 +104,21 @@ export class GpuReflections {
   private temporalGroups: GPUBindGroup[] = [];
   private fogGroup?: GPUBindGroup;
   private readonly data = new Float32Array(PARAMETER_BYTES / 4);
+  private screenEnabled: boolean;
+  private screenTextures: GPUTexture[] = [];
+  private screenBytes = 0;
+  private screenSize: [number, number] = [0, 0];
+  private screenSources?: { hdr: GPUTexture; depth: GPUTexture };
+  private screenOverBudget = false;
+  private screenCapture?: Float32Array;
+  private screenState: ReflectionScreenState;
+  private screenActive = false;
+  private currentViewProjection?: Float32Array;
 
   get surfaceParameters(): GPUBuffer { return this.parameters; }
   get surfaceAnchors(): GPUBuffer { return this.anchors; }
   get temporalConfigured(): boolean { return !!this.options.temporal; }
+  get screenTraceConfigured(): boolean { return !!this.options.screenTrace; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: ReflectionsOptions,
     account: (bytes: number) => void, gi?: GpuDiffuseGi, fog?: GpuVolumetricFog, shadow?: GPUTexture): Promise<GpuReflections> {
@@ -113,7 +136,10 @@ export class GpuReflections {
   private constructor(private device: GPUDevice, private queries: GpuWorldQuery,
     options: ReturnType<typeof resolveReflectionsOptions>, private capacity: number,
     private account: (bytes: number) => void, private gi?: GpuDiffuseGi, private fog?: GpuVolumetricFog,
-    private shadow?: GPUTexture) { this.options = options; this.temporalEnabled = !!options.temporal; }
+    private shadow?: GPUTexture) {
+    this.options = options; this.temporalEnabled = !!options.temporal; this.screenEnabled = !!options.screenTrace;
+    this.screenState = options.screenTrace ? 'awaiting-resize' : 'not-configured';
+  }
   private assertAlive(): void { if (this.disposed) throw new Error('REFLECTIONS_DISPOSED'); }
   private buffer(label: string, size: number, usage: GPUBufferUsageFlags): GPUBuffer {
     const buffer = this.device.createBuffer({ label, size, usage });
@@ -128,7 +154,8 @@ export class GpuReflections {
     const historySize = this.options.temporal ? cap * REFLECTION_HISTORY_BYTES : 0;
     const sizes = [PARAMETER_BYTES, cap * WORLD_HIT_BYTES, rays * WORLD_HIT_BYTES,
       rays * SAMPLE_BYTES, cap * ANCHOR_BYTES, Math.min(cap, PROBE_LIMIT) * ANCHOR_BYTES];
-    if (sizes.reduce((a, b) => a + b, 0) + 2 * historySize > this.options.maxBytes) throw new Error('REFLECTIONS_MEMORY_BUDGET');
+    const placeholder = this.options.screenTrace ? REFLECTION_SCREEN_BYTES_PER_PIXEL : 0;
+    if (sizes.reduce((a, b) => a + b, 0) + 2 * historySize + placeholder > this.options.maxBytes) throw new Error('REFLECTIONS_MEMORY_BUDGET');
     if ([...sizes, historySize].some(size => size > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize))) throw new Error('REFLECTIONS_BUFFER_LIMIT');
     if (Math.ceil(rays / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('REFLECTIONS_DISPATCH_LIMIT');
     this.parameters = this.buffer('reflection parameters', sizes[0], GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -148,8 +175,9 @@ export class GpuReflections {
       : 'fn reflectionDiffuse(hit:ReflectionHit)->vec3f { return hit.baseColor.xyz * (0.045+0.065*max(hit.normal.y,0.0)) * (1.0-hit.previous.w*0.6); }';
     const fogSource = this.fog ? reflectionFogShaderSource(this.fog, !!this.gi) : 'fn reflectionApplyFog(origin:vec3f,direction:vec3f,distance:f32,incoming:vec3f)->vec3f {return incoming;}';
     const module = this.device.createShaderModule({ label: 'world-space reflections',
-      code: surfaceFrame + '\n' + surfaceBrdf + '\n' + common + '\n' + updateSource.replace('// REFLECTION_GI', giSource) + '\n' + fogSource
-        + (this.options.temporal ? '\n' + temporalSource : '') });
+      code: surfaceFrame + '\n' + surfaceBrdf + '\n' + common + '\n' + updateSource.replace('// REFLECTION_GI', giSource)
+        .replace('// REFLECTION_SCREEN_SAMPLE', this.options.screenTrace ? SCREEN_SAMPLE : '') + '\n' + fogSource
+        + (this.options.temporal ? '\n' + temporalSource : '') + (this.options.screenTrace ? '\n' + screenSource : '') });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `reflections:${error.lineNum}: ${error.message}`).join('\n'));
     const names: Entry[] = ['generateCamera', 'generateReflections', 'generateShadows', 'integrate',
@@ -163,10 +191,9 @@ export class GpuReflections {
       generateReflections: this.bind(p.generateReflections, [[0, this.parameters], [1, this.queries.rayBuffer], [3, this.cameraHits], [5, this.samples]]),
       generateShadows: this.bind(p.generateShadows, [[0, this.parameters], [1, this.queries.rayBuffer], [4, this.secondaryHits], [5, this.samples]]),
     };
-    const base: [number, GPUBuffer][] = [[0, this.parameters], [2, this.queries.hitBuffer], [3, this.cameraHits],
-      [4, this.secondaryHits], [5, this.samples], [6, this.anchors]];
-    this.integrateGroups = this.gi ? this.gi.lightingProbeBuffers.map(probes =>
-      this.bind(p.integrate, [...base, [7, this.gi!.lightingParameters], [8, probes]])) : [this.bind(p.integrate, base)];
+    // One-texel placeholders keep the bindings valid until the first resize.
+    if (this.options.screenTrace) this.allocateScreen(1, 1);
+    this.createIntegrateGroups();
     if (this.fog) this.fogGroup = this.device.createBindGroup({ layout: p.integrate.getBindGroupLayout(1), entries: [
       { binding: 0, resource: { buffer: this.fog.worldParameters } }, { binding: 1, resource: { buffer: this.fog.worldVolumes } },
       { binding: 2, resource: this.shadow!.createView() },
@@ -175,6 +202,62 @@ export class GpuReflections {
     // Group i writes history[i] from history[1 - i].
     if (this.options.temporal) this.temporalGroups = [0, 1].map(index => this.bind(p.temporal,
       [[0, this.parameters], [6, this.anchors], [9, this.history[1 - index]], [10, this.history[index]]]));
+  }
+  private createIntegrateGroups(): void {
+    const pipeline = this.pipelines.integrate;
+    const base: [number, GPUBuffer][] = [[0, this.parameters], [2, this.queries.hitBuffer], [3, this.cameraHits],
+      [4, this.secondaryHits], [5, this.samples], [6, this.anchors]];
+    const screen: GPUBindGroupEntry[] = this.options.screenTrace ? [{ binding: 11, resource: this.screenTextures[0].createView() },
+      { binding: 12, resource: this.screenTextures[1].createView() }] : [];
+    const group = (entries: readonly [number, GPUBuffer][]) => this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+      entries: [...entries.map(([binding, buffer]) => ({ binding, resource: { buffer } })), ...screen] });
+    this.integrateGroups = this.gi ? this.gi.lightingProbeBuffers.map(probes =>
+      group([...base, [7, this.gi!.lightingParameters], [8, probes]])) : [group(base)];
+  }
+  private allocateScreen(width: number, height: number): void {
+    const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST;
+    this.screenTextures = [
+      this.device.createTexture({ label: 'reflection previous HDR', size: [width, height], format: 'rgba16float', usage }),
+      this.device.createTexture({ label: 'reflection previous depth', size: [width, height], format: 'depth32float', usage }),
+    ];
+    this.screenBytes = width * height * REFLECTION_SCREEN_BYTES_PER_PIXEL; this.account(this.screenBytes);
+    this.screenSize = [width, height];
+  }
+  private releaseScreen(): void {
+    if (!this.screenTextures.length) return;
+    for (const texture of this.screenTextures) texture.destroy();
+    this.screenTextures = []; this.account(-this.screenBytes); this.screenBytes = 0; this.screenSize = [0, 0];
+  }
+  /** Reallocate the owned previous-frame copies for a new HDR/depth pair. A size
+   * beyond maxBytes or the device limit leaves the supplement inactive
+   * ('over-budget'); world-query reflections are unaffected. */
+  resize(width: number, height: number, hdr: GPUTexture, depth: GPUTexture): void {
+    this.assertAlive();
+    if (!this.options.screenTrace) return;
+    if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) throw new Error('REFLECTIONS_SCREEN_SIZE');
+    const bytes = width * height * REFLECTION_SCREEN_BYTES_PER_PIXEL;
+    const fits = this.bytes + bytes <= this.options.maxBytes && Math.max(width, height) <= this.device.limits.maxTextureDimension2D;
+    this.releaseScreen();
+    if (fits) this.allocateScreen(width, height); else this.allocateScreen(1, 1);
+    this.screenSources = { hdr, depth }; this.screenOverBudget = !fits; this.screenCapture = undefined;
+    this.createIntegrateGroups();
+  }
+  /** Copy this frame's final scene-linear HDR and depth for the next frame's trace. */
+  encodeCapture(encoder: GPUCommandEncoder): void {
+    this.assertAlive();
+    if (!this.options.screenTrace || !this.screenSources || this.screenOverBudget || !this.currentViewProjection) {
+      this.screenCapture = undefined; return;
+    }
+    const size: [number, number] = [this.screenSize[0], this.screenSize[1]];
+    encoder.copyTextureToTexture({ texture: this.screenSources.hdr }, { texture: this.screenTextures[0] }, size);
+    encoder.copyTextureToTexture({ texture: this.screenSources.depth }, { texture: this.screenTextures[1] }, size);
+    this.screenCapture = this.currentViewProjection;
+  }
+  /** Runtime switch for a configured screen-space supplement; world queries continue. */
+  setScreenTraceEnabled(enabled: boolean): void {
+    this.assertAlive(); if (typeof enabled !== 'boolean') throw new Error('REFLECTIONS_SCREEN_TRACE_ENABLED');
+    if (enabled && !this.options.screenTrace) throw new Error('REFLECTIONS_SCREEN_TRACE_NOT_CONFIGURED');
+    this.screenEnabled = enabled;
   }
   setEnabled(enabled: boolean): void {
     this.assertAlive(); if (typeof enabled !== 'boolean') throw new Error('REFLECTIONS_ENABLED');
@@ -252,12 +335,24 @@ export class GpuReflections {
         this.historyValid = false; this.historyFrames = 0; this.resetReason = reason; this.pendingReset = null;
       }
       const cameraMoved = !!old && !!viewProjection && viewProjection.some((value, i) => value !== old.viewProjection[i]);
-      data.set(previousViewProjection ?? viewProjection ?? new Float32Array(16), 44);
       data.set([temporal.minHistoryFrames, temporal.maxHistoryFrames, temporal.clampSigma, temporal.parallaxRoughness], 60);
       uints.set([Number(this.temporalActive), Number(this.temporalActive && this.historyValid),
         Number(cameraMoved), Number(input.sceneMotion ?? true)], 64);
       this.previous = viewProjection ? { frame: input.frame, width: input.width, height: input.height, spacing: grid.spacing,
         viewProjection, materialRevision: input.materialRevision, light, media, historyRevision } : undefined;
+    }
+    data.set(previousViewProjection ?? viewProjection ?? new Float32Array(16), 44);
+    this.currentViewProjection = viewProjection;
+    const screen = this.options.screenTrace;
+    if (screen) {
+      const captured = this.screenCapture;
+      this.screenState = !this.screenEnabled || !this.enabled ? 'disabled' : this.screenOverBudget ? 'over-budget'
+        : !this.screenSources || this.screenSize[0] !== input.width || this.screenSize[1] !== input.height ? 'awaiting-resize'
+        : !captured ? 'awaiting-capture'
+        : !previousViewProjection || previousViewProjection.some((value, i) => value !== captured[i]) ? 'camera-cut' : 'active';
+      this.screenActive = this.screenState === 'active';
+      data.set([screen.maxDistance, screen.thickness, screen.distanceTolerance, screen.edgeFade], 68);
+      uints.set([Number(this.screenActive), screen.steps, this.screenSize[0], this.screenSize[1]], 72);
     }
     this.device.queue.writeBuffer(this.parameters, 0, data);
     this.grid = grid; this.frame = input.frame; this.materialRevision = input.materialRevision;
@@ -324,7 +419,9 @@ export class GpuReflections {
           rejectedHistory: this.temporalActive ? uints[base + 61] : 0, historyClamped: this.temporalActive && uints[base + 62] === 1,
           meanReflectedDistance: floats[base + 51],
           reflectedIdentity: Array.from(uints.subarray(base + 56, base + 59)),
-          reflectedSample: uints[base + 59] === 0xffff_ffff ? null : uints[base + 59] };
+          reflectedSample: uints[base + 59] === 0xffff_ffff ? null : uints[base + 59],
+          screen: { accepted: uints[base + 47] & 255, offscreen: (uints[base + 47] >>> 8) & 255,
+            unresolved: (uints[base + 47] >>> 16) & 255, disagree: uints[base + 47] >>> 24 } };
       }) };
     } finally { if (this.readback.mapState === 'mapped') this.readback.unmap(); this.pendingReadback = false; }
   }
@@ -335,11 +432,15 @@ export class GpuReflections {
       temporal: { configured: !!this.options.temporal, enabled: this.temporalEnabled, active: this.temporalActive,
         valid: this.temporalActive && this.historyValid, framesSinceReset: this.historyFrames,
         lastResetReason: this.resetReason, historyBytes: this.historyBytes,
-        minHistoryFrames: this.options.temporal?.minHistoryFrames ?? 0, maxHistoryFrames: this.options.temporal?.maxHistoryFrames ?? 0 } };
+        minHistoryFrames: this.options.temporal?.minHistoryFrames ?? 0, maxHistoryFrames: this.options.temporal?.maxHistoryFrames ?? 0 },
+      screenTrace: { configured: !!this.options.screenTrace, enabled: this.screenEnabled, active: this.screenActive,
+        state: this.screenState, captureBytes: this.screenBytes, width: this.screenSize[0], height: this.screenSize[1],
+        maxDistance: this.options.screenTrace?.maxDistance ?? 0, steps: this.options.screenTrace?.steps ?? 0 } };
   }
   dispose(): void {
     if (this.disposed) return; this.disposed = true;
     for (const buffer of this.buffers) buffer.destroy(); this.buffers = []; this.history = [];
     this.account(-this.bytes); this.bytes = 0;
+    this.releaseScreen(); this.screenSources = undefined; this.screenCapture = undefined; this.screenActive = false;
   }
 }

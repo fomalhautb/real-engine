@@ -13,12 +13,16 @@ struct ReflectionParameters {
     previousViewProjection: mat4x4f,
     temporal: vec4f, // minimum history, maximum history, clamp sigma, parallax roughness
     temporalState: vec4u, // active, history valid, camera moved, scene motion
+    screen: vec4f, // screen-trace maximum distance, thickness, distance tolerance, edge fade
+    screenState: vec4u, // active, march steps, capture width, capture height
 }
 struct ReflectionHit {
     identity: vec4u, metric: vec4f, position: vec4f, normal: vec4f,
     previous: vec4f, baseColor: vec4f, emissive: vec4f, versions: vec4u,
     uvInfo: vec4f, work: vec4u,
 }
+// state: valid, frame, failed queries, packed screen-trace sample counts
+// (accepted | off-screen << 8 | unresolved << 16 | disagreeing << 24).
 // radiance: resolved rgb and effective history count. raw: this frame's rgb and
 // weighted mean reflected distance. motion: weighted reflected-hit motion
 // (previous - current) and total BSDF weight. reflected: dominant sample's

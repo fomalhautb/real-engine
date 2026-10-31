@@ -468,6 +468,7 @@ export class Renderer {
       ...(this.diffuseGi ? [{ name: 'diffuse-gi-probes', kind: 'buffer' as const, source: 'imported' as const }] : []),
       ...(this.diffuseGi || this.reflections ? [{ name: 'world-query-scratch', kind: 'buffer' as const, source: 'imported' as const }] : []),
       ...(this.reflections ? [{ name: 'reflection-anchors', kind: 'buffer' as const, source: 'imported' as const }] : []),
+      ...(this.reflections?.screenTraceConfigured ? [{ name: 'reflection-screen-capture', kind: 'texture' as const, source: 'imported' as const }] : []),
       ...(this.diffuseGiOptions?.finalGather ? [{ name: 'final-gather-anchors', kind: 'buffer' as const, source: 'imported' as const }] : []),
       ...(this.surfaceReceivers ? [
         { name: 'receiver-metadata', kind: 'buffer' as const, source: 'imported' as const },
@@ -555,6 +556,8 @@ export class Renderer {
         { resource: 'world-query-scratch', access: 'readWrite' as const }, { resource: 'reflection-anchors', access: 'write' as const },
         ...(this.diffuseGi ? [{ resource: 'diffuse-gi-probes', access: 'read' as const }] : []),
         ...(this.volumetricFog ? [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const }] : []),
+        // The previous frame's copy: read here, replaced after this frame's surfaces.
+        ...(this.reflections.screenTraceConfigured ? [{ resource: 'reflection-screen-capture', access: 'read' as const }] : []),
       ], execute: (encoder: GPUCommandEncoder) => { this.stats.uploadedBytes += this.reflections!.encode(encoder, this.timestamp(this.reflectionTimestampIndex)); } }] : []),
       { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' },
         ...(this.geometryLod ? [{ resource: 'selected-geometry', access: 'read' as const }] : []),
@@ -578,6 +581,10 @@ export class Renderer {
           { resource: 'scene-hdr', access: 'attachmentLoad' as const }, { resource: 'depth', access: 'attachmentLoad' as const },
           { resource: 'velocity', access: 'attachmentLoad' as const }], execute: (encoder: GPUCommandEncoder) => this.encodeSurface(encoder, true) },
       ] : []),
+      ...(this.reflections?.screenTraceConfigured ? [{ name: 'reflection-screen-capture', uses: [
+        { resource: 'scene-hdr', access: 'read' as const }, { resource: 'depth', access: 'read' as const },
+        { resource: 'reflection-screen-capture', access: 'write' as const }],
+      execute: (encoder: GPUCommandEncoder) => this.reflections!.encodeCapture(encoder) }] : []),
       ...(this.volumetricFog ? [
         { name: 'fog-inject', uses: [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const },
           { resource: 'fog-source', access: 'write' as const }],
@@ -807,6 +814,12 @@ export class Renderer {
     this.reflections.setTemporalEnabled(enabled);
   }
 
+  /** Toggle a configured screen-space supplement; world-query reflections continue. */
+  setReflectionsScreenTraceEnabled(enabled: boolean): void {
+    if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    if (!this.reflections) throw new Error('REFLECTIONS_DISABLED');
+    this.reflections.setScreenTraceEnabled(enabled);
+  }
   async probeReflections(indices: readonly number[]): Promise<ReflectionProbeResult> {
     if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
     if (!this.reflections) throw new Error('REFLECTIONS_DISABLED');
@@ -1219,6 +1232,7 @@ export class Renderer {
     this.hdr = this.device.createTexture({ label: 'scene-linear HDR', size: [width, height], format: 'rgba16float',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING });
     this.volumetricFog?.resize(width, height, this.depth, this.hdr, this.shadow);
+    this.reflections?.resize(width, height, this.hdr, this.depth);
     this.resolveGroup = this.device.createBindGroup({ layout: this.resolveLayout, entries: [
       { binding: 0, resource: (this.volumetricFog?.colorTexture ?? this.hdr).createView() }, { binding: 1, resource: { buffer: this.exposureBuffer } },
     ] });

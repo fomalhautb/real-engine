@@ -21,6 +21,35 @@ export interface ResolvedReflectionTemporalOptions {
   readonly parallaxRoughness: number;
 }
 
+/** Opt-in short screen-space supplement over owned copies of the previous
+ * frame's scene-linear HDR and depth (counted in maxBytes). A world-query sample
+ * is replaced, with confidence, only where the march finds the same surface at
+ * the same reflected distance; every other case keeps the world-query result. */
+export interface ReflectionScreenTraceOptions {
+  /** Longest world-hit distance that may use screen detail, meters; 0.05..20. */
+  readonly maxDistance?: number;
+  /** Fixed linear march steps per sample before a four-step refinement; 4..32. */
+  readonly steps?: number;
+  /** Depth-buffer thickness accepted behind a crossing, meters; 0.001..2. */
+  readonly thickness?: number;
+  /** Required agreement with the world-hit distance, and the largest accepted
+   * reflected-hit motion, meters; 0.001..1. */
+  readonly distanceTolerance?: number;
+  /** Confidence fade width at the screen border, as a fraction of NDC; 0.01..0.5. */
+  readonly edgeFade?: number;
+}
+
+export interface ResolvedReflectionScreenTraceOptions {
+  readonly maxDistance: number;
+  readonly steps: number;
+  readonly thickness: number;
+  readonly distanceTolerance: number;
+  readonly edgeFade: number;
+}
+
+/** Owned previous-frame copies: rgba16float HDR plus depth32float. */
+export const REFLECTION_SCREEN_BYTES_PER_PIXEL = 12;
+
 export interface ReflectionsOptions {
   readonly pixelSpacing?: number;
   readonly maxAnchors?: number;
@@ -38,6 +67,8 @@ export interface ReflectionsOptions {
   readonly textureLod?: number;
   /** Reprojected history with per-frame rotated GGX samples; memory is counted in maxBytes. */
   readonly temporal?: ReflectionTemporalOptions;
+  /** Near-contact screen-space detail; world queries remain the source of every sample. */
+  readonly screenTrace?: ReflectionScreenTraceOptions;
 }
 
 export interface ResolvedReflectionsOptions {
@@ -54,6 +85,8 @@ export interface ResolvedReflectionsOptions {
   readonly textureLod: number;
   /** Undefined when history is not configured. */
   readonly temporal: ResolvedReflectionTemporalOptions | undefined;
+  /** Undefined when the screen-space supplement is not configured. */
+  readonly screenTrace: ResolvedReflectionScreenTraceOptions | undefined;
 }
 
 export interface ReflectionGridPlan {
@@ -114,6 +147,19 @@ export function resolveReflectionsOptions(options: ReflectionsOptions = {}): Res
     skyRadiance,
     textureLod: boundedNumber(options.textureLod === undefined ? 0 : options.textureLod, 0, 16, 'TEXTURE_LOD'),
     temporal: resolveTemporal(options.temporal),
+    screenTrace: resolveScreenTrace(options.screenTrace),
+  });
+}
+
+function resolveScreenTrace(screen: ReflectionScreenTraceOptions | undefined): ResolvedReflectionScreenTraceOptions | undefined {
+  if (screen === undefined) return undefined;
+  if (!screen || typeof screen !== 'object' || Array.isArray(screen)) throw new RangeError('REFLECTIONS_SCREEN_TRACE');
+  return Object.freeze({
+    maxDistance: boundedNumber(screen.maxDistance ?? 1.5, 0.05, 20, 'SCREEN_MAX_DISTANCE'),
+    steps: boundedInteger(screen.steps ?? 12, 4, 32, 'SCREEN_STEPS'),
+    thickness: boundedNumber(screen.thickness ?? 0.1, 0.001, 2, 'SCREEN_THICKNESS'),
+    distanceTolerance: boundedNumber(screen.distanceTolerance ?? 0.05, 0.001, 1, 'SCREEN_DISTANCE_TOLERANCE'),
+    edgeFade: boundedNumber(screen.edgeFade ?? 0.1, 0.01, 0.5, 'SCREEN_EDGE_FADE'),
   });
 }
 

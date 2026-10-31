@@ -18,6 +18,20 @@ describe('reflection temporal contracts', () => {
     expect(() => resolveReflectionsOptions({ temporal: null as never })).toThrow('REFLECTIONS_TEMPORAL');
   });
 
+  it('resolves the bounded screen-space supplement only when configured', () => {
+    expect(resolveReflectionsOptions().screenTrace).toBeUndefined();
+    expect(resolveReflectionsOptions({ screenTrace: {} }).screenTrace).toEqual({ maxDistance: 1.5, steps: 12,
+      thickness: 0.1, distanceTolerance: 0.05, edgeFade: 0.1 });
+    const resolved = resolveReflectionsOptions({ screenTrace: { maxDistance: 20, steps: 32, thickness: 2, distanceTolerance: 1, edgeFade: 0.5 } });
+    expect(Object.isFrozen(resolved.screenTrace)).toBe(true);
+    expect(resolveReflectionsOptions(resolved).screenTrace).toEqual(resolved.screenTrace);
+    for (const screenTrace of [{ maxDistance: 0.01 }, { maxDistance: 21 }, { steps: 3 }, { steps: 33 }, { steps: 8.5 },
+      { thickness: 0 }, { distanceTolerance: 2 }, { edgeFade: 0.6 }, { edgeFade: Number.NaN }]) {
+      expect(() => resolveReflectionsOptions({ screenTrace })).toThrow(RangeError);
+    }
+    expect(() => resolveReflectionsOptions({ screenTrace: [] as never })).toThrow('REFLECTIONS_SCREEN_TRACE');
+  });
+
   it('ramps the history cap from mirror-like to rough reflections', () => {
     const temporal = resolveReflectionsOptions({ temporal: { minHistoryFrames: 8, maxHistoryFrames: 32 } }).temporal!;
     expect(reflectionHistoryLimit(0, temporal)).toBe(8);

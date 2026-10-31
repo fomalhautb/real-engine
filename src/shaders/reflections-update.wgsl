@@ -106,6 +106,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     var failures = select(0u, 1u, reflectionFailed(camera));
     var sum = vec3f(0.0);
     var weightSum = 0.0; var distanceSum = 0.0; var motionSum = vec3f(0.0); var dominant = 0.0;
+    var screenCounts = vec4u(0u);
     result.reflected = vec4u(0u, 0u, 0u, 0xffffffffu);
     for (var sampleIndex = 0u; sampleIndex < reflection.settings.z; sampleIndex++) {
         let index = id.x * reflection.settings.z + sampleIndex;
@@ -125,6 +126,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
             }
         }
         let distance = select(reflection.eye.w, hit.metric.x, hit.identity.x != 0u);
+        // REFLECTION_SCREEN_SAMPLE
         incoming = reflectionApplyFog(camera.position.xyz + reflectionGeometry(camera) * reflection.limits.x,
             sample.direction.xyz, distance, incoming);
         sum += clamp(incoming, vec3f(0.0), vec3f(65504.0)) * sample.weight.xyz / f32(reflection.settings.z);
@@ -139,6 +141,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     result.raw = vec4f(raw, meanDistance);
     result.radiance = vec4f(raw, 1.0);
     result.motion = vec4f(select(vec3f(0.0), motionSum / weightSum, weightSum > 0.0), weightSum);
-    result.state = vec4u(select(0u, 1u, camera.identity.x != 0u && camera.emissive.w == 0.0 && failures == 0u), reflection.state.x, failures, 0u);
+    result.state = vec4u(select(0u, 1u, camera.identity.x != 0u && camera.emissive.w == 0.0 && failures == 0u), reflection.state.x, failures,
+        min(screenCounts.x, 255u) | (min(screenCounts.y, 255u) << 8u) | (min(screenCounts.z, 255u) << 16u) | (min(screenCounts.w, 255u) << 24u));
     anchors[id.x] = result;
 }

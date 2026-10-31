@@ -187,8 +187,8 @@ describe('GPU reflections ownership and preflight', () => {
       expect(device.writes).toHaveLength(0);
       expect(() => reflections.setEnabled(1 as unknown as boolean)).toThrow('REFLECTIONS_ENABLED');
       reflections.setEnabled(false);
-      expect(reflections.update(frame)).toBe(176);
-      expect(device.writes).toEqual([{ label: 'reflection parameters', bytes: 176 }]);
+      expect(reflections.update(frame)).toBe(272);
+      expect(device.writes).toEqual([{ label: 'reflection parameters', bytes: 272 }]);
       let passes = 0, dispatches = 0;
       const encoder = { beginComputePass: ({ label }: { label: string }) => {
         expect(label).toBe('reflections disabled'); passes++;
@@ -202,3 +202,84 @@ describe('GPU reflections ownership and preflight', () => {
     expect(tracked.bytes).toBe(0);
   });
 });
+
+function fakeEncoder() {
+  const labels: string[] = [];
+  const encoder = { beginComputePass: ({ label }: { label: string }) => {
+    labels.push(label);
+    return { setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {}, end() {} };
+  }, copyBufferToBuffer() {} } as unknown as GPUCommandEncoder;
+  return { encoder, labels };
+}
+
+const identityMatrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+const moved = identityMatrix.map((value, i) => i === 12 ? 0.5 : value);
+
+describe('GPU reflection history', () => {
+  it('allocates two budgeted history buffers only when configured and rejects a budget without room for them', async () => {
+    const device = new FakeDevice(), tracked = ledger();
+    const plain = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query, {}, tracked.account);
+    const plainBytes = tracked.bytes;
+    plain.dispose();
+    const temporal = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query,
+      { temporal: {} }, tracked.account);
+    try {
+      expect(device.buffers.filter(item => item.label.startsWith('reflection reprojected history'))).toHaveLength(2);
+      expect(tracked.bytes - plainBytes).toBe(2 * 4 * 96);
+      expect(temporal.diagnostics().temporal).toMatchObject({ configured: true, enabled: true, historyBytes: 768,
+        minHistoryFrames: 8, maxHistoryFrames: 32 });
+    } finally { temporal.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    const tight = new FakeDevice(), balance = ledger();
+    await expect(GpuReflections.create(tight as unknown as GPUDevice, borrowed().query,
+      { maxBytes: plainBytes, temporal: {} }, balance.account)).rejects.toThrow('REFLECTIONS_MEMORY_BUDGET');
+    expect(tight.buffers).toHaveLength(0);
+    expect(balance.bytes).toBe(0);
+  });
+
+  it('names every discrete history reset and keeps continuous frames accumulating', async () => {
+    const device = new FakeDevice(), tracked = ledger(), { query } = borrowed();
+    const reflections = await GpuReflections.create(device as unknown as GPUDevice, query, { temporal: {} }, tracked.account);
+    try {
+      let index = 0;
+      const step = (patch: Partial<ReflectionUpdate> = {}, encode = true) => {
+        index++;
+        reflections.update({ ...frame, frame: index, viewProjection: identityMatrix,
+          previousViewProjection: index > 1 ? identityMatrix : undefined, sceneMotion: false, historyRevision: 0, ...patch });
+        const { encoder, labels } = fakeEncoder();
+        if (encode) reflections.encode(encoder);
+        return { history: reflections.diagnostics().temporal, labels };
+      };
+      expect(() => reflections.update({ ...frame, viewProjection: undefined })).toThrow('REFLECTIONS_TEMPORAL_VIEW_PROJECTION');
+      const first = step();
+      expect(first.history).toMatchObject({ active: true, valid: true, framesSinceReset: 1, lastResetReason: 'initial' });
+      expect(first.labels.at(-1)).toBe('reflections temporal');
+      expect(step().history).toMatchObject({ framesSinceReset: 2, lastResetReason: 'initial' });
+      expect(step({ previousViewProjection: undefined }).history).toMatchObject({ framesSinceReset: 1, lastResetReason: 'camera-cut' });
+      expect(step({ previousViewProjection: moved }).history.lastResetReason).toBe('camera-cut');
+      expect(step({ materialRevision: 2 }).history.lastResetReason).toBe('material-changed');
+      expect(step({ materialRevision: 2, sunColor: [2, 2, 1.5] }).history.lastResetReason).toBe('lighting-changed');
+      const stable = step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 0 });
+      expect(stable.history).toMatchObject({ framesSinceReset: 2, lastResetReason: 'lighting-changed' });
+      expect(step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1 }).history.lastResetReason).toBe('scene-identity-changed');
+      expect(step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1, width: 40 }).history.lastResetReason).toBe('grid-changed');
+      step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1, width: 40 }, false);
+      expect(step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1, width: 40 }).history.lastResetReason).toBe('unrendered-history');
+      reflections.invalidateHistory('gi-changed');
+      expect(step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1, width: 40 }).history.lastResetReason).toBe('gi-changed');
+      reflections.setTemporalEnabled(false);
+      const off = step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1, width: 40 });
+      expect(off.history).toMatchObject({ active: false, valid: false });
+      expect(off.labels).not.toContain('reflections temporal');
+      reflections.setTemporalEnabled(true);
+      expect(step({ materialRevision: 2, sunColor: [2, 2, 1.5], historyRevision: 1, width: 40 }).history)
+        .toMatchObject({ active: true, framesSinceReset: 1, lastResetReason: 'temporal-toggle' });
+      expect(device.writes.every(write => write.bytes === 272)).toBe(true);
+    } finally { reflections.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    const untimed = await GpuReflections.create(device as unknown as GPUDevice, borrowed().query, {}, tracked.account);
+    expect(() => untimed.setTemporalEnabled(true)).toThrow('REFLECTIONS_TEMPORAL_NOT_CONFIGURED');
+    untimed.dispose();
+  });
+});
+

@@ -8,6 +8,18 @@ struct ReflectionRay { origin: vec4f, direction: vec4f, ignore: vec4u }
 @group(0) @binding(6) var<storage, read_write> anchors: array<ReflectionAnchor>;
 // REFLECTION_GI
 
+fn reflectionHash(value: u32) -> u32 {
+    var x = value;
+    x = (x ^ (x >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+// Hashed per-anchor offset plus an R2 step per frame, as 0.32 fixed point.
+fn reflectionRotation(frame: u32, anchor: u32) -> vec2u {
+    let seed = reflectionHash((anchor * 0x9e3779b9u) ^ 0x5bd1e995u);
+    let step = frame % 4096u;
+    return vec2u(seed + step * 3242174889u, reflectionHash(seed) + step * 2447445414u);
+}
 fn emptyReflectionRay() -> ReflectionRay {
     return ReflectionRay(vec4f(0.0), vec4f(0.0, 1.0, 0.0, 0.0), vec4u(0u));
 }
@@ -39,8 +51,15 @@ fn generateReflections(@builtin(global_invocation_id) id: vec3u) {
         let alpha = roughness * roughness;
         let a2 = alpha * alpha;
         let index = id.x % reflection.settings.z;
-        let u = (f32(index) + 0.5) / f32(reflection.settings.z);
-        let phi = 6.28318530718 * f32(reverseBits(index)) * 2.3283064365386963e-10;
+        var u = (f32(index) + 0.5) / f32(reflection.settings.z);
+        var phi = 6.28318530718 * f32(reverseBits(index)) * 2.3283064365386963e-10;
+        if (reflection.temporalState.x != 0u) {
+            // Per-anchor Cranley-Patterson rotation of the same stratified set;
+            // integer wrapping keeps the CPU replica exact (reflectionSampleCoordinates).
+            let rotation = reflectionRotation(reflection.state.x, id.x / reflection.settings.z);
+            phi = 6.28318530718 * f32((reverseBits(index) + rotation.x) >> 8u) * 5.9604644775390625e-8;
+            u = min(fract(u + f32(rotation.y >> 8u) * 5.9604644775390625e-8), 0.99999994);
+        }
         let cosine = sqrt((1.0 - u) / (1.0 + (a2 - 1.0) * u));
         let sine = sqrt(max(0.0, 1.0 - cosine * cosine));
         let helper = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n.y) > 0.9);
@@ -86,6 +105,8 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
     result.hit = camera;
     var failures = select(0u, 1u, reflectionFailed(camera));
     var sum = vec3f(0.0);
+    var weightSum = 0.0; var distanceSum = 0.0; var motionSum = vec3f(0.0); var dominant = 0.0;
+    result.reflected = vec4u(0u, 0u, 0u, 0xffffffffu);
     for (var sampleIndex = 0u; sampleIndex < reflection.settings.z; sampleIndex++) {
         let index = id.x * reflection.settings.z + sampleIndex;
         let sample = samples[index];
@@ -107,8 +128,17 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
         incoming = reflectionApplyFog(camera.position.xyz + reflectionGeometry(camera) * reflection.limits.x,
             sample.direction.xyz, distance, incoming);
         sum += clamp(incoming, vec3f(0.0), vec3f(65504.0)) * sample.weight.xyz / f32(reflection.settings.z);
+        // Reflected-hit statistics drive parallax reprojection and history checks.
+        let lobe = dot(sample.weight.xyz, vec3f(0.2126, 0.7152, 0.0722));
+        weightSum += lobe; distanceSum += lobe * distance;
+        if (hit.identity.x != 0u) { motionSum += lobe * (hit.previous.xyz - hit.position.xyz); }
+        if (lobe > dominant) { dominant = lobe; result.reflected = vec4u(hit.identity.xyz, sampleIndex); }
     }
-    result.radiance = vec4f(clamp(sum, vec3f(0.0), vec3f(65504.0)), 0.0);
+    let raw = clamp(sum, vec3f(0.0), vec3f(65504.0));
+    let meanDistance = select(reflection.eye.w, distanceSum / weightSum, weightSum > 0.0);
+    result.raw = vec4f(raw, meanDistance);
+    result.radiance = vec4f(raw, 1.0);
+    result.motion = vec4f(select(vec3f(0.0), motionSum / weightSum, weightSum > 0.0), weightSum);
     result.state = vec4u(select(0u, 1u, camera.identity.x != 0u && camera.emissive.w == 0.0 && failures == 0u), reflection.state.x, failures, 0u);
     anchors[id.x] = result;
 }

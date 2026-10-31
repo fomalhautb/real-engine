@@ -1,5 +1,6 @@
 import common from './shaders/reflections-common.wgsl?raw';
 import updateSource from './shaders/reflections-update.wgsl?raw';
+import temporalSource from './shaders/reflections-temporal.wgsl?raw';
 import sampleSource from './shaders/reflections-sample.wgsl?raw';
 import surfaceFrame from './shaders/surface-frame.wgsl?raw';
 import surfaceBrdf from './shaders/surface-brdf.wgsl?raw';
@@ -16,27 +17,55 @@ import { WORLD_HIT_BYTES } from './world-query';
 import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 export const reflectionSurfaceSource = common + '\n' + sampleSource;
-const PARAMETER_BYTES = 176, ANCHOR_BYTES = 192, SAMPLE_BYTES = 32, PROBE_LIMIT = 1024;
-type Entry = 'generateCamera' | 'generateReflections' | 'generateShadows' | 'integrate';
+export const REFLECTION_PARAMETER_BYTES = 272;
+export const REFLECTION_ANCHOR_BYTES = 256;
+export const REFLECTION_HISTORY_BYTES = 96;
+const PARAMETER_BYTES = REFLECTION_PARAMETER_BYTES, ANCHOR_BYTES = REFLECTION_ANCHOR_BYTES;
+const SAMPLE_BYTES = 32, PROBE_LIMIT = 1024, ANCHOR_WORDS = ANCHOR_BYTES / 4;
+type Entry = 'generateCamera' | 'generateReflections' | 'generateShadows' | 'integrate' | 'temporal';
+export type ReflectionHistoryMode = 'none' | 'stationary' | 'surface' | 'parallax' | 'rejected';
+const MODES: readonly ReflectionHistoryMode[] = ['none', 'stationary', 'surface', 'parallax', 'rejected'];
 export interface ReflectionUpdate {
   frame: number; materialRevision: number; width: number; height: number;
   eye: readonly number[]; target: readonly number[]; fovY: number; near: number; far: number;
   sunDirection: readonly number[]; sunColor: readonly number[];
+  /** Current view-projection; required for reprojected history. */
+  viewProjection?: ArrayLike<number>;
+  /** Previous rendered view-projection; omission is an explicit camera cut. */
+  previousViewProjection?: ArrayLike<number>;
+  /** Any batch changed this frame (pose, deformation or instance parameters). */
+  sceneMotion?: boolean;
+  /** World-query identity/history revision; a change rejects all history. */
+  historyRevision?: number;
 }
-export interface ReflectionProbeResult {
-  frame: number;
-  anchors: { index: number; identity: number[]; position: number[]; normal: number[]; radiance: number[];
-    valid: boolean; failedQueries: number }[];
+export interface ReflectionProbeAnchor {
+  index: number; identity: number[]; position: number[]; normal: number[];
+  /** Resolved radiance used by the surface pass (temporal output when active). */
+  radiance: number[];
+  /** This frame's estimate before history. */
+  rawRadiance: number[];
+  valid: boolean; failedQueries: number;
+  historyCount: number; historyMode: ReflectionHistoryMode; rejectedHistory: number; historyClamped: boolean;
+  meanReflectedDistance: number;
+  /** Dominant reflected sample: [batch, entity, generation]; batch 0 is a miss. */
+  reflectedIdentity: number[]; reflectedSample: number | null;
 }
+export interface ReflectionProbeResult { frame: number; anchors: ReflectionProbeAnchor[] }
+
+const LIGHT_EPSILON = 0;
 
 /** Single reflected segment through the shared world query and material path.
- * Samples and reconstruction are bounded; no per-frame geometry readback or hidden history. */
+ * Samples and reconstruction are bounded; no per-frame geometry readback. The
+ * optional history is explicit, budgeted and reset on identity, version,
+ * material, lighting, media and camera discontinuities. */
 export class GpuReflections {
   readonly options;
   private buffers: GPUBuffer[] = [];
   private bytes = 0;
+  private historyBytes = 0;
   private disposed = false;
   private enabled = true;
+  private temporalEnabled: boolean;
   private pendingReadback = false;
   private frame = 0;
   private encodedFrame = 0;
@@ -48,14 +77,25 @@ export class GpuReflections {
   private samples!: GPUBuffer;
   private anchors!: GPUBuffer;
   private readback!: GPUBuffer;
+  private history: GPUBuffer[] = [];
+  private historyIndex = 0;
+  private historyValid = false;
+  private historyFrames = 0;
+  private resetReason = 'initial';
+  private pendingReset: string | null = 'initial';
+  private temporalActive = false;
+  private previous?: { frame: number; width: number; height: number; spacing: number; viewProjection: Float32Array;
+    materialRevision: number; light: number[]; media: number; historyRevision: number };
   private pipelines!: Record<Entry, GPUComputePipeline>;
-  private groups!: Record<Exclude<Entry, 'integrate'>, GPUBindGroup>;
+  private groups!: Record<Exclude<Entry, 'integrate' | 'temporal'>, GPUBindGroup>;
   private integrateGroups: GPUBindGroup[] = [];
+  private temporalGroups: GPUBindGroup[] = [];
   private fogGroup?: GPUBindGroup;
   private readonly data = new Float32Array(PARAMETER_BYTES / 4);
 
   get surfaceParameters(): GPUBuffer { return this.parameters; }
   get surfaceAnchors(): GPUBuffer { return this.anchors; }
+  get temporalConfigured(): boolean { return !!this.options.temporal; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: ReflectionsOptions,
     account: (bytes: number) => void, gi?: GpuDiffuseGi, fog?: GpuVolumetricFog, shadow?: GPUTexture): Promise<GpuReflections> {
@@ -73,7 +113,7 @@ export class GpuReflections {
   private constructor(private device: GPUDevice, private queries: GpuWorldQuery,
     options: ReturnType<typeof resolveReflectionsOptions>, private capacity: number,
     private account: (bytes: number) => void, private gi?: GpuDiffuseGi, private fog?: GpuVolumetricFog,
-    private shadow?: GPUTexture) { this.options = options; }
+    private shadow?: GPUTexture) { this.options = options; this.temporalEnabled = !!options.temporal; }
   private assertAlive(): void { if (this.disposed) throw new Error('REFLECTIONS_DISPOSED'); }
   private buffer(label: string, size: number, usage: GPUBufferUsageFlags): GPUBuffer {
     const buffer = this.device.createBuffer({ label, size, usage });
@@ -85,10 +125,11 @@ export class GpuReflections {
   }
   private async initialize(): Promise<void> {
     const cap = this.capacity, rays = cap * this.options.samplesPerAnchor;
+    const historySize = this.options.temporal ? cap * REFLECTION_HISTORY_BYTES : 0;
     const sizes = [PARAMETER_BYTES, cap * WORLD_HIT_BYTES, rays * WORLD_HIT_BYTES,
       rays * SAMPLE_BYTES, cap * ANCHOR_BYTES, Math.min(cap, PROBE_LIMIT) * ANCHOR_BYTES];
-    if (sizes.reduce((a, b) => a + b, 0) > this.options.maxBytes) throw new Error('REFLECTIONS_MEMORY_BUDGET');
-    if (sizes.some(size => size > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize))) throw new Error('REFLECTIONS_BUFFER_LIMIT');
+    if (sizes.reduce((a, b) => a + b, 0) + 2 * historySize > this.options.maxBytes) throw new Error('REFLECTIONS_MEMORY_BUDGET');
+    if ([...sizes, historySize].some(size => size > Math.min(this.device.limits.maxBufferSize, this.device.limits.maxStorageBufferBindingSize))) throw new Error('REFLECTIONS_BUFFER_LIMIT');
     if (Math.ceil(rays / 64) > this.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('REFLECTIONS_DISPATCH_LIMIT');
     this.parameters = this.buffer('reflection parameters', sizes[0], GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.cameraHits = this.buffer('reflection camera hits', sizes[1], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -96,6 +137,10 @@ export class GpuReflections {
     this.samples = this.buffer('reflection directions and BSDF weights', sizes[3], GPUBufferUsage.STORAGE);
     this.anchors = this.buffer('reflection radiance anchors', sizes[4], GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     this.readback = this.buffer('reflection explicit diagnostic readback', sizes[5], GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    if (historySize) {
+      this.history = [0, 1].map(index => this.buffer('reflection reprojected history ' + index, historySize, GPUBufferUsage.STORAGE));
+      this.historyBytes = 2 * historySize;
+    }
     const giSource = this.gi ? giCommon.replace('// GI_DISTANCE_CONSTANTS',
       `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`)
       + '\n@group(0) @binding(7) var<uniform> gi: GiParameters;\n@group(0) @binding(8) var<storage, read> giProbes: array<GiProbe>;\n'
@@ -103,10 +148,12 @@ export class GpuReflections {
       : 'fn reflectionDiffuse(hit:ReflectionHit)->vec3f { return hit.baseColor.xyz * (0.045+0.065*max(hit.normal.y,0.0)) * (1.0-hit.previous.w*0.6); }';
     const fogSource = this.fog ? reflectionFogShaderSource(this.fog, !!this.gi) : 'fn reflectionApplyFog(origin:vec3f,direction:vec3f,distance:f32,incoming:vec3f)->vec3f {return incoming;}';
     const module = this.device.createShaderModule({ label: 'world-space reflections',
-      code: surfaceFrame + '\n' + surfaceBrdf + '\n' + common + '\n' + updateSource.replace('// REFLECTION_GI', giSource) + '\n' + fogSource });
+      code: surfaceFrame + '\n' + surfaceBrdf + '\n' + common + '\n' + updateSource.replace('// REFLECTION_GI', giSource) + '\n' + fogSource
+        + (this.options.temporal ? '\n' + temporalSource : '') });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `reflections:${error.lineNum}: ${error.message}`).join('\n'));
-    const names: Entry[] = ['generateCamera', 'generateReflections', 'generateShadows', 'integrate'];
+    const names: Entry[] = ['generateCamera', 'generateReflections', 'generateShadows', 'integrate',
+      ...(this.options.temporal ? ['temporal' as const] : [])];
     const pipelines = await Promise.all(names.map(entryPoint => this.device.createComputePipelineAsync({
       label: 'reflections ' + entryPoint, layout: 'auto', compute: { module, entryPoint } })));
     this.pipelines = Object.fromEntries(names.map((name, index) => [name, pipelines[index]])) as Record<Entry, GPUComputePipeline>;
@@ -125,9 +172,27 @@ export class GpuReflections {
       { binding: 2, resource: this.shadow!.createView() },
       { binding: 3, resource: this.device.createSampler({ compare: 'less-equal', minFilter: 'linear', magFilter: 'linear' }) },
     ] });
+    // Group i writes history[i] from history[1 - i].
+    if (this.options.temporal) this.temporalGroups = [0, 1].map(index => this.bind(p.temporal,
+      [[0, this.parameters], [6, this.anchors], [9, this.history[1 - index]], [10, this.history[index]]]));
   }
   setEnabled(enabled: boolean): void {
-    this.assertAlive(); if (typeof enabled !== 'boolean') throw new Error('REFLECTIONS_ENABLED'); this.enabled = enabled;
+    this.assertAlive(); if (typeof enabled !== 'boolean') throw new Error('REFLECTIONS_ENABLED');
+    if (enabled !== this.enabled) this.invalidateHistory('reflections-toggle');
+    this.enabled = enabled;
+  }
+  /** Runtime switch for configured history; disabled uses the fixed sample set. */
+  setTemporalEnabled(enabled: boolean): void {
+    this.assertAlive(); if (typeof enabled !== 'boolean') throw new Error('REFLECTIONS_TEMPORAL_ENABLED');
+    if (enabled && !this.options.temporal) throw new Error('REFLECTIONS_TEMPORAL_NOT_CONFIGURED');
+    if (enabled !== this.temporalEnabled) this.invalidateHistory('temporal-toggle');
+    this.temporalEnabled = enabled;
+  }
+  /** Explicit discontinuity outside the identity/material/lighting contracts. */
+  invalidateHistory(reason = 'explicit'): void {
+    this.assertAlive();
+    if (typeof reason !== 'string' || !reason) throw new Error('REFLECTIONS_HISTORY_REASON');
+    this.pendingReset ??= reason;
   }
   update(input: ReflectionUpdate): number {
     this.assertAlive();
@@ -140,18 +205,60 @@ export class GpuReflections {
       || input.eye.some(value => Math.abs(value) > 1e6) || input.target.some(value => Math.abs(value) > 1e6)) throw new Error('REFLECTIONS_CAMERA');
     const sunLength = Math.hypot(...input.sunDirection);
     if (!(sunLength > 0) || !Number.isFinite(sunLength)) throw new Error('REFLECTIONS_SUN_DIRECTION');
+    const matrix = (value: ArrayLike<number> | undefined, name: string): Float32Array | undefined => {
+      if (value === undefined) return undefined;
+      const values = Float32Array.from(Array.from(value));
+      if (values.length !== 16 || !values.every(Number.isFinite)) throw new Error('REFLECTIONS_' + name);
+      return values;
+    };
+    const viewProjection = matrix(input.viewProjection, 'VIEW_PROJECTION');
+    const previousViewProjection = matrix(input.previousViewProjection, 'PREVIOUS_VIEW_PROJECTION');
+    if (input.sceneMotion !== undefined && typeof input.sceneMotion !== 'boolean') throw new Error('REFLECTIONS_SCENE_MOTION');
+    if (input.historyRevision !== undefined && (!Number.isSafeInteger(input.historyRevision) || input.historyRevision < 0
+      || input.historyRevision > 0xffff_ffff)) throw new Error('REFLECTIONS_HISTORY_REVISION');
     const grid = planReflectionGrid(input.width, input.height, this.options, this.queries.options.maxRays, this.queries.options.maxTotalWorkUnits);
     const tangent = Math.tan(input.fovY / 2), horizontal = tangent * input.width / input.height;
     const data = this.data, uints = new Uint32Array(data.buffer);
+    data.fill(0);
     data.set([...input.eye, this.options.maxDistance], 0);
     data.set([view[0] * horizontal, view[4] * horizontal, view[8] * horizontal, input.near], 4);
     data.set([view[1] * tangent, view[5] * tangent, view[9] * tangent, input.far], 8);
     data.set([-view[2], -view[6], -view[10], 0], 12);
-    data.set(input.sunDirection.map(value => value / sunLength), 16); data.set(input.sunColor, 20); data.set(this.options.skyRadiance, 24);
+    const sunDirection = input.sunDirection.map(value => value / sunLength);
+    data.set(sunDirection, 16); data.set(input.sunColor, 20); data.set(this.options.skyRadiance, 24);
     uints.set([input.width, input.height, grid.columns, grid.rows], 28);
     uints.set([grid.spacing, grid.anchorCount, this.options.samplesPerAnchor, Number(this.enabled)], 32);
     uints.set([input.frame, input.materialRevision, this.options.fogSteps, 0], 36);
     data.set([this.options.normalBias, this.options.textureLod, this.options.maxGatherDistance, this.options.planeTolerance], 40);
+    const temporal = this.options.temporal;
+    this.temporalActive = !!temporal && this.temporalEnabled && this.enabled;
+    if (temporal) {
+      if (this.temporalActive && !viewProjection) throw new Error('REFLECTIONS_TEMPORAL_VIEW_PROJECTION');
+      const light = [...sunDirection, ...input.sunColor].map(Math.fround);
+      const media = this.fog?.diagnostics().revision ?? 0, historyRevision = input.historyRevision ?? 0;
+      const old = this.previous;
+      let reason = this.pendingReset;
+      if (!reason && this.temporalActive) {
+        reason = !old ? 'initial' : old.frame + 1 !== input.frame ? 'frame-discontinuity'
+          : this.encodedFrame !== old.frame ? 'unrendered-history'
+          : !previousViewProjection || previousViewProjection.some((value, i) => value !== old.viewProjection[i]) ? 'camera-cut'
+          : old.width !== input.width || old.height !== input.height || old.spacing !== grid.spacing ? 'grid-changed'
+          : old.materialRevision !== input.materialRevision ? 'material-changed'
+          : old.light.some((value, i) => Math.abs(value - light[i]) > LIGHT_EPSILON) ? 'lighting-changed'
+          : old.media !== media ? 'media-changed'
+          : old.historyRevision !== historyRevision ? 'scene-identity-changed' : null;
+      }
+      if (reason && this.temporalActive) {
+        this.historyValid = false; this.historyFrames = 0; this.resetReason = reason; this.pendingReset = null;
+      }
+      const cameraMoved = !!old && !!viewProjection && viewProjection.some((value, i) => value !== old.viewProjection[i]);
+      data.set(previousViewProjection ?? viewProjection ?? new Float32Array(16), 44);
+      data.set([temporal.minHistoryFrames, temporal.maxHistoryFrames, temporal.clampSigma, temporal.parallaxRoughness], 60);
+      uints.set([Number(this.temporalActive), Number(this.temporalActive && this.historyValid),
+        Number(cameraMoved), Number(input.sceneMotion ?? true)], 64);
+      this.previous = viewProjection ? { frame: input.frame, width: input.width, height: input.height, spacing: grid.spacing,
+        viewProjection, materialRevision: input.materialRevision, light, media, historyRevision } : undefined;
+    }
     this.device.queue.writeBuffer(this.parameters, 0, data);
     this.grid = grid; this.frame = input.frame; this.materialRevision = input.materialRevision;
     return PARAMETER_BYTES;
@@ -177,8 +284,13 @@ export class GpuReflections {
     encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.secondaryHits, 0, grid.rayCount * WORLD_HIT_BYTES);
     dispatch('generateShadows', grid.rayCount, this.groups.generateShadows);
     uploaded += this.queries.encodeTrace(encoder, grid.rayCount, this.options.textureLod, this.materialRevision);
+    // The span ends on the last encoded pass: temporal history when active.
     dispatch('integrate', grid.anchorCount, this.integrateGroups[this.gi?.lightingIndex ?? 0],
-      timestampSpanEnd(timing));
+      this.temporalActive ? undefined : timestampSpanEnd(timing));
+    if (this.temporalActive) {
+      dispatch('temporal', grid.anchorCount, this.temporalGroups[this.historyIndex], timestampSpanEnd(timing));
+      this.historyIndex = 1 - this.historyIndex; this.historyValid = true; this.historyFrames++;
+    }
     this.encodedFrame = this.frame; return uploaded;
   }
   async probe(indices: readonly number[]): Promise<ReflectionProbeResult> {
@@ -198,23 +310,36 @@ export class GpuReflections {
       const floats = new Float32Array(this.readback.getMappedRange(0, requested.length * ANCHOR_BYTES));
       const uints = new Uint32Array(floats.buffer, floats.byteOffset, floats.length);
       return { frame, anchors: requested.map((index, i) => {
-        const base = i * 48;
+        const base = i * ANCHOR_WORDS;
         if (uints[base + 45] !== frame) throw new Error('REFLECTIONS_FRAME_MISMATCH');
         const radiance = Array.from(floats.subarray(base + 40, base + 43));
-        if (radiance.some(value => !Number.isFinite(value) || value < 0 || value > 65504)) throw new Error('REFLECTIONS_INVALID_RADIANCE');
+        const rawRadiance = Array.from(floats.subarray(base + 48, base + 51));
+        if ([...radiance, ...rawRadiance].some(value => !Number.isFinite(value) || value < 0 || value > 65504)) throw new Error('REFLECTIONS_INVALID_RADIANCE');
+        const mode = MODES[uints[base + 60]];
+        if (!mode) throw new Error('REFLECTIONS_INVALID_HISTORY_MODE');
         return { index, identity: Array.from(uints.subarray(base, base + 4)), position: Array.from(floats.subarray(base + 8, base + 11)),
-          normal: Array.from(floats.subarray(base + 12, base + 15)), radiance, valid: uints[base + 44] === 1, failedQueries: uints[base + 46] };
+          normal: Array.from(floats.subarray(base + 12, base + 15)), radiance, rawRadiance,
+          valid: uints[base + 44] === 1, failedQueries: uints[base + 46],
+          historyCount: this.temporalActive ? floats[base + 43] : 1, historyMode: this.temporalActive ? mode : 'none',
+          rejectedHistory: this.temporalActive ? uints[base + 61] : 0, historyClamped: this.temporalActive && uints[base + 62] === 1,
+          meanReflectedDistance: floats[base + 51],
+          reflectedIdentity: Array.from(uints.subarray(base + 56, base + 59)),
+          reflectedSample: uints[base + 59] === 0xffff_ffff ? null : uints[base + 59] };
       }) };
     } finally { if (this.readback.mapState === 'mapped') this.readback.unmap(); this.pendingReadback = false; }
   }
   diagnostics() {
     return { enabled: this.enabled, frame: this.encodedFrame, grid: this.grid ? { ...this.grid } : null,
       ownedGpuBytes: this.bytes, capacity: this.capacity, options: this.options,
-      diffuseGi: !!this.gi, worldMedia: !!this.fog, reflectedSegments: 1, temporalHistory: false };
+      diffuseGi: !!this.gi, worldMedia: !!this.fog, reflectedSegments: 1, temporalHistory: this.temporalActive,
+      temporal: { configured: !!this.options.temporal, enabled: this.temporalEnabled, active: this.temporalActive,
+        valid: this.temporalActive && this.historyValid, framesSinceReset: this.historyFrames,
+        lastResetReason: this.resetReason, historyBytes: this.historyBytes,
+        minHistoryFrames: this.options.temporal?.minHistoryFrames ?? 0, maxHistoryFrames: this.options.temporal?.maxHistoryFrames ?? 0 } };
   }
   dispose(): void {
     if (this.disposed) return; this.disposed = true;
-    for (const buffer of this.buffers) buffer.destroy(); this.buffers = [];
+    for (const buffer of this.buffers) buffer.destroy(); this.buffers = []; this.history = [];
     this.account(-this.bytes); this.bytes = 0;
   }
 }

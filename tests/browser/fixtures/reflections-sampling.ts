@@ -2,6 +2,7 @@ import surfaceFrame from '../../../src/shaders/surface-frame.wgsl?raw';
 import surfaceBrdf from '../../../src/shaders/surface-brdf.wgsl?raw';
 import reflectionCommon from '../../../src/shaders/reflections-common.wgsl?raw';
 import reflectionUpdate from '../../../src/shaders/reflections-update.wgsl?raw';
+import { REFLECTION_PARAMETER_BYTES } from '../../../src/gpu-reflections';
 
 const SAMPLE_COUNT = 16;
 const VIEW_COSINES = [0.0001, 0.005, 0.1, 1] as const;
@@ -36,7 +37,7 @@ export async function runReflectionSamplingFixture() {
     const pipeline = await device.createComputePipelineAsync({
       layout: 'auto', compute: { module: shader, entryPoint: 'generateReflections' },
     });
-    const uniform = allocate(176, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const uniform = allocate(REFLECTION_PARAMETER_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const camera = allocate(160, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const rays = allocate(SAMPLE_COUNT * 48, GPUBufferUsage.STORAGE);
     const samples = allocate(SAMPLE_COUNT * 32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
@@ -60,7 +61,8 @@ export async function runReflectionSamplingFixture() {
     device.queue.writeBuffer(camera, 0, hit);
     for (const nv of VIEW_COSINES) {
       const eye = [Math.sqrt(1 - nv * nv), 0, nv];
-      const parameters = new Float32Array(44);
+      // Zeroed temporal fields keep the fixed stratified sample set under test.
+      const parameters = new Float32Array(REFLECTION_PARAMETER_BYTES / 4);
       const words = new Uint32Array(parameters.buffer);
       parameters.set([...eye, 20], 0);
       words.set([1, 1, 1, 1], 28); // viewport

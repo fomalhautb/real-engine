@@ -800,6 +800,13 @@ export class Renderer {
     this.reflections.setEnabled(enabled);
   }
 
+  /** Toggle configured reflection history; disabling restores the fixed sample set. */
+  setReflectionsTemporalEnabled(enabled: boolean): void {
+    if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
+    if (!this.reflections) throw new Error('REFLECTIONS_DISABLED');
+    this.reflections.setTemporalEnabled(enabled);
+  }
+
   async probeReflections(indices: readonly number[]): Promise<ReflectionProbeResult> {
     if (this.disposed || this.errors.length) throw new Error('RENDERER_UNAVAILABLE');
     if (!this.reflections) throw new Error('REFLECTIONS_DISABLED');
@@ -851,11 +858,13 @@ export class Renderer {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
     this.diffuseGi.setEnabled(enabled);
+    this.reflections?.invalidateHistory('gi-changed');
   }
   setDiffuseGiMultiBounce(enabled: boolean): void {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.diffuseGi) throw new Error('DIFFUSE_GI_DISABLED');
     this.diffuseGi.setMultiBounce(enabled);
+    this.reflections?.invalidateHistory('gi-changed');
   }
   /** Switching support direction resets world feedback and surface GI history. */
   setDiffuseGiVisibilityDirection(direction: GiVisibilityDirection): void {
@@ -1303,10 +1312,8 @@ export class Renderer {
       this.materialRevision, this.worldQueries!.historyRevision) ?? 0;
     this.stats.uploadedBytes += this.diffuseGi?.updateFinalGather(this.stats.frames + 1, this.stats.width, this.stats.height,
       eye, vp, this.lastViewProjection, this.batches.some(batch => batch.dirty), this.materialRevision) ?? 0;
-    this.stats.uploadedBytes += this.reflections?.update({ frame: this.stats.frames + 1, materialRevision: this.materialRevision,
-      width: this.stats.width, height: this.stats.height, eye, target, fovY: Math.PI / 3.2, near: 0.1, far: 150,
-      sunDirection: this.sunDirection, sunColor: this.sunColor }) ?? 0;
-    // Changed-caster bounds come from this frame's batch uploads.
+    // Changed-caster bounds come from this frame's batch uploads. Fog updates
+    // first so reflection history sees this frame's media revision.
     if (this.volumetricFog) {
       const fog = this.volumetricFog;
       this.stats.uploadedBytes += fog.update(eye, target, Math.PI / 3.2, 0.1, 150,
@@ -1315,6 +1322,10 @@ export class Renderer {
           changedBounds: fog.localRejection ? this.batches.flatMap(batch => batch.fogChangedBounds) : null,
           shadowResolution: this.sunShadowOptions.resolution });
     }
+    this.stats.uploadedBytes += this.reflections?.update({ frame: this.stats.frames + 1, materialRevision: this.materialRevision,
+      width: this.stats.width, height: this.stats.height, eye, target, fovY: Math.PI / 3.2, near: 0.1, far: 150,
+      sunDirection: this.sunDirection, sunColor: this.sunColor, viewProjection: vp, previousViewProjection: this.lastViewProjection,
+      sceneMotion: this.batches.some(batch => batch.dirty), historyRevision: this.worldQueries!.historyRevision }) ?? 0;
     this.lastViewProjection = vp;
     const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → HDR surface → resolve' });
     const readTiming = !!this.querySet && !this.timingPending && this.stats.frames % 30 === 0;

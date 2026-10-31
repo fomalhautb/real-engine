@@ -1,4 +1,26 @@
 /** CPU contracts and bounded screen grid planning for world-space reflection rays. */
+
+/** Opt-in reprojected reflection history. Omitted means the deterministic single-frame path. */
+export interface ReflectionTemporalOptions {
+  /** History cap for rough reflections (roughness >= 0.5); 2..128. */
+  readonly maxHistoryFrames?: number;
+  /** History cap for mirror-like reflections (roughness <= 0.1); 1..maxHistoryFrames. */
+  readonly minHistoryFrames?: number;
+  /** Width, in neighborhood standard deviations, of the motion clamp box; 0.25..8. */
+  readonly clampSigma?: number;
+  /** Below this roughness a moving view reprojects by reflected-hit parallax first
+   * and falls back to surface motion; at or above it only surface motion is
+   * used. 0 disables the parallax candidate; 0..1. */
+  readonly parallaxRoughness?: number;
+}
+
+export interface ResolvedReflectionTemporalOptions {
+  readonly maxHistoryFrames: number;
+  readonly minHistoryFrames: number;
+  readonly clampSigma: number;
+  readonly parallaxRoughness: number;
+}
+
 export interface ReflectionsOptions {
   readonly pixelSpacing?: number;
   readonly maxAnchors?: number;
@@ -14,6 +36,8 @@ export interface ReflectionsOptions {
   readonly maxBytes?: number;
   readonly skyRadiance?: readonly [number, number, number];
   readonly textureLod?: number;
+  /** Reprojected history with per-frame rotated GGX samples; memory is counted in maxBytes. */
+  readonly temporal?: ReflectionTemporalOptions;
 }
 
 export interface ResolvedReflectionsOptions {
@@ -28,6 +52,8 @@ export interface ResolvedReflectionsOptions {
   readonly maxBytes: number;
   readonly skyRadiance: readonly [number, number, number];
   readonly textureLod: number;
+  /** Undefined when history is not configured. */
+  readonly temporal: ResolvedReflectionTemporalOptions | undefined;
 }
 
 export interface ReflectionGridPlan {
@@ -87,7 +113,78 @@ export function resolveReflectionsOptions(options: ReflectionsOptions = {}): Res
       1, 128 * 1024 * 1024, 'MAX_BYTES'),
     skyRadiance,
     textureLod: boundedNumber(options.textureLod === undefined ? 0 : options.textureLod, 0, 16, 'TEXTURE_LOD'),
+    temporal: resolveTemporal(options.temporal),
   });
+}
+
+function resolveTemporal(temporal: ReflectionTemporalOptions | undefined): ResolvedReflectionTemporalOptions | undefined {
+  if (temporal === undefined) return undefined;
+  if (!temporal || typeof temporal !== 'object' || Array.isArray(temporal)) throw new RangeError('REFLECTIONS_TEMPORAL');
+  const maxHistoryFrames = boundedInteger(temporal.maxHistoryFrames ?? 32, 2, 128, 'MAX_HISTORY_FRAMES');
+  return Object.freeze({
+    maxHistoryFrames,
+    minHistoryFrames: boundedInteger(temporal.minHistoryFrames ?? Math.min(8, maxHistoryFrames), 1, maxHistoryFrames,
+      'MIN_HISTORY_FRAMES'),
+    clampSigma: boundedNumber(temporal.clampSigma ?? 1.5, 0.25, 8, 'CLAMP_SIGMA'),
+    parallaxRoughness: boundedNumber(temporal.parallaxRoughness ?? 0.35, 0, 1, 'PARALLAX_ROUGHNESS'),
+  });
+}
+
+/** Roughness-aware history cap; WGSL `reflectionHistoryLimit` uses the same ramp. */
+export function reflectionHistoryLimit(roughness: number, temporal: ResolvedReflectionTemporalOptions): number {
+  boundedNumber(roughness, 0, 1, 'ROUGHNESS');
+  const t = Math.min(1, Math.max(0, (roughness - 0.1) / 0.4));
+  const ramp = t * t * (3 - 2 * t);
+  return Math.max(1, Math.round(temporal.minHistoryFrames + (temporal.maxHistoryFrames - temporal.minHistoryFrames) * ramp));
+}
+
+/** 32-bit integer avalanche shared with WGSL `reflectionHash`. */
+export function reflectionHash(value: number): number {
+  let x = value >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x7feb352d) >>> 0;
+  x = Math.imul(x ^ (x >>> 15), 0x846ca68b) >>> 0;
+  return (x ^ (x >>> 16)) >>> 0;
+}
+
+/** R2 sequence steps (1/plastic number and its square) in 0.32 fixed point. */
+const R2_STEP = [3242174889, 2447445414] as const;
+
+/** Per-anchor Cranley-Patterson rotation for `frame` as two 0.32 fixed-point
+ * words: a hashed anchor offset plus the R2 low-discrepancy step, so consecutive
+ * frames stratify the GGX lobe. Integer wrapping matches WGSL `reflectionRotation` exactly. */
+export function reflectionSampleRotation(frame: number, anchor: number): [number, number] {
+  boundedInteger(frame, 0, 0xffff_ffff, 'FRAME');
+  boundedInteger(anchor, 0, 0xffff_ffff, 'ANCHOR');
+  const seed = reflectionHash((Math.imul(anchor, 0x9e3779b9) ^ 0x5bd1e995) >>> 0);
+  const step = frame % 4096;
+  return [(seed + Math.imul(step, R2_STEP[0])) >>> 0, (reflectionHash(seed) + Math.imul(step, R2_STEP[1])) >>> 0];
+}
+
+/** GGX (u1 azimuth, u2 polar CDF) for sample `index` of `count`. Without a
+ * rotation this is the legacy fixed Hammersley set; with one it is the
+ * temporal set. u1 keeps 24 exact bits; u2 follows the float32 WGSL sum. */
+export function reflectionSampleCoordinates(index: number, count: number,
+  rotation?: readonly [number, number]): [number, number] {
+  boundedInteger(count, 1, 16, 'SAMPLES_PER_ANCHOR');
+  boundedInteger(index, 0, count - 1, 'SAMPLE_INDEX');
+  let reversed = 0;
+  for (let bit = 0; bit < 32; bit++) if (index & (1 << bit)) reversed |= 1 << (31 - bit);
+  reversed >>>= 0;
+  if (!rotation) return [reversed / 4294967296, (index + 0.5) / count];
+  const u1 = (((reversed + rotation[0]) >>> 0) >>> 8) / 16777216;
+  const sum = Math.fround(Math.fround((index + 0.5) / count) + (rotation[1] >>> 8) / 16777216);
+  return [u1, Math.min(sum - Math.floor(sum), 0.99999994)];
+}
+
+/** Previous-frame image of a reflected point across the receiving plane.
+ * `hitPrevious` is the reflected hit's previous position; the receiver plane
+ * passes through `receiverPrevious` with normal `normal`. A static hit gives a
+ * camera-independent virtual point, which is the reflected-hit parallax target. */
+export function reflectionVirtualPoint(hitPrevious: Vec3, receiverPrevious: Vec3, normal: Vec3): [number, number, number] {
+  const n = normalized(normal, 'NORMAL');
+  const offset = dot([hitPrevious[0] - receiverPrevious[0], hitPrevious[1] - receiverPrevious[1],
+    hitPrevious[2] - receiverPrevious[2]], n);
+  return [hitPrevious[0] - 2 * offset * n[0], hitPrevious[1] - 2 * offset * n[1], hitPrevious[2] - 2 * offset * n[2]];
 }
 
 /** Find the finest integer spacing that fits anchors, ray capacity and shared work units. */

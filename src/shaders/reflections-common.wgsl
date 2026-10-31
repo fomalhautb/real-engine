@@ -31,3 +31,11 @@ struct ReflectionSample { direction: vec4f, weight: vec4f }
 fn reflectionGeometry(hit: ReflectionHit) -> vec3f {
     return surfaceOctDecode(vec2f(hit.position.w, hit.uvInfo.w));
 }
+// World-query hits report the current position parametrically (origin + t*d)
+// and the previous one barycentrically, so a static surface differs only by
+// rounding. Motion within this relative tolerance is treated as none.
+fn reflectionHitMotion(hit: ReflectionHit) -> vec3f {
+    let delta = hit.previous.xyz - hit.position.xyz;
+    let extent = max(max(abs(hit.position.x), abs(hit.position.y)), max(abs(hit.position.z), hit.metric.x));
+    return select(delta, vec3f(0.0), all(abs(delta) <= vec3f(1e-5 * (1.0 + extent))));
+}

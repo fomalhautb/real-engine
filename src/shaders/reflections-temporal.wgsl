@@ -110,12 +110,15 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
     var mode = REFLECTION_MODE_NONE;
     var rejected = 0u;
     if (reflection.temporalState.y != 0u) {
-        let receiverPrevious = hit.previous.xyz;
-        if (reflection.temporalState.z == 0u && all(receiverPrevious == hit.position.xyz)) {
+        let receiverMotion = reflectionHitMotion(hit);
+        let receiverPrevious = hit.position.xyz + receiverMotion;
+        if (reflection.temporalState.z == 0u && all(receiverMotion == vec3f(0.0))) {
             // Stationary camera and receiver: the same anchor, without resampling.
             let record = historyIn[id.x];
             var reason = reflectionHistoryMatches(record, current);
-            if (reason == 0u && any(record.position.xyz != hit.position.xyz)) { reason = REFLECTION_REJECT_GEOMETRY; }
+            if (reason == 0u && any(abs(record.position.xyz - hit.position.xyz) > vec3f(1e-5 * (1.0 + hit.metric.x)))) {
+                reason = REFLECTION_REJECT_GEOMETRY;
+            }
             // Only scene motion can change static-view reflected content; rotated
             // samples straddling a static depth edge must not reset its history.
             if (reason == 0u && reflection.temporalState.w != 0u

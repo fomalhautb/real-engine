@@ -131,7 +131,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
         // Reflected-hit statistics drive parallax reprojection and history checks.
         let lobe = dot(sample.weight.xyz, vec3f(0.2126, 0.7152, 0.0722));
         weightSum += lobe; distanceSum += lobe * distance;
-        if (hit.identity.x != 0u) { motionSum += lobe * (hit.previous.xyz - hit.position.xyz); }
+        if (hit.identity.x != 0u) { motionSum += lobe * reflectionHitMotion(hit); }
         if (lobe > dominant) { dominant = lobe; result.reflected = vec4u(hit.identity.xyz, sampleIndex); }
     }
     let raw = clamp(sum, vec3f(0.0), vec3f(65504.0));

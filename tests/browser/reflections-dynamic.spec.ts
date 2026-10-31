@@ -1,6 +1,8 @@
 import { writeFileSync } from 'node:fs';
 import { expect, test, type Page, type TestInfo } from '@playwright/test';
+import type { ReflectionsOptions } from '../../src/reflections';
 import type { runReflectionsDynamicFixture } from './fixtures/reflections-dynamic';
+import { REFLECTION_QUALITY_OPTIONS } from './reflection-quality-options';
 
 test.use({ deviceScaleFactor: 1 });
 
@@ -9,9 +11,11 @@ type Stage = Result['stages'][number];
 const luminance = (rgb: readonly number[]) => 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
 const mean = (values: readonly number[]) => values.reduce((a, b) => a + b, 0) / values.length;
 
-/** Frames until the resolved center luminance stays within 10% of the step. */
+/** Frames until the displayed center luminance stays within 10% of the step. */
 function response(stage: Stage, before: number) {
   const series = stage.frames.map(frame => mean(frame.radiance.map(luminance)));
+  // History output before the display-only spatial filter (equal to series without it).
+  const unfiltered = stage.frames.map(frame => mean(frame.unfiltered.map(luminance)));
   const raw = stage.frames.map(frame => mean(frame.raw.map(luminance)));
   const settled = mean(raw.slice(-16));
   const step = settled - before;
@@ -20,26 +24,26 @@ function response(stage: Stage, before: number) {
   for (let k = series.length - 1; k >= 0 && within(series[k]); k--) t90 = k + 1;
   return { label: stage.label, roughness: stage.roughness, reason: stage.reason, before, settled, step,
     t90, residual: series.slice(0, 4).map(value => Math.abs(step) > 1e-6 ? (value - settled) / step : 0),
-    series, raw, firstReset: stage.frames[0].reason, firstModes: stage.frames[0].mode,
+    series, unfiltered, raw, firstResponse: mean(stage.frames[0].response), firstReset: stage.frames[0].reason, firstModes: stage.frames[0].mode,
     firstCounts: stage.frames[0].count, firstRejected: stage.frames[0].rejected, firstValid: stage.frames[0].valid,
     invalidPositions: stage.frames[0].position.filter((_, i) => !stage.frames[0].valid[i]) };
 }
 
-async function dynamicCase(page: Page, testInfo: TestInfo, roughPoseTarget: boolean) {
+async function dynamicCase(page: Page, testInfo: TestInfo, roughPoseTarget: boolean, reflections?: ReflectionsOptions) {
   test.setTimeout(600_000);
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto('/?trees=1');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async options => {
     window.__REAL_ENGINE__!.pause(true);
     window.__REAL_ENGINE__!.dispose();
     const fixture = await import('/tests/browser/fixtures/' + 'reflections-dynamic.ts') as {
       runReflectionsDynamicFixture: typeof runReflectionsDynamicFixture;
     };
-    return fixture.runReflectionsDynamicFixture({ motionFrames: 48, probeEvery: 4 });
-  });
+    return fixture.runReflectionsDynamicFixture({ motionFrames: 48, probeEvery: 4, reflections: options });
+  }, reflections);
   if (process.env.PLAYWRIGHT_GPU === 'hardware') expect(result.adapter.isFallbackAdapter).toBe(false);
   if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) expect(result.adapter.vendor.toLowerCase()).toBe(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR);
   const dynamicIds = [result.ids.character, result.ids.side, ...result.ids.boxes];
@@ -82,7 +86,8 @@ async function dynamicCase(page: Page, testInfo: TestInfo, roughPoseTarget: bool
     const before = previous ? mean(previous.frames.at(-1)!.radiance.map(luminance)) : luminance(result.sky);
     return response(stage, before);
   }).filter(curve => curve.label !== 'settle');
-  const report = JSON.stringify({ adapter: result.adapter, motion, seen: [...seen], curves, diagnostics: result.diagnostics }, null, 2);
+  const report = JSON.stringify({ adapter: result.adapter, reflections: reflections ?? null, motion, seen: [...seen], curves,
+    diagnostics: result.diagnostics }, null, 2);
   writeFileSync(testInfo.outputPath('reflection-dynamic-d02.json'), report);
   await testInfo.attach('reflection-dynamic-d02.json', { body: report, contentType: 'application/json' });
 
@@ -111,12 +116,13 @@ async function dynamicCase(page: Page, testInfo: TestInfo, roughPoseTarget: bool
       expect(curve('teleport-in', roughness).t90, `teleport-in@${roughness} T90`).toBeLessThanOrEqual(2);
     }
     // Material and history-version events reset every anchor: the first frame
-    // uses no history at all. At roughness 0.3 the four-sample estimate after a
-    // reset is noisy, so T90 is only gated on the smooth mirror.
+    // uses no history at all (checked before the display-only spatial filter). At
+    // roughness 0.3 the four-sample estimate after a reset is noisy, so T90 is
+    // only gated on the smooth mirror.
     for (const label of ['material-parameter', 'history-version']) {
       const stage = curve(label, roughness);
       expect(stage.firstCounts.every(count => count === 1), `${label}@${roughness} reset`).toBe(true);
-      expect(Math.abs(stage.series[0] - stage.raw[0]), `${label}@${roughness} first frame equals raw`)
+      expect(Math.abs(stage.unfiltered[0] - stage.raw[0]), `${label}@${roughness} first frame equals raw`)
         .toBeLessThanOrEqual(1e-6 * Math.max(1, stage.raw[0]));
       if (roughness < 0.1) expect(stage.t90, `${label}@${roughness} T90`).toBeLessThanOrEqual(2);
     }
@@ -138,8 +144,9 @@ test('off-screen skinned and rigid-body reflections follow world queries and his
 });
 
 test('D02 target: an object appearing inside a roughness-0.3 lobe reaches 90% within two frames', async ({ page }, testInfo) => {
-  // Measured gap, kept with its original threshold: without a reset contract the
-  // stationary history only follows through the noise-limited 3x3 clamp.
-  test.fail(true, 'known gap: rough-lobe pose response is bounded by the history cap');
-  await dynamicCase(page, testInfo, true);
+  // Original threshold, measured with the opt-in quality configuration: the
+  // lobe-motion response rebuilds the history from this frame's compatible
+  // neighbours where reflected content moved, and the spatial filter is on. The
+  // default configuration still needs 31 frames (docs/pending/reflections-quality.md).
+  await dynamicCase(page, testInfo, true, REFLECTION_QUALITY_OPTIONS);
 });

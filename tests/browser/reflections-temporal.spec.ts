@@ -1,8 +1,9 @@
 import { writeFileSync } from 'node:fs';
 import { expect, test, type Page, type TestInfo } from '@playwright/test';
 import { reflectionHistoryLimit, reflectionSampleCoordinates, reflectionSampleRotation,
-  resolveReflectionsOptions, sampleReflectionGgx } from '../../src/reflections';
+  resolveReflectionsOptions, sampleReflectionGgx, type ReflectionsOptions } from '../../src/reflections';
 import type { runReflectionsLadderFixture, runReflectionsParallaxFixture } from './fixtures/reflections-temporal';
+import { REFLECTION_QUALITY_OPTIONS } from './reflection-quality-options';
 
 test.use({ deviceScaleFactor: 1 });
 
@@ -73,24 +74,25 @@ function normalizedError(test: readonly Vec3[], expected: readonly Vec3[]): numb
   return error / Math.max(magnitude, 1e-6);
 }
 
-async function ladderCase(page: Page, testInfo: TestInfo, l05Targets: boolean) {
+async function ladderCase(page: Page, testInfo: TestInfo, l05Targets: boolean, reflections?: ReflectionsOptions) {
   test.setTimeout(600_000);
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto('/?trees=1');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async options => {
     window.__REAL_ENGINE__!.pause(true);
     window.__REAL_ENGINE__!.dispose();
     const fixture = await import('/tests/browser/fixtures/' + 'reflections-temporal.ts') as {
       runReflectionsLadderFixture: typeof runReflectionsLadderFixture;
     };
-    return fixture.runReflectionsLadderFixture({ warmup: 64, measured: 120 });
-  });
+    return fixture.runReflectionsLadderFixture({ warmup: 64, measured: 120, reflections: options });
+  }, reflections);
   if (process.env.PLAYWRIGHT_GPU === 'hardware') expect(result.adapter.isFallbackAdapter).toBe(false);
   if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) expect(result.adapter.vendor.toLowerCase()).toBe(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR);
-  const temporal = resolveReflectionsOptions({ temporal: { minHistoryFrames: 8, maxHistoryFrames: 32 } }).temporal!;
+  const temporal = resolveReflectionsOptions({ temporal: { minHistoryFrames: 8, maxHistoryFrames: 32, ...reflections?.temporal } }).temporal!;
+  const filtered = !!reflections?.spatialFilter;
   const perStrip = result.rois.length ? result.rois[0].pixels.length : 0;
   const strip = (anchorPosition: number) => Math.floor(anchorPosition / perStrip);
 
@@ -109,10 +111,11 @@ async function ladderCase(page: Page, testInfo: TestInfo, l05Targets: boolean) {
   }));
   expect(replicated).toBeGreaterThan(result.steps.length * result.traced.length * 0.6);
 
-  // 2. Stationary accumulation is the exact capped running mean of raw estimates.
+  // 2. Stationary accumulation is the exact capped running mean of raw estimates
+  // (before any display filter; without one the displayed radiance is that mean).
   result.traced.forEach((_, i) => {
     let mean = [0, 0, 0], count = 0;
-    const cap = reflectionHistoryLimit(result.roughness[i], temporal);
+    const cap = reflectionHistoryLimit(result.roughness[i], temporal, true);
     result.steps.forEach((step, k) => {
       const anchor = step.anchors[i];
       count = Math.min(count + 1, cap);
@@ -120,10 +123,12 @@ async function ladderCase(page: Page, testInfo: TestInfo, l05Targets: boolean) {
       expect(anchor.historyCount, `count step ${k} strip ${i}`).toBe(count);
       expect(anchor.historyMode).toBe(k === 0 ? 'none' : 'stationary');
       expect(anchor.historyClamped).toBe(false);
+      expect(anchor.historyResponse).toBe(0);
       for (let channel = 0; channel < 3; channel++) {
-        expect(Math.abs(anchor.radiance[channel] - mean[channel]), `mean step ${k} strip ${i}`)
+        expect(Math.abs(anchor.unfilteredRadiance[channel] - mean[channel]), `mean step ${k} strip ${i}`)
           .toBeLessThan(1e-4 * Math.max(1, mean[channel]));
       }
+      if (!filtered) expect(anchor.radiance).toEqual(anchor.unfilteredRadiance);
     });
   });
   // The first enable after construction keeps the oldest pending reason: no
@@ -138,10 +143,17 @@ async function ladderCase(page: Page, testInfo: TestInfo, l05Targets: boolean) {
     for (const anchor of anchors) {
       expect(anchor.valid).toBe(true);
       expect(anchor.historyMode).toBe('stationary');
-      expect(anchor.historyCount).toBe(reflectionHistoryLimit(roughness, temporal));
+      expect(anchor.historyCount).toBe(reflectionHistoryLimit(roughness, temporal, true));
     }
-    return { roughness, cap: reflectionHistoryLimit(roughness, temporal),
+    // World distance between neighbouring anchors of this strip (one anchor per pixel).
+    const spacing = Math.min(...anchors.slice(1).map((anchor, i) => Math.hypot(...anchor.position.map((value, axis) =>
+      value - anchors[i].position[axis]))).filter(distance => distance > 0));
+    const radius = anchors.reduce((sum, anchor) => sum + anchor.filterRadius, 0) / anchors.length;
+    return { roughness, cap: reflectionHistoryLimit(roughness, temporal, true), spacing, filterRadius: radius,
+      mirrorUnchanged: anchors.every(anchor => anchor.filterRadius < spacing
+        && anchor.radiance.every((value, channel) => value === anchor.unfilteredRadiance[channel])),
       temporalError: normalizedError(anchors.map(anchor => anchor.radiance as Vec3), expected),
+      unfilteredError: normalizedError(anchors.map(anchor => anchor.unfilteredRadiance as Vec3), expected),
       fixedError: normalizedError(fixed.map(anchor => anchor.radiance as Vec3), expected),
       referenceLuminance: expected.reduce((sum, value) => sum + luminance(value), 0) / expected.length };
   });
@@ -158,7 +170,8 @@ async function ladderCase(page: Page, testInfo: TestInfo, l05Targets: boolean) {
       coefficientOfVariation: deviation / mean, frames: series.length };
   });
   await testInfo.attach('reflection-temporal-ladder.json', { body: writeReport(testInfo.outputPath('reflection-temporal-ladder.json'),
-    { adapter: result.adapter, ladder, stability, diagnostics: result.diagnostics }), contentType: 'application/json' });
+    { adapter: result.adapter, reflections: reflections ?? null, ladder, stability, diagnostics: result.diagnostics }),
+    contentType: 'application/json' });
   for (const rung of ladder) {
     expect(rung.temporalError, `ladder ${rung.roughness} not worse than fixed`).toBeLessThanOrEqual(Math.max(rung.fixedError, 0.02));
   }
@@ -168,6 +181,15 @@ async function ladderCase(page: Page, testInfo: TestInfo, l05Targets: boolean) {
   expect(result.errors).toEqual([]);
   expect(result.ownedBytesAfterDispose).toBe(0);
   expect(pageErrors).toEqual([]);
+  if (filtered) {
+    // Mirror detail is not blurred: below one anchor spacing the kernel keeps
+    // every mirror-like anchor's value exactly; rough rungs are filtered.
+    for (const rung of ladder) {
+      if (rung.roughness <= 0.1) expect(rung.mirrorUnchanged, `mirror rung ${rung.roughness} unfiltered`).toBe(true);
+      if (rung.roughness >= 0.35) expect(rung.filterRadius, `rough rung ${rung.roughness} kernel`).toBeGreaterThan(rung.spacing);
+    }
+    expect(result.diagnostics?.spatialFilter).toMatchObject({ configured: true, active: true, iterations: 4, footprint: 0.3 });
+  }
   if (!l05Targets) return;
   for (const rung of ladder) {
     expect(rung.temporalError, `ladder ${rung.roughness} temporal error`).toBeLessThan(0.1);
@@ -183,10 +205,11 @@ test('temporal reflections accumulate exactly on a roughness ladder and improve 
 });
 
 test('L05 targets: ladder within 10% of a 4,096-sample reference and 120 static frames within 3%', async ({ page }, testInfo) => {
-  // Measured gap, kept with its original thresholds: four samples per anchor,
-  // an 8-32 frame history and no spatial filter (docs/pending/reflections.md).
-  test.fail(true, 'known gap: L05 error and 120-frame stability targets are not met');
-  await ladderCase(page, testInfo, true);
+  // Original thresholds, measured with the opt-in quality configuration: the
+  // edge-aware spatial filter and a 64-frame stationary history at four samples
+  // per anchor. The default configuration (no filter, 8-32 frames) still misses
+  // the r=0.5/0.7 error and r>=0.1 stability targets (docs/pending/reflections-quality.md).
+  await ladderCase(page, testInfo, true, REFLECTION_QUALITY_OPTIONS);
 });
 
 test('camera motion reprojects mirror history by reflected-hit parallax rather than surface motion', async ({ page }, testInfo) => {
@@ -196,20 +219,22 @@ test('camera motion reprojects mirror history by reflected-hit parallax rather t
   await page.goto('/?trees=1');
   await page.waitForFunction(() => window.__REAL_ENGINE__ || !document.getElementById('error')!.hidden);
   await expect(page.locator('#error')).toBeHidden();
-  const runs = await page.evaluate(async () => {
+  const runs = await page.evaluate(async quality => {
     window.__REAL_ENGINE__!.pause(true);
     window.__REAL_ENGINE__!.dispose();
     const fixture = await import('/tests/browser/fixtures/' + 'reflections-temporal.ts') as {
       runReflectionsParallaxFixture: typeof runReflectionsParallaxFixture;
     };
     const runs = [];
-    // Default parallax threshold, surface-motion-only history, and no history.
+    // Default parallax threshold, surface-motion-only history, and no history;
+    // then the default threshold with the opt-in quality configuration.
     for (const parallaxRoughness of [0.35, 0, null]) {
       runs.push(await fixture.runReflectionsParallaxFixture({ parallaxRoughness, settle: 40, frames: 16, step: 0.08 }));
     }
+    runs.push(await fixture.runReflectionsParallaxFixture({ parallaxRoughness: 0.35, settle: 40, frames: 16, step: 0.08, reflections: quality }));
     return runs;
-  });
-  const [parallax, surface, fixed] = runs;
+  }, REFLECTION_QUALITY_OPTIONS);
+  const [parallax, surface, fixed, quality] = runs;
   for (const run of runs) {
     if (process.env.PLAYWRIGHT_GPU === 'hardware') expect(run.adapter.isFallbackAdapter).toBe(false);
     if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) expect(run.adapter.vendor.toLowerCase()).toBe(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR);
@@ -221,7 +246,7 @@ test('camera motion reprojects mirror history by reflected-hit parallax rather t
   // the camera path and pixel grid, so their receivers must agree.
   const strip = (i: number) => Math.floor(i / parallax.perStrip);
   const references = parallax.frames.map((frame, k) => frame.anchors.map((anchor, i) => {
-    for (const run of [surface, fixed]) {
+    for (const run of [surface, fixed, quality]) {
       const other = run.frames[k].anchors[i];
       for (let axis = 0; axis < 3; axis++) expect(Math.abs(other.position[axis] - anchor.position[axis])).toBeLessThan(1e-4);
     }
@@ -240,7 +265,7 @@ test('camera motion reprojects mirror history by reflected-hit parallax rather t
     return { roughness, meanError: moving.reduce((sum, item) => sum + item.error, 0) / moving.length,
       maxError: Math.max(...moving.map(item => item.error)), perFrame };
   });
-  const report = { parallax: evaluate(parallax), surface: evaluate(surface), fixed: evaluate(fixed) };
+  const report = { parallax: evaluate(parallax), surface: evaluate(surface), fixed: evaluate(fixed), quality: evaluate(quality) };
   await testInfo.attach('reflection-temporal-parallax.json', { body: writeReport(testInfo.outputPath('reflection-temporal-parallax.json'), { adapter: parallax.adapter, step: 0.08,
     report: Object.fromEntries(Object.entries(report).map(([key, rungs]) => [key, rungs.map(rung => ({
       roughness: rung.roughness, meanError: rung.meanError, maxError: rung.maxError,
@@ -265,6 +290,13 @@ test('camera motion reprojects mirror history by reflected-hit parallax rather t
   // The mirror-like strip stays close to the high-sample reference while moving;
   // rougher strips at four samples are noise-limited (reported, not gated).
   expect(report.parallax[0].meanError, 'moving mirror-strip error').toBeLessThan(0.1);
+  // The opt-in quality configuration does not regress any moving strip. Mirror-like
+  // strips differ only through the longer stationary history of the settle phase
+  // (their kernel is below one anchor); rough strips gain from the filter.
+  parallax.roughness.forEach((roughness, index) => {
+    const quality = report.quality[index].meanError, plain = report.parallax[index].meanError;
+    expect(quality, `quality moving error ${roughness}`).toBeLessThanOrEqual(plain * 1.02 + 0.002);
+  });
   expect(pageErrors).toEqual([]);
 });
 

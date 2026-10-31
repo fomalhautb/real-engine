@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GpuOcclusion } from '../src/gpu-occlusion';
 import { identity } from '../src/math';
 import { planOcclusionPyramid } from '../src/occlusion';
+import { createTimestampQuerySet } from '../src/gpu-timestamp-span';
 
 type FakeBuffer = { id: number; destroyed: boolean; destroy(): void };
 type FakeTexture = { id: number; destroyed: boolean; createView(): object; destroy(): void };
@@ -264,20 +265,22 @@ describe('GPU occlusion ownership and frame state', () => {
     expect(tracked.bytes).toBe(0);
   });
 
-  it('writes timestamps only on the endpoints of a multi-mip sequence and both ends of a disabled pass', async () => {
+  it('writes full timestamp pairs only on the endpoints of a multi-mip sequence and both ends of a disabled pass', async () => {
     const device = new FakeDevice(), tracked = ledger();
     const occlusion = await GpuOcclusion.create(device as unknown as GPUDevice, {}, tracked.account);
     try {
       const borrowedDepth = depth();
-      const querySet = {} as GPUQuerySet;
+      // Slots 0..3 are measured; slot 4 is the reserved scratch slot.
+      const querySet = createTimestampQuerySet({ createQuerySet: () => ({}) } as unknown as GPUDevice, 4);
       const timestamps = { querySet, beginningOfPassWriteIndex: 2, endOfPassWriteIndex: 3 };
       occlusion.update(1, 32, 20, identity(), borrowedDepth);
       const active = encoder();
       occlusion.encodePyramid(active.gpu, timestamps);
       expect(active.passes).toBeGreaterThan(2);
-      expect(active.descriptors[0].timestampWrites).toEqual({ querySet, beginningOfPassWriteIndex: 2 });
+      // No pass writes only one end (that loses the device on Apple/Metal); the end a pass does not own goes to scratch.
+      expect(active.descriptors[0].timestampWrites).toEqual({ querySet, beginningOfPassWriteIndex: 2, endOfPassWriteIndex: 4 });
       for (const middle of active.descriptors.slice(1, -1)) expect(middle.timestampWrites).toBeUndefined();
-      expect(active.descriptors.at(-1)!.timestampWrites).toEqual({ querySet, endOfPassWriteIndex: 3 });
+      expect(active.descriptors.at(-1)!.timestampWrites).toEqual({ querySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 3 });
 
       occlusion.setEnabled(false);
       occlusion.update(2, 32, 20, identity(), borrowedDepth);

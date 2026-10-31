@@ -13,6 +13,7 @@ import { GpuGiEmissiveSampler } from './gpu-gi-emissive';
 import { GpuFinalGather, finalGatherSampleSource, type FinalGatherProbeResult } from './gpu-final-gather';
 import type { RasterReceiverBindings } from './surface-receivers';
 import type { Mat4 } from './math';
+import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 const constants = `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`;
 const giCommon = commonSource.replace('// GI_DISTANCE_CONSTANTS', constants);
@@ -269,7 +270,7 @@ export class GpuDiffuseGi {
       pass.setPipeline(pipeline); pass.setBindGroup(0, this.computeGroups[outputIndex]);
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     };
-    dispatch('generate world-space GI rays', this.generate, count, timing && { querySet: timing.querySet, beginningOfPassWriteIndex: timing.beginningOfPassWriteIndex });
+    dispatch('generate world-space GI rays', this.generate, count, timestampSpanStart(timing));
     let uploaded = this.queries.encodeTrace(encoder, count, 0, materialRevision);
     encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.primary, 0, count * WORLD_HIT_BYTES);
     dispatch('generate GI sun visibility rays', this.generateShadows, count);
@@ -285,7 +286,7 @@ export class GpuDiffuseGi {
       dispatch('validate receiver-directed GI support', this.validateVisibility, this.options.probeCount);
     }
     dispatch('integrate GI directional visibility', this.integrateVisibility, this.options.probeCount * GI_DISTANCE_CELLS,
-      timing && { querySet: timing.querySet, endOfPassWriteIndex: timing.endOfPassWriteIndex });
+      timestampSpanEnd(timing));
     this.frame = frame;
     this.currentIndex = outputIndex;
     this.historyUpdates = this.multiBounce ? this.historyUpdates + 1 : 1;

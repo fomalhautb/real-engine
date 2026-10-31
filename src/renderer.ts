@@ -37,6 +37,7 @@ import { meshWorldUnitsPerUv, modelStretch, textureViewDemand } from './texture-
 import type { TextureStreamDemand, TextureStreamingOptions } from './texture-stream-types';
 import { GpuSurfaceReceivers } from './gpu-surface-receivers';
 import { decodeFinalGatherDiagnostics, decodeFinalGatherDiagnosticSurfaces, decodeFinalGatherCoverage, validateFinalGatherDiagnosticPoints } from './final-gather-diagnostics';
+import { createTimestampQuerySet, timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 0, length = values.length): boolean {
@@ -320,7 +321,7 @@ export class Renderer {
     this.shadowFrameLayout = shadowFrameLayout;
     this.setSun({ direction: this.sunDirection, color: this.sunColor });
     if (timing) {
-      this.querySet = device.createQuerySet({ type: 'timestamp', count: this.timestampCount });
+      this.querySet = createTimestampQuerySet(device, this.timestampCount);
       this.queryResolve = this.buffer('timestamp resolve', this.timestampCount * 8, GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC);
       this.queryRead = this.buffer('timestamp readback', this.timestampCount * 8, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     }
@@ -1324,12 +1325,10 @@ export class Renderer {
   private encodeGeometrySelection(encoder: GPUCommandEncoder): void {
     const timestamp = this.timestamp(this.worldQueries ? 10 : 8);
     if (!this.hasGeometryStream) { this.geometryLod!.encode(encoder, timestamp); return; }
-    const begin = encoder.beginComputePass({ label: 'all geometry selection begin', timestampWrites: timestamp
-      ? { querySet: timestamp.querySet, beginningOfPassWriteIndex: timestamp.beginningOfPassWriteIndex } : undefined }); begin.end();
+    const begin = encoder.beginComputePass({ label: 'all geometry selection begin', timestampWrites: timestampSpanStart(timestamp) }); begin.end();
     this.geometryLod!.encode(encoder);
     for (const batch of this.batches) batch.stream?.runtime.selection.encode(encoder);
-    const end = encoder.beginComputePass({ label: 'all geometry selection end', timestampWrites: timestamp
-      ? { querySet: timestamp.querySet, endOfPassWriteIndex: timestamp.endOfPassWriteIndex } : undefined }); end.end();
+    const end = encoder.beginComputePass({ label: 'all geometry selection end', timestampWrites: timestampSpanEnd(timestamp) }); end.end();
   }
   private encodeShadow(encoder: GPUCommandEncoder): void {
     const pass = encoder.beginRenderPass({ label: 'sun shadow', colorAttachments: [], timestampWrites: this.timestamp(2),
@@ -1339,12 +1338,10 @@ export class Renderer {
   }
   private encodeGeometryRecovery(encoder: GPUCommandEncoder): void {
     const timestamp = this.timestamp(this.occlusionTimestampIndex + 2);
-    const begin = encoder.beginComputePass({ label: 'geometry visibility recovery begin', timestampWrites: timestamp
-      ? { querySet: timestamp.querySet, beginningOfPassWriteIndex: timestamp.beginningOfPassWriteIndex } : undefined }); begin.end();
+    const begin = encoder.beginComputePass({ label: 'geometry visibility recovery begin', timestampWrites: timestampSpanStart(timestamp) }); begin.end();
     this.geometryLod!.encodeRecovery(encoder);
     for (const batch of this.batches) batch.stream?.runtime.selection.encodeRecovery(encoder);
-    const end = encoder.beginComputePass({ label: 'geometry visibility recovery end', timestampWrites: timestamp
-      ? { querySet: timestamp.querySet, endOfPassWriteIndex: timestamp.endOfPassWriteIndex } : undefined }); end.end();
+    const end = encoder.beginComputePass({ label: 'geometry visibility recovery end', timestampWrites: timestampSpanEnd(timestamp) }); end.end();
   }
   private encodeSurface(encoder: GPUCommandEncoder, recovery = false): void {
     const pass = encoder.beginRenderPass({ label: recovery ? 'recovered PBR and velocity' : 'PBR and velocity',

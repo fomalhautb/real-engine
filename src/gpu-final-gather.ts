@@ -14,6 +14,7 @@ import type { RasterReceiverBindings } from './surface-receivers';
 import type { GpuWorldQuery } from './gpu-world-query';
 import { WORLD_HIT_BYTES, WORLD_RAY_BYTES } from './world-query';
 import { DEFORMED_VERTEX_BYTES, type MeshData } from './geometry';
+import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
@@ -525,19 +526,19 @@ export class GpuFinalGather {
         pass.setPipeline(this.pipelines[name]); pass.setBindGroup(0, group);
         pass.dispatchWorkgroups(Math.ceil(count / workgroupSize)); pass.end();
       };
-      const begin = timing && { querySet: timing.querySet, beginningOfPassWriteIndex: timing.beginningOfPassWriteIndex };
+      const begin = timestampSpanStart(timing);
       let uploaded = 0;
       if (this.options.receiver === 'raster') {
         if (!this.rasterReceiverGroup) throw new Error('FINAL_GATHER_RASTER_BINDINGS');
         dispatch('loadRasterReceivers', grid.anchorCount, this.rasterReceiverGroup, begin);
         if (this.supplemental.anchorCount) {
           dispatch('clearSupplementalReceivers', this.supplemental.anchorCount, this.coverageGroups.clear,
-            coverageTiming && { querySet: coverageTiming.querySet, beginningOfPassWriteIndex: coverageTiming.beginningOfPassWriteIndex });
+            timestampSpanStart(coverageTiming));
           dispatch('loadSupplementalReceivers', this.supplemental.tileCount, this.rasterReceiverGroup);
           dispatch('scanSupplementalTiles', this.supplemental.tileCount, this.coverageGroups.tiles, undefined, 128);
           dispatch('scanSupplementalBlocks', 128, this.coverageGroups.blocks, undefined, 128);
           dispatch('scatterSupplementalReceivers', this.supplemental.tileCount, this.coverageScatterGroups[output],
-            coverageTiming && { querySet: coverageTiming.querySet, endOfPassWriteIndex: coverageTiming.endOfPassWriteIndex });
+            timestampSpanEnd(coverageTiming));
         }
         else if (coverageTiming) encoder.beginComputePass({ label: 'empty supplemental receivers', timestampWrites: coverageTiming }).end();
       } else {
@@ -566,9 +567,9 @@ export class GpuFinalGather {
       if (retainedCount) dispatch('updateSupplementalHistory', retainedCount, this.supplementalHistoryGroups[output]);
       dispatch('accumulate', anchors, this.accumulateGroups[output]);
       dispatch('denoise', anchors, this.denoiseGroups[output],
-        !retainedCount && timing ? { querySet: timing.querySet, endOfPassWriteIndex: timing.endOfPassWriteIndex } : undefined);
+        !retainedCount ? timestampSpanEnd(timing) : undefined);
       if (retainedCount) dispatch('filterSupplementalHistory', retainedCount, this.supplementalFilterGroups[output],
-        timing && { querySet: timing.querySet, endOfPassWriteIndex: timing.endOfPassWriteIndex });
+        timestampSpanEnd(timing));
       this.outputIndex = output; this.encodedFrame = this.frame;
       this.historyUpdates = Math.min(this.options.maxHistory, this.historyUpdates + 1);
       return uploaded;

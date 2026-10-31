@@ -3,6 +3,7 @@ import { packGeometryLod, type PackedGeometryLod } from './geometry-lod-data';
 import type { SceneBatch } from './contracts';
 import type { Mat4 } from './math';
 import { occlusionTestSource, type GpuOcclusion } from './gpu-occlusion';
+import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 export interface GeometryLodSettings {
   maxErrorPixels?: number;
@@ -165,9 +166,7 @@ export class GpuGeometryLod {
   }
   encode(encoder: GPUCommandEncoder, timestamp?: GPUComputePassTimestampWrites): void {
     for (const entry of this.entries.values()) encoder.clearBuffer(entry.binding.arguments);
-    const select = encoder.beginComputePass({ label: 'GPU LOD selection and index compaction', timestampWrites: timestamp ? {
-      querySet: timestamp.querySet, beginningOfPassWriteIndex: timestamp.beginningOfPassWriteIndex,
-    } : undefined });
+    const select = encoder.beginComputePass({ label: 'GPU LOD selection and index compaction', timestampWrites: timestampSpanStart(timestamp) });
     select.setPipeline(this.select);
     if (this.occlusion) select.setBindGroup(1, this.occlusion.previousGroup);
     for (const entry of this.entries.values()) {
@@ -175,9 +174,7 @@ export class GpuGeometryLod {
       select.setBindGroup(0, entry.compute); select.dispatchWorkgroups(Math.ceil(entry.packed.clusterCount * entry.count / 64));
     }
     select.end();
-    const finalize = encoder.beginComputePass({ label: 'LOD indirect argument guard', timestampWrites: timestamp ? {
-      querySet: timestamp.querySet, endOfPassWriteIndex: timestamp.endOfPassWriteIndex,
-    } : undefined });
+    const finalize = encoder.beginComputePass({ label: 'LOD indirect argument guard', timestampWrites: timestampSpanEnd(timestamp) });
     finalize.setPipeline(this.finalize);
     if (this.occlusion) finalize.setBindGroup(1, this.occlusion.previousGroup);
     for (const entry of this.entries.values()) {

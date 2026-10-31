@@ -3,6 +3,7 @@ import baseSource from './shaders/occlusion-pyramid.wgsl?raw';
 import reduceSource from './shaders/occlusion-reduce.wgsl?raw';
 import { planOcclusionPyramid, resolveOcclusionOptions, type OcclusionOptions, type OcclusionPyramidPlan } from './occlusion';
 import type { Mat4 } from './math';
+import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 export const occlusionTestSource = testSource;
 /** Previous depth predicts the first draw; current depth alone makes final exclusions.
@@ -136,10 +137,8 @@ export class GpuOcclusion {
     if (this.disposed || !this.grid || this.frame === this.encodedFrame) throw new Error('OCCLUSION_FRAME');
     const levels = this.activeForView ? this.grid.mipLevelCount : 1;
     for (let level = 0; level < levels; level++) {
-      const pass = encoder.beginComputePass({ label: 'occlusion maximum depth ' + level, timestampWrites: timestamp && (level === 0 || level === levels - 1) ? {
-        querySet: timestamp.querySet, ...(level === 0 ? { beginningOfPassWriteIndex: timestamp.beginningOfPassWriteIndex } : {}),
-        ...(level === levels - 1 ? { endOfPassWriteIndex: timestamp.endOfPassWriteIndex } : {}),
-      } : undefined });
+      const pass = encoder.beginComputePass({ label: 'occlusion maximum depth ' + level, timestampWrites: levels === 1 ? timestamp
+        : level === 0 ? timestampSpanStart(timestamp) : level === levels - 1 ? timestampSpanEnd(timestamp) : undefined });
       if (this.activeForView) {
         pass.setPipeline(level === 0 ? this.basePipeline : this.reducePipeline);
         pass.setBindGroup(0, level === 0 ? this.baseGroups[this.writeIndex] : this.reduceGroups[this.writeIndex][level - 1]);

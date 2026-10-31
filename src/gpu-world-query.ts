@@ -9,6 +9,7 @@ import { residentMesh, type RenderBatch, type StreamedSceneBatch } from './contr
 import { validateMeshColors, type MeshData } from './geometry';
 import type { GpuMaterial } from './gpu-material';
 import type { MaterialProgram } from './material';
+import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 import { decodeWorldHits, packWorldRays, resolveWorldQueryOptions, WORLD_HIT_BYTES, WORLD_RAY_BYTES,
   type WorldHitGeometry, type WorldQueryOptions, type WorldQueryResult, type WorldRay } from './world-query';
 
@@ -433,11 +434,8 @@ export class GpuWorldQuery {
       encoder.beginComputePass({ label: 'cached world BVH refit', timestampWrites: timing }).end();
     }
     const timestampForPass = (): GPUComputePassTimestampWrites | undefined => {
-      const writes = timing && (first || remaining === 1) ? {
-        querySet: timing.querySet,
-        beginningOfPassWriteIndex: first ? timing.beginningOfPassWriteIndex : undefined,
-        endOfPassWriteIndex: remaining === 1 ? timing.endOfPassWriteIndex : undefined,
-      } : undefined;
+      const writes = first && remaining === 1 ? timing
+        : first ? timestampSpanStart(timing) : remaining === 1 ? timestampSpanEnd(timing) : undefined;
       first = false; remaining--;
       return writes;
     };

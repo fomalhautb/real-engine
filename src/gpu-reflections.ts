@@ -13,6 +13,7 @@ import type { GpuWorldQuery } from './gpu-world-query';
 import type { GpuDiffuseGi } from './gpu-diffuse-gi';
 import { diffuseGiQueryParameterSlots } from './diffuse-gi';
 import { WORLD_HIT_BYTES } from './world-query';
+import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 export const reflectionSurfaceSource = common + '\n' + sampleSource;
 const PARAMETER_BYTES = 176, ANCHOR_BYTES = 192, SAMPLE_BYTES = 32, PROBE_LIMIT = 1024;
@@ -168,7 +169,7 @@ export class GpuReflections {
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     };
     dispatch('generateCamera', grid.anchorCount, this.groups.generateCamera,
-      timing && { querySet: timing.querySet, beginningOfPassWriteIndex: timing.beginningOfPassWriteIndex });
+      timestampSpanStart(timing));
     let uploaded = this.queries.encodeTrace(encoder, grid.anchorCount, this.options.textureLod, this.materialRevision);
     encoder.copyBufferToBuffer(this.queries.hitBuffer, 0, this.cameraHits, 0, grid.anchorCount * WORLD_HIT_BYTES);
     dispatch('generateReflections', grid.rayCount, this.groups.generateReflections);
@@ -177,7 +178,7 @@ export class GpuReflections {
     dispatch('generateShadows', grid.rayCount, this.groups.generateShadows);
     uploaded += this.queries.encodeTrace(encoder, grid.rayCount, this.options.textureLod, this.materialRevision);
     dispatch('integrate', grid.anchorCount, this.integrateGroups[this.gi?.lightingIndex ?? 0],
-      timing && { querySet: timing.querySet, endOfPassWriteIndex: timing.endOfPassWriteIndex });
+      timestampSpanEnd(timing));
     this.encodedFrame = this.frame; return uploaded;
   }
   async probe(indices: readonly number[]): Promise<ReflectionProbeResult> {

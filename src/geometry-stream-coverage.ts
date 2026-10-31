@@ -1,5 +1,6 @@
 import { validateGeometryStreamDirectory } from './geometry-stream-directory';
 import type { GeometryStreamDirectory } from './geometry-stream-types';
+import type { GeometryHierarchy } from './geometry-hierarchy-types';
 
 /** Exact structural coverage of one instance's cut over directory metadata. */
 export interface GeometryCutCoverage {
@@ -57,4 +58,50 @@ export function geometryCutCoverage(directoryInput: GeometryStreamDirectory, sel
     }
   }
   return { lod0Clusters, uncovered, overlapping, partialGroups, selectedClusters };
+}
+
+/** Edge topology of the triangles a cut actually draws. */
+export interface GeometryCutWatertightness {
+  readonly triangles: number;
+  /** Directed edges whose reverse is absent after welding equal positions: cracks or open borders. */
+  readonly boundaryEdges: number;
+  /** Directed edges used more than once: folds, overlaps or duplicated surface. */
+  readonly repeatedEdges: number;
+}
+
+/** Welds vertices with bit-identical positions, then requires every directed
+ * edge of the cut to appear exactly once with its reverse exactly once. For a
+ * closed source surface this proves the drawn cut is crack-free regardless of
+ * screen error; open sources report their own borders. Work is bounded by the
+ * cut's triangle count. */
+export function geometryCutWatertightness(hierarchy: Pick<GeometryHierarchy, 'source' | 'clusters'>, selected: Iterable<number>): GeometryCutWatertightness {
+  const source = hierarchy.source, view = new DataView(source.vertices), canonical = new Map<string, number>();
+  const weld = (vertex: number) => {
+    const offset = vertex * 80, key = `${view.getUint32(offset, true)},${view.getUint32(offset + 4, true)},${view.getUint32(offset + 8, true)}`;
+    let id = canonical.get(key);
+    if (id === undefined) { id = canonical.size; canonical.set(key, id); }
+    return id;
+  };
+  const edges = new Map<number, number>();
+  let triangles = 0;
+  for (const id of selected) {
+    const cluster = hierarchy.clusters[id];
+    if (!cluster) throw new RangeError('GEOMETRY_CUT_WATERTIGHT_CLUSTER');
+    triangles += cluster.triangles.length / 3;
+    if (triangles > 4_000_000) throw new RangeError('GEOMETRY_CUT_WATERTIGHT_BUDGET');
+    for (let t = 0; t < cluster.triangles.length; t += 3) {
+      const v = [0, 1, 2].map(k => weld(cluster.vertices[cluster.triangles[t + k]]));
+      for (let k = 0; k < 3; k++) {
+        const key = v[k] * 0x4000000 + v[(k + 1) % 3];
+        edges.set(key, (edges.get(key) ?? 0) + 1);
+      }
+    }
+  }
+  let boundaryEdges = 0, repeatedEdges = 0;
+  for (const [key, count] of edges) {
+    if (count > 1) repeatedEdges++;
+    const a = Math.floor(key / 0x4000000), b = key % 0x4000000;
+    if (!edges.has(b * 0x4000000 + a)) boundaryEdges++;
+  }
+  return { triangles, boundaryEdges, repeatedEdges };
 }

@@ -41,6 +41,8 @@ export interface StreamedGalleryObject {
   readonly name: string;
   readonly primitiveKey: string;
   readonly directory: GeometryStreamDirectory;
+  /** Offline build output, retained for diagnostics and the full-detail reference. */
+  readonly hierarchy: GeometryHierarchy;
   readonly model: Mat4;
   readonly center: Vec3;
   readonly radius: number;
@@ -217,9 +219,12 @@ export class StreamedGalleryScene {
     for (let index = 0; index < options.objects; index++) {
       const seed = (options.seed + Math.imul(index + 1, 0x9e3779b1)) >>> 0;
       const mesh = streamedGalleryMesh(seed, options.around, options.across);
-      const key = `streamed-gallery-v1/${options.seed}/${options.around}x${options.across}/${index}`;
+      const key = `streamed-gallery-v2/${options.seed}/${options.around}x${options.across}/${index}`;
+      // Groups of 8 clusters leave fewer locked group borders than the default 4,
+      // so far fewer groups terminate early: on these meshes roots drop from
+      // ~15% to under 7% of source triangles, leaving the pool for detail.
       const hierarchy = await buildGeometryHierarchy({ primitiveKey: key, mesh, coverage: 'opaque' },
-        { maxClusterTriangles: 96, simplifyRatio: 0.5, maxLevels: 12 });
+        { maxClusterTriangles: 96, groupSize: 8, simplifyRatio: 0.5, maxLevels: 16 });
       const encoded = await encodeGeometryPages(hierarchy, { maxPageBytes: options.maxPageBytes });
       const directory = await buildGeometryStreamDirectory(hierarchy, encoded);
       const room = Math.floor(index / PER_ROOM), [x, z] = SPOT_OFFSETS[index % PER_ROOM];
@@ -240,7 +245,7 @@ export class StreamedGalleryScene {
       const layout = geometryGpuPoolLayout(entry.directory);
       const uniqueResidentBytes = entry.directory.clusters.reduce((sum, cluster) =>
         sum + cluster.vertexCount * GEOMETRY_GPU_VERTEX_BYTES + cluster.triangleCount * 12, 0);
-      return { name: `gallery-${index}`, primitiveKey: entry.key, directory: entry.directory, model: entry.model, center: entry.center,
+      return { name: `gallery-${index}`, primitiveKey: entry.key, directory: entry.directory, hierarchy: entry.hierarchy, model: entry.model, center: entry.center,
         radius: entry.radius, room: entry.room, identityColor: streamedGalleryIdentityColor(index),
         sourceTriangles: entry.directory.sourceTriangleCount, uniqueResidentBytes, slotPaddedBytes: layout.fullBytes };
     });

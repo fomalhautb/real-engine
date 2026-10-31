@@ -3,15 +3,16 @@ import { buildGeometryHierarchy } from '../src/geometry-hierarchy';
 import { encodeGeometryPages } from '../src/geometry-pages';
 import { buildGeometryStreamDirectory } from '../src/geometry-stream-directory';
 import { GeometryStreamCut } from '../src/geometry-stream-cut';
-import { geometryCutCoverage } from '../src/geometry-stream-coverage';
+import { geometryCutCoverage, geometryCutWatertightness } from '../src/geometry-stream-coverage';
 import { streamedGalleryMesh } from '../src/geometry-demo-streamed-scene';
 
-async function fixture() {
+async function build(groupSize = 4) {
   const hierarchy = await buildGeometryHierarchy({ primitiveKey: 'coverage/gallery', mesh: streamedGalleryMesh(7, 64, 16), coverage: 'opaque' },
-    { maxClusterTriangles: 96, simplifyRatio: 0.5, maxLevels: 12 });
+    { maxClusterTriangles: 96, groupSize, simplifyRatio: 0.5, maxLevels: 12 });
   const encoded = await encodeGeometryPages(hierarchy, { maxPageBytes: 16384 });
-  return buildGeometryStreamDirectory(hierarchy, encoded);
+  return { hierarchy, directory: await buildGeometryStreamDirectory(hierarchy, encoded) };
 }
+async function fixture() { return (await build()).directory; }
 
 describe('geometryCutCoverage', () => {
   it('accepts every CPU reference cut across thresholds, views and partial residency', async () => {
@@ -68,5 +69,26 @@ describe('geometryCutCoverage', () => {
     expect(() => geometryCutCoverage(directory, [-1])).toThrow('GEOMETRY_CUT_COVERAGE_CLUSTER');
     expect(() => geometryCutCoverage(directory, [0.5])).toThrow('GEOMETRY_CUT_COVERAGE_CLUSTER');
     expect(() => geometryCutCoverage(directory, [directory.roots[0], directory.roots[0]])).toThrow('GEOMETRY_CUT_COVERAGE_DUPLICATE');
+  });
+
+  // Simplification may pinch a coarse level into a non-manifold edge (four
+  // triangles on one edge, observed in the 56-triangle root of this torus); that
+  // closes the surface but repeats directed edges. Cracks are boundary edges.
+  it('proves every reference cut of a closed surface is crack-free and detects removed or duplicated surface', async () => {
+    for (const groupSize of [4, 8]) {
+      const { hierarchy, directory } = await build(groupSize), planner = new GeometryStreamCut(directory);
+      const all = new Set(directory.pages.map(page => page.id)), roots = new Set(directory.rootPages);
+      const half = new Set([...roots, ...directory.pages.filter((_, index) => index % 2 === 0).map(page => page.id)]);
+      for (const resident of [all, roots, half]) for (const maxErrorPixels of [0, 1, 8, 1e9]) {
+        const plan = planner.plan(resident, { eye: [0.5, 0.6, 4], near: 0.1, projectionScale: 900, maxErrorPixels });
+        const result = geometryCutWatertightness(hierarchy, plan.selectedClusters);
+        expect(result.boundaryEdges).toBe(0);
+        if (resident === all && maxErrorPixels === 0) expect(result.repeatedEdges).toBe(0);
+      }
+      const leaves = hierarchy.clusters.map((cluster, id) => ({ cluster, id })).filter(entry => entry.cluster.level === 0).map(entry => entry.id);
+      expect(geometryCutWatertightness(hierarchy, leaves)).toEqual({ triangles: 64 * 16 * 2, boundaryEdges: 0, repeatedEdges: 0 });
+      expect(geometryCutWatertightness(hierarchy, leaves.slice(1)).boundaryEdges).toBeGreaterThan(0);
+      expect(geometryCutWatertightness(hierarchy, [...leaves, leaves[0]]).repeatedEdges).toBeGreaterThan(0);
+    }
   });
 });

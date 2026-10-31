@@ -73,6 +73,10 @@ describe('streamed gallery scene', () => {
     expect(forward(before)).toBe(1);
     expect(forward(after)).toBe(-1);
     expect(() => scene.pose('walk', -1)).toThrow('STREAMED_GALLERY_TIME');
+    // The walk reaches its far-wall hold exactly at walkSeconds.
+    expect(scene.pose('walk', scene.walkSeconds).eye[2]).toBeCloseTo(scene.rooms * 12 - 2, 9);
+    expect(scene.pose('walk', scene.walkSeconds - 0.5).eye[2]).toBeLessThan(scene.rooms * 12 - 2);
+    expect(scene.pose('walk', scene.walkSeconds + 5).eye[2]).toBeCloseTo(scene.rooms * 12 - 2, 9);
     const colors = new Set(Array.from({ length: 48 }, (_, index) => streamedGalleryIdentityColor(index).join(',')));
     expect(colors.size).toBe(48);
   });

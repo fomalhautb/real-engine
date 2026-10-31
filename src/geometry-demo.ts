@@ -89,9 +89,12 @@ function advanceCamera(dt: number): void {
   if (trajectory === 'manual') return;
   phase += dt;
   if (mode === 'streamed' && streamed) {
+    // The walk ends facing the far wall; restart it at the entrance as a camera cut.
+    const restart = trajectory === 'walk' && phase > streamed.walkSeconds;
+    if (restart) phase = 0;
     const pose = streamed.pose(trajectory as StreamedGalleryTrajectory, phase);
     streamEye = [...pose.eye]; streamTarget = [...pose.target];
-    if (pose.discontinuity) lastDiscontinuity = renderer?.stats.frames ?? 0;
+    if (pose.discontinuity || restart) lastDiscontinuity = renderer?.stats.frames ?? 0;
     return;
   }
   yaw = trajectory === 'dolly' ? 0.35 : 0.35 + phase * 0.27;

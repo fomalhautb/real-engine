@@ -96,6 +96,7 @@ const WALL_HEIGHT = 4.2;
 const DOOR_WIDTH = 2.6;
 const DOOR_HEIGHT = 3;
 const PER_ROOM = 8;
+const WALK_SPEED = 1.6;
 // Offsets inside a room; z is measured from the room's entrance wall. The
 // central aisle |x| < 1.2 stays clear for the walk and turn trajectories.
 const SPOT_OFFSETS: readonly [number, number][] = [[-6.6, 3], [-2.6, 3], [2.6, 3], [6.6, 3], [-6.6, 8.6], [-2.6, 8.6], [2.6, 8.6], [6.6, 8.6]];
@@ -192,6 +193,9 @@ export class StreamedGalleryScene {
     this.options = options; this.objects = objects; this.streamed = streamed; this.reference = reference;
     this.accounting = accounting; this.runtimeBudget = runtimeBudget; this.rooms = Math.ceil(objects.length / PER_ROOM);
   }
+
+  /** Time at which the walk reaches the far wall; later walk poses hold there. */
+  get walkSeconds(): number { return (this.rooms * ROOM_DEPTH - 0.5) / WALK_SPEED; }
 
   /** Source-free paged sculptures with fixed query proxies, plus resident walls. */
   get batches(): RenderBatch[] { return this.streamed; }
@@ -328,7 +332,7 @@ export class StreamedGalleryScene {
     switch (trajectory) {
       case 'walk': {
         // Enter room 0 and walk the central aisle through every doorway at 1.6 m/s.
-        const z = Math.min(depth - 2, -1.5 + 1.6 * t), sway = 0.9 * Math.sin(t * 0.7);
+        const z = Math.min(depth - 2, -1.5 + WALK_SPEED * t), sway = 0.9 * Math.sin(t * 0.7);
         return { eye: [0.4 * Math.sin(t * 0.45), eyeHeight, z], target: [sway * 3, 1.2, z + 6], discontinuity: false };
       }
       case 'zoom': {

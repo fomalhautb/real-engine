@@ -21,7 +21,7 @@ export async function removeOwnTemporary(temporary, targetParent, output) {
 /** Claim the destination exclusively. The manifest is the completion marker;
  * it is linked last, since portable Node APIs lack no-replace directory rename.
  * Readers must require the manifest, not just the presence of a directory. */
-export async function publishDirectory(temporary, output) {
+export async function publishDirectory(temporary, output, { hardLinkFiles = false } = {}) {
   const source = resolve(temporary), destination = resolve(output);
   const directories = [], files = [];
   const visit = async (folder, prefix = '') => {
@@ -43,7 +43,9 @@ export async function publishDirectory(temporary, output) {
     }
     for (const name of [...files.filter(name => name !== 'manifest.json'), 'manifest.json']) {
       const path = join(destination, name);
-      if (name === 'manifest.json') await link(join(source, name), path);
+      // Hard links (same filesystem, sibling staging) publish multi-GB payloads
+      // without a second copy; link() also refuses to replace an existing file.
+      if (name === 'manifest.json' || hardLinkFiles) await link(join(source, name), path);
       else await copyFile(join(source, name), path, constants.COPYFILE_EXCL);
       createdFiles.push(path);
     }

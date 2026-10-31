@@ -603,10 +603,12 @@ export class GpuWorldQuery {
    * maxWorkUnits limits this trace. An explicit partition adds a separate bounded
    * supplemental budget without changing primary quotas or ray/hit indices.
    * Reversed material support changes only single-sided eligibility; its hits
-   * are not receiver-origin nearest shading hits. Returns queued uniform bytes. */
+   * are not receiver-origin nearest shading hits. An optional timestamp pair spans
+   * this trace's own passes (first pass beginning to last pass end; both ends are
+   * written on every timed pass). Returns queued uniform bytes. */
   encodeTrace(encoder: GPUCommandEncoder, count: number, textureLod: number, materialRevision: number,
     maxWorkUnits = this.options.maxTotalWorkUnits, partition?: WorldQueryWorkPartition,
-    facePolicy: WorldQueryFacePolicy = 'material'): number {
+    facePolicy: WorldQueryFacePolicy = 'material', timing?: GPUComputePassTimestampWrites): number {
     if (this.disposed || !this.frame) throw new Error('WORLD_QUERY_NO_RENDERED_FRAME');
     if (facePolicy !== 'material' && facePolicy !== 'reverse-material-support') throw new Error('WORLD_QUERY_FACE_POLICY');
     this.validateTopology();
@@ -660,10 +662,13 @@ export class GpuWorldQuery {
     let shared: GPUComputePassEncoder | undefined;
     // WebGPU orders dispatches and their storage writes within one pass, so the
     // single-pass encoding keeps closest-hit ordering without a pass per batch.
-    const begin = (label: string): GPUComputePassEncoder => single
-      ? (shared ??= encoder.beginComputePass({ label: 'world query trace' })) : encoder.beginComputePass({ label });
+    const begin = (label: string, timestampWrites?: GPUComputePassTimestampWrites): GPUComputePassEncoder => single
+      ? (shared ??= encoder.beginComputePass({ label: 'world query trace', timestampWrites: timing }))
+      : encoder.beginComputePass({ label, timestampWrites });
     const end = (pass: GPUComputePassEncoder): void => { if (!single) pass.end(); };
-    const reset = begin('world ray reset');
+    // Pass-per-batch timing spans the reset pass to the last batch pass.
+    const last = active.length ? active[active.length - 1].index : -1;
+    const reset = begin('world ray reset', last < 0 ? timing : timestampSpanStart(timing));
     reset.setPipeline(this.resetPipeline); reset.setBindGroup(0, this.resetGroups[parameterSlot]);
     reset.dispatchWorkgroups(Math.ceil(count / 64)); end(reset);
     // Pooled members are not in the candidate tree; skip it when nothing else uses it.
@@ -696,7 +701,8 @@ export class GpuWorldQuery {
       }
       // Distinct passes (or ordered dispatches in one pass) order closest-hit
       // updates between batches. Members only resolve rays they won.
-      const pass = begin((member ? 'world shared static resolve ' : 'world rays ') + batch.name);
+      const pass = begin((member ? 'world shared static resolve ' : 'world rays ') + batch.name,
+        index === last ? timestampSpanEnd(timing) : undefined);
       pass.setPipeline(member ? resolves.get(index)! : batch.source.getPipeline());
       pass.setBindGroup(0, member ? batch.pool!.resolve[parameterSlot] : batch.trace[parameterSlot]);
       pass.setBindGroup(1, batch.source.getMaterial().bindGroup);

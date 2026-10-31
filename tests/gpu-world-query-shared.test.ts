@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SceneBatch } from '../src/contracts';
 import type { MorphTarget } from '../src/deformation';
 import { createPlane } from '../src/geometry';
+import { createTimestampQuerySet, timestampSpanEnd, timestampSpanStart } from '../src/gpu-timestamp-span';
 import { GpuWorldQuery } from '../src/gpu-world-query';
 import type { MaterialProgram } from '../src/material';
 import { identity, translation } from '../src/math';
@@ -50,10 +51,10 @@ async function setup(options: WorldQueryOptions, count = 10, overrides: (index: 
   scenes.forEach((scene, index) => query.addBatch({ scene, output: {} as GPUBuffer, instances: {} as GPUBuffer,
     getPipeline: () => trace, getMaterial: () => materials[index] as never, getDirty: () => dirty[index] }));
   const record = () => {
-    const passes: { label: string; dispatches: Dispatch[] }[] = [];
+    const passes: { label: string; dispatches: Dispatch[]; timestampWrites?: GPUComputePassTimestampWrites }[] = [];
     const encoder = {
       beginComputePass: vi.fn((descriptor?: GPUComputePassDescriptor) => {
-        const pass = { label: descriptor?.label ?? '', dispatches: [] as Dispatch[] };
+        const pass = { label: descriptor?.label ?? '', dispatches: [] as Dispatch[], timestampWrites: descriptor?.timestampWrites };
         passes.push(pass);
         let pipeline: { entryPoint: string } | undefined;
         return { setPipeline: (value: { entryPoint: string }) => { pipeline = value; }, setBindGroup: vi.fn(),
@@ -96,6 +97,24 @@ describe('shared static world query encoding', () => {
       expect(traced.passes).toHaveLength(12);
       expect(query.diagnostics()).toMatchObject({ staticTraversal: 'shared', dispatchEncoding: 'pass-per-batch' });
     } finally { query.dispose(); }
+  });
+  it('spans an optional trace timestamp pair over the first and last trace pass only', async () => {
+    const querySet = createTimestampQuerySet({ createQuerySet: (descriptor: GPUQuerySetDescriptor) => ({ count: descriptor.count }) } as unknown as GPUDevice, 2);
+    const timing = { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 };
+    for (const dispatchEncoding of ['pass-per-batch', 'single-pass'] as const) {
+      const { query, record } = await setup({ staticTraversal: 'shared', dispatchEncoding });
+      try {
+        query.updateSnapshot(1, 0);
+        const traced = record();
+        query.encodeTrace(traced.encoder, 64, 0, 0, undefined, undefined, 'material', timing);
+        const writes = traced.passes.map(pass => pass.timestampWrites);
+        if (dispatchEncoding === 'single-pass') expect(writes).toEqual([timing]);
+        else expect(writes).toEqual([timestampSpanStart(timing), ...Array(10).fill(undefined), timestampSpanEnd(timing)]);
+        const untimed = record();
+        query.encodeTrace(untimed.encoder, 64, 0, 0);
+        expect(untimed.passes.every(pass => pass.timestampWrites === undefined)).toBe(true);
+      } finally { query.dispose(); }
+    }
   });
   it('records the same ordered dispatches in one pass for single-pass encoding', async () => {
     for (const staticTraversal of ['per-batch', 'shared'] as const) {

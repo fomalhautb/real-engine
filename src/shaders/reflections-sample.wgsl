@@ -27,6 +27,31 @@ fn reflectionRadiance(pixel: vec2f, position: vec3f, normal: vec3f, geometricNor
         let weight = weights.x * weights.y;
         sum += anchor.radiance.xyz * weight; total += weight;
     }
-    if (total < 0.001) { return vec3f(0.0); }
+    if (total < 0.001) {
+        // Bounded fallback for curved receivers whose four corners all fail the
+        // strict normal test: same-identity, same-material anchors of the 4x4
+        // neighborhood within ~25 degrees, on a surface consistent with that
+        // curvature, weighted toward the closest normal. It never crosses
+        // identities or materials; with no such anchor the pixel receives none.
+        sum = vec3f(0.0); total = 0.0;
+        for (var neighbor = 0u; neighbor < 16u; neighbor++) {
+            let cell = lower + vec2i(i32(neighbor % 4u) - 1, i32(neighbor / 4u) - 1);
+            if (any(cell < vec2i(0)) || any(cell >= vec2i(reflection.viewport.zw))) { continue; }
+            let anchor = reflectionAnchors[u32(cell.y) * reflection.viewport.z + u32(cell.x)];
+            let hit = anchor.hit;
+            if (anchor.state.x == 0u || anchor.state.y != reflection.state.x || hit.versions.w != reflection.state.y
+                || any(hit.identity.xy != identity)) { continue; }
+            let agreement = dot(geometricNormal, reflectionGeometry(hit));
+            let distance = position - hit.position.xyz;
+            let bend = length(distance) * sqrt(max(1.0 - agreement * agreement, 0.0));
+            if (agreement < 0.9 || length(distance) > reflection.limits.z
+                || abs(dot(distance, geometricNormal)) > reflection.limits.w + bend
+                || any(abs(base - hit.baseColor.xyz) > vec3f(0.02))
+                || abs(metallic - hit.previous.w) > 0.01 || abs(roughness - hit.normal.w) > 0.01) { continue; }
+            let weight = (agreement - 0.9) * (agreement - 0.9) + 1e-6;
+            sum += anchor.radiance.xyz * weight; total += weight;
+        }
+        if (total <= 0.0) { return vec3f(0.0); }
+    }
     return sum / total;
 }

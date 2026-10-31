@@ -1,6 +1,22 @@
 # 阶段 1–2 实现状态
 
-更新日期：2026-10-25。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
+更新日期：2026-10-31。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
+
+## Apple M3 Max 目标机、时间戳兼容与体积雾空气光照（2026-10-31）
+
+2026-10-30 起，阶段 1–2 的硬件验收目标机改为 Apple M3 Max：30 核 GPU、36 GB 统一内存，macOS 26.6.2，Google Chrome 156，WebGPU adapter 为非 fallback 的 `apple / metal-3`。此前在 Windows 上的 NVIDIA/Intel 记录只作历史证据保留，不与 Apple 的数字混用。本节的计时都是在多个并行开发分支同时占用 GPU 时测得的，只作诊断，不作性能验收。
+
+**时间戳兼容。** 在目标机上，如果计算 pass 的 `timestampWrites` 只写开始或只写结束一端，Metal command buffer 会以 `kIOGPUCommandBufferCallbackErrorOutOfMemory` 失败，随后设备丢失，Chrome 在收尾时卡死，测试因此停住而不是报失败。在硬件上二分定位：原代码 17 次运行中 16 次丢失设备；只去掉或只补全这类单端写入后，丢失为 0 次。修复在 `src/gpu-timestamp-span.ts`：跨多个 pass 的计时段由首尾两个 pass 各写一对完整的时间戳，不属于该 pass 的那一端写入暂存槽。暂存槽由 `createTimestampQuerySet()` 预留在测量槽之后，从不解析，所以计时语义不变。单元测试禁止 `src` 中除这个辅助模块和 renderer 槽分配器之外的模块直接写 pass 时间戳下标。
+
+**Apple 全量回归分诊（诊断）。** 修复后，完整浏览器回归在目标机上 138 项中 131 项通过，用时 2.3 分钟，没有卡死。失败的 7 项在硬件上重跑 2/2 复现，在 SwiftShader 上全部通过，分属三类问题，目前都未修复：
+
+- 世界查询：射线恰好落在两个三角形的共享边上时，两侧三角形都判为未命中，偏移 ±0.01 后两种 adapter 都能命中。初步判断是三角形边测试在 Metal 舍入下不封闭。涉及 `world-query.spec.ts:17` 的两种配置和 `world-query-capacity.spec.ts:51`。
+- 光栅接收点：打包法线通道在 Apple 上读回为零，法线解码为 (0,0,1)，根因尚未确定。涉及 `raster-receivers.spec.ts:5`、`gi-filter-boundary.spec.ts:11`、`gi-supplemental.spec.ts:40`。
+- 流式与常驻路径：在 Apple 上有一个 HDR 采样相差约 0.03，而测试要求两条路径逐位一致。尚未判定这是缺陷还是测试假设。涉及 `geometry-stream-renderer.spec.ts:4`。
+
+这些问题解决之前，相应能力在目标机上不算通过。
+
+**体积雾。** 新增可选的 GI 空气光照和遮挡体局部历史拒绝，详见「线性 HDR、输出与光照基础」中的体积雾小节。F01–F04 的自动化用例在目标机和 SwiftShader 上均通过。F05 的 1080p 扫描显示，默认预算靠把网格降到 14 像素/格保持在 64 MiB 以内；8 像素/格、64 层并开启时序历史需要 158.2 MiB，**未满足 64 MiB 预算**。局部灯散射、移动聚光灯和短闪光尚未支持。
 
 ## Sponza 世界查询的分段实测（2026-10-25）
 
@@ -1174,17 +1190,61 @@ GPU 模块提供驻留的 rays/hits 缓冲与编码入口，供光照直接消�
 
 `participating-media.ts` 保留独立的均匀介质 CPU 解析参考：米制消光、RGB 散射反照率、每米发光和有界 HG 各向异性，支持 Beer–Lambert 透射率、零消光稳定极限、分段前后合成及 `L_medium + T * L_surface`。GPU 路径在 `RendererOptions.volumetricFog` 下启用：全局高度密度为 `exp(-heightFalloff × max(y − baseHeight, 0))`，另可配置最多 64 个世界空间盒或球体积；重叠介质分别求 HG 光源项，再将消光与源项相加。主视锥使用平方分布的相机前向深度切片，先把密度、发光和共享太阳阴影单次散射注入网格，再逐列前后积分，最后按全分辨率表面深度对末格做部分积分并在线性 HDR 合成。天空积分截于 `maxViewDepth`，合成输出截于 65504。介质定义不依赖相机选出的渲染 LOD，主视图仅是视图缓存。
 
-`pixelSize/slices/maxViewDepth/maxFroxels/maxBytes` 默认分别为 `8/64/80 m/1,048,576/64 MiB`。尺寸变化时在给定 `pixelSize` 及以上选择满足格数与字节上限的最小整数像素尺寸，设备 storage/dispatch 限额也预检；超过预算明确拒绝，不静默扩大。每格基础源和累计结果各占 16 字节；固定开销为 384 字节 uniform 加 5,120 字节局部介质缓冲，另有 8 字节/输出像素的 HDR 附件。`temporal` 默认关闭；配置 `{ maxHistoryFrames }` 时默认 8、允许整数 2–32，增加双份历史源（各 16 字节/格）与有效计数（各 4 字节/格），即额外 40 字节/格、合计 72 字节/格。`maxBytes` 与 `diagnostics().volumetricFog.ownedGpuBytes` 是模块应用账本，不是 JS RSS、驱动显存驻留或整帧全部资源。`setVolumetricFogEnabled(boolean)` 开关雾；禁用时跳过 compute，但仍以表面颜色写合成附件。`setVolumetricFogMedia({ global?, volumes? })` 原子替换整套介质，省略的项清空。初始化、pipeline 和 resize 部分失败路径释放已拥有资源，`dispose()` 后模块及 Renderer 应用账本归零。
+`pixelSize/slices/maxViewDepth/maxFroxels/maxBytes` 默认分别为 `8/64/80 m/1,048,576/64 MiB`。尺寸变化时在给定 `pixelSize` 及以上选择满足格数与字节上限的最小整数像素尺寸，设备 storage/dispatch 限额也预检；超过预算明确拒绝，不静默扩大。每格基础源和累计结果各占 16 字节；固定开销为 384 字节 uniform 加 5,120 字节局部介质缓冲，另有 8 字节/输出像素的 HDR 附件；`temporal.occluderRejection: 'local'` 另加 1,040 字节变化遮挡区域 uniform，固定开销由 5,504 字节增至 6,544 字节。`temporal` 默认关闭；配置 `{ maxHistoryFrames }` 时默认 8、允许整数 2–32，增加双份历史源（各 16 字节/格）与有效计数（各 4 字节/格），即额外 40 字节/格、合计 72 字节/格。`maxBytes` 与 `diagnostics().volumetricFog.ownedGpuBytes` 是模块应用账本，不是 JS RSS、驱动显存驻留或整帧全部资源。`setVolumetricFogEnabled(boolean)` 开关雾；禁用时跳过 compute，但仍以表面颜色写合成附件。`setVolumetricFogMedia({ global?, volumes? })` 原子替换整套介质，省略的项清空。初始化、pipeline 和 resize 部分失败路径释放已拥有资源，`dispose()` 后模块及 Renderer 应用账本归零。
 
-可选时序 pass 将当前世界空间三维 froxel 中心投影到前一帧网格，以三线性插值读取历史源；Halton 抖动改变当前采样位置，有效计数上限与指数移动平均共同限制历史权重。`setVolumetricFogTemporalEnabled(boolean)` 可在已配置时切换并清除历史。介质、光照、切镜、尺寸、材质版本或实际渲染状态变化时保守地重置历史，更新须在提交后确认。`mutable` 输入的每帧上传和前帧状态收敛不单独触发雾历史重置；有限的 float32 状态比较涵盖实例变换、骨骼、形变标量及实例材质输入。动态物体目前仍触发全局重置，而非仅局部遮挡体附近失效。`probeVolumetricFogHistory` 只按需读取最多 1,024 格，不逐帧读回。当前没有遮挡体局部历史拒绝或邻域夹取，HG 方向守卫也不是严格误差证明；仍需更广的动态遮挡与画质验收。网格内源项按格平均，表面截断最后一格时，若该格同时跨过阴影或密度边界，仍存在有限分辨率误差。
+可选时序 pass 将当前世界空间三维 froxel 中心投影到前一帧网格，以三线性插值读取历史源；Halton 抖动改变当前采样位置，有效计数上限与指数移动平均共同限制历史权重。`setVolumetricFogTemporalEnabled(boolean)` 可在已配置时切换并清除历史。介质、光照、切镜、尺寸、材质版本或实际渲染状态变化时保守地重置历史，更新须在提交后确认。`mutable` 输入的每帧上传和前帧状态收敛不单独触发雾历史重置；有限的 float32 状态比较涵盖实例变换、骨骼、形变标量及实例材质输入。默认的 `temporal.occluderRejection: 'global'` 下，动态物体仍触发全局重置；可选的 `'local'` 只拒绝支撑球与变化投射体光源空间矩形相交的历史格，见本小节末尾。`probeVolumetricFogHistory` 只按需读取最多 1,024 格，不逐帧读回。当前没有邻域夹取，HG 方向守卫也不是严格误差证明；仍需更广的动态遮挡与画质验收。网格内源项按格平均，表面截断最后一格时，若该格同时跨过阴影或密度边界，仍存在有限分辨率误差。
 
-启用雾时，太阳辐亮度每通道上限为 1e20；超过时 setSun 在提交状态前明确拒绝，独立模块也检查，避免多个介质、HG 与长斜射线的 float32 乘积溢出。光源目前只有共享阴影贴图的方向太阳单次散射；阴影覆盖范围外按无遮挡处理。反射已借用同一世界介质定义执行有界光路积分，见世界空间反射小节；没有点/聚光灯、空气中的低频 GI、透明分段积分、介质自阴影或多重散射。雾与 GI 同时启用的功能用例只验证共存及 GI 探针不被主视图雾改写，不表示 GI 已照亮空气。`/fog.html` 是柱廊内局部盒状雾的代码演示，可切换雾/密度/太阳/镜头。此前[雾开](../artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png)与[雾关](../artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-off.png)是无时序的实际截图；本轮[雾开](../artifacts/fog-temporal-demo-native-20261019/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png)与[关闭时序、每格中心采样](../artifacts/fog-temporal-demo-native-20261019/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-centered.png)是可选时序版 NVIDIA 实际截图。演示显式使用 8 像素/格、64 个切片、最多 16 帧历史及 128 MiB 雾预算；这些图只展示有限场景，不是最终次世代画质或性能证据。
+启用雾时，太阳辐亮度每通道上限为 1e20；超过时 setSun 在提交状态前明确拒绝，独立模块也检查，避免多个介质、HG 与长斜射线的 float32 乘积溢出。光源目前只有共享阴影贴图的方向太阳单次散射；阴影覆盖范围外按无遮挡处理。反射已借用同一世界介质定义执行有界光路积分，见世界空间反射小节；没有点/聚光灯、透明分段积分、介质自阴影或多重散射；空气中的低频 GI 见本小节末尾的可选 `airLighting`。未配置 `airLighting` 时，雾与 GI 同时启用的功能用例只验证两者共存、GI 探针不被主视图雾改写，不表示 GI 已照亮空气。`/fog.html` 是柱廊内局部盒状雾的代码演示，可切换雾/密度/太阳/镜头。此前[雾开](../artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png)与[雾关](../artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-off.png)是无时序的实际截图；本轮[雾开](../artifacts/fog-temporal-demo-native-20261019/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png)与[关闭时序、每格中心采样](../artifacts/fog-temporal-demo-native-20261019/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-centered.png)是可选时序版 NVIDIA 实际截图。演示显式使用 8 像素/格、64 个切片、最多 16 帧历史及 128 MiB 雾预算；这些图只展示有限场景，不是最终次世代画质或性能证据。
 
 此前无时序版本的完整本地 `npm run check` 通过 391 项 CPU 测试（51 文件）、类型检查与生产构建，日志 `artifacts/fog-check-release-20261019-final.log`。NVIDIA 定向 GPU 数值回归以实际绘制后的 HDR 读回对照独立 CPU 解析式：纯吸收、零消光发光、HG 太阳散射覆盖距相机 0.2–136 m 的表面与天空截断；重叠局部介质的 9 个像素对照每条射线 16,384 步独立积分，最大 HDR 绝对误差 0.00225978，高度介质为 0.000230491。另验证 Mask/Morph/skin 的离屏阴影遮挡及移除恢复、雾开关、运行时替换、尺寸预算、GI 探针不变、构造/pipeline/resize 部分失败后的资源清理和释放账本归零。原生 NVIDIA 完整浏览器回归 74/74 通过，日志 `artifacts/fog-browser-release-native-20261019-final.log`；Intel 定向 3/3 与 SwiftShader 定向 3/3 也已通过，日志分别为 `artifacts/fog-target-intel-20261019.log`、`artifacts/fog-target-software-20261019.log`。这些功能用例不证明大场景帧时间、完整 F01–F05 或阶段 2 完成。
 
 本轮时序版本的完整 `npm run check` 通过 399 项 CPU 测试（51 文件）、类型检查与生产构建，日志 `artifacts/fog-temporal-check-release-20261019.log`；原生 NVIDIA 完整浏览器回归 78/78 通过，日志 `artifacts/fog-temporal-browser-release-native-20261019.log`；Intel 定向 7/7 通过，日志 `artifacts/fog-temporal-target-intel-20261019.log`。SwiftShader 定向 7/7 也已通过，日志 `artifacts/fog-temporal-target-software-20261019.log`。此前 391/74 数字属于无时序版本；提交 `ab53842` 的[远程 CI run 39273105318](https://github.com/fomalhautb/real-engine/actions/runs/39273105318) 已完成且全部作业成功，不代表本轮时序版本的远程结果。
 
 定向画质用例使用 96×64 输出、16 个深度切片、最多 32 次历史、预热 96 帧；对独立解析的 8 条格栅遮挡，读取 96 个像素及 24 帧移动轨迹。NVIDIA 的静态 HDR RMS 从 0.019234779 降至 0.0002457097，运动 RMS 从 0.017230502 降至 0.0020069106；扣除解析参考自身变化后，连续帧残差变化 RMS 从 0.00628011 降至 0.00227293。这些结果只适用于该小场景，未测定大场景性能。另有 `committed`/`mutable` 输入的计数上限、原地变换、切镜、光照/介质/材质变化、resize、HG 方向变化拒绝旧样本，以及积累后的离屏 Mask、Morph、skin 和删除遮挡首帧响应。重置帧 HDR 与无历史同视图对照，资源释放归零。配置和生命周期用例覆盖五个 storage binding 预检及历史缓冲部分分配失败。软件演示采用 640×600 页面以限制工作量，原生硬件保留完整演示尺寸。
+
+**空气光照（2026-10-31）。** 配置为 `volumetricFog.airLighting: { gi?: boolean = true, outsideSkyVisibility?: [0,1] = 0 }`，必须同时配置 `diffuseGi`，否则构造时抛出 `FOG_AIR_LIGHTING_REQUIRES_DIFFUSE_GI`。
+
+- 数据来源：直接读取 GI 探针存储的入射辐亮度 SH9。未命中的射线计为天空辐亮度，所以几何对天空的遮挡已经包含在场里。
+- 相函数：HG 的带状 SH 系数为 `g^l`，每个介质只需三项散射矩，一次探针插值就能得到所有重叠介质的卷积结果。
+- 可见性：沿用表面的三线性插值、Chebyshev 矩可见性和低支撑曲线。场外半格过渡带以外使用 `outsideSkyVisibility · Σσ_s · sky`。
+- 时序：空气光在时序解析之后的独立 `air` pass 中按不抖动的格心计算，不进入雾历史。因此 GI 的变化第一帧就生效，GI 失效或开关都不会重置雾历史；代价是每帧多一个三维 pass。
+- 反射：沿雾积分的每一步加入同一项；主机没有 GI 时抛出 `FOG_AIR_LIGHTING_REFLECTION_GI_REQUIRED`。
+- 接口：运行时用 `renderer.setVolumetricFogAirLighting(options)` 修改；Render Graph 中 `fog-integrate` 声明读取 `diffuse-gi-probes`。
+- 未实现：多重散射；空气光的格内梯度也没有时序超采样。
+
+**局部历史拒绝。** 配置为 `temporal.occluderRejection: 'global' | 'local'`，默认 `'global'`，行为与之前逐位一致。
+
+- 支撑半径：`'local'` 模式为每个历史格保存一个保守的支撑半径（f16，存放在历史计数的高 16 位），并把支撑球保守投影到正交光源 NDC。
+- 拒绝范围：只拒绝与变化投射体前后包围盒的光源空间矩形（各向外扩 2 个阴影 texel）相交的格。每帧最多 32 个区域，溢出时保守合并。
+- 回退：缺少包围盒、包围盒为空或光源矩阵不是仿射矩阵时，回退到全局重置。切镜、resize、网格、介质、材质和太阳变化仍是全局重置。
+- 已知限制：假定投影对称；相机运动时半径增大，拒绝范围变粗，但仍然保守。
+- 诊断：诊断项为 `history.occluderRejection` 与 `history.occluderRegions`。`setVolumetricFogDebugView('scattering-transmittance')` 输出 `vec4(L_fog, T)`，用于分开测量散射与透射率。
+
+**F01–F05 验收（Apple M3 Max 与 SwiftShader，2026-10-31）。** `npm run check` 通过 86 个文件、744 项测试。
+
+- **F01**：场景为零密度、g = 0/±0.6 的均匀雾、纯吸收和均匀发光，分别在关闭历史与开启累计两条序列上判定。
+  - 最差 T 误差：硬件 0.00027，软件 0.00014；最差 L 归一化误差：硬件 0.86%，软件 0.77%。
+  - 零密度时 T 恰为 1、L 恰为 0。
+  - 非均匀高度雾不属于 F01 场景：关闭历史时 T 误差 0.00028；开启累计后为 **0.00142，超过 0.001**。这是抖动累计的残差，按测量值记录。
+- **F04 空气光**：
+  - 开阔天空：相对 `albedo·sky·(1−T)` 的最差误差为 0.13%。
+  - 黑墙封闭房间：天空漏光为 0。
+  - 镜头后方的离屏红墙：雾的色度误差 0.02%（软件 0.05%）。
+  - 开顶庭院：探针天空可见性与 CPU 射线结果偏差 1.6e-7。
+  - 镜面：反射拾取到镜头后方雾的空气光。
+- **F02/F03 历史**：场景为零厚度屋顶开窗，local 与 global 两种模式各跑一遍。以下为硬件数值。
+  - 光柱：L 误差 0.75%（门限 15%）；阴影侧和关门后薄屋顶的漏光均为 0。
+  - 蒙皮角色穿过光柱：进入/离开的首帧残影，local 为 3.7%/0%，global 为 7.1%/7.4%（门限 50%）。
+  - 开门：T90 为 1 帧（目标 ≤ 6 帧 @60 Hz）。
+  - 瞬移：2 帧后误差稳定在 3% 以内。
+  - 固定镜头 120 帧：亮度波动 0.95%（门限 3%）。
+  - 移动聚光灯与短闪光依赖局部灯，用例跳过。
+- **F05**：仅在硬件上运行，1920×1080，A/B 对按 ABBA 顺序穿插。**计时是并发负载下的诊断值**，只有默认预算的内存是门限。
+  - 默认预算选出 138×78×64 网格（14 像素/格），63.1 MiB，p95 1.05 ms。
+  - 不限预算的 8 像素/格、64 层为 240×135×64，158.2 MiB，p95 3.08 ms，**未满足 64 MiB 预算**。
+  - 空气 pass 在该网格上增加约 1.4 ms（p50）；64 个完全重叠的体积时 p50 为 5.1 ms。
+
+证据目录为 `artifacts/fog-{regression,acceptance,air,history,budget}-20261030/`，不提交。这些用例只覆盖受控小场景，不证明大场景画质或帧时间。
 
 提交 `2454e22` 已通过本地及远程 TypeScript、184 项单元测试和生产构建，以及 [远程 Linux 软件 GPU 的 16 项浏览器回归](https://github.com/fomalhautb/real-engine/actions/runs/38510988726)。HDR 附件在曝光前后及 resize 后均读到 `[5, 0.75, 0.125, 1]`；EV 0 的 canvas RGB 为 `[0.99216, 0.87451, 0.45098]`，EV −2 为 `[0.92941, 0.56471, 0.15686]`，符合 filmic＋sRGB 解析预期和 8-bit 量化。曝光不重编材质或清除对象运动历史；resize 的账本增量为 16 字节/像素。
 

@@ -40,5 +40,6 @@ fn fogWorldSource(world: vec3f, direction: vec3f) -> vec4f {
     if (volume.centerKind.w > 0.5) { inside = dot(delta, delta) <= volume.extent.x * volume.extent.x; }
     if (inside) { source += fogMediumSource(volume.optics.xy, volume.albedo.xyz, volume.emission.xyz, incident, cosine); }
   }
+  // FOG_LOCAL_LIGHTS
   return source;
 }

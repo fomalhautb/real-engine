@@ -18,6 +18,7 @@ import type { Bounds3 } from './deformation';
 import { GiProbeScheduler, resolveDiffuseGiUpdateOptions, type DiffuseGiUpdateOptions, type GiSchedulePlan,
   type ResolvedDiffuseGiUpdateOptions } from './gi-probe-schedule';
 import { GiSceneObserver, type GiObservedBatch } from './gi-scene-changes';
+import { localLightsShaderSource, type GpuLocalLights } from './gpu-local-lights';
 
 const constants = `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`;
 const giCommon = commonSource.replace('// GI_DISTANCE_CONSTANTS', constants);
@@ -88,6 +89,7 @@ export class GpuDiffuseGi {
   private emissiveSampler?: GpuGiEmissiveSampler;
   private finalGather?: GpuFinalGather;
   private finalGatherEnabled = true;
+  private localLightGroup?: GPUBindGroup;
 
   get surfaceGroup(): GPUBindGroup { return this.surfaceGroups[this.currentIndex][this.finalGather?.currentIndex ?? 0]; }
   /** Borrowed resources; the GI owner retains allocation and disposal responsibility. */
@@ -101,7 +103,7 @@ export class GpuDiffuseGi {
   }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: DiffuseGiOptions,
-    account: (bytes: number) => void): Promise<GpuDiffuseGi> {
+    account: (bytes: number) => void, localLights?: GpuLocalLights): Promise<GpuDiffuseGi> {
     const resolved = resolveDiffuseGiOptions(options);
     if (device.limits.maxStorageBuffersPerShaderStage < 7) throw new Error('DIFFUSE_GI_STORAGE_BINDING_LIMIT');
     validateDiffuseGiQueryBudget(resolved, queries.options);
@@ -112,12 +114,13 @@ export class GpuDiffuseGi {
       resolved.probeCount * Uint32Array.BYTES_PER_ELEMENT];
     if (sizes.some(size => size > Math.min(device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize))
       || sizes.reduce((a, b) => a + b, 0) > resolved.maxBytes) throw new Error('DIFFUSE_GI_MEMORY_BUDGET');
-    const result = new GpuDiffuseGi(device, queries, resolved, account);
+    const result = new GpuDiffuseGi(device, queries, resolved, account, localLights);
     try { await result.initialize(); return result; }
     catch (error) { result.dispose(); throw error; }
   }
   private constructor(private readonly device: GPUDevice, private readonly queries: GpuWorldQuery,
-    options: ReturnType<typeof resolveDiffuseGiOptions>, private readonly account: (bytes: number) => void) {
+    options: ReturnType<typeof resolveDiffuseGiOptions>, private readonly account: (bytes: number) => void,
+    private readonly localLights?: GpuLocalLights) {
     this.options = options;
     this.multiBounce = options.multiBounce;
     this.visibilityDirection = options.visibilityDirection;
@@ -170,13 +173,23 @@ export class GpuDiffuseGi {
   private async initialize(): Promise<void> {
     // Allocate inside create()'s try/finally ownership boundary.
     this.initializeResources();
-    const module = this.device.createShaderModule({ label: 'diffuse GI', code: surfaceFrameSource + '\n' + giSource(updateSource) });
+    // Local lights add a shadowed diffuse term to each captured hit, beside the sun.
+    const lights = this.localLights;
+    const code = giSource(updateSource)
+      .replace('// GI_LOCAL_LIGHTS_PROGRAM', lights ? localLightsShaderSource(lights.options, { group: 1 }) : '')
+      .replace('// GI_LOCAL_LIGHTS', lights ? 'radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)'
+        + ' * localLightsIrradiance(hit.position.xyz, hit.normal.xyz, giHitGeometry(hit));' : '');
+    const module = this.device.createShaderModule({ label: 'diffuse GI', code: surfaceFrameSource + '\n' + code });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
     if (errors.length) throw new Error(errors.map(error => `diffuse GI:${error.lineNum}: ${error.message}`).join('\n'));
     const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
+    const integrateLayout = lights
+      ? this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout, lights.computeLayout] }) : layout;
+    if (lights) this.localLightGroup = lights.bindGroup();
     [this.generate, this.generateShadows, this.integrate, this.integrateVisibility, this.validateVisibility, this.restamp] = await Promise.all(
       ['generate', 'generateShadows', 'integrate', 'integrateVisibility', 'validateVisibility', 'restamp'].map(entryPoint =>
-      this.device.createComputePipelineAsync({ label: 'diffuse GI ' + entryPoint, layout, compute: { module, entryPoint } })));
+      this.device.createComputePipelineAsync({ label: 'diffuse GI ' + entryPoint,
+        layout: entryPoint === 'integrate' ? integrateLayout : layout, compute: { module, entryPoint } })));
     if (this.options.emissiveSamplesPerProbe) {
       this.emissiveSampler = await GpuGiEmissiveSampler.create(this.device, this.queries, this.parameters,
         this.probeBuffers, this.schedule, this.options.rayCount, this.options.emissiveSamplesPerProbe, bytes => {
@@ -187,7 +200,7 @@ export class GpuDiffuseGi {
     if (this.options.finalGather) {
       this.finalGather = await GpuFinalGather.create(this.device, this.queries, this.parameters,
         this.probeBuffers, this.options.finalGather, bytes => { this.bytes += bytes; this.account(bytes); },
-        this.options.maxBytes - this.bytes);
+        this.options.maxBytes - this.bytes, this.localLights);
       this.checkMemoryBudget();
     }
     const gatherBuffers = this.finalGather?.outputBuffers ?? [undefined];
@@ -376,6 +389,7 @@ export class GpuDiffuseGi {
     const dispatch = (label: string, pipeline: GPUComputePipeline, count: number, timestampWrites?: GPUComputePassTimestampWrites) => {
       const pass = encoder.beginComputePass({ label, timestampWrites });
       pass.setPipeline(pipeline); pass.setBindGroup(0, this.computeGroups[outputIndex]);
+      if (pipeline === this.integrate && this.localLightGroup) pass.setBindGroup(1, this.localLightGroup);
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     };
     if (slots < this.options.probeCount) {

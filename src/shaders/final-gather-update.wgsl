@@ -72,6 +72,7 @@ struct ReceiverMetadata {
 }
 
 // GI_INTERPOLATE
+// GATHER_LOCAL_LIGHTS_PROGRAM
 
 fn gatherHitGeometry(hit: Hit) -> vec3f {
     return surfaceOctDecode(vec2f(hit.position.w, hit.uvInfo.w));
@@ -338,6 +339,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
                     let cosine = select(0.0, max(0.0, dot(hit.normal.xyz, gi.sunDirection.xyz)),
                         dot(gatherHitGeometry(hit), gi.sunDirection.xyz) > 0.0);
                     var hitIrradiance = gi.sunColor.xyz * cosine * visible;
+                    // GATHER_LOCAL_LIGHTS
                     if (gather.state.w != 0u && path.x + 1u == path.y) {
                         hitIrradiance += giSampleSurfaceIrradiance(hit.position.xyz, hit.normal.xyz, gatherHitGeometry(hit), gi.state.x);
                     }

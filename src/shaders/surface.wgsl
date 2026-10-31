@@ -230,6 +230,7 @@ fn visibility(light: vec4f) -> f32 {
     return sum / 9.0;
 }
 // REFLECTION_PROGRAM
+// LOCAL_LIGHTS_PROGRAM
 struct RasterSurface { material: MaterialSurface, geometryNormal: vec3f, shadingNormal: vec3f, covered: bool }
 // Both the receiver pass and PBR evaluate exactly the same coverage, derivatives,
 // tangent frame and material mip filtering on the selected raster geometry.
@@ -272,8 +273,10 @@ fn fragmentMain(input: Varyings, @builtin(front_facing) front: bool) -> Fragment
     let metalness = surface.metallic;
     let roughness = surface.roughness;
     let base = surface.baseColor;
-    let direct = surfaceDirectBrdf(base, metalness, roughness, n, geometricNormal, v, l)
+    let sunDirect = surfaceDirectBrdf(base, metalness, roughness, n, geometricNormal, v, l)
         * frame.sunColor.rgb * shadowVisibility;
+    // Defines `direct`: the sun alone, or plus every bounded local light.
+    // LOCAL_LIGHTING
     // Compiled world-space irradiance, or the legacy fill when GI is unconfigured.
     // INDIRECT_LIGHTING
     // REFLECTED_LIGHTING

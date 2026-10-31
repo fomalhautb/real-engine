@@ -1,3 +1,4 @@
+import type { Bounds3 } from './deformation';
 import { lookAt, multiply, type Mat4 } from './math';
 
 /**
@@ -315,6 +316,22 @@ export interface PackedLocalLights {
   readonly lightCount: number;
   /** Atlas views that must be rendered this frame (enabled shadowed lights). */
   readonly views: readonly { readonly layer: number; readonly matrix: Mat4 }[];
+}
+
+/** World bounds of every light whose shading differs between two snapshots: the range-sphere box before and
+ * after each added, removed or re-versioned light. Disabled lights shade nothing, so they contribute no box. */
+export function localLightChangeRegions(before: readonly ResolvedLocalLight[], after: readonly ResolvedLocalLight[]): Bounds3[] {
+  const box = (light: ResolvedLocalLight): Bounds3 => ({
+    min: [light.position[0] - light.range, light.position[1] - light.range, light.position[2] - light.range],
+    max: [light.position[0] + light.range, light.position[1] + light.range, light.position[2] + light.range] });
+  const key = (light: ResolvedLocalLight) => light.handle.id;
+  const same = (a: ResolvedLocalLight | undefined, b: ResolvedLocalLight | undefined) =>
+    !!a && !!b && a.handle.generation === b.handle.generation && a.version === b.version;
+  const previous = new Map(before.map(light => [key(light), light])), next = new Map(after.map(light => [key(light), light]));
+  const regions: Bounds3[] = [];
+  for (const light of before) if (light.enabled && !same(light, next.get(key(light)))) regions.push(box(light));
+  for (const light of after) if (light.enabled && !same(previous.get(key(light)), light)) regions.push(box(light));
+  return regions;
 }
 
 /** CPU owner of slots, generations, versions, budgets and GPU packing.

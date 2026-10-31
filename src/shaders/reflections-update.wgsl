@@ -7,6 +7,7 @@ struct ReflectionRay { origin: vec4f, direction: vec4f, ignore: vec4u }
 @group(0) @binding(5) var<storage, read_write> samples: array<ReflectionSample>;
 @group(0) @binding(6) var<storage, read_write> anchors: array<ReflectionAnchor>;
 // REFLECTION_GI
+// REFLECTION_LOCAL_LIGHTS_PROGRAM
 
 fn reflectionHash(value: u32) -> u32 {
     var x = value;
@@ -123,6 +124,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
                 incoming += surfaceDirectBrdf(hit.baseColor.xyz, hit.previous.w, hit.normal.w, hit.normal.xyz,
                     reflectionGeometry(hit), -sample.direction.xyz, reflection.sunDirection.xyz) * reflection.sunColor.xyz * visibility;
                 incoming += reflectionDiffuse(hit);
+                // REFLECTION_LOCAL_LIGHTS
             }
         }
         let distance = select(reflection.eye.w, hit.metric.x, hit.identity.x != 0u);

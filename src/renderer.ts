@@ -41,6 +41,8 @@ import { GpuSurfaceReceivers } from './gpu-surface-receivers';
 import { decodeFinalGatherDiagnostics, decodeFinalGatherDiagnosticSurfaces, decodeFinalGatherCoverage, validateFinalGatherDiagnosticPoints } from './final-gather-diagnostics';
 import { subscribeGpuDeviceLoss } from './gpu-device-loss';
 import { createTimestampQuerySet, timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
+import { GpuLocalLights, localLightsShaderSource } from './gpu-local-lights';
+import { resolveLocalLightOptions, type LocalLightDescriptor, type LocalLightHandle, type LocalLightOptions, type ResolvedLocalLight } from './local-lights';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 0, length = values.length): boolean {
@@ -79,7 +81,8 @@ export interface FrameStats {
   /** triangles is source instance-expanded geometry; use probeGeometryLod for actual selected triangles. */
   frames: number; drawCalls: number; triangles: number; deformedVertices: number;
   ownedGpuBytes: number; width: number; height: number; cpuSubmitMs: number;
-  gpuMs: { deformation: number; shadow: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number; supplementalReceivers: number; surfaceReceivers: number; reflections: number; occlusion: number; volumetricFog: number } | null;
+  /** shadow includes localLightShadows; do not add the subset again. */
+  gpuMs: { deformation: number; shadow: number; localLightShadows: number; surface: number; resolve: number; worldQueryRefit: number; geometryLod: number; diffuseGi: number; finalGather: number; supplementalReceivers: number; surfaceReceivers: number; reflections: number; occlusion: number; volumetricFog: number } | null;
   /** Render frame that produced gpuMs; unchanged while asynchronous readback is pending. */
   gpuSampleFrame: number | null;
   deformationDispatches: number; uploadedBytes: number;
@@ -118,6 +121,8 @@ export interface RendererOptions {
   reflections?: ReflectionsOptions;
   /** Conservative two-phase Hi-Z for resident/paged virtual geometry. */
   occlusion?: OcclusionOptions;
+  /** Bounded point/spot lights with a budgeted shadow atlas; disabled when omitted. */
+  localLights?: LocalLightOptions;
 }
 
 export interface RendererAdapterInfo {
@@ -188,6 +193,7 @@ export class Renderer {
   private reflections?: GpuReflections;
   private readonly occlusionOptions?: OcclusionOptions;
   private occlusion?: GpuOcclusion;
+  private localLights?: GpuLocalLights;
   private lightingLayout?: GPUBindGroupLayout;
   private lightingGroups: GPUBindGroup[] = [];
   private defaultClusterVertices!: GPUBuffer;
@@ -209,6 +215,7 @@ export class Renderer {
     }
     if (options.antiAliasing !== undefined && options.antiAliasing !== 'none' && options.antiAliasing !== 'fxaa') throw new Error('INVALID_ANTI_ALIASING');
     resolveSunShadowOptions(options.sunShadow);
+    if (options.localLights) resolveLocalLightOptions(options.localLights);
     if (options.volumetricFog && resolveVolumetricFogOptions(options.volumetricFog).airLighting && !options.diffuseGi) {
       throw new Error('FOG_AIR_LIGHTING_REQUIRES_DIFFUSE_GI');
     }
@@ -296,7 +303,7 @@ export class Renderer {
     this.timestampCount = 8 + (options.worldQueries ? 2 : 0) + (hasGeometryLod ? 2 : 0) + (options.diffuseGi ? 2 : 0)
       + (this.diffuseGiOptions?.finalGather ? 2 : 0) + (options.reflections ? 2 : 0) + (options.occlusion ? 6 : 0)
       + (this.diffuseGiOptions?.finalGather?.receiver === 'raster' ? (options.occlusion ? 4 : 2) : 0)
-      + (this.diffuseGiOptions?.finalGather?.maxSupplementalAnchors ? 2 : 0)
+      + (this.diffuseGiOptions?.finalGather?.maxSupplementalAnchors ? 2 : 0) + (options.localLights ? 2 : 0)
       + (options.volumetricFog ? (options.volumetricFog.temporal ? 8 : 6) : 0);
     this.materialResources = new MaterialResources(device, bytes => { this.stats.ownedGpuBytes += bytes; }, options.textureBudgetBytes, adapter.info);
     this.textureStreamingOptions = options.textureStreaming;
@@ -310,19 +317,24 @@ export class Renderer {
     this.shadow = device.createTexture({ label: 'sun shadow', size: [shadowResolution, shadowResolution], format: 'depth32float',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
     this.stats.ownedGpuBytes += this.sunShadowOptions.bytes;
+    // The depth pass must not bind its own render attachment as a sampled texture.
+    const shadowFrameLayout = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+    ] });
+    // Local lights reuse this shadow frame contract per atlas view and extend the surface frame contract.
+    if (options.localLights) this.localLights = GpuLocalLights.create(device, options.localLights, shadowFrameLayout,
+      bytes => { this.stats.ownedGpuBytes += bytes; });
     const frameLayout = device.createBindGroupLayout({ label: 'frame and lighting contract', entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+      ...(this.localLights?.frameLayoutEntries(3) ?? []),
     ] });
     this.frameBindGroup = device.createBindGroup({ layout: frameLayout, entries: [
       { binding: 0, resource: { buffer: this.frameBuffer } },
       { binding: 1, resource: this.shadow.createView() },
       { binding: 2, resource: device.createSampler({ compare: 'less-equal', magFilter: 'linear', minFilter: 'linear' }) },
-    ] });
-    // The depth pass must not bind its own render attachment as a sampled texture.
-    const shadowFrameLayout = device.createBindGroupLayout({ entries: [
-      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+      ...(this.localLights?.frameGroupEntries(3) ?? []),
     ] });
     this.shadowFrameBindGroup = device.createBindGroup({ layout: shadowFrameLayout,
       entries: [{ binding: 0, resource: { buffer: this.frameBuffer } }] });
@@ -431,11 +443,13 @@ export class Renderer {
         bytes => { this.stats.ownedGpuBytes += bytes; }, this.worldQueryOptions);
     }
     if (this.diffuseGiOptions) this.diffuseGi = await GpuDiffuseGi.create(this.device, this.worldQueries!, this.diffuseGiOptions,
-      bytes => { this.stats.ownedGpuBytes += bytes; });
+      bytes => { this.stats.ownedGpuBytes += bytes; }, this.localLights);
     if (this.volumetricFogOptions) this.volumetricFog = await GpuVolumetricFog.create(this.device, this.volumetricFogOptions,
-      bytes => { this.stats.ownedGpuBytes += bytes; }, this.diffuseGi);
+      bytes => { this.stats.ownedGpuBytes += bytes; }, this.diffuseGi, this.localLights);
     if (this.reflectionsOptions) this.reflections = await GpuReflections.create(this.device, this.worldQueries!, this.reflectionsOptions,
-      bytes => { this.stats.ownedGpuBytes += bytes; }, this.diffuseGi, this.volumetricFog, this.shadow);
+      bytes => { this.stats.ownedGpuBytes += bytes; }, this.diffuseGi, this.volumetricFog, this.shadow, this.localLights);
+    // Every consumer of the local light atlas reads it after the shared shadow pass.
+    const localShadowRead = this.localLights ? [{ resource: 'local-shadow-atlas', access: 'read' as const }] : [];
     if (this.diffuseGi || this.reflections) {
       this.lightingLayout = this.device.createBindGroupLayout({ label: 'surface GI and reflections', entries: [
         ...(this.diffuseGi?.surfaceBindingLayoutEntries ?? []),
@@ -478,6 +492,7 @@ export class Renderer {
         { name: 'receiver-identity-normals', kind: 'texture' as const, source: 'transient' as const },
       ] : []),
       { name: 'sun-shadow', kind: 'texture', source: 'transient' },
+      ...(this.localLights ? [{ name: 'local-shadow-atlas', kind: 'texture' as const, source: 'transient' as const }] : []),
       { name: 'canvas', kind: 'texture', source: 'imported' },
       { name: 'scene-hdr', kind: 'texture', source: 'transient' },
       { name: 'depth', kind: 'texture', source: 'transient' },
@@ -501,6 +516,11 @@ export class Renderer {
         { resource: 'shared-geometry' as const, access: 'read' as const },
         { resource: 'world-query-bounds' as const, access: 'write' as const },
       ], after: ['deformation'], execute: (encoder: GPUCommandEncoder) => this.worldQueries!.encodeRefit(encoder, this.timestamp(8)) }] : []),
+      ...(this.localLights ? [{ name: 'local-light-shadows', uses: [
+        { resource: 'shared-geometry' as const, access: 'read' as const },
+        { resource: 'local-shadow-atlas' as const, access: 'write' as const },
+      ], execute: (encoder: GPUCommandEncoder) => this.localLights!.encodeShadows(encoder, pass => this.draw(pass, 'shadow'),
+        this.timestamp(this.localLightTimestampIndex)) }] : []),
       ...(this.geometryLod ? [{ name: 'geometry-lod', uses: [
         { resource: 'scene-input' as const, access: 'read' as const },
         ...(this.occlusion ? [{ resource: 'occlusion-previous', access: 'read' as const }] : []),
@@ -511,7 +531,7 @@ export class Renderer {
         { resource: 'world-query-bounds', access: 'read' as const },
         { resource: 'shared-geometry', access: 'read' as const },
         { resource: 'world-query-scratch', access: 'readWrite' as const },
-        { resource: 'diffuse-gi-probes', access: 'readWrite' as const },
+        { resource: 'diffuse-gi-probes', access: 'readWrite' as const }, ...localShadowRead,
       ], execute: (encoder: GPUCommandEncoder) => {
         this.stats.uploadedBytes += this.diffuseGi!.encode(encoder, this.stats.frames + 1, this.materialRevision,
           this.timestamp(10 + (this.geometryLod ? 2 : 0)));
@@ -541,7 +561,7 @@ export class Renderer {
         { resource: 'shared-geometry', access: 'read' as const },
         { resource: 'world-query-scratch', access: 'readWrite' as const },
         { resource: 'diffuse-gi-probes', access: 'read' as const },
-        { resource: 'final-gather-anchors', access: 'readWrite' as const },
+        { resource: 'final-gather-anchors', access: 'readWrite' as const }, ...localShadowRead,
         ...(this.surfaceReceivers ? [
           { resource: 'receiver-metadata', access: 'read' as const },
           { resource: 'receiver-motion-depth', access: 'read' as const },
@@ -560,8 +580,9 @@ export class Renderer {
         ...(this.volumetricFog ? [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const }] : []),
         // The previous frame's copy: read here, replaced after this frame's surfaces.
         ...(this.reflections.screenTraceConfigured ? [{ resource: 'reflection-screen-capture', access: 'read' as const }] : []),
+        ...localShadowRead,
       ], execute: (encoder: GPUCommandEncoder) => { this.stats.uploadedBytes += this.reflections!.encode(encoder, this.timestamp(this.reflectionTimestampIndex)); } }] : []),
-      { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' },
+      { name: 'surface', uses: [{ resource: 'shared-geometry', access: 'read' }, { resource: 'sun-shadow', access: 'read' }, ...localShadowRead,
         ...(this.geometryLod ? [{ resource: 'selected-geometry', access: 'read' as const }] : []),
         ...(this.diffuseGi ? [{ resource: 'diffuse-gi-probes', access: 'read' as const }] : []),
         ...(this.diffuseGiOptions?.finalGather ? [{ resource: 'final-gather-anchors', access: 'read' as const }] : []),
@@ -576,6 +597,7 @@ export class Renderer {
       ] : []),
       ...(this.occlusion ? [
         { name: 'surface-recover', uses: [{ resource: 'shared-geometry', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const },
+          ...localShadowRead,
           { resource: 'selected-geometry', access: 'read' as const },
           ...(this.diffuseGi ? [{ resource: 'diffuse-gi-probes', access: 'read' as const }] : []),
           ...(this.diffuseGiOptions?.finalGather ? [{ resource: 'final-gather-anchors', access: 'read' as const }] : []),
@@ -589,7 +611,7 @@ export class Renderer {
       execute: (encoder: GPUCommandEncoder) => this.reflections!.encodeCapture(encoder) }] : []),
       ...(this.volumetricFog ? [
         { name: 'fog-inject', uses: [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const },
-          { resource: 'fog-source', access: 'write' as const }],
+          ...localShadowRead, { resource: 'fog-source', access: 'write' as const }],
           execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeInject(encoder, this.timestamp(this.timestampCount - (this.volumetricFog!.temporalConfigured ? 8 : 6))) },
         ...(this.volumetricFog.temporalConfigured ? [{ name: 'fog-temporal', uses: [
           { resource: 'fog-source', access: 'read' as const }, { resource: 'fog-history', access: 'readWrite' as const }],
@@ -625,6 +647,11 @@ export class Renderer {
           const module = await this.shader((surfaceFrameSource + '\n' + surfaceBrdfSource + '\n' + surfaceSource
             + (this.diffuseGiOptions?.finalGather ? '\n' + gatherDiagnosticSource : ''))
             .replace('// REFLECTION_PROGRAM', this.reflections ? reflectionSurfaceSource : '')
+            .replace('// LOCAL_LIGHTS_PROGRAM', this.localLights
+              ? localLightsShaderSource(this.localLights.options, { group: 0, firstBinding: 3, direct: true }) : '')
+            .replace('// LOCAL_LIGHTING', this.localLights
+              ? 'let direct = sunDirect + localLightsDirect(input.world, n, geometricNormal, v, base, metalness, roughness);'
+              : 'let direct = sunDirect;')
             .replace('// REFLECTED_LIGHTING', this.reflections
               ? 'let reflected = reflectionRadiance(input.position.xy, input.world, n, geometricNormal, base, metalness, roughness, input.surfaceIdentity);'
               : 'let reflected = vec3f(0.0);').replace('// DIFFUSE_GI_PROGRAM', this.diffuseGi
@@ -975,6 +1002,25 @@ export class Renderer {
     this.lightMatrix = projection.matrix;
   }
 
+  private requireLocalLights(): GpuLocalLights {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.localLights) throw new Error('LOCAL_LIGHTS_DISABLED');
+    return this.localLights;
+  }
+  /** Add a bounded point/spot light; it lights every path, on or off screen, from the next render. */
+  addLocalLight(light: LocalLightDescriptor): LocalLightHandle { return this.requireLocalLights().set.add(light); }
+  /** Partial update; an effective change bumps the light version and the set revision. */
+  updateLocalLight(handle: LocalLightHandle, patch: Partial<LocalLightDescriptor>): ResolvedLocalLight {
+    return this.requireLocalLights().set.update(handle, patch);
+  }
+  setLocalLightEnabled(handle: LocalLightHandle, enabled: boolean): ResolvedLocalLight {
+    return this.requireLocalLights().set.setEnabled(handle, enabled);
+  }
+  /** Releases the slot; the stale handle is rejected afterwards. */
+  removeLocalLight(handle: LocalLightHandle): void { this.requireLocalLights().set.remove(handle); }
+  localLight(handle: LocalLightHandle): ResolvedLocalLight { return this.requireLocalLights().set.get(handle); }
+  localLightList(): ResolvedLocalLight[] { return this.requireLocalLights().set.list(); }
+
   private async createBatch(scene: RenderBatch): Promise<Batch> {
     const capacity = scene.capacity;
     if (scene.geometryStream?.queryProxy && scene.mesh) throw new Error('GEOMETRY_STREAM_AMBIGUOUS_REPRESENTATION');
@@ -1315,6 +1361,8 @@ export class Renderer {
     frameWords[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : debug === 'residency' ? 3 : 0;
     frameWords[61] = Math.round((this.geometryLod?.settings.debugSplit ?? 0) * this.stats.width);
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
+    // Before GI and fog, which compare the light set revision for history invalidation.
+    this.stats.uploadedBytes += this.localLights?.update() ?? 0;
     this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
     for (const batch of this.batches) if (batch.stream) {
       const count = batch.material.program.alphaMode === 'opaque' ? batch.scene.instances.length : 0;
@@ -1326,6 +1374,13 @@ export class Renderer {
       committed: batch.scene.inputMode === 'committed', bounds: batch.bounds, material: batch.material,
       materialBinding: batch.material.bindGroup, materialVersion: batch.materialVersion,
       topologyVersion: batch.scene.queryIdentity?.topologyVersion ?? 0 })), this.stats.frames + 1, eye, vp);
+    // Local light changes dirty GI explicitly: their range boxes under the scheduled policy; under full updates,
+    // a global change that rejects bounce feedback like a sun change.
+    const lightChanges = this.localLights?.changedRegions ?? [];
+    if (this.diffuseGi && lightChanges.length) {
+      if (this.diffuseGi.updateOptions.mode === 'scheduled') for (const region of lightChanges) this.diffuseGi.markDirty(region);
+      else this.diffuseGi.markDirty();
+    }
     this.stats.uploadedBytes += this.diffuseGi?.update(this.stats.frames + 1, this.sunDirection, this.sunColor,
       this.materialRevision, this.worldQueries!.historyRevision) ?? 0;
     this.stats.uploadedBytes += this.diffuseGi?.updateFinalGather(this.stats.frames + 1, this.stats.width, this.stats.height,
@@ -1338,7 +1393,7 @@ export class Renderer {
         this.sunDirection, this.sunColor, this.lightMatrix, vp,
         { cameraCut: !this.lastViewProjection, sceneChanged: this.batches.some(batch => batch.fogSceneChanged), materialRevision: this.materialRevision,
           changedBounds: fog.localRejection ? this.batches.flatMap(batch => batch.fogChangedBounds) : null,
-          shadowResolution: this.sunShadowOptions.resolution });
+          shadowResolution: this.sunShadowOptions.resolution, lightRevision: this.localLights?.revision });
     }
     this.stats.uploadedBytes += this.reflections?.update({ frame: this.stats.frames + 1, materialRevision: this.materialRevision,
       width: this.stats.width, height: this.stats.height, eye, target, fovY: Math.PI / 3.2, near: 0.1, far: 150,
@@ -1397,6 +1452,10 @@ export class Renderer {
   private get occlusionTimestampIndex(): number { return this.reflectionTimestampIndex + (this.reflections ? 2 : 0); }
   private get receiverTimestampIndex(): number { return this.occlusionTimestampIndex + (this.occlusion ? 6 : 0); }
   private get supplementalTimestampIndex(): number { return this.receiverTimestampIndex + (this.surfaceReceivers ? (this.occlusion ? 4 : 2) : 0); }
+  /** Before the fog block, which is indexed from the end of the query set. */
+  private get localLightTimestampIndex(): number {
+    return this.supplementalTimestampIndex + (this.diffuseGiOptions?.finalGather?.maxSupplementalAnchors ? 2 : 0);
+  }
   private timestamp(index: number): GPUComputePassTimestampWrites | undefined {
     return this.querySet ? { querySet: this.querySet, beginningOfPassWriteIndex: index, endOfPassWriteIndex: index + 1 } : undefined;
   }
@@ -1473,6 +1532,7 @@ export class Renderer {
       volumetricFog: this.volumetricFog?.diagnostics() ?? null,
       reflections: this.reflections?.diagnostics() ?? null,
       occlusion: this.occlusion?.diagnostics() ?? null,
+      localLights: this.localLights?.diagnostics() ?? null,
       sunShadow: { resolution: this.sunShadowOptions.resolution, bytes: this.sunShadowOptions.bytes,
         focusBounds: this.sunShadowOptions.focusBounds ?? null, width: this.sunShadowProjection.width,
         depth: this.sunShadowProjection.depth, texelWorldSize: this.sunShadowProjection.texelWorldSize,
@@ -1522,8 +1582,9 @@ export class Renderer {
     try {
       await this.queryRead!.mapAsync(GPUMapMode.READ);
       const values = new BigUint64Array(this.queryRead!.getMappedRange());
+      const localLightShadows = this.localLights ? Number(values[this.localLightTimestampIndex + 1] - values[this.localLightTimestampIndex]) / 1e6 : 0;
       this.stats.gpuMs = { deformation: Number(values[1] - values[0]) / 1e6,
-        shadow: Number(values[3] - values[2]) / 1e6, surface: Number(values[5] - values[4]) / 1e6
+        shadow: Number(values[3] - values[2]) / 1e6 + localLightShadows, localLightShadows, surface: Number(values[5] - values[4]) / 1e6
           + (this.occlusion ? Number(values[this.occlusionTimestampIndex + 5] - values[this.occlusionTimestampIndex + 4]) / 1e6 : 0),
         resolve: Number(values[7] - values[6]) / 1e6,
         worldQueryRefit: this.worldQueries ? Number(values[9] - values[8]) / 1e6 : 0,
@@ -1813,6 +1874,7 @@ export class Renderer {
     this.reflections?.dispose();
     this.volumetricFog?.dispose();
     this.diffuseGi?.dispose();
+    this.localLights?.dispose();
     this.surfaceReceivers?.dispose();
     this.worldQueries?.dispose();
     this.geometryLod?.dispose();

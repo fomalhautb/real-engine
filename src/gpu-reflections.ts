@@ -8,6 +8,7 @@ import surfaceBrdf from './shaders/surface-brdf.wgsl?raw';
 import giCommon from './shaders/diffuse-gi-common.wgsl?raw';
 import giInterpolate from './shaders/diffuse-gi-interpolate.wgsl?raw';
 import { reflectionFogShaderSource, type GpuVolumetricFog } from './gpu-volumetric-fog';
+import { FOG_LOCAL_LIGHTS_HOOK, localLightsShaderSource, type GpuLocalLights } from './gpu-local-lights';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import { lookAt } from './math';
 import { planReflectionGrid, REFLECTION_SCREEN_BYTES_PER_PIXEL, resolveReflectionsOptions, type ReflectionsOptions,
@@ -97,12 +98,13 @@ export class GpuReflections {
   private pendingReset: string | null = 'initial';
   private temporalActive = false;
   private previous?: { frame: number; width: number; height: number; spacing: number; viewProjection: Float32Array;
-    materialRevision: number; light: number[]; media: number; historyRevision: number };
+    materialRevision: number; light: number[]; lights: number; media: number; historyRevision: number };
   private pipelines!: Record<Entry, GPUComputePipeline>;
   private groups!: Record<Exclude<Entry, 'integrate' | 'temporal'>, GPUBindGroup>;
   private integrateGroups: GPUBindGroup[] = [];
   private temporalGroups: GPUBindGroup[] = [];
   private fogGroup?: GPUBindGroup;
+  private localLightGroup?: GPUBindGroup;
   private readonly data = new Float32Array(PARAMETER_BYTES / 4);
   private screenEnabled: boolean;
   private screenTextures: GPUTexture[] = [];
@@ -121,7 +123,8 @@ export class GpuReflections {
   get screenTraceConfigured(): boolean { return !!this.options.screenTrace; }
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, options: ReflectionsOptions,
-    account: (bytes: number) => void, gi?: GpuDiffuseGi, fog?: GpuVolumetricFog, shadow?: GPUTexture): Promise<GpuReflections> {
+    account: (bytes: number) => void, gi?: GpuDiffuseGi, fog?: GpuVolumetricFog, shadow?: GPUTexture,
+    localLights?: GpuLocalLights): Promise<GpuReflections> {
     const resolved = resolveReflectionsOptions(options);
     const capacity = Math.min(resolved.maxAnchors, Math.floor(queries.options.maxRays / resolved.samplesPerAnchor),
       Math.floor(queries.options.maxTotalWorkUnits / resolved.samplesPerAnchor));
@@ -130,13 +133,13 @@ export class GpuReflections {
     if (queries.options.maxTraceParameterSetsPerEncoder < parameterSlots) throw new Error('REFLECTIONS_QUERY_PARAMETER_BUDGET');
     if (device.limits.maxStorageBuffersPerShaderStage < 5 + Number(!!gi) + Number(!!fog)) throw new Error('REFLECTIONS_STORAGE_BINDING_LIMIT');
     if (fog && !shadow) throw new Error('REFLECTIONS_FOG_SHADOW_REQUIRED');
-    const result = new GpuReflections(device, queries, resolved, capacity, account, gi, fog, shadow);
+    const result = new GpuReflections(device, queries, resolved, capacity, account, gi, fog, shadow, localLights);
     try { await result.initialize(); return result; } catch (error) { result.dispose(); throw error; }
   }
   private constructor(private device: GPUDevice, private queries: GpuWorldQuery,
     options: ReturnType<typeof resolveReflectionsOptions>, private capacity: number,
     private account: (bytes: number) => void, private gi?: GpuDiffuseGi, private fog?: GpuVolumetricFog,
-    private shadow?: GPUTexture) {
+    private shadow?: GPUTexture, private localLights?: GpuLocalLights) {
     this.options = options; this.temporalEnabled = !!options.temporal; this.screenEnabled = !!options.screenTrace;
     this.screenState = options.screenTrace ? 'awaiting-resize' : 'not-configured';
   }
@@ -173,9 +176,17 @@ export class GpuReflections {
       + '\n@group(0) @binding(7) var<uniform> gi: GiParameters;\n@group(0) @binding(8) var<storage, read> giProbes: array<GiProbe>;\n'
       + giInterpolate + '\nfn reflectionDiffuse(hit:ReflectionHit)->vec3f { return giSampleSurfaceIrradiance(hit.position.xyz,hit.normal.xyz,reflectionGeometry(hit),gi.state.x) * hit.baseColor.xyz * (1.0-hit.previous.w) * (0.96/3.14159265); }'
       : 'fn reflectionDiffuse(hit:ReflectionHit)->vec3f { return hit.baseColor.xyz * (0.045+0.065*max(hit.normal.y,0.0)) * (1.0-hit.previous.w*0.6); }';
-    const fogSource = this.fog ? reflectionFogShaderSource(this.fog, !!this.gi) : 'fn reflectionApplyFog(origin:vec3f,direction:vec3f,distance:f32,incoming:vec3f)->vec3f {return incoming;}';
+    const lights = this.localLights, lightGroup = this.fog ? 2 : 1;
+    const fogSource = this.fog ? reflectionFogShaderSource(this.fog, !!this.gi).replace('// FOG_LOCAL_LIGHTS', lights ? FOG_LOCAL_LIGHTS_HOOK : '')
+      : 'fn reflectionApplyFog(origin:vec3f,direction:vec3f,distance:f32,incoming:vec3f)->vec3f {return incoming;}';
+    // Reflected hits and reflected-ray media see every enabled local light (no froxel list off the view grid).
+    const update = updateSource.replace('// REFLECTION_GI', giSource)
+      .replace('// REFLECTION_LOCAL_LIGHTS_PROGRAM', lights ? localLightsShaderSource(lights.options,
+        { group: lightGroup, direct: true, fog: this.fog ? 'all-lights' : undefined }) : '')
+      .replace('// REFLECTION_LOCAL_LIGHTS', lights ? 'incoming += localLightsDirect(hit.position.xyz, hit.normal.xyz, reflectionGeometry(hit), '
+        + '-sample.direction.xyz, hit.baseColor.xyz, hit.previous.w, hit.normal.w);' : '');
     const module = this.device.createShaderModule({ label: 'world-space reflections',
-      code: surfaceFrame + '\n' + surfaceBrdf + '\n' + common + '\n' + updateSource.replace('// REFLECTION_GI', giSource)
+      code: surfaceFrame + '\n' + surfaceBrdf + '\n' + common + '\n' + update
         .replace('// REFLECTION_SCREEN_SAMPLE', this.options.screenTrace ? SCREEN_SAMPLE : '') + '\n' + fogSource
         + (this.options.temporal ? '\n' + temporalSource : '') + (this.options.screenTrace ? '\n' + screenSource : '') });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');
@@ -199,6 +210,7 @@ export class GpuReflections {
       { binding: 2, resource: this.shadow!.createView() },
       { binding: 3, resource: this.device.createSampler({ compare: 'less-equal', minFilter: 'linear', magFilter: 'linear' }) },
     ] });
+    if (lights) this.localLightGroup = lights.bindGroup(p.integrate.getBindGroupLayout(lightGroup));
     // Group i writes history[i] from history[1 - i].
     if (this.options.temporal) this.temporalGroups = [0, 1].map(index => this.bind(p.temporal,
       [[0, this.parameters], [6, this.anchors], [9, this.history[1 - index]], [10, this.history[index]]]));
@@ -319,6 +331,7 @@ export class GpuReflections {
       if (this.temporalActive && !viewProjection) throw new Error('REFLECTIONS_TEMPORAL_VIEW_PROJECTION');
       const light = [...sunDirection, ...input.sunColor].map(Math.fround);
       const media = this.fog?.diagnostics().revision ?? 0, historyRevision = input.historyRevision ?? 0;
+      const lights = this.localLights?.revision ?? 0;
       const old = this.previous;
       let reason = this.pendingReset;
       if (!reason && this.temporalActive) {
@@ -328,6 +341,7 @@ export class GpuReflections {
           : old.width !== input.width || old.height !== input.height || old.spacing !== grid.spacing ? 'grid-changed'
           : old.materialRevision !== input.materialRevision ? 'material-changed'
           : old.light.some((value, i) => Math.abs(value - light[i]) > LIGHT_EPSILON) ? 'lighting-changed'
+          : old.lights !== lights ? 'local-light-change'
           : old.media !== media ? 'media-changed'
           : old.historyRevision !== historyRevision ? 'scene-identity-changed' : null;
       }
@@ -339,7 +353,7 @@ export class GpuReflections {
       uints.set([Number(this.temporalActive), Number(this.temporalActive && this.historyValid),
         Number(cameraMoved), Number(input.sceneMotion ?? true)], 64);
       this.previous = viewProjection ? { frame: input.frame, width: input.width, height: input.height, spacing: grid.spacing,
-        viewProjection, materialRevision: input.materialRevision, light, media, historyRevision } : undefined;
+        viewProjection, materialRevision: input.materialRevision, light, lights, media, historyRevision } : undefined;
     }
     data.set(previousViewProjection ?? viewProjection ?? new Float32Array(16), 44);
     this.currentViewProjection = viewProjection;
@@ -368,6 +382,7 @@ export class GpuReflections {
       const pass = encoder.beginComputePass({ label: 'reflections ' + entry, timestampWrites: timestamps });
       pass.setPipeline(this.pipelines[entry]); pass.setBindGroup(0, group);
       if (entry === 'integrate' && this.fogGroup) pass.setBindGroup(1, this.fogGroup);
+      if (entry === 'integrate' && this.localLightGroup) pass.setBindGroup(this.fogGroup ? 2 : 1, this.localLightGroup);
       pass.dispatchWorkgroups(Math.ceil(count / 64)); pass.end();
     };
     dispatch('generateCamera', grid.anchorCount, this.groups.generateCamera,
@@ -428,7 +443,7 @@ export class GpuReflections {
   diagnostics() {
     return { enabled: this.enabled, frame: this.encodedFrame, grid: this.grid ? { ...this.grid } : null,
       ownedGpuBytes: this.bytes, capacity: this.capacity, options: this.options,
-      diffuseGi: !!this.gi, worldMedia: !!this.fog, reflectedSegments: 1, temporalHistory: this.temporalActive,
+      diffuseGi: !!this.gi, worldMedia: !!this.fog, localLights: !!this.localLights, reflectedSegments: 1, temporalHistory: this.temporalActive,
       temporal: { configured: !!this.options.temporal, enabled: this.temporalEnabled, active: this.temporalActive,
         valid: this.temporalActive && this.historyValid, framesSinceReset: this.historyFrames,
         lastResetReason: this.resetReason, historyBytes: this.historyBytes,

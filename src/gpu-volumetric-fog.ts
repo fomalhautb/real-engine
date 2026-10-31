@@ -14,6 +14,7 @@ import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 import { lookAt, type Mat4 } from './math';
 import { FOG_OCCLUDER_REGION_BYTES, decodeFogHistoryState, fogFixedBytes, fogOccluderRegions, resolveFogAirLighting, resolveVolumetricFogOptions, selectFogGrid,
   type FogAirLightingOptions, type FogOccluderBounds, type VolumetricFogOptions, type ResolvedVolumetricFogOptions } from './volumetric-fog';
+import { FOG_LOCAL_LIGHTS_HOOK, localLightsShaderSource, type GpuLocalLights } from './gpu-local-lights';
 
 type Grid = ReturnType<typeof selectFogGrid>;
 type FogMedia = Pick<VolumetricFogOptions, 'global' | 'volumes'>;
@@ -26,6 +27,8 @@ export interface FogFrameState {
   /** Bounds of changed casters for local rejection; null means the change cannot be localized. */
   changedBounds?: readonly FogOccluderBounds[] | null;
   shadowResolution?: number;
+  /** Local light set revision; any change resets history ('local-light-change'). */
+  lightRevision?: number;
 }
 type HistoryView = { source: GPUBuffer; count: GPUBuffer; compute: GPUBindGroup; temporal: GPUBindGroup; compose: GPUBindGroup };
 const LIGHT_COMPONENTS = [20, 21, 22, 23, 24, 25, 26, ...Array.from({ length: 16 }, (_, i) => i + 48)];
@@ -111,8 +114,11 @@ export class GpuVolumetricFog {
   private resetPending = true;
   private previousView?: Float32Array;
   private previousMaterialRevision?: number;
+  private previousLightRevision?: number;
   private submittedView?: Float32Array;
   private submittedMaterialRevision?: number;
+  private submittedLightRevision?: number;
+  private localLightGroup?: GPUBindGroup;
   private computeGroup?: GPUBindGroup;
   private composeGroup?: GPUBindGroup;
   private sources?: GPUBuffer;
@@ -126,20 +132,21 @@ export class GpuVolumetricFog {
   private volumeUploadPending = true;
   private maxAnisotropy = 0;
 
-  /** `gi` is borrowed for air lighting; the GI owner keeps allocation and disposal. */
+  /** `gi` is borrowed for air lighting and `localLights` for local-light scattering; their owners keep allocation and disposal. */
   static async create(device: GPUDevice, options: VolumetricFogOptions, account: (bytes: number) => void,
-    gi?: GpuDiffuseGi): Promise<GpuVolumetricFog> {
+    gi?: GpuDiffuseGi, localLights?: GpuLocalLights): Promise<GpuVolumetricFog> {
     const resolved = resolveVolumetricFogOptions(options);
     selectFogGrid(1, 1, resolved);
     if (resolved.airLighting && !gi) throw new Error('FOG_AIR_LIGHTING_REQUIRES_DIFFUSE_GI');
+    // Local lights bind a uniform, the shadow atlas and a sampler: no storage buffers.
     const injectStorage = 3 + (resolved.temporal ? 1 : 0) + (resolved.airLighting ? 1 : 0);
     if (device.limits.maxStorageBuffersPerShaderStage < Math.max(injectStorage, resolved.temporal ? 5 : 0)) throw new Error('FOG_STORAGE_BINDING_LIMIT');
-    const fog = new GpuVolumetricFog(device, resolved, account, resolved.airLighting ? gi : undefined);
+    const fog = new GpuVolumetricFog(device, resolved, account, resolved.airLighting ? gi : undefined, localLights);
     try { await fog.initialize(); return fog; } catch (error) { fog.dispose(); throw error; }
   }
 
   private constructor(private device: GPUDevice, options: ResolvedVolumetricFogOptions, private account: (bytes: number) => void,
-    private readonly gi?: GpuDiffuseGi) {
+    private readonly gi?: GpuDiffuseGi, private readonly localLights?: GpuLocalLights) {
     this.options = options;
     this.temporalEnabled = !!options.temporal;
     this.airLighting = options.airLighting;
@@ -187,11 +194,19 @@ export class GpuVolumetricFog {
     const resolvedSource = this.options.temporal
       ? '@group(0) @binding(6) var<storage, read> historySource: array<vec4f>;\nfn resolvedSource(index:u32)->vec4f { if(frame.reserved.w > 0.5){return historySource[index];}return sources[index];}'
       : 'fn resolvedSource(index:u32)->vec4f {return sources[index];}';
-    const compute = await shader(worldSource + '\n' + (this.gi ? GRID_AIR_SOURCE : AIR_STUB) + '\n'
+    // Local lights add single scattering per froxel from a bounded, deterministic per-block light list. The inject
+    // entry point binds them at group 1; the air entry point binds the GI field there and never reads local lights.
+    const lights = this.localLights;
+    const localSource = lights ? localLightsShaderSource(lights.options, { group: 1, fog: 'froxel-block' }) + '\n' : '';
+    const compute = await shader(localSource + worldSource.replace('// FOG_LOCAL_LIGHTS', lights ? FOG_LOCAL_LIGHTS_HOOK : '') + '\n'
+      + (this.gi ? GRID_AIR_SOURCE : AIR_STUB) + '\n'
       + `const FOG_AIR_PASS = ${!!this.gi};\n`
-      + computeSource.replace('// FOG_RESOLVED_SOURCE', resolvedSource), 'fog source and integration');
+      + computeSource.replace('// FOG_RESOLVED_SOURCE', resolvedSource)
+        .replace('// FOG_INJECT_PROLOGUE', lights ? 'fogCullLocalLights(block, lane);' : ''), 'fog source and integration');
     const computeLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
-    this.injectPipeline = await this.device.createComputePipelineAsync({ label: 'fog density and sun', layout: computeLayout, compute: { module: compute, entryPoint: 'inject' } });
+    const injectLayout = lights ? this.device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout, lights.computeLayout] }) : computeLayout;
+    if (lights) this.localLightGroup = lights.bindGroup();
+    this.injectPipeline = await this.device.createComputePipelineAsync({ label: 'fog density and sun', layout: injectLayout, compute: { module: compute, entryPoint: 'inject' } });
     if (this.gi) {
       this.airLayout = this.device.createBindGroupLayout({ label: 'fog borrowed GI field', entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
@@ -382,10 +397,12 @@ export class GpuVolumetricFog {
     if (this.options.temporal) {
       const local = this.localRejection;
       // Localizing a change needs every changed caster's bounds and an affine (orthographic) sun.
-      const localizable = local && !!state.changedBounds?.length && affineMatrix(lightMatrix);
+      // Local light shadows are perspective views outside the sun's light space: while any renders, a caster change resets globally.
+      const localizable = local && !!state.changedBounds?.length && affineMatrix(lightMatrix) && !this.localLights?.activeShadowViews;
       if (!this.resetPending && state.cameraCut) this.invalidateHistory('camera-cut');
       if (!this.resetPending && state.sceneChanged && !localizable) this.invalidateHistory('scene-change');
       if (!this.resetPending && state.materialRevision !== this.previousMaterialRevision) this.invalidateHistory('material-change');
+      if (!this.resetPending && state.lightRevision !== this.previousLightRevision) this.invalidateHistory('local-light-change');
       if (!this.resetPending && this.previousView && LIGHT_COMPONENTS
         .some(index => data[index] !== this.previousView![index])) this.invalidateHistory('lighting-change');
       if (localizable && !this.resetPending && state.sceneChanged) {
@@ -406,6 +423,7 @@ export class GpuVolumetricFog {
       data[47] = active ? 1 : 0;
       data.set([this.historyValid && active ? 1 : 0, this.options.temporal.maxHistoryFrames, this.maxAnisotropy, staticView ? 1 : 0], 88);
       this.submittedView = data.slice(); this.submittedView.set(viewProjection, 72); this.submittedMaterialRevision = state.materialRevision;
+      this.submittedLightRevision = state.lightRevision;
     }
     this.device.queue.writeBuffer(this.uniform, 0, data);
     let bytes = 384;
@@ -427,6 +445,7 @@ export class GpuVolumetricFog {
     const pass = encoder.beginComputePass({ label: 'fog density and lighting', timestampWrites });
     if (this.enabled && this.grid) {
       pass.setPipeline(this.injectPipeline); pass.setBindGroup(0, this.computeGroup!);
+      if (this.localLightGroup) pass.setBindGroup(1, this.localLightGroup);
       pass.dispatchWorkgroups(Math.ceil(this.grid.columns / 4), Math.ceil(this.grid.rows / 4), Math.ceil(this.grid.slices / 4));
     }
     pass.end();
@@ -468,6 +487,7 @@ export class GpuVolumetricFog {
 
   afterSubmit(): void {
     this.previousView = this.submittedView; this.previousMaterialRevision = this.submittedMaterialRevision;
+    this.previousLightRevision = this.submittedLightRevision;
     if (this.enabled && this.temporalEnabled) {
       this.historyIndex = 1 - this.historyIndex; this.historyValid = true;
       this.historyFrames++; this.resetPending = false;
@@ -503,6 +523,7 @@ export class GpuVolumetricFog {
     return { enabled: this.enabled, revision: this.revision, grid: this.grid ? { ...this.grid } : null,
       maxViewDepth: this.options.maxViewDepth, volumes: this.options.volumes.length, global: !!this.options.global,
       depthDistribution: 'quadratic' as const, lighting: 'sun-shadow-single-scattering' as const, temporalHistory: this.temporalEnabled,
+      localLightScattering: this.localLights ? 'froxel-block-light-list-shadowed-single-scattering' as const : null,
       history: { configured: !!this.options.temporal, valid: this.historyValid, framesSinceReset: this.historyFrames,
         maxFrames: this.options.temporal ? this.options.temporal.maxHistoryFrames : 0, lastResetReason: this.resetReason,
         occluderRejection: this.options.temporal ? this.options.temporal.occluderRejection : null,

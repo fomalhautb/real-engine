@@ -16,6 +16,7 @@ struct Hit {
 @group(0) @binding(7) var<storage, read> schedule: array<u32>;
 
 // GI_INTERPOLATE
+// GI_LOCAL_LIGHTS_PROGRAM
 
 fn giHitGeometry(hit: Hit) -> vec3f {
     return surfaceOctDecode(vec2f(hit.position.w, hit.uvInfo.w));
@@ -87,6 +88,7 @@ fn integrate(@builtin(global_invocation_id) id: vec3u) {
                 // Diffuse-only capture: dielectric F0=.04, no specular bounce.
                 radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)
                     * gi.sunColor.xyz * nl * visible;
+                // GI_LOCAL_LIGHTS
                 if (gi.state.z != 0u) {
                     radiance += hit.baseColor.xyz * (1.0 - hit.previous.w) * (0.96 / 3.14159265)
                         * giSampleSurfaceIrradianceSince(hit.position.xyz, hit.normal.xyz, giHitGeometry(hit), gi.state.y,

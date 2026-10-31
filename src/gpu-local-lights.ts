@@ -2,9 +2,10 @@ import coreSource from './shaders/local-lights.wgsl?raw';
 import directSource from './shaders/local-lights-direct.wgsl?raw';
 import fogSource from './shaders/local-lights-fog.wgsl?raw';
 import fogCullSource from './shaders/local-lights-fog-cull.wgsl?raw';
+import type { Bounds3 } from './deformation';
 import {
-  LOCAL_SHADOW_VIEW_MATRIX_OFFSET, LOCAL_SHADOW_VIEW_UNIFORM_STRIDE, LocalLightSet, resolveLocalLightOptions,
-  type LocalLightOptions, type ResolvedLocalLightOptions,
+  LOCAL_SHADOW_VIEW_MATRIX_OFFSET, LOCAL_SHADOW_VIEW_UNIFORM_STRIDE, LocalLightSet, localLightChangeRegions, resolveLocalLightOptions,
+  type LocalLightOptions, type ResolvedLocalLight, type ResolvedLocalLightOptions,
 } from './local-lights';
 
 export interface LocalLightShaderOptions {
@@ -68,6 +69,8 @@ export class GpuLocalLights {
   private readonly viewData: Float32Array<ArrayBuffer>;
   private uploadedRevision = -1;
   private renderedLayers: number[] = [];
+  private uploadedLights: ResolvedLocalLight[] = [];
+  private changed: Bounds3[] = [];
   private bytes = 0;
   private disposed = false;
   private uploads = 0;
@@ -127,6 +130,13 @@ export class GpuLocalLights {
   /** Monotonic set revision for explicit history invalidation by dependents. */
   get revision(): number { return this.set.revision; }
 
+  /** Range-sphere boxes (before and after) of the lights whose shading changed in the last update(); empty when
+   * nothing changed. Dependents with region-based invalidation (GI) consume them. */
+  get changedRegions(): readonly Bounds3[] { return this.changed; }
+
+  /** Shadow views rendered this frame (enabled shadowed lights), as of the last update(). */
+  get activeShadowViews(): number { return this.renderedLayers.length; }
+
   /** Fragment entries appended to the renderer's frame contract. */
   frameLayoutEntries(firstBinding: number): GPUBindGroupLayoutEntry[] {
     return [
@@ -151,7 +161,10 @@ export class GpuLocalLights {
   /** Upload the block only when the set changed. Returns uploaded bytes. */
   update(): number {
     this.assertAlive();
-    if (this.uploadedRevision === this.set.revision) return 0;
+    if (this.uploadedRevision === this.set.revision) { this.changed = []; return 0; }
+    const lights = this.set.list();
+    this.changed = localLightChangeRegions(this.uploadedLights, lights);
+    this.uploadedLights = lights;
     const packed = this.set.pack(this.packed);
     this.viewData.fill(0);
     for (const view of packed.views) {

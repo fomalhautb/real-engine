@@ -15,6 +15,7 @@ import type { GpuWorldQuery } from './gpu-world-query';
 import { WORLD_HIT_BYTES, WORLD_RAY_BYTES } from './world-query';
 import { DEFORMED_VERTEX_BYTES, type MeshData } from './geometry';
 import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
+import { localLightsShaderSource, type GpuLocalLights } from './gpu-local-lights';
 
 type QueryProxy = StreamedSceneBatch['geometryStream']['queryProxy'];
 
@@ -161,6 +162,7 @@ export class GpuFinalGather {
   private rasterReceiverGroup?: GPUBindGroup;
   private hemisphereGroups!: GPUBindGroup[][];
   private integrateGroups!: GPUBindGroup[][][];
+  private localLightGroup?: GPUBindGroup;
   private areaIntegrateGroups!: GPUBindGroup[];
   private accumulateGroups!: GPUBindGroup[];
   private denoiseGroups!: GPUBindGroup[];
@@ -176,7 +178,7 @@ export class GpuFinalGather {
 
   static async create(device: GPUDevice, queries: GpuWorldQuery, giParameterBuffer: GPUBuffer,
     giProbeBuffers: [GPUBuffer, GPUBuffer], options: ResolvedFinalGatherOptions,
-    account: (bytes: number) => void, maxBytesRemaining: number): Promise<GpuFinalGather> {
+    account: (bytes: number) => void, maxBytesRemaining: number, localLights?: GpuLocalLights): Promise<GpuFinalGather> {
     const resolved = resolveFinalGatherOptions(options);
     const capacity = Math.min(resolved.maxAnchors, Math.floor(queries.options.maxRays / resolved.raysPerAnchor),
       Math.floor(queries.options.maxTotalWorkUnits / resolved.raysPerAnchor));
@@ -192,14 +194,15 @@ export class GpuFinalGather {
       || queries.rayBuffer.size < queries.options.maxRays * WORLD_RAY_BYTES
       || queries.hitBuffer.size < queries.options.maxRays * WORLD_HIT_BYTES) throw new Error('FINAL_GATHER_BORROWED_BUFFER_LAYOUT');
     const result = new GpuFinalGather(device, queries, giParameterBuffer, giProbeBuffers, resolved,
-      capacity, account, Math.min(resolved.maxBytes, maxBytesRemaining));
+      capacity, account, Math.min(resolved.maxBytes, maxBytesRemaining), localLights);
     try { await result.initialize(); return result; }
     catch (error) { result.dispose(); throw error; }
   }
   private constructor(private readonly device: GPUDevice, private readonly queries: GpuWorldQuery,
     private readonly giParameterBuffer: GPUBuffer, private readonly giProbeBuffers: [GPUBuffer, GPUBuffer],
     options: ResolvedFinalGatherOptions, private readonly anchorCapacity: number,
-    private readonly account: (bytes: number) => void, private readonly maxBytes: number) { this.options = options; }
+    private readonly account: (bytes: number) => void, private readonly maxBytes: number,
+    private readonly localLights?: GpuLocalLights) { this.options = options; }
 
   private assertAlive(): void { if (this.disposed) throw new Error('FINAL_GATHER_DISPOSED'); }
   private preflight(sizes: readonly number[]): void {
@@ -264,7 +267,11 @@ export class GpuFinalGather {
       `const GI_DISTANCE_RESOLUTION: u32 = ${GI_DISTANCE_RESOLUTION}u;\nconst GI_DISTANCE_CELLS: u32 = ${GI_DISTANCE_CELLS}u;`);
     const progressive = this.options.supplementalSampling === 'progressive-halton';
     const update = updateSource.replace('// GI_COMMON', common).replace('// GI_INTERPOLATE', interpolateSource)
-      .replace('// GATHER_PROGRESSIVE_DIRECTION', progressive ? 'uv = cacheProgressiveUv(anchor, sample, uv);' : '');
+      .replace('// GATHER_PROGRESSIVE_DIRECTION', progressive ? 'uv = cacheProgressiveUv(anchor, sample, uv);' : '')
+      // Local lights reach every gathered hit through the shared atlas, beside the sun.
+      .replace('// GATHER_LOCAL_LIGHTS_PROGRAM', this.localLights ? localLightsShaderSource(this.localLights.options, { group: 1 }) : '')
+      .replace('// GATHER_LOCAL_LIGHTS', this.localLights
+        ? 'hitIrradiance += localLightsIrradiance(hit.position.xyz, hit.normal.xyz, gatherHitGeometry(hit));' : '');
     const cache = cacheSource.replace('// CACHE_CONSTANTS', `const CACHE_PRIMARY_CAPACITY: u32 = ${cap}u;`)
       .replace('const CACHE_PROGRESSIVE_SAMPLING: bool = false;', `const CACHE_PROGRESSIVE_SAMPLING: bool = ${progressive};`)
       .replace('const CACHE_SAMPLING_SEED: u32 = 0u;', `const CACHE_SAMPLING_SEED: u32 = ${this.options.supplementalSamplingSeed}u;`)
@@ -294,6 +301,7 @@ export class GpuFinalGather {
       compute: { module, entryPoint } })));
     this.pipelines = Object.fromEntries(names.map((name, i) => [name, results[i]])) as Record<EntryPoint, GPUComputePipeline>;
     const p = this.pipelines, q = this.queries;
+    if (this.localLights) this.localLightGroup = this.localLights.bindGroup(p.integrate.getBindGroupLayout(1));
     this.groups = {
       generateCamera: this.bind(p.generateCamera, [[0, this.parameters], [2, q.rayBuffer]]),
       generateShadows: this.bind(p.generateShadows, [[0, this.parameters], [1, this.giParameterBuffer], [2, q.rayBuffer],
@@ -524,6 +532,7 @@ export class GpuFinalGather {
         if (!count) return;
         const pass = encoder.beginComputePass({ label: 'surface final gather ' + name, timestampWrites });
         pass.setPipeline(this.pipelines[name]); pass.setBindGroup(0, group);
+        if (name === 'integrate' && this.localLightGroup) pass.setBindGroup(1, this.localLightGroup);
         pass.dispatchWorkgroups(Math.ceil(count / workgroupSize)); pass.end();
       };
       const begin = timestampSpanStart(timing);

@@ -3,7 +3,9 @@
 // FOG_RESOLVED_SOURCE
 
 @compute @workgroup_size(4, 4, 4)
-fn inject(@builtin(global_invocation_id) id: vec3u) {
+fn inject(@builtin(global_invocation_id) id: vec3u, @builtin(workgroup_id) block: vec3u,
+          @builtin(local_invocation_index) lane: u32) {
+  // FOG_INJECT_PROLOGUE
   if (any(id >= frame.grid.xyz)) { return; }
   let ray = fogRay((vec2f(id.xy) + 0.5) / vec2f(frame.grid.xy));
   let sampleRay = fogRay((vec2f(id.xy) + 0.5 + frame.reserved.xy) / vec2f(frame.grid.xy));

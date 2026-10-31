@@ -2,6 +2,21 @@
 
 更新日期：2026-10-31。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 能力矩阵、基准帧节奏与浏览器检查（2026-10-31）
+
+- **能力矩阵**：`docs/capability-matrix.json` 共 40 行，包括 26 个固定场景、12 个工作包、自动 LOD 演示与大场景视觉交付。门槛逐字取自 benchmarks.md，状态由门槛结果与证据推导，`npm run capability:report` 校验一致性。截至 main `0802479`：pass 0、fail 6、unsupported 3、partial 27、untested 4，没有任何一行达到 pass。
+- **基准帧节奏**：基准运行器逐帧记录 rAF 回调延迟与主线程工作，观察长任务，并把超预算帧与准时帧分成两组对照；组间差异只说明相关，不说明原因。macOS 上另记录机型、GPU、电源、温控与负载均值；`--caffeinate` 只在运行期间阻止睡眠，不改系统设置。
+- **诊断运行**：目标机上的 4 次 1,800 帧 foundation 运行都在主机争用下进行。同一压力负载相隔 8 分钟运行两次，超预算帧从 93 变为 0，CPU 与 GPU 时间同时变化，差异来自主机状态。这些都不是验收性能。
+- **未完成**：目标机 30 分钟运行、无干扰的验收计时和 headed 模式都没有执行。Safari 需要用户开启远程自动化，Playwright WebKit 需要用户允许下载。详见「当前能力边界」中的「机器可读能力矩阵与浏览器入口」，以及「基准运行器与首轮证据」中的「帧节奏归因、macOS 主机信息与争用下的诊断运行」。
+
+## 有界点光与聚光灯（2026-10-31）
+
+- **合约**：点光与聚光灯是引擎自有类型，带句柄（槽位与 generation）、逐灯版本和集合 revision。辐射度与太阳同一单位，在 range 处平滑衰减到恰好为 0。参数非法或超出预算时，在分配资源之前就显式报错。
+- **阴影**：有预算的阴影图集，计入 GPU 账本；聚光灯 1 个视图，点光 6 个立方体面。阴影 pass 复用共享形变与 Masked 覆盖，不按相机剔除灯。
+- **光照路径**：表面 PBR（Unlit 不受影响）、GI 探针捕获、Final Gather、反射命中，以及反射光路和主视图的体积雾单次散射。灯光变化时：雾和反射历史整体重置；GI 在 `full` 策略下整体重置，在 `scheduled` 策略下只标记变化灯范围内的探针。
+- **验证**：各路径对照独立参考，目标机与 SwiftShader 的最大误差为表面 0.19%、GI SH 1.08e-3、反射 2.7e-4、雾源项 3.1e-5。F03 的移动聚光灯与短闪光用例从跳过改为带门限：新光柱 T90 为 1 帧，残影面积为 0，闪光帧达到稳态的 96.7% 以上。
+- **未完成**：F05 灯数扫描与额外阴影成本、分簇灯剔除、面光源，以及大场景画质与性能都没有做；任何灯变化都会整体重置反射历史。详见「线性 HDR、输出与光照基础」中的「有界点光与聚光灯」。
+
 ## 资产转换、确定性 BC7 编码与大场景漫游页（2026-10-31）
 
 - **工具链**：
@@ -115,6 +130,13 @@
 - 用本地资产集在目标机上单独运行 `large-scene.spec.ts`：Bistro Exterior 与 Sponza 各 3/3 通过。Bistro 跑满 240 帧，1,402 个批次，应用持有 949,058,732 字节 GPU 内存，释放后为 0。
 - SwiftShader 上定向运行反射、几何、资产等 24 个 spec：34 项通过、1 项跳过（需要资产集）。
 - `npm run check`：106 个文件、871 项测试通过，构建通过。
+
+再合入有界点光/聚光灯、能力矩阵与基准帧节奏后，完整回归共 171 项：168 项通过、3 项跳过、0 项失败，用时 5.6 分钟（日志 `artifacts/main-integration-20261030/apple-full-lights-phase1.log`，代码提交 `0802479`）。
+
+- 跳过的 3 项：录像脚本、容量恢复 A/B 与大场景漫游，原因同上。F03 移动聚光灯/短闪光用例此前因缺局部灯而跳过，这次实际运行并通过。
+- 168 项通过中包括反射 L05 与 D02 两项标为 `test.fail` 的已知差距，它们按预期失败，不代表这两项达标。
+- SwiftShader 上定向运行局部灯、雾、GI、反射、基准等 18 个 spec：32 项全部通过（`swiftshader-lights-phase1.log`）。
+- `npm run check`：第一次运行在主机高负载下有 2 项 CPU 测试超过 5 s 的默认超时（`instance-bvh.test.ts` 的 4096 槽用例和 `volumetric-fog-air.test.ts` 的 HG 数值积分用例）。单独重跑这两个文件 14/14 通过，随后完整重跑 108 个文件、931 项测试和构建全部通过。这两项属于超时，不是断言失败，但完整检查的第一次运行确实没有通过。
 
 **体积雾。** 新增可选的 GI 空气光照和遮挡体局部历史拒绝，详见「线性 HDR、输出与光照基础」中的体积雾小节。F01–F04 的自动化用例在目标机和 SwiftShader 上均通过。F05 的 1080p 扫描显示，默认预算靠把网格降到 14 像素/格保持在 64 MiB 以内；8 像素/格、64 层并开启时序历史需要 158.2 MiB，**未满足 64 MiB 预算**。局部灯散射、移动聚光灯和短闪光尚未支持。
 
@@ -2441,6 +2463,201 @@ SwiftShader 只证明功能行为，不代表硬件性能。
 
 浏览器用例用 `GPUDevice.destroy()` 注入设备丢失，用测试内的原型包装模拟 adapter 不可用；页面本身无法触发真实的驱动重置。其他演示页面的恢复仍需重新加载。
 
+### 有界点光与聚光灯（2026-10-31）
+
+本小节对应十个提交：`424466f`、`c3a2e79`、`e412ed8`、`35be056`、`dd7923b`、`9e1e00e`、`ba93225`、`8b70d8b`、`e07940a`、`fbd406f`。局部灯需通过 `RendererOptions.localLights` 显式配置，不配置时原行为不变。硬件数据来自目标机 Apple M3 Max（Chrome 156，`apple / metal-3`）；测量时多个并行分支同时占用 GPU，计时只作诊断。SwiftShader 结果只证明功能正确。F05 灯数扫描、大场景画质与性能都没有做，不能视为已验收。
+
+#### 实现了什么
+
+**合约（`src/local-lights.ts`）**。点光和聚光灯是引擎自有类型，不依赖 Three.js/Babylon.js 对象。
+
+- **句柄**：`LocalLightHandle { id, generation }`。`id` 是槽位，`generation` 在槽位释放时递增；过期句柄报 `LOCAL_LIGHT_NOT_FOUND`。
+- **版本**：每盏灯有 `version`，只有实际生效的修改才递增，同值 `updateLocalLight` 不递增。集合 `revision` 供下游做显式历史失效。
+- **辐射度**：与太阳同一单位。`setSun` 的 `color` 是面向太阳的表面收到的辐照度 E⊥，局部灯的 `color × intensity` 是同单位乘 m² 的辐射强度：
+  - E⊥(d) = color × intensity × W(d) × C / max(d², 0.01²)；
+  - W(d) = saturate(1 − (d/range)⁴)²，d ≥ range 时恰为 0，且在 range 处斜率为 0；
+  - 聚光锥因子 C = t²，t 是 cos 空间里外锥到内锥的线性斜坡；点光 C = 1；
+  - 例如 color 1、intensity 3.5 的灯在 1 m 处，与太阳 color 3.5 给面向表面的辐照度相同。
+  - 聚光灯使用轴向强度，收窄锥角不集中功率（不做功率归一化）。
+- **阴影可选**：`castShadows` 在灯存在期间预留图集视图，聚光 1 个，点光 6 个。禁用的灯保留槽位和阴影预留，但不参与着色，也不渲染阴影视图。
+- **显式错误**：所有校验都在分配前完成，超限直接报错，不静默降质。
+  - 参数非法：`INVALID_LOCAL_LIGHT`、`INVALID_LOCAL_LIGHT_OPTIONS`、`INVALID_LOCAL_LIGHT_SHADOW_RESOLUTION`；
+  - 超预算：`LOCAL_LIGHT_BUDGET`、`LOCAL_LIGHT_SHADOW_BUDGET`；
+  - 句柄与投影：`LOCAL_LIGHT_NOT_FOUND`、`LOCAL_LIGHT_GENERATION_EXHAUSTED`、`LOCAL_LIGHT_SHADOW_PROJECTION_OUT_OF_RANGE`；
+  - 状态：未配置时调用报 `LOCAL_LIGHTS_DISABLED`，释放后调用报 `LOCAL_LIGHTS_DISPOSED`。
+
+**GPU 资源与预算（`src/gpu-local-lights.ts`）**。全部字节记入 `stats.ownedGpuBytes`，`dispose()` 后归零。
+
+- **灯光 uniform**：4 × (4 + 20 × maxLights + 16 × maxShadowViews) 字节，256 盏、48 视图时为 23,568 B，低于 64 KiB。
+- **每视图 uniform**：256 B × maxShadowViews。
+- **阴影图集**：depth32float 2D array，4 × 分辨率² × maxShadowViews 字节。默认 512²×24 层，为 24 MiB；默认上限 32 MiB。
+- **上传**：只在集合 revision 变化时上传。
+
+**阴影**。
+
+- **视图**：聚光为 1 个透视视图；点光为 6 个立方体面，顺序为 +X −X +Y −Y +Z −Z，着色时按主轴选面。
+- **视锥与偏移**：每个视图四周预留 2 texel 的 PCF 边框。near = clamp(range/500, 0.005, 1)，far = range。法线偏移默认 1.5 texel，深度偏移默认 1 texel。
+- **滤波**：3×3 tent PCF，用 4 个双线性比较样本实现。
+- **绘制**：阴影 pass 复用渲染器的共享阴影绘制，因此使用同一份形变后顶点（蒙皮/Morph）和 Masked 覆盖，没有按资产类别分出的管线。
+- **不按相机剔除**：启用的有阴影灯每帧重绘全部视图，`diagnostics().localLights.cameraCulling` 恒为 false。
+- **计时**：时间戳写在首个和最后一个视图 pass 上，每个计时 pass 都写完整一对，不归属本 pass 的一端写入 scratch 槽位。原先用空 compute 标记 pass 包住视图：Apple 上 7 个 1024² 视图读数恒为 0 ms，改为写在视图 pass 上后读到 0.26–0.92 ms（并发负载下的诊断值）。结果计入 `stats.gpuMs.localLightShadows`，且已包含在 `gpuMs.shadow` 中。
+
+**光照路径**。以下各项按此顺序逐一验证：
+
+- **表面 PBR**：逐像素遍历所有启用灯，先做 range 测试再计算阴影，BRDF 与太阳相同。Unlit 不受影响。
+- **GI 探针捕获**：探针射线命中点计算局部灯直接光，含图集阴影。
+- **Final Gather**：经 GI 捕获，Final Gather 同样看到局部灯。
+- **反射**：反射命中点计算局部灯直接光；反射光线上的介质积分也计入局部灯散射，并遍历全部启用灯，不使用 froxel 列表。
+- **体积雾**：单次散射计入该灯阴影（介质采样不做法线偏移），使用 HG 相函数，全局介质和局部体积各用自己的 g。
+  - 每个 4×4×4 注入工作组用一次球与 AABB 的测试，筛出与本块 froxel 世界包围盒相交的灯，记入 workgroup 位掩码。
+  - 块内 64 个 froxel 按升序只遍历这些灯，结果确定，上界为 maxLights。
+- **雾的空气光**：GI 空气光与局部灯散射在同一雾着色模块内相加。注入入口在 group 1 绑定局部灯，空气入口在 group 1 绑定 GI 场，两者属于不同入口点。
+
+**历史失效（显式）**。
+
+- **雾**：集合 revision 变化时整体重置，原因 `'local-light-change'`。
+- **雾的 local 遮挡拒绝**：只要有一盏有阴影的局部灯在渲染视图，投射体变化就退回整体重置 `'scene-change'`。原因是局部灯阴影是透视视图，不在太阳光空间矩形内。不加这条规则时，投射体进入光束后首帧保留 92% 的旧光。
+- **GI**：使用 `markDirty` 语义（与 `renderer.markDiffuseGiDirty(region?)` 相同）。`GpuLocalLights.update()` 比较上传前后的灯列表，给出变化灯的范围球包围盒（`localLightChangeRegions`）：新增、删除或版本变化且启用的灯，变化前后各一个盒，位置和 range 不变时只报一个。
+  - `'full'` 策略（默认）：按全局光照变化处理，GI 重置原因为 `'external-change'`；Final Gather 随 GI 重置，原因 `'scene-lighting-discontinuity'`。
+  - `'scheduled'` 策略：每个盒标记 reach 内的探针，不拒绝历史，由有界重采收敛。
+- **反射**：反射时序历史在集合 revision 变化时重置，原因 `'local-light-change'`，排在 `'lighting-changed'` 之后、`'media-changed'` 之前。
+
+**演示**：`fog.html` 新增"门洞聚光灯"开关。
+
+- **布置**：后墙外左侧放一盏有阴影的冷色聚光灯，对准门洞，墙的阴影把锥形裁成门形光柱，斜穿柱廊介质。
+- **资源**：槽位和单视图 1024² 图集在启动时预留，开关不改变显存账本。
+- **历史**：开关当帧通过 light revision 重置雾历史。
+
+#### 接口
+
+- **配置**：`RendererOptions.localLights?: LocalLightOptions`。
+  - `maxLights`：1–256，默认 64；
+  - `maxShadowedLights`：0–8，默认 4；
+  - `shadowResolution`：128–2048 的 2 的幂，默认 512；
+  - `maxShadowViews`：1–48，默认 min(48, 6 × maxShadowedLights)；
+  - `maxShadowBytes`：默认 32 MiB；
+  - `shadowNormalBias` / `shadowDepthBias`：0–16 texel，默认 1.5 / 1。
+- **API**：
+  - `renderer.addLocalLight(descriptor)` 返回 `LocalLightHandle`；
+  - `updateLocalLight(handle, patch)` 与 `setLocalLightEnabled(handle, enabled)` 返回 `ResolvedLocalLight`，包含 `version`；
+  - `removeLocalLight(handle)`。
+- **描述符**：
+  - `kind: 'point' | 'spot'`；
+  - `position`；
+  - `direction`：仅聚光，表示光的传播方向（与 `setSun` 的指向相反），内部归一化；
+  - `innerConeAngle` / `outerConeAngle`：半角，0 ≤ inner ≤ outer ≤ 80°；
+  - `color`：线性 RGB，≥ 0；
+  - `intensity`；
+  - `range`：0.01–10,000 m；
+  - `castShadows`、`enabled`。
+- **诊断**：`diagnostics().localLights` 包含：
+  - 数量与预算：`revision`、`lights`、`enabledLights`、`shadowedLights`、`reservedShadowViews`、`renderedShadowViews`、`limits`、`shadowAtlasBytes`、`ownedGpuBytes`、`uploads`；
+  - 算法标识：`shading: 'per-pixel-range-culled-loop'`、`fogLightList: 'froxel-block-sphere-aabb'`、`shadowProjection`、`shadowFilter: 'normal-offset-3x3-tent-pcf'`；
+  - `cameraCulling: false`。
+  - 雾诊断另有 `localLightScattering`；反射诊断另有 `localLights: true`。
+
+**内部接口**：
+
+- **雾**：
+  - `GpuVolumetricFog.create(device, options, account, gi?, localLights?)`；
+  - `FogFrameState.lightRevision?`；
+  - 雾模块预留的 `// FOG_LOCAL_LIGHTS` 钩子已使用；
+  - `volumetric-fog.wgsl` 的 `inject` 入口新增 `workgroup_id`/`local_invocation_index` 内建量和 `// FOG_INJECT_PROLOGUE`，裁剪函数必须在任何分支返回前由全工作组调用；
+  - FogFrame 的 `padding.w` 未使用，仍空闲。
+- **GI**：`GpuDiffuseGi.create(..., localLights?)`；`update()` 签名不变。渲染器在 `diffuseGi.update` 之前按 `GpuLocalLights.changedRegions` 调用 `markDirty`。
+- **反射**：`GpuReflections.create(..., localLights?)`；`ReflectionUpdate` 不变，反射对象自己读取 `localLights.revision`。`reflections-update.wgsl` 中有 `// REFLECTION_LOCAL_LIGHTS_PROGRAM` 与 `// REFLECTION_LOCAL_LIGHTS` 钩子。局部灯绑定在 integrate 的 group 2（有雾时）或 group 1，不占用 group 0 的屏幕追踪 binding 11/12。
+- **表面**：帧合约 group 0 从 binding 3 起追加局部灯条目，表面着色器中有 `// LOCAL_LIGHTS_PROGRAM` 与 `// LOCAL_LIGHTING` 钩子。
+
+#### 验证
+
+环境：
+
+- 硬件：Apple M3 Max，macOS 26.6.2，Chrome 156，适配器 `apple / metal-3`；
+- 软件：Playwright 自带 Chromium 的 SwiftShader；
+- 浏览器测试端口均为 `PLAYWRIGHT_PORT=5202`。
+
+命令：
+
+```
+npm run check
+PLAYWRIGHT_PORT=5202 npx playwright test tests/browser/local-lights.spec.ts tests/browser/local-lights-gi.spec.ts \
+  tests/browser/local-lights-reflections.spec.ts tests/browser/local-lights-fog.spec.ts \
+  tests/browser/volumetric-fog-history.spec.ts tests/browser/fog-demo.spec.ts \
+  tests/browser/reflections-temporal.spec.ts tests/browser/reflections-screen.spec.ts tests/browser/volumetric-fog-air.spec.ts
+# 硬件：同上命令前加 PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGHT_EXPECT_GPU_VENDOR=apple
+```
+
+- **单元测试**：基于 main `712507e`，`npm run check` 通过，107 个文件、926 项测试，构建通过。
+- **浏览器测试**：新增 8 项，SwiftShader 与 Apple 全部通过：
+  - `local-lights.spec.ts`：1 项；
+  - `local-lights-gi.spec.ts`：2 项，探针用例新增 scheduled 策略段；
+  - `local-lights-reflections.spec.ts`：1 项；
+  - `local-lights-fog.spec.ts`：2 项；
+  - `volumetric-fog-history.spec.ts` 中的 F03 移动聚光灯/短闪光：1 项，原为 `test.skip`，现在有门限；
+  - `fog-demo.spec.ts`：1 项，已扩展。
+- **回归**：在两种适配器上重跑 `volumetric-fog-history.spec.ts` F02、`volumetric-fog-air.spec.ts` F04、`reflections-temporal.spec.ts` 与 `reflections-screen.spec.ts`（共 6 项），全部通过。以上合计每种适配器 14 项，0 失败、0 跳过。
+
+**测量结果**。除特别说明，硬件与软件数值接近，下面给出两者中较差的一个。
+
+- **表面直接光**（HDR，对比独立 CPU 参考：GGX/Smith-Schlick/Schlick 与上述辐射度公式）。
+  - 门限：1e-4 + 1e-3 × (|lit| + |ambient|)。
+  - 粗糙/金属/半光滑、聚光锥内/斜坡/锥外、两灯叠加、强度加倍各 104 个像素，最大相对误差 0.19%，range 外的像素恰为 0。
+  - 遮挡物为 Masked 四边形（实例 alpha 低于/高于裁剪阈值两种状态）和蒙皮角色（共享形变），阴影像素与可见像素最大相对误差 0.09%。
+  - Unlit 区域误差 ≤ 1e-3。
+- **GI 探针**：屏外点光照到世界探针，SH9 对比解析投影，门限 2e-3 × 探针尺度。
+  - 误差：Apple 1.1e-4，SwiftShader 1.08e-3。
+  - 板遮挡阴影射线 9 条，开放射线 193 条。
+  - scheduled 策略：强度加倍产生 1 次区域标记，8 个探针都在 reach 内被标记，无全局标记、无整体刷新、无历史重置。待处理探针在第 16 帧清空（含 K = 8 次收敛重采），收敛后与解析值的误差和 full 相同（Apple 1.1e-4，SwiftShader 1.08e-3）。
+- **Final Gather**：封闭球内的均匀局部灯辐射场。
+  - 256 个锚点的平均辐照度 0.57485，解析区间 [0.57350, 0.57548]；强度加倍后为 1.14973。
+  - 首帧 GI 重置原因为 `external-change`，FG 原因为 `scene-lighting-discontinuity`。
+- **反射**：
+  - 反射命中的局部灯直接光对比 4 样本确定性 GGX 参考，门限 2e-3 相对：最大相对误差 Apple 2.7e-4、SwiftShader 2.7e-5。
+  - 被遮挡锚点：1.7e-4。
+  - 合成：5.5e-5（软件 9.4e-5）。
+  - 开关、超出 range 与恢复都是精确相等。
+- **体积雾**（8×8×16 网格，点光有阴影，加一盏聚光，全局与盒状介质的 g 不同）。
+  - froxel 源项对比 CPU 同一离散化的数值积分，最大相对误差：Apple 3.1e-5，SwiftShader 1.7e-5。
+  - HDR 合成：9.6e-4（软件 4.7e-4），门限 2e-3。
+  - CPU 细分积分（64×64×1024）与连续 4000 步积分相差 ≤ 0.22%（门限 3%），说明参考已收敛。
+  - 引擎 8×8×16 网格相对连续积分差约 33%，这是网格离散化的偏差，只记录、不设门限，不代表误差界。
+- **F03 移动聚光灯/短闪光**（门限按 benchmarks.md：T90 ≤ 100 ms @60 Hz，保存残影面积与亮度曲线，闪光要在其自身帧上判定）。两种适配器的结果为：
+  - 一帧跳变：旧光柱首帧残留 0，新光柱 T90 为 1 帧，残影面积 0；
+  - 每帧 5 cm、共 36 帧的扫动：与关闭历史的孪生渲染器逐帧完全相等；
+  - 一帧/两帧闪光：闪光帧达到稳态的 ≥ 96.7%，熄灭后残留 0；
+  - 投射体进出有阴影光束（local 拒绝模式）：首帧残留 0.19%，T90 为 1 帧。
+- **与空气光共存**：同一渲染器同时开启 GI 空气光、反射介质与局部灯。局部灯增量在有无空气光两种情况下一致，误差/门限最大 0.20；空气光本身 0.14–0.69。
+- **显存账本**：每个用例释放后 `ownedGpuBytes` 为 0。
+
+证据目录（不提交）：
+
+- `artifacts/lights-final-20261030/`；
+- `artifacts/lights-fog-response-20261030/`：含"无规则"对照日志；
+- `artifacts/lights-rebase-20261030/`：基于 `712507e` 的两种适配器日志；
+- `artifacts/lights-*-20261030/`：其余早期日志。
+
+#### 注意事项
+
+- **SwiftShader 光栅化**：立方体面投影中，顶点恰好落在 w = 0（灯的轴平面上）的三角形在该面不会被光栅化，Apple 正常。雾用例的板因此改为跨越该平面放置，并保留了证据日志。这是观察到的软件适配器行为，引擎没有对此做修正。
+- **计时有限**：Apple 计时都是多个代理并发占用 GPU 时的诊断值，读数按 65.536 µs 量化。没有做验收计时。
+- **软件测试不证明性能**：软件适配器测试只证明功能正确。
+
+#### 未完成与限制
+
+- **未做**：
+  - F05 灯数扫描与额外阴影成本；
+  - 大场景画质与性能；
+  - 面光源、IES、cookie、按光源尺寸变化的软阴影；
+  - 表面分簇/分块灯剔除：表面是逐像素遍历全部启用灯，上界 maxLights。
+- **阴影成本**：每盏有阴影的灯每帧重绘全部视图，不缓存也不剔除，成本与视图数和场景绘制量成正比。
+- **图集预算**：8 盏有阴影灯在默认 512² 下需要 48 层、48 MiB，超过 32 MiB 默认预算，会报 `LOCAL_LIGHT_SHADOW_BUDGET`，需要显式调大 `maxShadowBytes` 或降低分辨率。
+- **雾拒绝开销**：有阴影灯渲染时，雾的 local 遮挡拒绝退化为整体重置，正确但失去局部保留历史的收益。
+- **GI 失效粒度**：
+  - `'full'` 策略下，任何灯变化都是整体重置。
+  - `'scheduled'` 策略下按范围球包围盒标记，聚光灯也用整个球盒，偏保守。
+  - scheduled 下，有阴影灯 range 内的投射体移动只按投射体自身包围盒标记探针，不额外标记该灯的阴影变化区域。太阳阴影目前也是这样处理。
+- **反射重置粒度**：任何灯变化都会整体重置反射时序历史，没有按区域保留。
+
 ## glTF 与动画资产
 
 `loadGltf` 读取 glTF 2.0 JSON 或 GLB v2，支持相对 URI、外部 buffer、data URI、GLB BIN、PNG/JPEG 图像。二进制读取检查 component 对齐、步长、矩阵列填充、normalized 整数和 sparse accessor。默认下载累计上限 128 MiB，解码后 RGBA8 图像累计上限 256 MiB；图像尺寸由浏览器解码得知后，在创建 canvas/读取像素前检查剩余预算并关闭 bitmap。该预算不能阻止浏览器自身解码阶段的一次暂存分配。未被纹理引用的图像不解码；所有图像源元数据仍校验。嵌入图像必须声明 PNG/JPEG MIME，范围不得越过 buffer 声明长度。加载支持 AbortSignal；转换和动画采样目前仍在主线程。
@@ -2473,8 +2690,8 @@ Rapier 以独立适配器提供盒子刚体和地面碰撞、最近命中射线�
 | 材质 | 有界表达式图；PBR/Unlit、Opaque/Masked、双面、纹理与参数，基础法线贴图；无多层材质、透射或通用透明 |
 | 资源 | 固定容量批次；材质变体和纹理预算；静态 Opaque 几何有 CPU 缓存、GPU 页池、每帧上传预算、整组准入、祖先保留及默认预算内固定阴影/查询代理；尚无全应用资源预算或纹理流送 |
 | 几何/动画资产 | OBJ、glTF/GLB、蒙皮/Morph；静态 Opaque 离线簇层级、压缩页面、GPU LOD/视锥剔除/间接绘制与分簇演示，可选两阶段主视图遮挡剔除；主 Renderer 已接入分页表面和自动调度，源网格可省略时以固定代理供阴影/查询/GI，旧完整源流送仍可用；源网格可省略批次拒绝 Masked；离线工具可校验解包 ZIP、确定性编码 BC7、经 Blender 转换 FBX 并写出资产集，`/large-scene.html` 能加载 Bistro Exterior 与 Sponza 资产集（MASK/BLEND 不进分页，遮蔽贴图不参与着色）；仍缺动态形变简化或大型流送联合验收 |
-| 光照 | 可更新的单方向太阳光、直接光与阴影；共享形变世界查询上的固定探针漫反射 GI、可选跨帧反馈、可选变化驱动的有界探针更新和实验性屏幕 Final Gather；新增有界单段镜面/粗糙世界反射，以及可选的反射时间重建与屏幕空间补充（L05 粗糙档与 D02 粗糙波瓣响应未达标）；仍无完整 GI；联合验收中 L01 稳态与 L04 漏光未通过 |
-| 体积雾 | 主视图有界 GPU 高度雾和最多 64 个局部盒/球体积，太阳共享阴影的单次散射、可选三维历史重投影（可选遮挡体局部历史拒绝）、平方深度切片积分与全分辨率深度 HDR 合成；反射沿共享世界介质另行积分；可选 GI 探针空气光照与天空可见性；无点/聚光灯、透明介质路径、自阴影或多散射 |
+| 光照 | 可更新的单方向太阳光、直接光与阴影；可选有界点光/聚光灯（每像素遍历全部启用灯、可选图集阴影，同时进入 GI 捕获、Final Gather、反射命中与雾），无分簇灯剔除；共享形变世界查询上的固定探针漫反射 GI、可选跨帧反馈、可选变化驱动的有界探针更新和实验性屏幕 Final Gather；新增有界单段镜面/粗糙世界反射，以及可选的反射时间重建与屏幕空间补充（L05 粗糙档与 D02 粗糙波瓣响应未达标）；仍无完整 GI；联合验收中 L01 稳态与 L04 漏光未通过 |
+| 体积雾 | 主视图有界 GPU 高度雾和最多 64 个局部盒/球体积，太阳共享阴影的单次散射、可选三维历史重投影（可选遮挡体局部历史拒绝）、平方深度切片积分与全分辨率深度 HDR 合成；反射沿共享世界介质另行积分；可选 GI 探针空气光照与天空可见性；可选点光/聚光灯单次散射（带该灯阴影，按 4×4×4 块筛灯）；无透明介质路径、自阴影或多散射 |
 | 物理 | 地面、盒子刚体、最近命中射线与球形重叠查询；无角色控制器、ragdoll、布料或破坏 |
 | 平台 | WebGPU 必需；初始化失败明确报错，设备丢失报告后停止帧循环；主页面按有界策略在新设备上重建 Renderer，其他页面恢复需要重新加载 |
 | 性能 | 基础压力场景已在 NVIDIA 完成一次 30 分钟无验证错误/资源漂移运行；rAF p95 超过初始 33.3 ms 门槛，尚未完成目标规模、GI/LOD/体积雾联合长测及硬件性能验收 |
@@ -2496,6 +2713,123 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 最终组合为 216×128 方向采样、每探针 32 个发光面样本、2048 聚焦阴影和 FXAA。在 Edge 155、实际非 fallback `nvidia / ampere`、固定 1920×1080 和相位 0 镜头下测量三次，各预热 300 帧、测量 1800 帧。已接入 GPU pass 总和 p95 为 2.818/3.346/3.408 ms，GI 为 1.835/2.107/2.425 ms，resolve 均为 0.197 ms；每次 60 个稀疏 GPU 样本。rAF p95 均为 7.0 ms，CPU 提交 p95 均为 0.4 ms，应用 GPU 账本恒为 66,706,868 字节，释放为零且无错误。比加入发光面采样前增加 1,327,208 字节，等于本例面积元数据、索引、身份和参数；这不是驱动显存统计。证据为 `artifacts/benchmarks/local-floor-area-final-20261014`，源码指纹 `b8a594f65d56482d65d5e82d6e658759d58c98333f62f2f6be1f528110ce65c3`、构建/副本指纹 `09610f83b5262bd0f4402442426a26a338e1419d8339ad9f671ad15fbfe47580`。这是小房间短测，不含浏览器呈现、大型内容或后续反射/参与介质；不同运行的 pass 分位数不能直接相减归因。此前没有面积采样、早期 FXAA 的三次 3.277/2.949/3.149 ms 仅为历史证据（`local-shadow-aa-gi-quality-20261014`），不替代当前结果。
 
 最终 64 字节 shared deformed 布局与镜头 GI 基础回归保存在 `artifacts/benchmarks/local-normal-layout-release-camera-20261015`。Edge 155、Renderer 实际非 fallback `nvidia / ampere`、1920×1080，相同 orbit 镜头与 Final Gather 配置下，各轮预热 300 帧、测量 1800 帧，共三轮，每轮 60 个稀疏 GPU 样本。GPU pass 总和 p95 为 4.5907968/4.5252608/4.718592 ms，Final Gather p95 为 2.1659648/2.031616/2.031616 ms，世界 GI p95 为 1.96608/1.96608/2.031616 ms；rAF p95 为 7.0/7.0/13.9 ms，CPU 提交 p95 为 0.9/0.8/0.5 ms。应用持有 GPU 账本三轮稳定在 123,856,236 字节，释放归零且错误为空。manifest 源码指纹为 `2ae6912c024d3bbadd7b3493d9df54c6c24dbf656a101c0910dda779d796cdc7`，构建与快照指纹为 `a55f5804cb48137e238bfad18abc5c0327be49787cc8a126efe8b6d4bbd3cd4f`。这个 GI 房间未启用 `normalTexture`，数值只验证新共享布局与原有镜头 GI 的有限性能回归；不能据此声称复杂法线贴图开销低、大场景性能或稳定 60 FPS 达标，也不能跨旧构建的分位数推断加速。
+
+### 机器可读能力矩阵与浏览器入口（2026-10-31）
+
+本小节对应提交 `83f4de3`（能力矩阵与校验脚本）和 `0802479`（按 main `712507e` 的证据更新矩阵），状态又按同批合入的点光/聚光灯与 main 完整回归更新。矩阵只汇总已有证据，数值转录自各项工作的日志与本文档；争用下的计时只作诊断，不是验收。
+
+#### 内容
+
+- **版本**：v1，2026-10-30 冻结。目标为 Apple M3 Max（30 核 GPU，36 GB），macOS 26.6.2（25G83），Chrome 156.0.8078.76，适配器 `apple / metal-3`。证据截至 2026-10-31，对应 main `0802479`（字段 `evidenceMain`）。
+- **40 行**：
+  - 26 个固定场景：G01–G05、D01–D03、L01–L05、M01–M04、F01–F06、T01、P01、W01；
+  - 阶段 1 的 7 个工作包和阶段 2 的 5 个工作包；
+  - 自动 LOD 演示，以及阶段 2 的大场景视觉交付。
+- **每行字段**：子系统、优先级、阶段、输入规模、正确性参考、质量门槛、性能预算、兼容组合、门槛结果、缺失能力、状态与依据、目标机证据、历史证据、限制。
+- **门槛来源**：
+  - 18 项全局门槛逐字取自 benchmarks.md 的「初始验收目标」；
+  - 场景的动作与检查逐字取自 benchmarks.md；
+  - 工作包名取自 roadmap.md。
+- **证据记录**分两类：
+  - `target`：只能来自 `apple / metal-3`；
+  - `historical`：2026-10-30 之前的 NVIDIA/Intel 记录，不能使用目标适配器。
+- **证据种类**（`evidenceKinds`）：`functional`、`quality`、`long-run`、`diagnostic-timing`、`acceptance-timing`。并发负载下的计时只能标为 `diagnostic-timing`。
+
+#### 状态推导
+
+`deriveStatus` 按下面的顺序判定。矩阵里写的状态必须与推导结果一致，否则校验失败。
+
+1. **fail**：任一门槛结果为 `unmet`；
+2. **unsupported**：缺失能力非空；
+3. **untested**：没有目标机证据；
+4. **pass**：功能、全部质量门槛和性能预算都为 `met`；有预算的行还必须引用 `acceptance-timing` 证据；
+5. 其余为 **partial**。
+
+门槛结果取 `met`、`unmet`、`partly-measured` 或 `not-measured`，未列出的门槛按 `not-measured` 处理。结果不是 `not-measured` 时，必须有目标机证据引用该门槛。
+
+#### 当前状态（main `0802479`）
+
+合计：pass 0，fail 6，unsupported 3，partial 27，untested 4。按阶段：
+- 阶段 1：8 行全部 partial；
+- 阶段 2：fail 6、unsupported 2、partial 19、untested 4；
+- 阶段 4：F06 为 unsupported。
+
+| 状态 | 行 | 依据 |
+| --- | --- | --- |
+| fail | L01 | 两室联合场景的 6 个 ROI 中有 4 个超过 0.15（0.205–0.511） |
+| fail | L04 | 漏光箱 0/7，细缝箱归一化 MAE 6.63 |
+| fail | L05 | 静态 120 帧峰峰值只有镜面档 ≤ 3%；物体进入粗糙度 0.3 波瓣时 T90 为 31–35 帧 |
+| fail | P2-gi-reflections | 包含 L01、L04、L05 的未满足项 |
+| fail | P2-participating-media、F05 | 8 像素/格、64 层带历史需 158.2 MiB，预算 64 MiB |
+| unsupported | M02、M03、F06 | 缺角色光学、透明与 decal；F06 属阶段 4 |
+| untested | P2-joint-large-scene、G02、G05、W01 | 没有目标机证据 |
+
+相对首版（0 pass、5 fail、4 unsupported、26 partial、5 untested）的变化：
+
+- **fail → partial**：P2-world-query、G03、P2-geometry-visibility。
+  - 世界查询的 3 项由水密三角形测试修复。
+  - `geometry-stream-renderer.spec.ts:4` 只在放宽的 Apple 阈值下通过，矩阵把它记为测试假设变更，不是修复。
+- **partial → fail**：L01、L04、L05、P2-gi-reflections。
+- **unsupported → partial**：F03。点光/聚光灯接入后，移动聚光灯与短闪光用例改为带门限运行，在目标机与 SwiftShader 上通过。F05 与 P2-participating-media 不再缺能力，但仍因 F05 的显存预算为 fail。
+- **untested → partial**：P2-visual-delivery。`/large-scene.html` 在目标机上漫游了 Bistro Exterior 与 Sponza；Bistro 关键帧 0 的路缘有透出天空的漏洞，原因待查，记为限制。
+
+这些数值转录自各项工作的日志、JSON 和本文档，没有重新采集。新增 8 条目标机证据记录：
+
+| 记录 | 种类 | 内容 |
+| --- | --- | --- |
+| `apple-main-batch2-20261031` | functional | main 完整回归 165 项：161 通过、4 跳过、0 失败（`69229f9`，到 `712507e` 只改文档） |
+| `apple-gi-joint-20261031` | quality | 两室联合动态 GI 验收：L01–L04、T01 与稳定性 |
+| `apple-reflections-20261031` | quality | L05 阶梯、静态稳定性与 D02 响应 |
+| `apple-geometry-gallery-20261031` | quality | 4 倍超额订阅的程序化画廊，以及固定轨迹录屏 |
+| `apple-large-scene-20261031` | functional | 本地资产集漫游，Bistro Exterior 与 Sponza 各 3/3 |
+| `apple-benchmark-diagnostic-20261031` | diagnostic-timing | 「帧节奏归因、macOS 主机信息与争用下的诊断运行」中的 4 次基准运行 |
+| `apple-local-lights-20261031` | quality | 点光/聚光灯的表面、GI、反射与雾对照，以及 F03 移动聚光灯与短闪光 |
+| `apple-main-lights-20261031` | functional | 合入局部灯与本小节内容后的 main 完整回归 171 项：168 通过、3 跳过、0 失败（`0802479`） |
+
+#### 命令
+
+```sh
+npm run capability:report                        # 打印 Markdown 报告；矩阵不一致时退出码为 1
+node scripts/capability-report.mjs --json
+node scripts/capability-report.mjs --markdown <输出路径>
+npx vitest run tests/capability-matrix.test.ts
+```
+
+脚本检查以下各项：
+- 全局门槛、场景文本和工作包名与 benchmarks.md、roadmap.md 逐字一致，缺行时报错；
+- 目标机证据只来自 `apple / metal-3`，历史证据不使用该适配器；
+- 证据种类在列出的 5 种之内；
+- 证据中引用的每个 spec 文件都存在；
+- 门槛结果不是 `not-measured` 时有目标机证据；
+- 状态与推导结果一致，untested 行不带门槛结果。
+
+单元测试共 4 项，覆盖：
+- 当前矩阵通过校验；
+- 拒绝放宽门槛、删掉 F05、把历史记录改标为 apple，以及未知的证据种类；
+- 拒绝把 F01 提为 pass、没有证据的 `met`、去掉 `unmet` 后仍标 fail，以及有 `unmet` 却标 partial；
+- 有预算的行没有 `acceptance-timing` 证据时不能 pass。
+
+改变某行状态时，应同时更新门槛结果和证据记录，并运行 `npm run capability:report`。
+
+#### 限制
+
+- 校验只保证矩阵内部一致、门槛文本与文档逐字一致。门槛结果是否属实取决于证据记录，这些记录由人工整理。
+- 多数场景的输入规模仍为「未冻结」。
+- 范围、优先级或门槛的修改须在 `changeLog` 记录版本与原因；状态只随证据变化。
+
+
+#### Safari 与 WebKit（需要用户操作）
+
+- **Safari 26.6.2（21624.5.1.11.3）**：
+  - 系统自带 safaridriver；
+  - Safari 偏好中没有 `AllowRemoteAutomation` 和 `IncludeDevelopMenu`，即远程自动化未开启；
+  - 开启需要用户完成三步：在 Safari 设置的「高级」中显示开发者功能，在「开发」菜单中允许远程自动化，再以管理员身份运行一次 `safaridriver --enable`。
+  - 没有改动任何设置，没有启动会话，引擎也没有在 Safari 中运行过。
+- **Playwright WebKit**：
+  - Playwright 1.64.0 需要 webkit-2370，本机缓存只有 webkit-2248；
+  - 运行前需要用户允许下载（`npx playwright install webkit`）；
+  - Playwright WebKit 不是 Safari，结果只能作功能参考。
+- 矩阵的 `browsers` 中，两项都是 untested，blocker 分别为 `needs-user-action` 和 `needs-download-permission`。
 
 ## 验证入口
 
@@ -2558,3 +2892,125 @@ CI 将失败时的运行状态直接输出到日志。截图附件上传属于�
 基础压力场景随后在干净的 `eda4d5c` 源码上完成一次真实时长测试：Edge 155 的 Renderer 实际 adapter 为非 fallback 的 `nvidia / ampere`，启动参数含 `--force-high-performance-gpu`。测量时长 1,800,000.2 ms、167,349 帧、5,578 个稀疏 GPU 样本、3,627 次压力事件；92 个完整 1,800 帧循环都回到 6 个刚体、7 个材质绑定、2 张图像与 40,171,396 字节应用 GPU 账本。账本首末均为 40,171,396 字节，运行范围 25,656,196–40,171,396 字节，整体增长和分三段中位数增长均为零；释放后归零，验证错误和页面错误均为空。结束对照 25,016 个顶点，位置最大误差 1.04e-6、法线最大误差 5.18e-7，无边界越界。因此**这个基础压力场景的 30 分钟资源/功能稳定性通过**；不包括 GI、LOD、反射、体积雾或阶段 2 完整联合场景。
 
 同一长测的初始 33.3 ms 帧间隔预算未通过：rAF 间隔 p95 34.8 ms、p99 62.5 ms、最大 180.6 ms，167,349 帧中有 10,401 帧（6.215%）超过预算；场景更新 p95 4.9 ms、CPU 提交 p95 0.7 ms，已接入 GPU pass 总和 p95 2.490 ms、p99 5.374 ms、最大 10.355 ms。压力事件在 1920×1080 和 1440×810 间切换，不能称为固定 1080p。两份只读 GPU 观察 CSV 的样本从一次 16:49 的 P8/59°C/345 MHz 图形频率与 16:55 的 P0/66°C/765 MHz 变化；这只是伴随观察，不能据此判定帧间隔尾部的根因，也不能把 CPU、rAF 与 GPU 时间相加解释呈现延迟。运行期间有少量短时 CPU typecheck/单文件测试，未并行其他 GPU 或重负载构建，因此还不是严格无干扰的性能认证。证据在 `artifacts/benchmarks/local-stability-nvidia-20261014`：manifest 的源码 SHA-256 为 `963ef1a5a26fdbdfd99511d71965d3edd681edce33f8308b86a7cc345c13c92c`，构建 SHA-256 为 `441e2f0807354d9ee67b9e71ea1cee71d9079012abb5604e4cd332cf7138d89b`；两份 GPU 观察 CSV、逐帧数据、进度、统计、最终截图和清理结果分别保留。
+
+### 帧节奏归因、macOS 主机信息与争用下的诊断运行（2026-10-31）
+
+本小节对应提交 `02f8b55`（迟到帧逐帧记录与 macOS 主机信息）、`57d3668`（迟到/准时两组对照）和 `a9a9741`（主机负载均值）。所有计时都在主机同时运行其他并行任务时采集，只作诊断，不是验收性能。证据在 `artifacts/phase1-benchmark-20261031/`，不入库。
+
+#### 帧节奏（`summary.pacing`）
+
+**逐帧记录。** 每帧新增两个字段，作为 CSV 的最后两列：
+- `callbackLatencyMs`：rAF 时间戳到回调开始；
+- `frameWorkMs`：回调内的主线程工作。
+
+**长任务。** 测量期间用 `PerformanceObserver` 记录 `longtask` 与 `long-animation-frame`，最多 4,096 条，超出的计入 `dropped`。报告的 `pacingObservers` 说明浏览器支持哪些类型。
+
+**汇总字段：**
+- `nominalIntervalMs`：rAF 间隔的中位数；
+- `intervalMultiples`、`overBudgetMultiples`：全部帧与超预算帧，按名义间隔的整数倍（1、2、3、≥ 4）计数；
+- `longestOverBudgetRun`：最长的连续超预算帧数及起始帧；
+- `late`、`onTime`：超预算与准时两组，各自包含：
+  - 帧数；
+  - 前一帧回调延迟加主线程工作的分位数；
+  - 与长任务重叠的间隔数；
+  - 前一帧带稀疏 GPU 样本的帧数，以及其中样本超过名义间隔的帧数；
+- `callbackLatencyMs`、`frameWorkMs` 的分位数，以及长任务汇总。
+
+**为什么改为分组对照。** 最初的实现把每个迟到帧归给第一个匹配的原因。在 `dcb95df` 的压力运行中，93 个迟到帧全部匹配「前一帧主线程工作超过名义间隔」，但 1,706 个准时帧中也有 1,136 个满足这一条，阈值无法区分迟到帧。原因是 rAF 时间戳停在 vsync 网格上，超时的工作会表现为下一帧回调的延迟，而不是更长的间隔。因此改为两组对照，组间差异只说明相关，不说明原因。用同一份 CSV 离线重算，前一帧主线程跨度如下：
+- 迟到帧之前：p50 54.9 ms，p95 152.4 ms；
+- 准时帧之前：p50 18.8 ms，p95 32.9 ms。
+
+#### 主机信息（macOS）
+
+- **只读探测**：
+  - `sw_vers`、`hw.model`、CPU 型号、内存；
+  - `system_profiler SPDisplaysDataType`：GPU 型号、核数、Metal 族与显示器信息，不含序列号；
+  - `pmset -g`。
+- **每次重复前后**：采样 `pmset -g batt`、`pmset -g therm` 和负载均值。
+- **运行中**：每 15 s 的主机样本记录 1、5、15 分钟负载均值（`os.loadavg()`，Windows 上为 null）。
+- **`--caffeinate`**（仅 macOS）：运行期间以 `caffeinate -dims -w <pid>` 持有防睡眠断言，进程退出即释放，不改动系统设置。`b76f476` 的两次运行使用了该选项，结束后没有残留的 caffeinate 进程。
+
+#### 诊断运行（争用，非验收）
+
+环境：
+- Chrome 156.0.8078.76 headless，`apple / metal-3`，非 fallback；
+- 接电源并在充电；
+- 主机同时被其他并行任务占用；
+- headless Chrome 以 60 Hz 虚拟帧时钟出帧，而内置显示器为 1512×982 @ 120 Hz（ProMotion）。
+
+工作负载：foundation 场景，1920×1080，128 棵树，预热 300 帧后测 1,800 帧，预算 33.3 ms。命令：
+
+```sh
+npm run benchmark -- --channel chrome --expect-vendor apple --frames 1800 --warmup 300 --repeat 1 [--stress] [--caffeinate] --out <目录>
+```
+
+`dcb95df`、`b76f476` 是开发分支上的提交，不在 main 上，记录在各次运行的 manifest 中：前者带最初的归因，后者带分组对照。下表时间单位为 ms。
+
+| 运行 | 提交 | 超预算帧 | rAF p95 / p99 / max | update p50 / p95 | 帧工作 p95 | 回调延迟 p95 / max | GPU 总计 p50 / p95 | 长任务 |
+| --- | --- | ---: | --- | --- | ---: | --- | --- | --- |
+| 非压力 | `dcb95df` | 0 | 16.7 / 16.8 / 16.8 | 2.1 / 3.4 | 4.0 | 1.1 / 1.3 | 1.638 / 3.146 | 0 |
+| 压力 | `dcb95df` | 93（5.17%） | 33.4 / 83.3 / 200.1 | 12.4 / 16.2 | 18.8 | 21.4 / 200.6 | 15.139 / 31.457 | 53 条（51 个 LoAF），共 4.6 s |
+| 非压力 | `b76f476` | 0 | 16.7 / 16.8 / 16.8 | 2.3 / 3.0 | 3.5 | 1.3 / 1.6 | 1.704 / 3.015 | 0 |
+| 压力 | `b76f476` | 0 | 16.8 / 16.8 / 16.8 | 1.6 / 1.9 | 2.2 | 1.2 / 1.3 | 0.721 / 2.621 | 0 |
+
+- GPU 时间为每次运行 60 个稀疏样本。
+- 4 次运行中 GPU 账本都是 41,004,420 B，没有增长，释放后为 0；形变验证的最大位置误差 ≤ 1.1e-6，没有越界。
+- `b76f476` 的两次运行中，准时组前一帧主线程跨度的 p95 为 4.7 ms（非压力）和 3.3 ms（压力）。
+
+**结论：**
+- 同一压力负载相隔 8 分钟运行两次，超预算帧从 93 变为 0。update p50 从 12.4 ms 降到 1.6 ms，稀疏 GPU 总计 p50 从 15.1 ms 降到 0.72 ms。
+- 两次运行之间的代码改动只涉及运行后的汇总，不影响测量循环，所以差异来自主机状态。CPU 与 GPU 时间同时变化，与主机争用相符。
+- 运行后读到的 15 分钟负载均值约为 26（14 个逻辑 CPU）。当时运行器还没有记录负载，现已开始记录。
+- 按最初的首个匹配原因归因，`dcb95df` 的压力运行看起来受主线程限制。对照 `b76f476` 可知，CPU 与 GPU 时间都受主机争用影响，这个判断不成立。
+- 这些数据都不代表验收性能。
+
+#### 30 分钟运行的准备（未执行）
+
+```sh
+npm run benchmark -- --channel chrome --expect-vendor apple --seconds 1800 --stress --repeat 1 --caffeinate --out <输出目录>
+```
+
+- **安静窗口**：开始前确认 1 分钟负载均值远低于 14（逻辑 CPU 数）。运行中每 15 s 的样本记录负载，结束后可据此判断窗口是否安静。
+- **帧时钟**：headless 跟随 60 Hz 虚拟帧时钟；加 `--headed` 才跟随 120 Hz 显示器。headed 时窗口不能被遮挡或最小化，否则 Chrome 可能把页面视为隐藏，暂停或降低 rAF。目标机上还没有运行过 headed 模式，建议先用 300 帧做一次冒烟。
+- **容量**：帧数上限为 1,000,000，120 Hz 下 30 分钟约 216,000 帧。长任务最多记录 4,096 条，超出的计入 `dropped`。
+
+
+#### 接口变化
+
+- `BenchmarkFrame` 新增可选的 `callbackLatencyMs`、`frameWorkMs`。
+- `BenchmarkRecorder` 新增 `recordLongTask()`。
+- `BenchmarkSummary` 新增 `pacing`，没有帧时为 null。
+- 基准 CSV 末尾新增 `callbackLatencyMs`、`frameWorkMs` 两列，按列号读取 CSV 的脚本需要更新。
+- 基准报告新增 `pacingObservers`。运行 JSON 的 `hostSamples` 与 manifest 的 `host.power` 新增 `loadAverage`；macOS 的 manifest 新增 `host` 信息。
+- 运行器新增 `--caffeinate`。
+- 新增 `npm run capability:report`。
+
+#### 验证命令与结果
+
+以下均在 `PLAYWRIGHT_PORT=5201` 下运行，日志在 `artifacts/phase1-benchmark-20261031/`。
+
+- **基于 main `712507e`**：
+  - `npm run check`：107 个文件、876 项测试通过，类型检查与构建通过（`check-rebased-712507e.log`）；
+  - `tests/browser/benchmark.spec.ts`：Apple 2/2，SwiftShader 2/2。
+- **更早的开发分支提交**：
+  - `dcb95df`：benchmark、engine 与 device-loss 三个 spec，Apple 7/7，SwiftShader 7/7；
+  - `b76f476`：benchmark spec，Apple 2/2，SwiftShader 2/2；同一提交的 `npm run check` 为 88 个文件、756 项测试通过。
+- **单元测试**：`benchmark-stats` 11/11，`capability-matrix` 4/4。
+
+Apple 命令：
+
+```sh
+PLAYWRIGHT_PORT=5201 PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGHT_EXPECT_GPU_VENDOR=apple \
+  npx playwright test tests/browser/benchmark.spec.ts --global-timeout=300000 --output=<目录>
+```
+
+SwiftShader 使用同一命令，去掉三个 GPU 相关变量。
+
+#### 失败、限制与未完成
+
+- **未执行**：30 分钟运行与无干扰的验收计时，需要在主机空闲的窗口运行。
+- **未在目标机运行**：headed 模式、Safari 和 Playwright WebKit。Safari 需要用户操作，WebKit 需要下载许可。
+- **节奏分组**只说明相关。负载均值是整机指标，不能区分 GPU 争用。
+- **矩阵**中的数值为转录，只反映 main `0802479` 及之前的证据。
+- **SwiftShader 偶发失败**：此前 `raster-receivers` 出现过一次 `Execution context was destroyed`（`artifacts/phase1-apple-triage-20261030/fix-b-swiftshader.log`），单独重跑和第二次完整运行都通过。Playwright 的 webServer 没有转接 stdout，Vite 的依赖重载提示不会写进测试日志，所以这份日志既不能证实也不能排除「依赖预构建触发重载」的假设。要验证，可以在 webServer 上设 `stdout: 'pipe'` 后复现。
+- **保留的早期证据**：`dcb95df` 的压力运行（93 个迟到帧）保留在 `foundation-stress-headless/`。

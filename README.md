@@ -72,6 +72,8 @@ npm run dev
 
 `/fog.html` 展示柱廊中的局部盒状雾，可切换雾、密度、太阳和镜头轨迹，查看网格与资源诊断。此前未启用时序重建的 NVIDIA 截图为[雾开](artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png) / [雾关](artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-off.png)；本轮可选时序版的实际 NVIDIA 截图为[雾开](artifacts/fog-temporal-demo-native-20261019/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png) / [关闭时序、每格中心采样](artifacts/fog-temporal-demo-native-20261019/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-centered.png)。演示显式配置 `pixelSize=8`、64 个切片、最多 16 帧历史和 128 MiB 雾预算；截图是有限场景的功能证据，不代表最终画质或性能。
 
+2026-10-31 起 `/fog.html` 新增「门洞聚光灯」开关：后墙外一盏带阴影的有界聚光灯，光柱经门洞进入雾中。目标机（Apple M3 Max，Chrome 156）上集成回归的截图为[无聚光灯](artifacts/main-integration-20261030/test-results-lights-hw/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png) / [聚光灯开](artifacts/main-integration-20261030/test-results-lights-hw/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-spot.png)。点光/聚光灯通过 `RendererOptions.localLights` 显式配置，同时进入表面直接光、GI 捕获、Final Gather、反射命中与雾；表面逐像素遍历全部启用的灯，没有分簇剔除。此页只展示局部场景，不代表体积照明画质或性能目标；F05 灯数扫描尚未做。
+
 ```sh
 npm run check
 npx playwright install chromium
@@ -121,6 +123,10 @@ npm run benchmark -- --seconds 1800 --warmup 300 --trees 128 --stress --repeat 1
 ```
 
 第一条采集固定轨迹；第二条按真实时间运行 30 分钟，循环增删刚体、换材质、重置、调整分辨率和切换镜头。默认以正常 GPU 配置运行独立的 headless Chrome；`--software` 仅用于功能排错，`--headed` 可显示测试窗口，`--channel msedge` 可选 Edge。运行环境和实际启动参数写入报告。
+
+macOS 上可加 `--caffeinate`：运行期间以 `caffeinate -dims -w <pid>` 阻止睡眠，进程退出即释放，不改系统设置。报告的 `summary.pacing` 把超预算帧与准时帧分成两组，对照前一帧的回调延迟、主线程工作、长任务与稀疏 GPU 样本；组间差异只说明相关。主机样本每 15 秒记录负载均值，可据此判断运行窗口是否安静。
+
+`npm run capability:report` 打印能力矩阵 `docs/capability-matrix.json` 的 Markdown 报告。矩阵门槛与 benchmarks.md、roadmap.md 不一致，或者写入的状态与证据推导的结果不符时，退出码为 1。
 
 本机硬件基础压力基准可指定 Edge 与预期厂商：
 

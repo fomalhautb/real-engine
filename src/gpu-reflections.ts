@@ -5,7 +5,7 @@ import surfaceFrame from './shaders/surface-frame.wgsl?raw';
 import surfaceBrdf from './shaders/surface-brdf.wgsl?raw';
 import giCommon from './shaders/diffuse-gi-common.wgsl?raw';
 import giInterpolate from './shaders/diffuse-gi-interpolate.wgsl?raw';
-import { reflectionFogSource, type GpuVolumetricFog } from './gpu-volumetric-fog';
+import { reflectionFogShaderSource, type GpuVolumetricFog } from './gpu-volumetric-fog';
 import { GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION } from './gi-visibility';
 import { lookAt } from './math';
 import { planReflectionGrid, resolveReflectionsOptions, type ReflectionsOptions, type ReflectionGridPlan } from './reflections';
@@ -101,7 +101,7 @@ export class GpuReflections {
       + '\n@group(0) @binding(7) var<uniform> gi: GiParameters;\n@group(0) @binding(8) var<storage, read> giProbes: array<GiProbe>;\n'
       + giInterpolate + '\nfn reflectionDiffuse(hit:ReflectionHit)->vec3f { return giSampleSurfaceIrradiance(hit.position.xyz,hit.normal.xyz,reflectionGeometry(hit),gi.state.x) * hit.baseColor.xyz * (1.0-hit.previous.w) * (0.96/3.14159265); }'
       : 'fn reflectionDiffuse(hit:ReflectionHit)->vec3f { return hit.baseColor.xyz * (0.045+0.065*max(hit.normal.y,0.0)) * (1.0-hit.previous.w*0.6); }';
-    const fogSource = this.fog ? reflectionFogSource : 'fn reflectionApplyFog(origin:vec3f,direction:vec3f,distance:f32,incoming:vec3f)->vec3f {return incoming;}';
+    const fogSource = this.fog ? reflectionFogShaderSource(this.fog, !!this.gi) : 'fn reflectionApplyFog(origin:vec3f,direction:vec3f,distance:f32,incoming:vec3f)->vec3f {return incoming;}';
     const module = this.device.createShaderModule({ label: 'world-space reflections',
       code: surfaceFrame + '\n' + surfaceBrdf + '\n' + common + '\n' + updateSource.replace('// REFLECTION_GI', giSource) + '\n' + fogSource });
     const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === 'error');

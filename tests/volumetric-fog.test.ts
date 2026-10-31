@@ -63,11 +63,11 @@ describe('volumetric fog configuration', () => {
     const author = { maxHistoryFrames: 12 };
     const temporal = resolveVolumetricFogOptions({ pixelSize: 8, slices: 8, temporal: author });
     author.maxHistoryFrames = 20;
-    expect(temporal.temporal).toEqual({ maxHistoryFrames: 12 });
+    expect(temporal.temporal).toEqual({ maxHistoryFrames: 12, occluderRejection: 'global' });
     expect(Object.isFrozen(temporal.temporal)).toBe(true);
-    expect(resolveVolumetricFogOptions({ temporal: {} }).temporal).toEqual({ maxHistoryFrames: 8 });
-    expect(resolveVolumetricFogOptions({ temporal: { maxHistoryFrames: 2 } }).temporal).toEqual({ maxHistoryFrames: 2 });
-    expect(resolveVolumetricFogOptions({ temporal: { maxHistoryFrames: 32 } }).temporal).toEqual({ maxHistoryFrames: 32 });
+    expect(resolveVolumetricFogOptions({ temporal: {} }).temporal).toEqual({ maxHistoryFrames: 8, occluderRejection: 'global' });
+    expect(resolveVolumetricFogOptions({ temporal: { maxHistoryFrames: 2 } }).temporal).toEqual({ maxHistoryFrames: 2, occluderRejection: 'global' });
+    expect(resolveVolumetricFogOptions({ temporal: { maxHistoryFrames: 32 } }).temporal).toEqual({ maxHistoryFrames: 32, occluderRejection: 'global' });
 
     // 16x8 HDR: 1024 B; uniform + volume: 384 + 5120 B. A 2x1x8 grid
     // carries 16 * (32 base + 40 temporal) B, then drops to 1x1x8.

@@ -18,7 +18,9 @@ fn sampleColumn(xy: vec2i, depth: f32) -> vec4f {
 }
 @fragment fn fragmentMain(@builtin(position) pixel: vec4f) -> @location(0) vec4f {
   let surface = textureLoad(sceneColor, vec2i(pixel.xy), 0);
-  if (frame.forward.w < 0.5) { return surface; }
+  // padding.x selects the explicit diagnostic view: rgb = L_fog, a = T.
+  let split = frame.padding.x > 0.5;
+  if (frame.forward.w < 0.5) { return select(surface, vec4f(0.0, 0.0, 0.0, 1.0), split); }
   let depth = textureLoad(sceneDepth, vec2i(pixel.xy), 0);
   var viewDepth = frame.eye.w;
   if (depth < 1.0) { viewDepth = min(frame.eye.w, frame.right.w * frame.up.w / (frame.up.w - depth * (frame.up.w - frame.right.w))); }
@@ -30,5 +32,6 @@ fn sampleColumn(xy: vec2i, depth: f32) -> vec4f {
   let a = mix(sampleColumn(base, viewDepth), sampleColumn(base + vec2i(1, 0), viewDepth), fraction.x);
   let b = mix(sampleColumn(base + vec2i(0, 1), viewDepth), sampleColumn(base + vec2i(1, 1), viewDepth), fraction.x);
   let medium = mix(a, b, fraction.y);
+  if (split) { return vec4f(min(medium.xyz, vec3f(65504.0)), medium.w); }
   return vec4f(min(medium.xyz + medium.w * surface.xyz, vec3f(65504.0)), surface.w);
 }

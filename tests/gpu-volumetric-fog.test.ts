@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GpuVolumetricFog } from '../src/gpu-volumetric-fog';
+import { createTimestampQuerySet } from '../src/gpu-timestamp-span';
 import { identity } from '../src/math';
 
 type FakeBuffer = { label: string; destroyed: boolean; destroy(): void };
@@ -252,5 +253,193 @@ describe('GPU volumetric fog ownership', () => {
     } finally { tight.dispose(); }
     expect(constrainedLedger.bytes).toBe(0);
     expect(allDestroyed(constrained)).toBe(true);
+  });
+});
+
+type Write = { label: string; offset: number; data: Float32Array };
+function recordWrites(device: FakeDevice): Write[] {
+  const writes: Write[] = [];
+  device.queue.writeBuffer = ((buffer: FakeBuffer, offset: number, data: ArrayBufferView) => {
+    writes.push({ label: buffer.label, offset,
+      data: new Float32Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)) });
+  }) as never;
+  return writes;
+}
+function fakeGi(device: FakeDevice) {
+  const probes = [device.createBuffer({ label: 'gi probes 0' }), device.createBuffer({ label: 'gi probes 1' })];
+  const parameters = device.createBuffer({ label: 'gi parameters' });
+  return { lightingProbeBuffers: probes, lightingParameters: parameters, lightingIndex: 0, historyEpoch: 0 };
+}
+const view = identity();
+// Orthographic sun: NDC x = x / 10, y = z / 10, depth = 0.5 - y / 20.
+const sun = [0.1, 0, 0, 0, 0, 0, -0.05, 0, 0, 0.1, 0, 0, 0, 0, 0.5, 1];
+
+describe('GPU volumetric fog air lighting and local history rejection', () => {
+  it('requires a borrowed GI field and preflights its extra storage binding', async () => {
+    const device = new FakeDevice(), tracked = ledger();
+    await expect(GpuVolumetricFog.create(device as unknown as GPUDevice, { airLighting: {} }, tracked.account))
+      .rejects.toThrow('FOG_AIR_LIGHTING_REQUIRES_DIFFUSE_GI');
+    expect(device.buffers).toHaveLength(0);
+    const gi = fakeGi(device);
+    device.limits.maxStorageBuffersPerShaderStage = 3;
+    await expect(GpuVolumetricFog.create(device as unknown as GPUDevice, { airLighting: {} }, tracked.account,
+      gi as never)).rejects.toThrow('FOG_STORAGE_BINDING_LIMIT');
+    expect(device.buffers).toHaveLength(3);
+    expect(tracked.bytes).toBe(0);
+    device.limits.maxStorageBuffersPerShaderStage = 4;
+    const groups = device.bindGroupCalls;
+    const fog = await GpuVolumetricFog.create(device as unknown as GPUDevice, { airLighting: {} }, tracked.account, gi as never);
+    try {
+      expect(fog.airLightingConfigured).toBe(true);
+      // One borrowed GI bind group per GI ping-pong probe buffer.
+      expect(device.bindGroupCalls - groups).toBe(2);
+      expect(fog.diagnostics().airLighting).toMatchObject({ gi: true, outsideSkyVisibility: 0, configured: true,
+        representation: 'gi-incident-radiance-sh9-hg-zonal', evaluation: 'cell-centre-each-frame-after-history' });
+      expect(() => fog.reflectionShaderSource(false)).toThrow('FOG_AIR_LIGHTING_REFLECTION_GI_REQUIRED');
+      expect(fog.reflectionShaderSource(true)).toContain('fn fogAirField(');
+    } finally { fog.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    // GI owns its buffers; fog destroys only its own.
+    expect(device.buffers.filter(buffer => buffer.label.startsWith('gi ')).every(buffer => !buffer.destroyed)).toBe(true);
+    expect(device.buffers.filter(buffer => buffer.label.startsWith('fog ')).every(buffer => buffer.destroyed)).toBe(true);
+
+    const plain = await GpuVolumetricFog.create(device as unknown as GPUDevice, {}, tracked.account, gi as never);
+    try {
+      // Without air lighting the GI field is not borrowed and reflections use the stub.
+      expect(plain.airLightingConfigured).toBe(false);
+      expect(plain.reflectionShaderSource(false))
+        .toContain('fn fogAirSource(world: vec3f, direction: vec3f) -> vec3f { return vec3f(0.0); }');
+      expect(() => plain.setAirLighting({ gi: false })).toThrow('FOG_AIR_LIGHTING_NOT_CONFIGURED');
+      expect(plain.diagnostics().airLighting).toBeNull();
+    } finally { plain.dispose(); }
+    expect(tracked.bytes).toBe(0);
+  });
+
+  it('packs air lanes and the split debug view, keeps air light out of history, and splits the integrate timestamp span', async () => {
+    const device = new FakeDevice(), tracked = ledger(), writes = recordWrites(device), gi = fakeGi(device);
+    const fog = await GpuVolumetricFog.create(device as unknown as GPUDevice,
+      { pixelSize: 8, slices: 8, temporal: {}, airLighting: { outsideSkyVisibility: 0.5 } }, tracked.account, gi as never);
+    try {
+      resize(fog, 16, 16);
+      const frame = () => {
+        fog.update([0, 1, 5], [0, 1, 0], Math.PI / 3, 0.1, 100, [0, 1, 0], [1, 1, 1], view, view,
+          { cameraCut: false, sceneChanged: false, materialRevision: 1 });
+        const uniform = writes.filter(write => write.label === 'fog frame').at(-1)!.data;
+        fog.afterSubmit();
+        return Array.from(uniform.subarray(92, 96));
+      };
+      expect(frame()).toEqual([0, 1, 0.5, 0]);
+      expect(frame()).toEqual([0, 1, 0.5, 0]);
+      expect(fog.diagnostics().history.framesSinceReset).toBe(2);
+      fog.setDebugView('scattering-transmittance');
+      expect(frame()[0]).toBe(1);
+      expect(fog.diagnostics().debugView).toBe('scattering-transmittance');
+      expect(() => fog.setDebugView('depth' as never)).toThrow('INVALID_FOG_DEBUG_VIEW');
+      fog.setDebugView('composite');
+      // Air light is evaluated after the temporal resolve: toggling it keeps history.
+      fog.setAirLighting({ gi: false });
+      expect(frame()).toEqual([0, 0, 0.5, 0]);
+      expect(fog.diagnostics().history).toMatchObject({ framesSinceReset: 4, lastResetReason: 'resize' });
+      expect(() => fog.setAirLighting({ outsideSkyVisibility: 2 })).toThrow(/outsideSkyVisibility/);
+      expect(fog.diagnostics().airLighting).toMatchObject({ gi: false, outsideSkyVisibility: 0.5,
+        evaluation: 'cell-centre-each-frame-after-history' });
+
+      // One timestamp span: begins on the air pass and ends on the integration pass.
+      const passes: { label: string; timestampWrites?: Record<string, unknown> }[] = [];
+      const groups: number[] = [];
+      const encoder = { beginComputePass: (descriptor: { label: string; timestampWrites?: Record<string, unknown> }) => {
+        passes.push(descriptor);
+        return { setPipeline() {}, setBindGroup: (index: number) => { groups.push(index); }, dispatchWorkgroups() {}, end() {} };
+      } };
+      // Each pass writes both ends; the end it does not own goes to the reserved scratch slot (8).
+      const querySet = createTimestampQuerySet({ createQuerySet: (descriptor: GPUQuerySetDescriptor) => ({ count: descriptor.count }) } as never, 8);
+      fog.encodeIntegrate(encoder as never, { querySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 });
+      expect(passes.map(pass => pass.label)).toEqual(['fog air lighting', 'fog integration']);
+      expect(passes[0].timestampWrites).toEqual({ querySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 8 });
+      expect(passes[1].timestampWrites).toEqual({ querySet, beginningOfPassWriteIndex: 8, endOfPassWriteIndex: 5 });
+      expect(groups).toEqual([0, 1, 0]);
+      passes.length = 0;
+      fog.encodeInject(encoder as never);
+      expect(passes.map(pass => pass.label)).toEqual(['fog density and lighting']);
+    } finally { fog.dispose(); }
+    expect(tracked.bytes).toBe(0);
+
+    const plain = await GpuVolumetricFog.create(device as unknown as GPUDevice, { pixelSize: 8, slices: 8 }, tracked.account);
+    try {
+      resize(plain, 16, 16);
+      const passes: { timestampWrites?: unknown }[] = [];
+      const encoder = { beginComputePass: (descriptor: { timestampWrites?: unknown }) => {
+        passes.push(descriptor);
+        return { setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {}, end() {} };
+      } };
+      const timing = { querySet: {}, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 };
+      plain.encodeIntegrate(encoder as never, timing as never);
+      expect(passes).toHaveLength(1);
+      expect(passes[0].timestampWrites).toBe(timing);
+    } finally { plain.dispose(); }
+    expect(tracked.bytes).toBe(0);
+  });
+
+  it('localizes changed casters, falls back to a global reset when it cannot, and releases the region uniform', async () => {
+    const device = new FakeDevice(), tracked = ledger(), writes = recordWrites(device);
+    const fog = await GpuVolumetricFog.create(device as unknown as GPUDevice,
+      { pixelSize: 8, slices: 8, temporal: { occluderRejection: 'local' } }, tracked.account);
+    try {
+      expect(fog.localRejection).toBe(true);
+      expect(tracked.bytes).toBe(5504 + 1040);
+      expect(device.buffers.filter(buffer => buffer.label === 'fog changed occluder regions')).toHaveLength(1);
+      resize(fog, 16, 16);
+      expect(tracked.bytes).toBe(fog.diagnostics().grid!.bytes);
+      let eye: [number, number, number] = [0, 1, 5];
+      type State = { sceneChanged: boolean; changedBounds?: { min: number[]; max: number[] }[] | null };
+      const frame = (state: State, light: number[] = sun) => {
+        writes.length = 0;
+        fog.update(eye, [0, 1, 0], Math.PI / 3, 0.1, 100, [0, 1, 0], [1, 1, 1], light as never, view,
+          { cameraCut: false, materialRevision: 1, shadowResolution: 512, ...state });
+        fog.afterSubmit();
+        const regions = writes.filter(write => write.label === 'fog changed occluder regions').at(-1)?.data;
+        return { regions, staticView: writes.find(write => write.label === 'fog frame')!.data[91] };
+      };
+      // The constructor schedules one empty header; history then grows.
+      expect(Array.from(frame({ sceneChanged: false }).regions!)).toEqual([0, 0, 0, 0]);
+      expect(frame({ sceneChanged: false }).regions).toBeUndefined();
+      expect(fog.diagnostics().history.framesSinceReset).toBe(2);
+      const moved = frame({ sceneChanged: true,
+        changedBounds: [{ min: [0, 0, 0], max: [1, 1, 1] }, { min: [1, 0, 0], max: [2, 1, 1] }] });
+      expect(moved.regions!.length).toBe(1040 / 4);
+      expect(Array.from(moved.regions!.subarray(0, 2))).toEqual([2, 0]);
+      expect(moved.staticView).toBe(1);
+      expect(fog.diagnostics().history).toMatchObject({ framesSinceReset: 3, occluderRejection: 'local',
+        occluderRegions: { framesWithRegions: 1, lastRegions: 2, lastMerged: 0, totalMerged: 0 } });
+      // The next frame clears the regions with one empty header.
+      expect(Array.from(frame({ sceneChanged: false }).regions!)).toEqual([0, 0, 0, 0]);
+      expect(fog.diagnostics().history.occluderRegions).toMatchObject({ lastRegions: 0 });
+      eye = [0.5, 1, 5];
+      expect(frame({ sceneChanged: false }).staticView).toBe(0);
+      expect(frame({ sceneChanged: false }).staticView).toBe(1);
+      const projective = [...sun.slice(0, 11), 0.01, ...sun.slice(12)];
+      for (const [state, light] of [
+        [{ sceneChanged: true, changedBounds: null }, sun],
+        [{ sceneChanged: true, changedBounds: [] }, sun],
+        [{ sceneChanged: true, changedBounds: [{ min: [0, 0, 0], max: [1, 1, 1] }] }, projective],
+      ] as [State, number[]][]) {
+        frame({ sceneChanged: false }, light);
+        frame({ sceneChanged: false }, light);
+        expect(fog.diagnostics().history.framesSinceReset).toBeGreaterThan(1);
+        frame(state, light);
+        expect(fog.diagnostics().history).toMatchObject({ framesSinceReset: 1, lastResetReason: 'scene-change' });
+      }
+    } finally { fog.dispose(); }
+    expect(tracked.bytes).toBe(0);
+    expect(allDestroyed(device)).toBe(true);
+
+    const global = await GpuVolumetricFog.create(device as unknown as GPUDevice, { temporal: {} }, tracked.account);
+    try {
+      expect(global.localRejection).toBe(false);
+      expect(device.buffers.filter(buffer => buffer.label === 'fog changed occluder regions')).toHaveLength(1);
+      expect(tracked.bytes).toBe(5504);
+      expect(global.diagnostics().history).toMatchObject({ occluderRejection: 'global', occluderRegions: null });
+    } finally { global.dispose(); }
+    expect(tracked.bytes).toBe(0);
   });
 });

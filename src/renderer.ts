@@ -26,8 +26,8 @@ import { GeometryStreamCapacityCoordinator, type GeometryStreamCapacityOptions, 
 import { geometryGpuPoolLayout } from './geometry-gpu-pool-layout';
 import { GpuGeometryPagePool, type GeometryGpuFrameLease } from './gpu-geometry-page-pool';
 import { GeometryDecodeWorkerPool, type GeometryDecodeWorkerOptions } from './geometry-decode-worker-pool';
-import { GpuVolumetricFog, type FogHistoryCell } from './gpu-volumetric-fog';
-import { resolveVolumetricFogOptions, type VolumetricFogOptions } from './volumetric-fog';
+import { GpuVolumetricFog, type FogDebugView, type FogHistoryCell } from './gpu-volumetric-fog';
+import { resolveVolumetricFogOptions, type FogAirLightingOptions, type VolumetricFogOptions } from './volumetric-fog';
 import { GpuReflections, reflectionSurfaceSource, type ReflectionProbeResult } from './gpu-reflections';
 import { resolveReflectionsOptions, type ReflectionsOptions } from './reflections';
 import { GpuOcclusion } from './gpu-occlusion';
@@ -62,6 +62,8 @@ type Batch = {
   morphBounds: Bounds3[]; bounds: Map<number, Bounds3>;
   history: Map<number, Previous>;
   dirty: boolean; fogSceneChanged: boolean; lastInstances: InstanceState[]; lastInputMode?: RenderBatch['inputMode'];
+  /** Pre- and post-change caster bounds this frame, for local fog history rejection. */
+  fogChangedBounds: Bounds3[];
   /** Reused [start, end) slot ranges, bounded to 16 writes per input stream. */
   uploadRanges: number[];
   material: GpuMaterial; materialPipelines: MaterialPipelines; materialRequest: number;
@@ -202,7 +204,9 @@ export class Renderer {
     }
     if (options.antiAliasing !== undefined && options.antiAliasing !== 'none' && options.antiAliasing !== 'fxaa') throw new Error('INVALID_ANTI_ALIASING');
     resolveSunShadowOptions(options.sunShadow);
-    if (options.volumetricFog) resolveVolumetricFogOptions(options.volumetricFog);
+    if (options.volumetricFog && resolveVolumetricFogOptions(options.volumetricFog).airLighting && !options.diffuseGi) {
+      throw new Error('FOG_AIR_LIGHTING_REQUIRES_DIFFUSE_GI');
+    }
     if (options.reflections) {
       resolveReflectionsOptions(options.reflections);
       if (!options.worldQueries) throw new Error('REFLECTIONS_WORLD_QUERIES_REQUIRED');
@@ -423,7 +427,7 @@ export class Renderer {
     if (this.diffuseGiOptions) this.diffuseGi = await GpuDiffuseGi.create(this.device, this.worldQueries!, this.diffuseGiOptions,
       bytes => { this.stats.ownedGpuBytes += bytes; });
     if (this.volumetricFogOptions) this.volumetricFog = await GpuVolumetricFog.create(this.device, this.volumetricFogOptions,
-      bytes => { this.stats.ownedGpuBytes += bytes; });
+      bytes => { this.stats.ownedGpuBytes += bytes; }, this.diffuseGi);
     if (this.reflectionsOptions) this.reflections = await GpuReflections.create(this.device, this.worldQueries!, this.reflectionsOptions,
       bytes => { this.stats.ownedGpuBytes += bytes; }, this.diffuseGi, this.volumetricFog, this.shadow);
     if (this.diffuseGi || this.reflections) {
@@ -571,12 +575,15 @@ export class Renderer {
           { resource: 'velocity', access: 'attachmentLoad' as const }], execute: (encoder: GPUCommandEncoder) => this.encodeSurface(encoder, true) },
       ] : []),
       ...(this.volumetricFog ? [
-        { name: 'fog-inject', uses: [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const }, { resource: 'fog-source', access: 'write' as const }],
+        { name: 'fog-inject', uses: [{ resource: 'fog-media', access: 'read' as const }, { resource: 'sun-shadow', access: 'read' as const },
+          { resource: 'fog-source', access: 'write' as const }],
           execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeInject(encoder, this.timestamp(this.timestampCount - (this.volumetricFog!.temporalConfigured ? 8 : 6))) },
         ...(this.volumetricFog.temporalConfigured ? [{ name: 'fog-temporal', uses: [
           { resource: 'fog-source', access: 'read' as const }, { resource: 'fog-history', access: 'readWrite' as const }],
           execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeTemporal(encoder, this.timestamp(this.timestampCount - 6)) }] : []),
-        { name: 'fog-integrate', uses: [{ resource: 'fog-source', access: 'read' as const },
+        // Air lighting resolves this frame's source in place from the current GI field before integration.
+        { name: 'fog-integrate', uses: [{ resource: 'fog-source', access: this.volumetricFog.airLightingConfigured ? 'readWrite' as const : 'read' as const },
+          ...(this.volumetricFog.airLightingConfigured ? [{ resource: 'diffuse-gi-probes', access: 'read' as const }] : []),
           ...(this.volumetricFog.temporalConfigured ? [{ resource: 'fog-history', access: 'read' as const }] : []),
           { resource: 'fog-integrated', access: 'write' as const }],
           execute: (encoder: GPUCommandEncoder) => this.volumetricFog!.encodeIntegrate(encoder, this.timestamp(this.timestampCount - 4)) },
@@ -814,6 +821,20 @@ export class Renderer {
     this.volumetricFog.setTemporalEnabled(enabled);
   }
 
+  /** Air GI/sky controls for media configured with `airLighting`; fog history restarts on change. */
+  setVolumetricFogAirLighting(options: FogAirLightingOptions): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.volumetricFog) throw new Error('VOLUMETRIC_FOG_DISABLED');
+    this.volumetricFog.setAirLighting(options);
+  }
+
+  /** Diagnostic only: `scattering-transmittance` replaces the HDR output with L_fog (rgb) and T (alpha). */
+  setVolumetricFogDebugView(view: FogDebugView): void {
+    if (this.disposed) throw new Error('RENDERER_DISPOSED');
+    if (!this.volumetricFog) throw new Error('VOLUMETRIC_FOG_DISABLED');
+    this.volumetricFog.setDebugView(view);
+  }
+
   async probeVolumetricFogHistory(cells: readonly FogHistoryCell[]) {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');
     if (!this.volumetricFog || !this.lastViewProjection) throw new Error('FOG_HISTORY_UNAVAILABLE');
@@ -988,7 +1009,7 @@ export class Renderer {
         entries: [params, rest, instances, palettes, output, morphs, scalars, tangents].map((buffer, binding) => ({ binding, resource: { buffer } })) }),
       render: undefined as unknown as GPUBindGroup,
       instanceData, instanceWords: new Uint32Array(instanceData.buffer), paletteData: new Float32Array(capacity * program.jointCount * 32),
-      scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, fogSceneChanged: true, lastInstances: [], uploadRanges: [],
+      scalarData: new Float32Array(capacity * scalarStride * 2), history: new Map(), dirty: true, fogSceneChanged: true, fogChangedBounds: [], lastInstances: [], uploadRanges: [],
     };
     try {
       if (scene.geometryLod) batch.geometryLod = this.geometryLod!.addBatch(scene, instances, () => batch.material.program.alphaMode === 'opaque');
@@ -1042,6 +1063,8 @@ export class Renderer {
   private upload(batch: Batch): void {
     const states = batch.scene.instances;
     batch.fogSceneChanged = states.length !== batch.lastInstances.length;
+    batch.fogChangedBounds.length = 0;
+    const localFog = !!this.volumetricFog?.localRejection;
     if (states.length > batch.scene.capacity) throw new Error('INSTANCE_CAPACITY: ' + batch.scene.name);
     const committed = batch.scene.inputMode === 'committed' && batch.lastInputMode === 'committed';
     const reusable = (state: InstanceState, i: number, previous: Previous | undefined): boolean =>
@@ -1078,8 +1101,10 @@ export class Renderer {
       // Fog history depends on actual rendered changes, not a CPU upload request.
       // Compare bounded inputs before overwriting the existing render snapshot;
       // no second geometry copy or per-frame GPU readback is needed.
-      if (this.volumetricFog?.temporalConfigured && !batch.fogSceneChanged) {
-        batch.fogSceneChanged = !previous || previous.version !== state.historyVersion || previous.generation !== generation
+      // Local rejection compares every slot and records old and new caster bounds.
+      let fogCaster = false;
+      if (this.volumetricFog?.temporalConfigured && (localFog || !batch.fogSceneChanged)) {
+        fogCaster = !previous || previous.version !== state.historyVersion || previous.generation !== generation
           || differsF32(state.model, batch.instanceData, i * 56)
           || differsF32(state.normalMatrix, batch.instanceData, i * 56 + 32)
           || differsF32(state.color, batch.instanceData, i * 56 + 48)
@@ -1087,6 +1112,9 @@ export class Renderer {
           || Math.fround(state.roughness) !== batch.instanceData[i * 56 + 53]
           || state.bones.some((bone, j) => differsF32(bone, previous!.bones[j]))
           || differsF32(state.deformScalars, batch.scalarData, i * scalarCount * 2, batch.program.scalarCount);
+        if (fogCaster) batch.fogSceneChanged = true;
+        const old = fogCaster && localFog ? batch.bounds.get(state.entityId) : undefined;
+        if (old) batch.fogChangedBounds.push(old);
       }
       // Adjacent changes share a write. Highly fragmented updates use one
       // envelope instead of issuing an unbounded number of tiny queue writes.
@@ -1095,6 +1123,7 @@ export class Renderer {
       else if (ranges.length < 32) ranges.push(i, i + 1);
       else { ranges[1] = i + 1; ranges.length = 2; coalesced = true; }
       const bounds = conservativeDeformationBounds(batch.program, batch.mesh.bounds, batch.morphBounds, state.bones, state.deformScalars, state.model);
+      if (fogCaster && localFog) batch.fogChangedBounds.push(bounds);
       if (!previous || previous.version !== state.historyVersion || previous.generation !== generation) {
         previous = { model: state.model.slice(), bones: state.bones.map(b => b.slice()), scalars: [...state.deformScalars], version: state.historyVersion, generation, settled: true };
         batch.history.set(state.entityId, previous);
@@ -1121,7 +1150,11 @@ export class Renderer {
       previous.source = state;
       previous.model.set(state.model); previous.scalars = [...state.deformScalars]; previous.version = state.historyVersion; previous.generation = generation;
     }
-    for (const id of batch.history.keys()) if (!alive.has(id)) { batch.history.delete(id); batch.bounds.delete(id); }
+    for (const id of batch.history.keys()) if (!alive.has(id)) {
+      const removed = localFog ? batch.bounds.get(id) : undefined;
+      if (removed) batch.fogChangedBounds.push(removed);
+      batch.history.delete(id); batch.bounds.delete(id);
+    }
     if (states.length !== batch.lastInstances.length) {
       this.device.queue.writeBuffer(batch.params, 0, new Uint32Array([batch.mesh.vertexCount, states.length, joints, scalarCount]));
       this.stats.uploadedBytes += 16;
@@ -1237,9 +1270,6 @@ export class Renderer {
     const debug = this.geometryLod?.settings.debug;
     new Uint32Array(this.frameData.buffer)[60] = debug === 'clusters' ? 1 : debug === 'levels' ? 2 : 0;
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
-    this.stats.uploadedBytes += this.volumetricFog?.update(eye, target, Math.PI / 3.2, 0.1, 150,
-      this.sunDirection, this.sunColor, this.lightMatrix, vp,
-      { cameraCut: !this.lastViewProjection, sceneChanged: this.batches.some(batch => batch.fogSceneChanged), materialRevision: this.materialRevision }) ?? 0;
     this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
     for (const batch of this.batches) if (batch.stream) {
       const count = batch.material.program.alphaMode === 'opaque' ? batch.scene.instances.length : 0;
@@ -1254,6 +1284,15 @@ export class Renderer {
     this.stats.uploadedBytes += this.reflections?.update({ frame: this.stats.frames + 1, materialRevision: this.materialRevision,
       width: this.stats.width, height: this.stats.height, eye, target, fovY: Math.PI / 3.2, near: 0.1, far: 150,
       sunDirection: this.sunDirection, sunColor: this.sunColor }) ?? 0;
+    // Changed-caster bounds come from this frame's batch uploads.
+    if (this.volumetricFog) {
+      const fog = this.volumetricFog;
+      this.stats.uploadedBytes += fog.update(eye, target, Math.PI / 3.2, 0.1, 150,
+        this.sunDirection, this.sunColor, this.lightMatrix, vp,
+        { cameraCut: !this.lastViewProjection, sceneChanged: this.batches.some(batch => batch.fogSceneChanged), materialRevision: this.materialRevision,
+          changedBounds: fog.localRejection ? this.batches.flatMap(batch => batch.fogChangedBounds) : null,
+          shadowResolution: this.sunShadowOptions.resolution });
+    }
     this.lastViewProjection = vp;
     const encoder = this.device.createCommandEncoder({ label: 'deform → shadow → HDR surface → resolve' });
     const readTiming = !!this.querySet && !this.timingPending && this.stats.frames % 30 === 0;

@@ -3,12 +3,12 @@ import { createServer } from 'node:http';
 import { createReadStream } from 'node:fs';
 import { cp, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { resolve, extname, sep } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { platform, release, arch, cpus, totalmem } from 'node:os';
 
 const args = process.argv.slice(2), options = {}, settings = { channel: 'chrome', repeats: 3, headed: false, software: false,
-  highPerformanceGpu: false, expectVendor: null };
+  highPerformanceGpu: false, expectVendor: null, caffeinate: false };
 let output;
 const numeric = new Map([['--frames', 'frames'], ['--seconds', 'durationSeconds'], ['--warmup', 'warmupFrames'],
   ['--trees', 'trees'], ['--seed', 'seed'], ['--width', 'width'], ['--height', 'height'], ['--budget-ms', 'frameBudgetMs']]);
@@ -20,6 +20,7 @@ for (let i = 0; i < args.length; i++) {
   else if (arg === '--high-performance-gpu') settings.highPerformanceGpu = true;
   else if (arg === '--expect-vendor') settings.expectVendor = args[++i];
   else if (arg === '--headed') settings.headed = true;
+  else if (arg === '--caffeinate') settings.caffeinate = true;
   else if (arg === '--channel') settings.channel = args[++i];
   else if (arg === '--repeat') settings.repeats = Number(args[++i]);
   else if (arg === '--out') output = args[++i];
@@ -28,6 +29,7 @@ for (let i = 0; i < args.length; i++) {
 if (!Number.isInteger(settings.repeats) || settings.repeats < 1 || settings.repeats > 10) throw new Error('--repeat must be 1..10');
 if (!['chrome', 'msedge', 'chromium'].includes(settings.channel)) throw new Error('--channel must be chrome, msedge, or chromium');
 if (settings.software && settings.highPerformanceGpu) throw new Error('Cannot combine software and high-performance GPU selection');
+if (settings.caffeinate && platform() !== 'darwin') throw new Error('--caffeinate is only available on macOS');
 if (settings.expectVendor !== null && !['nvidia', 'intel', 'amd', 'apple', 'qualcomm', 'arm'].includes(settings.expectVendor)) {
   throw new Error('--expect-vendor must be nvidia, intel, amd, apple, qualcomm, or arm');
 }
@@ -80,6 +82,30 @@ const metadata = { commit: git(['rev-parse', 'HEAD']), dirty: status !== '', sta
   sourceSha256: sourceHashes.sha256, sourceFiles: sourceHashes.files, startedAt: new Date().toISOString(),
   os: { platform: platform(), release: release(), architecture: arch(), cpu: cpus()[0]?.model, logicalCpus: cpus().length, memoryBytes: totalmem() },
   browserSettings: settings, requestedOptions: options, runTimeoutMs, gpuDrivers: null };
+// Read-only macOS host facts. Each probe is optional; a failed probe is recorded as null.
+const probe = (file, probeArgs) => {
+  try { return execFileSync(file, probeArgs, { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; }
+};
+const darwinPower = () => ({ observedAt: new Date().toISOString(), battery: probe('pmset', ['-g', 'batt']), thermal: probe('pmset', ['-g', 'therm']) });
+if (platform() === 'darwin') {
+  let gpus = null;
+  try {
+    gpus = JSON.parse(probe('system_profiler', ['SPDisplaysDataType', '-json'])).SPDisplaysDataType.map(gpu => ({
+      model: gpu.sppci_model ?? gpu._name ?? null, cores: gpu.sppci_cores ?? null, metal: gpu.spdisplays_mtlgpufamilysupport ?? null,
+      displays: (gpu.spdisplays_ndrvs ?? []).map(display => ({ name: display._name ?? null, resolution: display._spdisplays_resolution ?? null,
+        pixels: display._spdisplays_pixels ?? null, connection: display.spdisplays_connection_type ?? null, main: display.spdisplays_main === 'spdisplays_yes' })) }));
+  } catch { /* Explicit null when system_profiler is unavailable. */ }
+  const memory = Number(probe('sysctl', ['-n', 'hw.memsize']));
+  metadata.host = { productVersion: probe('sw_vers', ['-productVersion']), buildVersion: probe('sw_vers', ['-buildVersion']),
+    model: probe('sysctl', ['-n', 'hw.model']), cpu: probe('sysctl', ['-n', 'machdep.cpu.brand_string']),
+    memoryBytes: Number.isSafeInteger(memory) && memory > 0 ? memory : null, gpus, powerSettings: probe('pmset', ['-g']),
+    power: [darwinPower()] };
+  console.log('BENCHMARK_HOST ' + JSON.stringify({ os: metadata.host.productVersion, build: metadata.host.buildVersion, model: metadata.host.model,
+    gpus: gpus?.map(gpu => gpu.model + ' ' + gpu.cores + ' cores ' + gpu.displays.map(display => display.resolution).join(', ')) }));
+}
+// caffeinate holds a sleep assertion only while this process runs; it changes no system setting.
+const caffeinate = settings.caffeinate ? spawn('caffeinate', ['-dims', '-w', String(process.pid)], { stdio: 'ignore' }) : null;
+if (caffeinate) metadata.caffeinate = { args: ['-dims', '-w', String(process.pid)], pid: caffeinate.pid ?? null };
 if (platform() === 'win32') {
   try { metadata.gpuDrivers = JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-Command',
     'Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate | ConvertTo-Json -Compress'],
@@ -192,6 +218,7 @@ try {
       await writeFile(resolve(directory, `run-${repetition}.json`), JSON.stringify(report, null, 2) + '\n');
       await writeFile(resolve(directory, `run-${repetition}.csv`), csv);
       results.push({ repetition, measuredDurationMs: result.measuredDurationMs, summary: result.summary, verification: result.verification, cleanup });
+      if (metadata.host) { metadata.host.power.push(darwinPower()); await writeFile(resolve(directory, 'manifest.json'), JSON.stringify(metadata, null, 2) + '\n'); }
       console.log('BENCHMARK_RESULT ' + JSON.stringify(results.at(-1)));
     } finally { clearInterval(interval); await context.close(); }
   }
@@ -200,4 +227,4 @@ try {
 } catch (error) {
   await writeFile(resolve(directory, 'failure.json'), JSON.stringify({ error: String(error), completedRuns: results, time: new Date().toISOString() }, null, 2) + '\n');
   throw error;
-} finally { await browser?.close(); await new Promise(resolveClose => server.close(resolveClose)); }
+} finally { await browser?.close(); await new Promise(resolveClose => server.close(resolveClose)); caffeinate?.kill(); }

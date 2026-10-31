@@ -85,9 +85,9 @@ describe('BenchmarkRecorder', () => {
     recorder.recordGpu({ frame: 2, deformation: 0, shadow: 1, surface: 2 });
     expect(recorder.summary().frameIntervalMs?.p50).toBe(0);
     expect(recorder.toCsv()).toBe(
-      'frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuSurfaceReceiversMs,gpuTotalMs\n'
-      + '1,0,0,0,0,0,0,0,0,0,0,,,,,,,,,,,,,\n'
-      + '2,32,2,1,0.5,0.25,20,2,200,4,2,0,1,2,0,0,0,0,0,0,0,0,0,3\n',
+      'frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuSurfaceReceiversMs,gpuTotalMs,callbackLatencyMs,frameWorkMs\n'
+      + '1,0,0,0,0,0,0,0,0,0,0,,,,,,,,,,,,,,,\n'
+      + '2,32,2,1,0.5,0.25,20,2,200,4,2,0,1,2,0,0,0,0,0,0,0,0,0,3,,\n',
     );
   });
 
@@ -106,9 +106,9 @@ describe('BenchmarkRecorder', () => {
     expect(gpuMs.total).toEqual({ count: 2, mean: 20, p50: 12, p95: 28, p99: 28, max: 28 });
     const rows = recorder.toCsv().trimEnd().split('\n');
     expect(rows[0]).toContain('gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuSurfaceReceiversMs,gpuTotalMs');
-    expect(rows[1]).toMatch(/,1,2,3,4,5,6,0,7,0,0,0,0,28$/);
-    expect(rows[2].split(',').slice(11)).toEqual(Array(13).fill('')); // No GPU sample on frame 2.
-    expect(rows[3]).toMatch(/,0,0,1,2,3,4,0,2,0,0,0,0,12$/);
+    expect(rows[1]).toMatch(/,1,2,3,4,5,6,0,7,0,0,0,0,28,,$/);
+    expect(rows[2].split(',').slice(11, 24)).toEqual(Array(13).fill('')); // No GPU sample on frame 2.
+    expect(rows[3]).toMatch(/,0,0,1,2,3,4,0,2,0,0,0,0,12,,$/);
   });
 
   it('includes final gather in the measured GPU total and CSV', () => {
@@ -186,6 +186,34 @@ describe('BenchmarkRecorder', () => {
     expect(column).toBeGreaterThan(0);
     expect(first.split(',')[column]).toBe('5');
     expect(second.split(',')[column]).toBe('0');
+  });
+
+  it('counts vsync multiples, the longest late run and the first matching cause of each late frame', () => {
+    const recorder = new BenchmarkRecorder(16, 33.3);
+    // Seven frames keep the 16.7 ms pace. Frame 8 follows heavy main-thread work, 9 overlaps a long
+    // task, 10 follows a heavy GPU sample, 11 has no measured cause and 12 overlaps a long animation frame.
+    const intervals = [16.7, 16.6, 16.7, 16.7, 16.6, 16.7, 16.7, 33.5, 33.4, 33.5, 50.1, 50];
+    const work = [4, 4, 4, 4, 4, 4, 20, 4, 4, 4, 4, 4];
+    let elapsed = 0;
+    intervals.forEach((interval, i) => {
+      elapsed += interval;
+      recorder.record(frame(i + 1, { elapsedMs: elapsed, frameIntervalMs: interval, callbackLatencyMs: 0.5, frameWorkMs: work[i] }));
+    });
+    recorder.recordGpu({ frame: 9, deformation: 0, shadow: 10, surface: 10 });
+    recorder.recordLongTask({ kind: 'longtask', startMs: 160, durationMs: 10 });
+    recorder.recordLongTask({ kind: 'long-animation-frame', startMs: 280, durationMs: 55 });
+    const pacing = recorder.summary().pacing!;
+    expect(pacing.nominalIntervalMs).toBe(16.7);
+    expect(pacing.intervalMultiples).toEqual({ one: 7, two: 3, three: 2, fourOrMore: 0 });
+    expect(pacing.overBudgetMultiples).toEqual({ one: 0, two: 3, three: 2, fourOrMore: 0 });
+    expect(pacing.longestOverBudgetRun).toEqual({ frames: 5, startFrame: 8 });
+    expect(pacing.overBudgetAttribution).toEqual({ previousFrameWork: 1, longTask: 2, gpuSampled: 1, unattributed: 1 });
+    expect(pacing.frameWorkMs?.max).toBe(20);
+    expect(pacing.callbackLatencyMs?.p50).toBe(0.5);
+    expect(pacing.longTasks).toEqual({ recorded: 2, dropped: 0, longAnimationFrames: 1, totalDurationMs: 65 });
+    expect(recorder.toCsv().trimEnd().split('\n')[3].split(',').slice(24)).toEqual(['0.5', '4']);
+    expect(() => recorder.recordLongTask({ kind: 'longtask', startMs: 0, durationMs: -1 })).toThrow(RangeError);
+    expect(() => recorder.record(frame(13, { elapsedMs: elapsed + 16, frameWorkMs: Number.NaN }))).toThrow(RangeError);
   });
 
   it('rejects invalid limits, frames, GPU samples, and byte-total overflow', () => {

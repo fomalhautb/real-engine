@@ -47,6 +47,7 @@ export class FoundationBenchmark {
   private started = false;
   private raf = 0;
   private rejectFrame?: (reason: Error) => void;
+  private stopLongTasks?: () => void;
 
   constructor(private readonly canvas: HTMLCanvasElement, options: BenchmarkOptions = {}) {
     this.options = config(options);
@@ -66,6 +67,31 @@ export class FoundationBenchmark {
       });
     });
   }
+  /** Records long tasks and long animation frames that end after `origin`, in the measured timeline. */
+  private observeLongTasks(origin: number): { longtask: boolean; longAnimationFrame: boolean } {
+    const supported = typeof PerformanceObserver === 'undefined' ? [] : PerformanceObserver.supportedEntryTypes ?? [];
+    const support = { longtask: supported.includes('longtask'), longAnimationFrame: supported.includes('long-animation-frame') };
+    const observers: PerformanceObserver[] = [];
+    const take = (entries: PerformanceEntryList) => {
+      for (const entry of entries) {
+        if (entry.startTime + entry.duration < origin) continue;
+        this.recorder.recordLongTask({ kind: entry.entryType === 'long-animation-frame' ? 'long-animation-frame' : 'longtask',
+          startMs: entry.startTime - origin, durationMs: entry.duration });
+      }
+    };
+    for (const [type, enabled] of [['longtask', support.longtask], ['long-animation-frame', support.longAnimationFrame]] as const) {
+      if (!enabled) continue;
+      const observer = new PerformanceObserver(list => take(list.getEntries()));
+      observer.observe({ type, buffered: false });
+      observers.push(observer);
+    }
+    this.stopLongTasks = () => {
+      for (const observer of observers) { take(observer.takeRecords()); observer.disconnect(); }
+      this.stopLongTasks = undefined;
+    };
+    return support;
+  }
+
   private size(small = false): void {
     const scale = small ? 0.75 : 1;
     this.canvas.style.width = Math.round(this.options.width * scale) + 'px';
@@ -132,8 +158,9 @@ export class FoundationBenchmark {
         }
       };
       this.progress.phase = 'measuring';
+      const pacingObservers = this.observeLongTasks(measuredStart);
       for (let frame = 0; frame < (this.options.frames ?? 1_000_000); frame++) {
-        const now = await this.nextFrame(), interval = now - previousNow;
+        const now = await this.nextFrame(), callbackStart = performance.now(), interval = now - previousNow;
         measuredDurationMs = now - measuredStart;
         previousNow = now;
         const sample = sampleBenchmarkScenario(frame, this.options.seed, this.options.stress);
@@ -159,7 +186,8 @@ export class FoundationBenchmark {
         if (renderer.errors.length) throw new Error(renderer.errors.join('\n'));
         this.recorder.record({ frame: stats.frames, elapsedMs: measuredDurationMs, frameIntervalMs: interval,
           updateMs, eventMs, cpuSubmitMs: stats.cpuSubmitMs, ownedGpuBytes: stats.ownedGpuBytes,
-          uploadedBytes: stats.uploadedBytes, triangles: stats.triangles, deformedVertices: stats.deformedVertices, physicsBodies: scene.physics.bodyCount });
+          uploadedBytes: stats.uploadedBytes, triangles: stats.triangles, deformedVertices: stats.deformedVertices, physicsBodies: scene.physics.bodyCount,
+          callbackLatencyMs: Math.max(0, callbackStart - now), frameWorkMs: performance.now() - callbackStart });
         captureGpu();
         if (stats.width !== lastWidth || stats.height !== lastHeight) {
           resolutions.push({ frame, width: stats.width, height: stats.height }); lastWidth = stats.width; lastHeight = stats.height;
@@ -177,6 +205,7 @@ export class FoundationBenchmark {
         if (this.options.durationSeconds !== null && measuredDurationMs >= this.options.durationSeconds * 1000) break;
         if (frame === 999_999 && this.options.durationSeconds !== null) throw new Error('BENCHMARK_FRAME_LIMIT_BEFORE_DURATION');
       }
+      this.stopLongTasks?.();
       this.progress.phase = 'validating';
       // Diagnostic stalls and image export are outside the measured sequence.
       const verification = await renderer.verifyDeformation({ allInstances: true });
@@ -188,19 +217,20 @@ export class FoundationBenchmark {
         devicePixelRatio, simulationStepSeconds: 1 / 60, rendererFrameOffset, measuredDurationMs,
         startupMs: { assets: assetsDone - start, scene: sceneDone - assetsDone, renderer: rendererDone - sceneDone,
           prewarm: prewarmDone - rendererDone, total: prewarmDone - start },
-        summary: this.recorder.summary(), events, resolutions, cycles,
+        summary: this.recorder.summary(), pacingObservers, events, resolutions, cycles,
         verification: { vertices: verification.vertices, maxError: verification.maxError, maxNormalError: verification.maxNormalError, boundsViolations: verification.boundsViolations },
         errors: [...renderer.errors], diagnostics: renderer.diagnostics(),
         notes: ['rAF intervals are browser callback cadence, not display scanout or isolated GPU execution time.',
           'GPU timings are sparse asynchronous samples; missing samples remain absent.',
           'Owned GPU bytes exclude driver, browser, JS, WASM, and swapchain allocations.',
           'Scenario advances exactly 1/60 simulated second per rendered frame; durationSeconds uses real wall time.',
-          'This foundation scene does not validate large-scene, virtual geometry, GI, or reflection performance.'] };
+          'This foundation scene does not validate large-scene, virtual geometry, GI, or reflection performance.',
+          'Pacing attribution names the first matching cause from the preceding frame; it is diagnostic, not a root-cause proof.'] };
     } catch (error) { this.progress.phase = 'failed'; this.dispose(); throw error; }
   }
 
   dispose(): void {
-    this.disposed = true; cancelAnimationFrame(this.raf);
+    this.disposed = true; cancelAnimationFrame(this.raf); this.stopLongTasks?.();
     this.rejectFrame?.(new Error('BENCHMARK_DISPOSED')); this.rejectFrame = undefined;
     // Repeat disposal also releases resources whose async initialization finished after cancellation.
     this.renderer?.dispose(); this.scene?.dispose();

@@ -11,6 +11,37 @@ export interface BenchmarkFrame {
   triangles: number;
   deformedVertices: number;
   physicsBodies: number;
+  /** performance.now() at the frame callback minus its rAF timestamp; absent in older recordings. */
+  callbackLatencyMs?: number;
+  /** Main-thread time from the frame callback to the end of that frame's submitted work. */
+  frameWorkMs?: number;
+}
+
+/** A main-thread long task or long animation frame, in the recorder's elapsedMs timeline. */
+export interface BenchmarkLongTask {
+  kind: 'longtask' | 'long-animation-frame';
+  startMs: number;
+  durationMs: number;
+}
+
+export interface BenchmarkIntervalMultiples { one: number; two: number; three: number; fourOrMore: number }
+
+/**
+ * Frame pacing diagnostics. rAF intervals are quantized to the browser's frame clock, so each
+ * interval is counted as a whole multiple of the median (nominal) interval. Each over-budget frame
+ * is attributed to the first matching cause, using the preceding frame: its main-thread work
+ * exceeded the nominal interval; a long task overlapped the interval; its sparse GPU sample
+ * exceeded the nominal interval; otherwise unattributed (outside measured page work).
+ */
+export interface BenchmarkPacingSummary {
+  nominalIntervalMs: number;
+  intervalMultiples: BenchmarkIntervalMultiples;
+  overBudgetMultiples: BenchmarkIntervalMultiples;
+  longestOverBudgetRun: { frames: number; startFrame: number | null };
+  overBudgetAttribution: { previousFrameWork: number; longTask: number; gpuSampled: number; unattributed: number };
+  callbackLatencyMs: BenchmarkQuantiles | null;
+  frameWorkMs: BenchmarkQuantiles | null;
+  longTasks: { recorded: number; dropped: number; longAnimationFrames: number; totalDurationMs: number };
 }
 
 /** Optional GPU timings arrive after the corresponding CPU frame. Times are milliseconds. */
@@ -79,6 +110,8 @@ export interface BenchmarkSummary {
     volumetricFog: BenchmarkQuantiles | null;
     total: BenchmarkQuantiles | null;
   };
+  /** Null when no frames were recorded. */
+  pacing: BenchmarkPacingSummary | null;
   ownedGpuBytes: BenchmarkMemorySummary | null;
   uploadedBytesTotal: number | null;
   workload: {
@@ -89,7 +122,8 @@ export interface BenchmarkSummary {
 }
 
 const CHUNK_FRAMES = 4096;
-const STRIDE = 24;
+const STRIDE = 26;
+const MAX_LONG_TASKS = 4096;
 const FIELD = Object.freeze({
   frame: 0,
   elapsedMs: 1,
@@ -115,6 +149,8 @@ const FIELD = Object.freeze({
   gpuVolumetricFog: 21,
   gpuSurfaceReceivers: 22,
   gpuTotal: 23,
+  callbackLatencyMs: 24,
+  frameWorkMs: 25,
 });
 type Field = (typeof FIELD)[keyof typeof FIELD];
 
@@ -161,6 +197,8 @@ export class BenchmarkRecorder {
   private gpuSamples = 0;
   private lastGpuFrame = -1;
   private uploadedTotal = 0;
+  private readonly longTasks: BenchmarkLongTask[] = [];
+  private droppedLongTasks = 0;
 
   constructor(readonly maxFrames: number, readonly frameBudgetMs: number) {
     if (!Number.isSafeInteger(maxFrames) || maxFrames < 1 || maxFrames > 1_000_000) {
@@ -195,6 +233,8 @@ export class BenchmarkRecorder {
     count(frame.triangles, 'triangles');
     count(frame.deformedVertices, 'deformedVertices');
     count(frame.physicsBodies, 'physicsBodies');
+    if (frame.callbackLatencyMs !== undefined) nonnegative(frame.callbackLatencyMs, 'callbackLatencyMs');
+    if (frame.frameWorkMs !== undefined) nonnegative(frame.frameWorkMs, 'frameWorkMs');
     if (this.frames > 0 && (frame.frame <= this.get(this.frames - 1, FIELD.frame)
       || frame.elapsedMs <= this.get(this.frames - 1, FIELD.elapsedMs))) {
       throw new RangeError('benchmark frame IDs and elapsed times must strictly increase');
@@ -219,6 +259,8 @@ export class BenchmarkRecorder {
       FIELD.gpuResolve, FIELD.gpuWorldQueryRefit, FIELD.gpuGeometryLod, FIELD.gpuOcclusion, FIELD.gpuDiffuseGi,
       FIELD.gpuFinalGather, FIELD.gpuReflections, FIELD.gpuVolumetricFog, FIELD.gpuSurfaceReceivers,
       FIELD.gpuTotal]) this.set(index, field, NaN);
+    this.set(index, FIELD.callbackLatencyMs, frame.callbackLatencyMs ?? NaN);
+    this.set(index, FIELD.frameWorkMs, frame.frameWorkMs ?? NaN);
     this.uploadedTotal = nextUploadedTotal;
     this.frames++;
   }
@@ -267,6 +309,70 @@ export class BenchmarkRecorder {
       else high = middle - 1;
     }
     throw new RangeError('GPU sample must refer to a recorded frame');
+  }
+
+  /** Keeps at most 4,096 entries and counts the rest, so long runs stay bounded. */
+  recordLongTask(task: BenchmarkLongTask): void {
+    if (task.kind !== 'longtask' && task.kind !== 'long-animation-frame') throw new RangeError('long task kind must be longtask or long-animation-frame');
+    if (typeof task.startMs !== 'number' || !Number.isFinite(task.startMs)) throw new RangeError('long task startMs must be finite');
+    nonnegative(task.durationMs, 'long task durationMs');
+    if (this.longTasks.length >= MAX_LONG_TASKS) { this.droppedLongTasks++; return; }
+    this.longTasks.push({ kind: task.kind, startMs: task.startMs, durationMs: task.durationMs });
+  }
+
+  private present(field: Field): Float64Array {
+    const values: number[] = [];
+    for (let index = 0; index < this.frames; index++) {
+      const value = this.get(index, field);
+      if (!Number.isNaN(value)) values.push(value);
+    }
+    return Float64Array.from(values);
+  }
+
+  private pacing(): BenchmarkPacingSummary | null {
+    if (this.frames === 0) return null;
+    const nominal = nearestRank(this.values(FIELD.frameIntervalMs).sort(), 0.5);
+    const multiples = (): BenchmarkIntervalMultiples => ({ one: 0, two: 0, three: 0, fourOrMore: 0 });
+    const all = multiples(), over = multiples();
+    const add = (target: BenchmarkIntervalMultiples, k: number) => {
+      if (k <= 1) target.one++; else if (k === 2) target.two++; else if (k === 3) target.three++; else target.fourOrMore++;
+    };
+    const tasks = [...this.longTasks].sort((a, b) => a.startMs - b.startMs);
+    const longestTask = tasks.reduce((longest, task) => Math.max(longest, task.durationMs), 0);
+    const overlapsTask = (start: number, end: number): boolean => {
+      let low = 0, high = tasks.length;
+      while (low < high) { const middle = (low + high) >> 1; if (tasks[middle].startMs < end) low = middle + 1; else high = middle; }
+      for (let index = low - 1; index >= 0 && tasks[index].startMs + longestTask > start; index--) {
+        if (tasks[index].startMs + tasks[index].durationMs > start) return true;
+      }
+      return false;
+    };
+    const attribution = { previousFrameWork: 0, longTask: 0, gpuSampled: 0, unattributed: 0 };
+    let run = 0, runStart = 0, longest = 0, longestStart: number | null = null;
+    for (let index = 0; index < this.frames; index++) {
+      const interval = this.get(index, FIELD.frameIntervalMs);
+      const k = nominal > 0 ? Math.max(1, Math.round(interval / nominal)) : 1;
+      add(all, k);
+      if (interval <= this.frameBudgetMs) { run = 0; continue; }
+      add(over, k);
+      if (run++ === 0) runStart = this.get(index, FIELD.frame);
+      if (run > longest) { longest = run; longestStart = runStart; }
+      const end = this.get(index, FIELD.elapsedMs), start = end - interval;
+      const previousWork = index === 0 ? NaN
+        : (this.get(index - 1, FIELD.callbackLatencyMs) || 0) + this.get(index - 1, FIELD.frameWorkMs);
+      if (previousWork > nominal) attribution.previousFrameWork++;
+      else if (overlapsTask(start, end)) attribution.longTask++;
+      else if (index > 0 && this.get(index - 1, FIELD.gpuTotal) > nominal) attribution.gpuSampled++;
+      else attribution.unattributed++;
+    }
+    return {
+      nominalIntervalMs: nominal, intervalMultiples: all, overBudgetMultiples: over,
+      longestOverBudgetRun: { frames: longest, startFrame: longestStart }, overBudgetAttribution: attribution,
+      callbackLatencyMs: quantiles(this.present(FIELD.callbackLatencyMs)), frameWorkMs: quantiles(this.present(FIELD.frameWorkMs)),
+      longTasks: { recorded: tasks.length, dropped: this.droppedLongTasks,
+        longAnimationFrames: tasks.filter(task => task.kind === 'long-animation-frame').length,
+        totalDurationMs: tasks.reduce((total, task) => total + task.durationMs, 0) },
+    };
   }
 
   private values(field: Field, gpuOnly = false): Float64Array {
@@ -340,6 +446,7 @@ export class BenchmarkRecorder {
         volumetricFog: quantiles(this.values(FIELD.gpuVolumetricFog, true)),
         total: quantiles(this.values(FIELD.gpuTotal, true)),
       },
+      pacing: this.pacing(),
       ownedGpuBytes: this.memory(),
       uploadedBytesTotal: this.frames === 0 ? null : this.uploadedTotal,
       workload: this.frames === 0 ? null : {
@@ -351,7 +458,7 @@ export class BenchmarkRecorder {
   }
 
   toCsv(): string {
-    const rows = ['frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuSurfaceReceiversMs,gpuTotalMs'];
+    const rows = ['frame,elapsedMs,frameIntervalMs,updateMs,eventMs,cpuSubmitMs,ownedGpuBytes,uploadedBytes,triangles,deformedVertices,physicsBodies,gpuDeformationMs,gpuShadowMs,gpuSurfaceMs,gpuResolveMs,gpuWorldQueryRefitMs,gpuGeometryLodMs,gpuOcclusionMs,gpuDiffuseGiMs,gpuFinalGatherMs,gpuReflectionsMs,gpuVolumetricFogMs,gpuSurfaceReceiversMs,gpuTotalMs,callbackLatencyMs,frameWorkMs'];
     for (let index = 0; index < this.frames; index++) {
       const cells = Array.from({ length: STRIDE }, (_, field) => this.get(index, field as Field));
       rows.push(cells.map(value => Number.isNaN(value) ? '' : String(value)).join(','));

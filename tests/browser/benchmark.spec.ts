@@ -17,6 +17,14 @@ test('benchmark measures fixed frames, tags sparse GPU samples and disposes reso
   expect(result.report.summary.ownedGpuBytes!.growthBytes).toBe(0);
   expect(result.report.summary.workload!.physicsBodies.last).toBe(6);
   expect(result.csv.trim().split('\n')).toHaveLength(13);
+  expect(result.csv.split('\n')[0].split(',').slice(-2)).toEqual(['callbackLatencyMs', 'frameWorkMs']);
+  const pacing = result.report.summary.pacing!;
+  expect(pacing.nominalIntervalMs).toBeGreaterThan(0);
+  expect(Object.values(pacing.intervalMultiples).reduce((sum, count) => sum + count, 0)).toBe(12);
+  expect(Object.values(pacing.overBudgetAttribution).reduce((sum, count) => sum + count, 0)).toBe(result.report.summary.framesOverBudget);
+  expect([pacing.frameWorkMs!.count, pacing.callbackLatencyMs!.count]).toEqual([12, 12]);
+  expect(typeof result.report.pacingObservers.longtask).toBe('boolean');
+  expect(pacing.longTasks.dropped).toBe(0);
   expect(result.report.verification.maxError).toBeLessThan(0.0002);
   expect(result.report.errors).toEqual([]);
   expect(result.cleanup.ownedGpuBytes).toBe(0);

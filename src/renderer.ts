@@ -37,6 +37,7 @@ import { meshWorldUnitsPerUv, modelStretch, textureViewDemand } from './texture-
 import type { TextureStreamDemand, TextureStreamingOptions } from './texture-stream-types';
 import { GpuSurfaceReceivers } from './gpu-surface-receivers';
 import { decodeFinalGatherDiagnostics, decodeFinalGatherDiagnosticSurfaces, decodeFinalGatherCoverage, validateFinalGatherDiagnosticPoints } from './final-gather-diagnostics';
+import { subscribeGpuDeviceLoss } from './gpu-device-loss';
 import { createTimestampQuerySet, timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
@@ -1329,6 +1330,9 @@ export class Renderer {
       + (batch.stream && batch.material.program.alphaMode === 'opaque' ? batch.stream.runtime.selection.physicalVertexCount * batch.scene.instances.length : 0), 0);
     this.stats.cpuSubmitMs = performance.now() - started;
   }
+  /** One-shot notice if this renderer's device is lost while subscribed (asynchronous when already lost).
+   * Unsubscribe before dispose(): disposal destroys the device on purpose. Recovery is the caller's job. */
+  onDeviceLost(listener: (info: GPUDeviceLostInfo) => void): () => void { return subscribeGpuDeviceLoss(this.device, listener); }
   /** Query the last submitted deformation snapshot; material changes use the current revision. */
   async traceRays(rays: readonly WorldRay[], options: { textureLod?: number } = {}): Promise<WorldQueryResult> {
     if (this.disposed) throw new Error('RENDERER_DISPOSED');

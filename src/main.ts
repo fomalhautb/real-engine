@@ -3,6 +3,7 @@ import { DemoScene } from './scene';
 import { Renderer } from './renderer';
 import type { RayHit } from './physics';
 import { loadGltf } from './gltf-load';
+import { GpuDeviceRecovery } from './gpu-device-loss';
 
 const element = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -11,6 +12,8 @@ const element = <T extends HTMLElement>(id: string): T => {
 };
 const canvas = element<HTMLCanvasElement>('viewport');
 let scene: DemoScene | undefined, renderer: Renderer | undefined, raf = 0, disposed = false;
+// Rebuilds the Renderer on a new adapter/device from the retained, renderer-independent DemoScene.
+let recovery: GpuDeviceRecovery<Renderer> | undefined;
 let yaw = 0.34, elevation = 0.40, radius = 14, lastTime = performance.now(), lastUI = 0;
 const samples: number[] = [];
 const controls: AbortController = new AbortController();
@@ -28,6 +31,7 @@ function snapshot() {
     stage: '1.2', time: scene?.time ?? 0, paused: scene?.paused ?? false,
     stats: renderer ? structuredClone(renderer.stats) : null, environment: renderer?.info ?? null,
     errors: [...renderer?.errors ?? []],
+    deviceRecovery: recovery?.diagnostics() ?? null,
     renderGraph: renderer?.diagnostics() ?? null,
     sceneChanges: scene ? { revision: scene.committedRevision, lastFrame: scene.changeCounts } : null,
     physics: { bodies: scene?.physics.bodyCount ?? 0, active: scene?.physics.activeCount ?? 0, droppedSeconds: scene?.droppedSeconds ?? 0 },
@@ -39,9 +43,14 @@ function percentile(values: number[], q: number): number {
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
 }
-function render(): void { scene!.commitFrame(); renderer!.render(camera(), [0, 1.2, -1.5]); }
+function live(): Renderer {
+  if (!renderer) throw new Error('RENDERER_UNAVAILABLE: device ' + (recovery?.state ?? 'not started'));
+  return renderer;
+}
+function render(): void { scene!.commitFrame(); live().render(camera(), [0, 1.2, -1.5]); }
 function frame(now: number): void {
-  if (disposed) return;
+  // A device loss cancels this loop; the recovery supervisor restarts it with the rebuilt Renderer.
+  if (disposed || !renderer) return;
   try {
     scene!.advance(Math.max(0, (now - lastTime) / 1000)); lastTime = now;
     render();
@@ -68,7 +77,7 @@ async function verify() {
   const button = element<HTMLButtonElement>('verify');
   button.disabled = true;
   try {
-    const result = await renderer!.verifyDeformation();
+    const result = await live().verifyDeformation();
     const passed = result.vertices > 0 && result.maxError < 0.0002 && result.maxNormalError < 0.0002 && result.boundsViolations === 0;
     element('verification').textContent = (passed ? 'PASS' : 'FAIL') + ' · ' + result.vertices + ' vertices · max error ' + result.maxError.toExponential(2);
     return { ...result, passed };
@@ -76,7 +85,13 @@ async function verify() {
 }
 function dispose(): void {
   if (disposed) return;
-  disposed = true; cancelAnimationFrame(raf); controls.abort(); renderer?.dispose(); scene?.dispose();
+  disposed = true; cancelAnimationFrame(raf); controls.abort();
+  // The supervisor owns the live Renderer and cancels any in-flight rebuild.
+  if (recovery) recovery.dispose(); else renderer?.dispose();
+  renderer = undefined; scene?.dispose(); scene = undefined;
+}
+function showAdapter(active: Renderer): void {
+  element('adapter').textContent = active.info.adapter + ' · ' + active.info.timing;
 }
 const signal = controls.signal;
 async function start(): Promise<void> {
@@ -87,8 +102,24 @@ async function start(): Promise<void> {
     loadGltf('/assets/gltf/AnimatedMorphCube/glTF/AnimatedMorphCube.gltf'),
   ]);
   scene = await DemoScene.create(count, assets);
-  renderer = await Renderer.create(canvas, scene.renderBatches);
-  element('adapter').textContent = renderer.info.adapter + ' · ' + renderer.info.timing;
+  const retained = scene;
+  recovery = new GpuDeviceRecovery(() => Renderer.create(canvas, retained.renderBatches), {
+    lost(info) {
+      cancelAnimationFrame(raf); renderer = undefined; samples.length = 0;
+      element('status').innerHTML = '<i></i>DEVICE LOST · RECOVERING';
+      element('adapter').textContent = 'WebGPU device lost (' + info.reason + '); requesting a new adapter…';
+    },
+    recovered(next) {
+      if (disposed) return;
+      // The rebuilt Renderer starts without GPU history; the scene's simulation state is unchanged.
+      renderer = next; showAdapter(next); lastTime = performance.now();
+      raf = requestAnimationFrame(frame);
+    },
+    failed(error) { fail(error); },
+  });
+  renderer = await recovery.start();
+  if (disposed) return;
+  showAdapter(renderer);
   element('pause').addEventListener('click', () => { scene!.paused = !scene!.paused; }, { signal });
   element('reset').addEventListener('click', () => { scene!.reset(); samples.length = 0; }, { signal });
   element('spawn').addEventListener('click', () => scene!.spawnBox(), { signal });

@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { assetSetRoots, captureBaseUrl, captureChannel, launchCaptureBrowser, requireAssetRoots } from './capture-target.mjs';
+import { assetSetRoots, boundedCapture, captureBaseUrl, captureChannel, launchCaptureBrowser, requireAssetRoots } from './capture-target.mjs';
 
 // Local, already-built Intel Sponza assets only. This capture does not fetch,
 // rebuild, or accept unhashed geometry pages/proxies. Coarse proxies are not a
@@ -14,13 +14,14 @@ const defaults = {
   exposureEV: 3,
   anisotropy: 8,
   warmupFrames: 600,
+  timeoutMs: 3600000,
 };
 const valueFlags = new Map([
   ['--geometry-root', 'geometryRoot'], ['--query-root', 'queryRoot'], ['--output', 'output'],
   ['--texture-gpu-root', 'textureGpuRoot'], ['--texture-reference-root', 'textureReferenceRoot'],
   ['--uv-audit', 'uvAuditUrl'], ['--asset-set', 'assetSet'], ['--base-url', 'baseUrl'], ['--channel', 'channel'],
   ['--anisotropy', 'anisotropy'],
-  ['--warmup-frames', 'warmupFrames'],
+  ['--warmup-frames', 'warmupFrames'], ['--timeout-ms', 'timeoutMs'],
   ['--gather-spacing', 'gatherPixelSpacing'], ['--gather-capacity', 'gatherCapacity'],
   ['--supplemental-capacity', 'supplementalCapacity'], ['--supplemental-work', 'supplementalWork'],
   ['--gather-sampling-seed', 'gatherSamplingSeed'],
@@ -101,6 +102,9 @@ if (options.anisotropy !== undefined) {
 options.warmupFrames = Number(options.warmupFrames);
 if (!Number.isSafeInteger(options.warmupFrames) || options.warmupFrames < 90 || options.warmupFrames > 3600)
   throw Error('SPONZA_GI_WARMUP_FRAMES');
+options.timeoutMs = Number(options.timeoutMs);
+if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 60000 || options.timeoutMs > 14400000)
+  throw Error('SPONZA_GI_TIMEOUT_MS');
 
 await mkdir(options.output, { recursive: true });
 const browser = await launchCaptureBrowser(options.channel);
@@ -112,12 +116,12 @@ try {
   page.on('console', message => { if (message.text().startsWith('SPONZA_PROGRESS')) console.log(message.text()); });
   await page.goto(options.baseUrl + '/');
   await page.waitForFunction(() => window.__REAL_ENGINE__);
-  const result = await page.evaluate(async settings => {
+  const result = await boundedCapture(browser, page.evaluate(async settings => {
     window.__REAL_ENGINE__.pause(true);
     window.__REAL_ENGINE__.dispose();
     const { captureIntelSponzaGi } = await import('/tests/browser/fixtures/intel-sponza-gi.ts');
     return captureIntelSponzaGi(settings);
-  }, options);
+  }, options), options.timeoutMs, 'SPONZA_GI');
   for (const capture of result.giAudit.captures) {
     await writeFile(join(options.output, `${capture.label}.png`), Buffer.from(capture.png.split(',')[1], 'base64'));
     delete capture.png;

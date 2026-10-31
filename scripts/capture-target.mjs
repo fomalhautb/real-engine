@@ -30,6 +30,23 @@ export function captureChannel(flag, env = process.env, platform = process.platf
   return channel;
 }
 
+/**
+ * Bounds one long page evaluation: rejects with `${label}_DEADLINE` after `ms`
+ * and with `${label}_BROWSER_DISCONNECTED` as soon as the browser goes away
+ * (killed, crashed or out of memory), so a capture never waits forever on a
+ * browser that no longer exists. `browser` only needs once/off('disconnected').
+ */
+export function boundedCapture(browser, work, ms, label) {
+  if (!Number.isSafeInteger(ms) || ms < 1) throw Error('CAPTURE_DEADLINE');
+  let timer, onDisconnected;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Error(`${label}_DEADLINE: ${ms} ms`)), ms);
+    onDisconnected = () => reject(Error(`${label}_BROWSER_DISCONNECTED`));
+    browser.once('disconnected', onDisconnected);
+  });
+  return Promise.race([work, guard]).finally(() => { clearTimeout(timer); browser.off('disconnected', onDisconnected); });
+}
+
 /** Hardware adapter launch, matching the previous Edge captures except for the channel. */
 export function launchCaptureBrowser(channel) {
   return chromium.launch({ channel, headless: true, args: ['--force-high-performance-gpu'] });

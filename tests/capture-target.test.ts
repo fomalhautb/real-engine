@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
 
 type Env = Record<string, string | undefined>;
@@ -10,6 +11,7 @@ const target = await import(pathToFileURL(resolve('scripts/capture-target.mjs'))
   captureChannel: (flag: string | undefined, env?: Env, platform?: string) => string;
   assetSetRoots: (flag: string | undefined, env?: Env) => Promise<Record<string, string>>;
   requireAssetRoots: (options: Record<string, unknown>, label: string) => void;
+  boundedCapture: <T>(browser: EventEmitter, work: Promise<T>, ms: number, label: string) => Promise<T>;
 };
 
 describe('capture target', () => {
@@ -44,5 +46,17 @@ describe('capture target', () => {
       await expect(target.assetSetRoots(file, {})).rejects.toThrow('CAPTURE_ASSET_SET_ROOT: geometryRoot');
       expect(() => target.requireAssetRoots({ geometryRoot: '/g/' }, 'SPONZA_GI')).toThrow(/SPONZA_GI_ASSET_ROOTS_REQUIRED: textureGpuRoot,textureReferenceRoot,uvAuditUrl/);
     } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it('bounds a capture by a deadline and by browser disconnection', async () => {
+    const browser = new EventEmitter();
+    await expect(target.boundedCapture(browser, Promise.resolve(7), 1000, 'X')).resolves.toBe(7);
+    expect(browser.listenerCount('disconnected')).toBe(0);
+    await expect(target.boundedCapture(browser, new Promise(() => {}), 5, 'X')).rejects.toThrow('X_DEADLINE: 5 ms');
+    const pending = target.boundedCapture(browser, new Promise(() => {}), 60000, 'X');
+    browser.emit('disconnected');
+    await expect(pending).rejects.toThrow('X_BROWSER_DISCONNECTED');
+    expect(browser.listenerCount('disconnected')).toBe(0);
+    expect(() => target.boundedCapture(browser, Promise.resolve(1), 0, 'X')).toThrow('CAPTURE_DEADLINE');
   });
 });

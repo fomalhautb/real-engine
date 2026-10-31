@@ -5,6 +5,7 @@ import {
   localLightShadowViewCount, resolveLocalLightOptions, validateLocalLight, type LocalLightDescriptor, type LocalLightVec3,
 } from '../src/local-lights';
 import { FOG_LOCAL_LIGHTS_HOOK, GpuLocalLights, localLightsShaderSource } from '../src/gpu-local-lights';
+import { createTimestampQuerySet } from '../src/gpu-timestamp-span';
 
 const point = (overrides: Partial<LocalLightDescriptor> = {}): LocalLightDescriptor => ({
   kind: 'point', position: [0, 2, 0], color: [1, 0.5, 0.25], intensity: 4, range: 10, ...overrides });
@@ -359,16 +360,21 @@ describe('GPU local light resources', () => {
     lights.set.add(spot({ castShadows: true }));
     expect(lights.update()).toBeGreaterThan(0);
     expect(lights.shadowEncodings().map(encoding => encoding.layer)).toEqual([0, 1, 2, 3, 4, 5, 6]);
-    const passes: string[] = [];
+    const passes: string[] = [], writes: (GPUComputePassTimestampWrites | undefined)[] = [];
     const encoder = {
-      beginRenderPass: ({ label }: { label: string }) => { passes.push(label); return { setBindGroup() {}, end() {} }; },
-      beginComputePass: ({ label }: { label: string }) => { passes.push(label); return { end() {} }; },
+      beginRenderPass: (descriptor: GPURenderPassDescriptor) => { passes.push(descriptor.label!); writes.push(descriptor.timestampWrites); return { setBindGroup() {}, end() {} }; },
+      beginComputePass: (descriptor: GPUComputePassDescriptor) => { passes.push(descriptor.label!); writes.push(descriptor.timestampWrites); return { end() {} }; },
     } as unknown as GPUCommandEncoder;
     let draws = 0;
-    lights.encodeShadows(encoder, () => { draws++; }, { querySet: {} as GPUQuerySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 });
+    const querySet = createTimestampQuerySet({ createQuerySet: () => ({}) } as unknown as GPUDevice, 8);
+    lights.encodeShadows(encoder, () => { draws++; }, { querySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 });
     expect(draws).toBe(7);
     expect(passes[0]).toBe('local light shadows begin');
     expect(passes.at(-1)).toBe('local light shadows end');
+    // Every timed pass writes a whole pair; the unowned ends go to the reserved scratch slot 8.
+    expect(writes[0]).toEqual({ querySet, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 8 });
+    expect(writes.at(-1)).toEqual({ querySet, beginningOfPassWriteIndex: 8, endOfPassWriteIndex: 5 });
+    expect(writes.slice(1, -1).every(write => write === undefined)).toBe(true);
     lights.set.setEnabled(handle, false);
     lights.update();
     expect(lights.shadowEncodings().map(encoding => encoding.layer)).toEqual([6]);

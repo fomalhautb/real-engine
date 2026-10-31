@@ -7,6 +7,7 @@ import {
   LOCAL_SHADOW_VIEW_MATRIX_OFFSET, LOCAL_SHADOW_VIEW_UNIFORM_STRIDE, LocalLightSet, localLightChangeRegions, resolveLocalLightOptions,
   type LocalLightOptions, type ResolvedLocalLight, type ResolvedLocalLightOptions,
 } from './local-lights';
+import { timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 
 export interface LocalLightShaderOptions {
   /** Bind group index and the three consecutive bindings: uniform, atlas, comparison sampler. */
@@ -189,8 +190,8 @@ export class GpuLocalLights {
   encodeShadows(encoder: GPUCommandEncoder, draw: (pass: GPURenderPassEncoder) => void,
     timing?: GPUComputePassTimestampWrites): void {
     const encodings = this.shadowEncodings();
-    if (timing) encoder.beginComputePass({ label: 'local light shadows begin',
-      timestampWrites: { querySet: timing.querySet, beginningOfPassWriteIndex: timing.beginningOfPassWriteIndex } }).end();
+    // Both marker passes write whole pairs (unowned end to the scratch slot): partial writes lose the device on Apple/Metal.
+    if (timing) encoder.beginComputePass({ label: 'local light shadows begin', timestampWrites: timestampSpanStart(timing) }).end();
     for (const encoding of encodings) {
       const pass = encoder.beginRenderPass({ label: 'local light shadow view ' + encoding.layer, colorAttachments: [],
         depthStencilAttachment: { view: encoding.view, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
@@ -198,8 +199,7 @@ export class GpuLocalLights {
       draw(pass);
       pass.end();
     }
-    if (timing) encoder.beginComputePass({ label: 'local light shadows end',
-      timestampWrites: { querySet: timing.querySet, endOfPassWriteIndex: timing.endOfPassWriteIndex } }).end();
+    if (timing) encoder.beginComputePass({ label: 'local light shadows end', timestampWrites: timestampSpanEnd(timing) }).end();
     this.shadowViewsRendered = encodings.length;
   }
 

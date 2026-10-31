@@ -82,10 +82,11 @@ export async function runGeometryStreamRendererFixture() {
       y: Math.floor((Math.floor(id / 32) + 0.5) * a.stats.height / 24) }));
     const compare = async () => {
       const [expected, actual] = await Promise.all([a.probeHdr(samples), b.probeHdr(samples)]);
-      let maxError = 0, totalError = 0, foreground = 0;
+      let maxError = 0, totalError = 0, foreground = 0, differingSamples = 0;
       actual.forEach((pixel, id) => { if (pixel.slice(0, 3).some(value => value > 0.015)) foreground++;
+        if (pixel.slice(0, 3).some((value, channel) => value !== expected[id][channel])) differingSamples++;
         pixel.slice(0, 3).forEach((value, channel) => { const delta = Math.abs(value - expected[id][channel]); maxError = Math.max(maxError, delta); totalError += delta; }); });
-      return { maxError, meanError: totalError / (samples.length * 3), foreground };
+      return { maxError, meanError: totalError / (samples.length * 3), foreground, differingSamples };
     };
     const probes = async () => Promise.all([b.probeGeometryLod('stream-sculpture-0'), b.probeGeometryLod('stream-sculpture-1')]);
     const coarse = await probes();

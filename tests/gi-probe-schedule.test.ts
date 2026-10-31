@@ -38,8 +38,8 @@ describe('GI probe update policy', () => {
 
   it('resolves bounded scheduled defaults and refuses budgets that cannot meet the staleness bound', () => {
     const value = resolveDiffuseGiUpdateOptions({ mode: 'scheduled' }, 216);
-    expect(value).toMatchObject({ mode: 'scheduled', maxStalenessUpdates: 8, staleReserve: 27, maxProbesPerUpdate: 54,
-      convergenceUpdates: 3, dirtyThreshold: 0.002, offscreenPriority: 0.25 });
+    expect(value).toMatchObject({ mode: 'scheduled', maxStalenessUpdates: 8, staleReserve: 27, maxProbesPerUpdate: 108,
+      convergenceUpdates: 8, dirtyThreshold: 0.002, offscreenPriority: 0.25 });
     expect(resolveDiffuseGiUpdateOptions({ mode: 'scheduled', maxStalenessUpdates: 4, maxProbesPerUpdate: 54 }, 216).staleReserve)
       .toBe(54);
     expect(() => resolveDiffuseGiUpdateOptions({ mode: 'scheduled', maxStalenessUpdates: 4, maxProbesPerUpdate: 53 }, 216))

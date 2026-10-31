@@ -19,11 +19,15 @@ export interface DiffuseGiUpdateOptions {
   /** 'full' (default) recaptures every probe each update, as before. 'scheduled'
    * recaptures a bounded, prioritized subset with an explicit staleness bound. */
   mode?: DiffuseGiUpdateMode;
-  /** Probes captured by one scheduled update, 1..probeCount. */
+  /** Probes captured by one scheduled update, 1..probeCount. Default
+   * max(staleReserve, ceil(probeCount / 2)): the joint acceptance scene needs
+   * this transient budget for GI T90 <= 15 updates (0.5 s at 30 fps). */
   maxProbesPerUpdate?: number;
   /** Largest number of completed GI updates between two captures of one probe. */
   maxStalenessUpdates?: number;
-  /** Prioritized recaptures after a change (multi-bounce convergence), 1..16. */
+  /** Prioritized recaptures after a change (multi-bounce convergence), 1..16.
+   * Default 8: each recapture is one feedback iteration of the asynchronous
+   * multi-bounce solve, so fewer leave visible residual after a light change. */
   convergenceUpdates?: number;
   /** Smallest estimated solid-angle fraction of a local change that marks a probe. */
   dirtyThreshold?: number;
@@ -43,7 +47,7 @@ export interface ResolvedDiffuseGiUpdateOptions {
 }
 
 const DEFAULT_STALENESS = 8;
-const DEFAULT_CONVERGENCE = 3;
+const DEFAULT_CONVERGENCE = 8;
 const DEFAULT_DIRTY_THRESHOLD = 0.002;
 const DEFAULT_OFFSCREEN_PRIORITY = 0.25;
 /** Region marks beyond this per update are merged into one conservative box. */
@@ -80,7 +84,7 @@ export function resolveDiffuseGiUpdateOptions(options: DiffuseGiUpdateOptions | 
   const maxStalenessUpdates = integer(options?.maxStalenessUpdates, DEFAULT_STALENESS, 1, 1024, 'STALENESS');
   const staleReserve = Math.ceil(probeCount / maxStalenessUpdates);
   const maxProbesPerUpdate = integer(options?.maxProbesPerUpdate,
-    Math.min(probeCount, Math.max(staleReserve, Math.ceil(probeCount / 4))), 1, probeCount, 'BUDGET');
+    Math.min(probeCount, Math.max(staleReserve, Math.ceil(probeCount / 2))), 1, probeCount, 'BUDGET');
   if (maxProbesPerUpdate < staleReserve) throw new RangeError('DIFFUSE_GI_UPDATE_STALENESS_BUDGET');
   return Object.freeze({ mode, maxProbesPerUpdate, maxStalenessUpdates, staleReserve,
     convergenceUpdates: integer(options?.convergenceUpdates, DEFAULT_CONVERGENCE, 1, 16, 'CONVERGENCE'),

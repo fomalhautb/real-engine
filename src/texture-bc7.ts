@@ -170,7 +170,7 @@ export function decodeBc7Image(blocks: Uint8Array, width: number, height: number
 export interface Bc7EncodeOptions {
   /** 0: mode 6 only; 1: adds ranked two-subset and rotated separate-alpha modes; 2: all eight modes, wider search. Default 1. */
   readonly quality?: number;
-  /** Squared-error channel weights for RGBA; default 1,1,1,1. */
+  /** Squared-error channel weights for RGBA; default 1,1,1,1. A zero alpha weight marks alpha as unused (any decoded alpha is acceptable, opaque blocks still decode 255). */
   readonly channelWeights?: readonly [number, number, number, number];
   /** Stop trying further modes once the block's weighted squared error is at or below this value (default 0). */
   readonly earlyOutError?: number;
@@ -593,13 +593,16 @@ export function encodeBc7Block(pixels: ArrayLike<number>, out: Uint8Array, offse
   }
   for (let c = 0; c < 4; c++) baseWeight[c] = weights[c];
   if (opaque) baseWeight[3] = OPAQUE_ALPHA_WEIGHT;
+  // A zero alpha weight means the material never reads alpha: the opaque-only
+  // modes 0-3 (decoded alpha 255) are then as valid as the alpha modes.
+  const alphaFree = opaque || weights[3] === 0;
   weight.set(baseWeight);
   estimated2 = false; estimated3 = false;
   best.error = Infinity;
   tryMode6();
   const more = (): boolean => best.error > earlyOut;
   if (quality >= 1 && more()) {
-    if (opaque) {
+    if (alphaFree) {
       // Rotated separate-channel modes first: cheap, and they win on weakly
       // correlated data channels, which lets the early-out skip partitions.
       for (let rotation = 1; rotation <= 3 && more(); rotation++) {

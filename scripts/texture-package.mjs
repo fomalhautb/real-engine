@@ -1,10 +1,12 @@
 // Shared texture package builder used by build-texture.mjs (one image) and
 // build-gltf-textures.mjs (a whole scene). Two encoder paths:
 //  - 'texconv': external Microsoft DirectXTex texconv (Windows), unchanged;
-//  - 'builtin': cross-platform PNG/TGA decode, the engine's buildMipChain
-//    semantics and the repo's deterministic CPU BC7 encoder on worker threads.
-// Both publish the same layout: manifest.json, build.json, source.<ext>,
-// source.dds and mips/<level>.bin. DDS inputs are packaged without a codec.
+//  - 'builtin': cross-platform PNG/TGA/legacy-DDS decode, the engine's
+//    buildMipChain semantics and the repo's deterministic CPU BC7 encoder on
+//    worker threads. Legacy DDS sources keep only their top level.
+// Both publish the same layout: manifest.json, build.json, source.<ext> (a
+// re-encoded DDS source is kept as source-input.dds), source.dds and
+// mips/<level>.bin. DDS inputs without an encoder are packaged as-is.
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { open, realpath, mkdir, writeFile, readFile } from 'node:fs/promises';
@@ -22,7 +24,7 @@ const execute = promisify(execFile);
 export const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const json = value => Buffer.from(JSON.stringify(value, null, 2) + '\n');
 export const BUILTIN_DEFAULTS = Object.freeze({ bc7Quality: 2, bc7EarlyOutError: 96 });
-const CODEC_MODULES = ['src/texture-bc7.ts', 'src/texture-mip-chain.ts', 'src/texture-image-decode.ts',
+const CODEC_MODULES = ['src/texture-bc7.ts', 'src/texture-mip-chain.ts', 'src/texture-image-decode.ts', 'src/texture-bcn.ts',
   'scripts/texture-codec-pool.mjs', 'scripts/texture-codec-worker.mjs', 'scripts/texture-package.mjs'];
 
 export async function boundedRead(path, limit) {
@@ -87,8 +89,12 @@ export function ddsContainer(width, height, format, colorSpace, levels) {
   return Buffer.concat([header, ...levels.map(level => Buffer.from(level.buffer, level.byteOffset, level.byteLength))]);
 }
 
-/** Per-level error of a decoded level against its RGBA8 reference (stored-byte space). */
-export function levelError(reference, decoded) {
+/**
+ * Per-level error of a decoded level against its RGBA8 reference (stored-byte
+ * space). `weights` marks the channels the material actually reads; the
+ * `*Used` fields cover only those, the other fields always cover all channels.
+ */
+export function levelError(reference, decoded, weights = [1, 1, 1, 1]) {
   const se = [0, 0, 0, 0], max = [0, 0, 0, 0];
   for (let i = 0; i < reference.length; i++) {
     const d = decoded[i] - reference[i], c = i & 3;
@@ -97,8 +103,11 @@ export function levelError(reference, decoded) {
   }
   const pixels = reference.length / 4, rgb = (se[0] + se[1] + se[2]) / (3 * pixels);
   const psnr = mse => mse === 0 ? null : 10 * Math.log10(255 * 255 / mse);
+  const used = [0, 1, 2, 3].filter(c => weights[c] > 0);
+  const usedMse = used.reduce((sum, c) => sum + se[c], 0) / (used.length * pixels);
   return { pixels, sse: se, maxAbs: max, rmse: se.map(v => Math.sqrt(v / pixels) / 255),
-    rmseRgb: Math.sqrt(rgb) / 255, psnrRgb: psnr(rgb), psnrAlpha: psnr(se[3] / pixels) };
+    rmseRgb: Math.sqrt(rgb) / 255, psnrRgb: psnr(rgb), psnrAlpha: psnr(se[3] / pixels),
+    usedChannels: used, psnrUsed: psnr(usedMse), maxAbsUsed: Math.max(...used.map(c => max[c])) };
 }
 
 async function moduleHashes() {
@@ -117,23 +126,42 @@ export async function createTextureContext() {
     ...await server.ssrLoadModule('/src/texture-image-decode.ts'),
     ...await server.ssrLoadModule('/src/texture-mip-chain.ts'),
     ...await server.ssrLoadModule('/src/texture-bc7.ts'),
+    ...await server.ssrLoadModule('/src/texture-bcn.ts'),
   };
   return { modules, hashes: await moduleHashes(), close: () => server.close() };
 }
 
+function decodeSource(config, input, modules) {
+  const { decodePng, decodeTga, decodeLegacyDds } = modules;
+  const bytes = new Uint8Array(input.bytes.buffer, input.bytes.byteOffset, input.bytes.byteLength);
+  if (config.extension === '.png') return decodePng(bytes, data => zlib.inflateSync(data, { maxOutputLength: 8192 * 8192 * 8 + 8192 }));
+  if (config.extension === '.tga') return decodeTga(bytes);
+  const dds = decodeLegacyDds(bytes, LIMITS.dimension);
+  return { width: dds.width, height: dds.height, pixels: dds.pixels,
+    source: { format: 'dds', fourCC: dds.fourCC, encoding: dds.format, sourceLevels: dds.mipCount, channels: dds.channels, decodedLevels: 1 } };
+}
+
 async function builtinEncode(config, input, context, pool) {
-  const { decodePng, decodeTga, buildRgba8MipChain, decodeBc7Image, encodeBc7Image, bc7ModeHistogram } = context.modules;
+  const { buildRgba8MipChain, decodeBc7Image, encodeBc7Image, bc7ModeHistogram, convertNormalMap } = context.modules;
   const started = Date.now();
-  const decoded = config.extension === '.png'
-    ? decodePng(new Uint8Array(input.bytes.buffer, input.bytes.byteOffset, input.bytes.byteLength), data => zlib.inflateSync(data, { maxOutputLength: 8192 * 8192 * 8 + 8192 }))
-    : decodeTga(new Uint8Array(input.bytes.buffer, input.bytes.byteOffset, input.bytes.byteLength));
+  const decoded = decodeSource(config, input, context.modules);
   if (config.format === 'bc7' && (decoded.width % 4 || decoded.height % 4)) throw Error('TEXTURE_BUILD_BC7_DIMENSIONS');
+  // Tangent-space normal policy is explicit: the DirectX green axis is flipped
+  // to glTF's, and a two-channel source (BC5/ATI2) gets Z = sqrt(1 - x^2 - y^2).
+  const decodedSha256 = sha256(decoded.pixels);
+  const normalMap = config.normalConvention ? { convention: config.normalConvention, flippedGreen: config.normalConvention === 'directx',
+    reconstructedZ: decoded.source.format === 'dds' && decoded.source.channels === 2 } : null;
+  if (normalMap && (normalMap.flippedGreen || normalMap.reconstructedZ)) {
+    convertNormalMap(decoded.pixels, { flipGreen: normalMap.flippedGreen, reconstructZ: normalMap.reconstructedZ });
+    normalMap.convertedRgba8Sha256 = sha256(decoded.pixels);
+  }
   const nativeBytes = mipBytes(decoded.width, decoded.height, config.format);
   if (input.bytes.length + nativeBytes * 2 + 148 + MiB > LIMITS.outputBytes) throw Error('TEXTURE_BUILD_OUTPUT_BYTE_BUDGET');
   const decodeMs = Date.now() - started;
   const chain = buildRgba8MipChain(decoded.width, decoded.height, decoded.pixels, config.colorSpace);
   const mipMs = Date.now() - started - decodeMs;
-  const options = { quality: config.bc7Quality, earlyOutError: config.bc7EarlyOutError };
+  const weights = config.bc7ChannelWeights ?? [1, 1, 1, 1];
+  const options = { quality: config.bc7Quality, earlyOutError: config.bc7EarlyOutError, channelWeights: weights };
   const levels = [], quality = [];
   for (const level of chain) {
     if (config.format === 'rgba8') { levels.push(level.pixels); continue; }
@@ -142,7 +170,7 @@ async function builtinEncode(config, input, context, pool) {
       : encodeBc7Image(level.pixels, level.width, level.height, options);
     levels.push(blocks);
     quality.push({ level: quality.length, width: level.width, height: level.height, modes: bc7ModeHistogram(blocks),
-      ...levelError(level.pixels, decodeBc7Image(blocks, level.width, level.height)) });
+      ...levelError(level.pixels, decodeBc7Image(blocks, level.width, level.height), weights) });
   }
   const encodeMs = Date.now() - started - decodeMs - mipMs;
   const encoded = ddsContainer(decoded.width, decoded.height, config.format, config.colorSpace, levels);
@@ -150,13 +178,16 @@ async function builtinEncode(config, input, context, pool) {
     const totals = quality.reduce((sum, level) => ({ pixels: sum.pixels + level.pixels, sse: sum.sse.map((v, c) => v + level.sse[c]),
       maxAbs: sum.maxAbs.map((v, c) => Math.max(v, level.maxAbs[c])) }), { pixels: 0, sse: [0, 0, 0, 0], maxAbs: [0, 0, 0, 0] });
     const rgb = (totals.sse[0] + totals.sse[1] + totals.sse[2]) / (3 * totals.pixels);
+    const used = quality[0].usedChannels, usedMse = used.reduce((sum, c) => sum + totals.sse[c], 0) / (used.length * totals.pixels);
     return { top: quality[0], allLevels: { pixels: totals.pixels, maxAbs: totals.maxAbs, rmseRgb: Math.sqrt(rgb) / 255,
-      psnrRgb: rgb ? 10 * Math.log10(255 * 255 / rgb) : null, psnrAlpha: totals.sse[3] ? 10 * Math.log10(255 * 255 * totals.pixels / totals.sse[3]) : null } };
+      psnrRgb: rgb ? 10 * Math.log10(255 * 255 / rgb) : null, psnrAlpha: totals.sse[3] ? 10 * Math.log10(255 * 255 * totals.pixels / totals.sse[3]) : null,
+      usedChannels: used, psnrUsed: usedMse ? 10 * Math.log10(255 * 255 / usedMse) : null, maxAbsUsed: Math.max(...used.map(c => totals.maxAbs[c])) } };
   })() : null;
   const codec = { name: 'real-engine builtin', node: process.version, moduleSha256: context.hashes,
-    decodedSource: { ...decoded.source, width: decoded.width, height: decoded.height, rgba8Sha256: sha256(decoded.pixels) },
+    decodedSource: { ...decoded.source, width: decoded.width, height: decoded.height, rgba8Sha256: decodedSha256 }, normalMap,
     mipFilter: { kernel: 'source-area box (buildMipChain semantics)', rgb: config.colorSpace === 'srgb' ? 'linear-light-srgb' : 'linear', alpha: 'independent', rounding: 'nearest' },
     encoder: config.format === 'bc7' ? { format: 'bc7', ...options, deterministic: 'independent of worker count and task order',
+      channelWeightsMeaning: 'squared-error weight per RGBA channel; 0 marks a channel the material never reads',
       opaqueAlpha: 'blocks with all alpha 255 decode to exactly 255', errorSpace: config.colorSpace === 'srgb' ? 'stored sRGB bytes' : 'stored linear bytes' } : { format: 'rgba8', lossless: true },
     quality: summary ? { reference: 'buildMipChain RGBA8 level of the decoded source', summary, levels: quality } : null };
   // Timings and worker count are run diagnostics, kept out of build.json so the
@@ -168,7 +199,8 @@ async function builtinEncode(config, input, context, pool) {
 export async function buildTextureInto(config, temporary, context, pool) {
   const { parseTextureDds, validateTextureStreamManifest } = context.modules;
   const input = await boundedRead(config.input, config.extension === '.dds' ? LIMITS.inputBytes : LIMITS.pngBytes);
-  const sourceFile = 'source' + config.extension;
+  const reencodedDds = config.extension === '.dds' && config.encoder === 'builtin';
+  const sourceFile = reencodedDds ? 'source-input.dds' : 'source' + config.extension;
   let codec = null, encoded = input.bytes, expectedPng, run = null;
   await writeFile(join(temporary, sourceFile), input.bytes, { flag: 'wx' });
   if (config.encoder === 'builtin') {
@@ -221,7 +253,7 @@ export async function buildTextureInto(config, temporary, context, pool) {
     nativeBytes, fallbackBytes: mips.slice(fallbackMip).reduce((sum, level) => sum + level.byteLength, 0),
     fallbackSize: config.fallbackSize, limits: LIMITS };
   const manifestBytes = json(manifest), buildBytes = json(build);
-  const totalBytes = nativeBytes + input.bytes.length + (config.extension !== '.dds' ? encoded.length : 0) + manifestBytes.length + buildBytes.length;
+  const totalBytes = nativeBytes + input.bytes.length + (sourceFile !== 'source.dds' ? encoded.length : 0) + manifestBytes.length + buildBytes.length;
   if (totalBytes > LIMITS.outputBytes) throw Error('TEXTURE_BUILD_OUTPUT_BYTE_BUDGET');
   await mkdir(join(temporary, 'mips'));
   for (let mip = 0; mip < mips.length; mip++) await writeFile(join(temporary, mips[mip].file), asset.levels[mip].data, { flag: 'wx' });

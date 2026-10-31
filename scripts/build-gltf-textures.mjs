@@ -5,12 +5,14 @@
 // are BC7 in the color space their slots require (conflicts fail). Output:
 // <output>/manifest.json (set summary with roles, sizes and quality), one
 // <output>/image-<n>/ package per image, and an optional copied license file.
-import { copyFile, mkdir, mkdtemp } from 'node:fs/promises';
+// Inputs are PNG, TGA or legacy FourCC DDS (top level decoded, mips rebuilt).
+// --normal-convention directx flips the green axis of every normal-slot image
+// (and rebuilds Z for two-channel BC5 sources); the default opengl keeps it.
+import { copyFile, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { exists, publishDirectory, removeOwnTemporary } from './asset-output.mjs';
 import { BUILTIN_DEFAULTS, boundedRead, buildTextureInto, createTextureContext, sha256 } from './texture-package.mjs';
 import { TextureCodecPool, defaultWorkerCount } from './texture-codec-pool.mjs';
-import { writeFile } from 'node:fs/promises';
 
 const MiB = 1024 * 1024;
 const SLOT_ROLES = [
@@ -22,13 +24,13 @@ const SLOT_ROLES = [
 ];
 
 function argumentsOf(argv) {
-  const keys = ['--input', '--output', '--workers', '--bc7-quality', '--bc7-early-out', '--fallback-size', '--license', '--images'];
+  const keys = ['--input', '--output', '--workers', '--bc7-quality', '--bc7-early-out', '--fallback-size', '--license', '--images', '--channel-policy', '--normal-convention'];
   const values = new Map();
   for (let i = 0; i < argv.length; i++) {
     if (!keys.includes(argv[i]) || values.has(argv[i]) || !argv[i + 1] || argv[i + 1].startsWith('--')) throw Error('GLTF_TEXTURES_ARGUMENTS');
     values.set(argv[i], argv[++i]);
   }
-  if (!values.has('--input') || !values.has('--output')) throw Error('usage: build-gltf-textures --input scene.gltf --output new-directory [--workers n] [--bc7-quality 0|1|2] [--bc7-early-out sse] [--fallback-size 64] [--license file] [--images 0,1,...]');
+  if (!values.has('--input') || !values.has('--output')) throw Error('usage: build-gltf-textures --input scene.gltf --output new-directory [--workers n] [--bc7-quality 0|1|2] [--bc7-early-out sse] [--fallback-size 64] [--license file] [--images 0,1,...] [--channel-policy material|all] [--normal-convention opengl|directx]');
   const workers = Number(values.get('--workers') ?? defaultWorkerCount());
   const bc7Quality = Number(values.get('--bc7-quality') ?? BUILTIN_DEFAULTS.bc7Quality);
   const bc7EarlyOutError = Number(values.get('--bc7-early-out') ?? BUILTIN_DEFAULTS.bc7EarlyOutError);
@@ -38,13 +40,18 @@ function argumentsOf(argv) {
   if (!Number.isSafeInteger(bc7EarlyOutError) || bc7EarlyOutError < 0) throw Error('GLTF_TEXTURES_BC7_EARLY_OUT');
   if (!Number.isSafeInteger(fallbackSize) || fallbackSize < 1 || fallbackSize > 8192) throw Error('GLTF_TEXTURES_FALLBACK_SIZE');
   const images = values.has('--images') ? values.get('--images').split(',').map(Number) : null;
+  const channelPolicy = values.get('--channel-policy') ?? 'material';
+  if (!['material', 'all'].includes(channelPolicy)) throw Error('GLTF_TEXTURES_CHANNEL_POLICY');
   if (images && images.some(i => !Number.isSafeInteger(i) || i < 0)) throw Error('GLTF_TEXTURES_IMAGES');
+  const normalConvention = values.get('--normal-convention') ?? 'opengl';
+  if (!['opengl', 'directx'].includes(normalConvention)) throw Error('GLTF_TEXTURES_NORMAL_CONVENTION');
   return { input: resolve(values.get('--input')), output: resolve(values.get('--output')),
     license: values.has('--license') ? resolve(values.get('--license')) : null,
-    workers, bc7Quality, bc7EarlyOutError, fallbackSize, images };
+    workers, bc7Quality, bc7EarlyOutError, fallbackSize, images, channelPolicy, normalConvention };
 }
 
-/** Image index -> sorted role list, from material texture slots only. */
+/** Image index -> sorted role list, from material texture slots only. A base
+ * color read by a MASK or BLEND material gets the extra role 'coverage:alpha'. */
 export function imageRoles(document) {
   const roles = new Map();
   for (const material of document.materials ?? []) for (const [slot, role] of SLOT_ROLES) {
@@ -54,8 +61,22 @@ export function imageRoles(document) {
     if (!texture || !Number.isSafeInteger(texture.source)) throw Error('GLTF_TEXTURES_TEXTURE_SOURCE');
     if (!roles.has(texture.source)) roles.set(texture.source, new Set());
     roles.get(texture.source).add(role);
+    if (role === 'baseColor:srgb' && ['MASK', 'BLEND'].includes(material.alphaMode)) roles.get(texture.source).add('coverage:alpha');
   }
   return new Map([...roles].sort((a, b) => a[0] - b[0]).map(([image, set]) => [image, [...set].sort()]));
+}
+
+/** RGBA channels the engine/glTF reads for these roles (metallicRoughness: G
+ * roughness, B metalness; occlusion: R; base color alpha only for coverage). */
+export function channelWeights(roles) {
+  const used = [0, 0, 0, 0];
+  for (const role of roles) {
+    if (role === 'baseColor:srgb' || role === 'emissive:srgb') used[0] = used[1] = used[2] = 1;
+    else if (role === 'metallicRoughness:linear') used[1] = used[2] = 1;
+    else if (role === 'occlusion:linear') used[0] = 1;
+    else if (role === 'coverage:alpha') used[3] = 1;
+  }
+  return used;
 }
 
 /** Format and color space for one image; mixed sRGB/linear use is rejected. */
@@ -64,7 +85,7 @@ export function imageEncoding(roles) {
     if (roles.length !== 1) throw Error('GLTF_TEXTURES_NORMAL_SHARED: ' + roles.join(','));
     return { format: 'rgba8', colorSpace: 'linear', path: 'reference' };
   }
-  const spaces = new Set(roles.map(role => role.split(':')[1]));
+  const spaces = new Set(roles.filter(role => role !== 'coverage:alpha').map(role => role.split(':')[1]));
   if (spaces.size !== 1) throw Error('GLTF_TEXTURES_COLOR_SPACE_CONFLICT: ' + roles.join(','));
   return { format: 'bc7', colorSpace: [...spaces][0], path: 'gpu' };
 }
@@ -90,7 +111,7 @@ async function main() {
     const entry = document.images?.[image];
     if (!entry || entry.bufferView !== undefined || entry.uri === undefined) throw Error('GLTF_TEXTURES_EMBEDDED_IMAGE_UNSUPPORTED: ' + image);
     const input = imagePath(base, entry.uri), extension = extname(input).toLowerCase();
-    if (!['.png', '.tga'].includes(extension)) throw Error(`GLTF_TEXTURES_IMAGE_FORMAT_UNSUPPORTED: ${image} ${entry.uri}`);
+    if (!['.png', '.tga', '.dds'].includes(extension)) throw Error(`GLTF_TEXTURES_IMAGE_FORMAT_UNSUPPORTED: ${image} ${entry.uri}`);
     return { image, uri: entry.uri, input, extension, roles: roles.get(image), ...imageEncoding(roles.get(image)) };
   });
   await mkdir(dirname(config.output), { recursive: true });
@@ -102,11 +123,16 @@ async function main() {
     for (const item of plan) {
       const directory = join(temporary, `image-${item.image}`);
       await mkdir(directory);
+      const weights = config.channelPolicy === 'material' ? channelWeights(item.roles) : [1, 1, 1, 1];
       const result = await buildTextureInto({ input: item.input, extension: item.extension, id: `image-${item.image}`,
         fallbackSize: config.fallbackSize, format: item.format, colorSpace: item.colorSpace, encoder: 'builtin',
-        bc7Quality: config.bc7Quality, bc7EarlyOutError: config.bc7EarlyOutError }, directory, context, pool);
+        bc7Quality: config.bc7Quality, bc7EarlyOutError: config.bc7EarlyOutError, bc7ChannelWeights: weights,
+        normalConvention: item.roles.includes('normal:linear') ? config.normalConvention : undefined }, directory, context, pool);
       const manifestBytes = await boundedRead(join(directory, 'manifest.json'), MiB);
-      const quality = result.quality ? { psnrRgbTop: result.quality.top.psnrRgb, rmseRgbTop: result.quality.top.rmseRgb,
+      const quality = result.quality ? { channelWeights: weights, usedChannels: result.quality.top.usedChannels,
+        psnrUsedTop: result.quality.top.psnrUsed, maxAbsUsedTop: result.quality.top.maxAbsUsed,
+        psnrUsedAllLevels: result.quality.allLevels.psnrUsed,
+        psnrRgbTop: result.quality.top.psnrRgb, rmseRgbTop: result.quality.top.rmseRgb,
         maxAbsTop: result.quality.top.maxAbs, psnrAlphaTop: result.quality.top.psnrAlpha, modesTop: result.quality.top.modes,
         psnrRgbAllLevels: result.quality.allLevels.psnrRgb, maxAbsAllLevels: result.quality.allLevels.maxAbs } : null;
       images.push({ image: item.image, uri: item.uri, roles: item.roles, path: item.path, format: result.format,
@@ -126,17 +152,21 @@ async function main() {
     const sum = (list, key) => list.reduce((total, item) => total + item[key], 0);
     const bc7 = images.filter(item => item.format === 'bc7'), rgba8 = images.filter(item => item.format === 'rgba8');
     const psnr = bc7.map(item => item.quality.psnrRgbTop).filter(Number.isFinite);
+    const psnrUsed = bc7.map(item => item.quality.psnrUsedTop).filter(Number.isFinite);
     const manifest = { version: 1, format: 'real-engine-gltf-texture-set',
       source: { file: basename(source.canonical), bytes: source.bytes.length, sha256: sha256(source.bytes) },
       encoder: { name: 'real-engine builtin', node: process.version, bc7Quality: config.bc7Quality,
-        bc7EarlyOutError: config.bc7EarlyOutError, fallbackSize: config.fallbackSize,
-        normals: 'RGBA8 linear reference path (not block compressed)', otherImages: 'BC7, slot color space' },
+        bc7EarlyOutError: config.bc7EarlyOutError, fallbackSize: config.fallbackSize, channelPolicy: config.channelPolicy,
+        normals: 'RGBA8 linear reference path (not block compressed)', normalConvention: config.normalConvention,
+        otherImages: 'BC7, slot color space' },
       license, complete: !config.images, images,
       totals: { images: images.length, bc7Images: bc7.length, rgba8Images: rgba8.length,
         bc7NativeBytes: sum(bc7, 'nativeBytes'), rgba8NativeBytes: sum(rgba8, 'nativeBytes'),
         nativeBytes: sum(images, 'nativeBytes'), fallbackBytes: sum(images, 'fallbackBytes'), packageBytes: sum(images, 'packageBytes'),
         bc7PsnrRgbTop: psnr.length ? { min: Math.min(...psnr), max: Math.max(...psnr), mean: psnr.reduce((a, b) => a + b, 0) / psnr.length } : null,
-        bc7MaxAbsTop: bc7.reduce((max, item) => max.map((v, c) => Math.max(v, item.quality.maxAbsTop[c])), [0, 0, 0, 0]) } };
+        bc7MaxAbsTop: bc7.reduce((max, item) => max.map((v, c) => Math.max(v, item.quality.maxAbsTop[c])), [0, 0, 0, 0]),
+        bc7PsnrUsedTop: psnrUsed.length ? { min: Math.min(...psnrUsed), max: Math.max(...psnrUsed), mean: psnrUsed.reduce((a, b) => a + b, 0) / psnrUsed.length } : null,
+        bc7MaxAbsUsedTop: bc7.reduce((max, item) => Math.max(max, item.quality.maxAbsUsedTop), 0) } };
     await writeFile(join(temporary, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx' });
     await publishDirectory(temporary, config.output, { hardLinkFiles: true });
     console.log(JSON.stringify({ done: config.output, elapsedMs: Date.now() - started, workers: pool?.size ?? 0, totals: manifest.totals }));

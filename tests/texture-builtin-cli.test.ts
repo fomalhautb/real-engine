@@ -6,6 +6,7 @@ import { crc32, deflateSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { buildMipChain } from '../src/texture-assets';
 import { decodeBc7Image } from '../src/texture-bc7';
+import { convertNormalMap, decodeLegacyDds } from '../src/texture-bcn';
 
 const script = resolve('scripts/build-texture.mjs');
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
@@ -121,6 +122,46 @@ describe('texture CLI builtin encoder', () => {
         expect(build.codec.encoder).toEqual({ format: 'rgba8', lossless: true });
         expect(build.codec.quality).toBeNull();
       }
+    });
+  });
+
+  it('re-encodes legacy DDS sources and converts DirectX BC5 normals explicitly', async () => {
+    await withRoot(async root => {
+      // 8x8 legacy DDS files with deterministic block bytes (ATI2 normal, DXT1 color).
+      const legacy = (fourCC: string, blockBytes: number) => {
+        const data = Buffer.alloc(4 * blockBytes);
+        for (let i = 0; i < data.length; i++) data[i] = (i * 37 + 11) & 255;
+        const header = Buffer.alloc(128);
+        header.write('DDS ', 0, 'ascii'); header.writeUInt32LE(124, 4); header.writeUInt32LE(0x81007, 8);
+        header.writeUInt32LE(8, 12); header.writeUInt32LE(8, 16); header.writeUInt32LE(data.length, 20); header.writeUInt32LE(1, 28);
+        header.writeUInt32LE(32, 76); header.writeUInt32LE(4, 80); header.write(fourCC, 84, 'ascii'); header.writeUInt32LE(0x1000, 108);
+        return Buffer.concat([header, data]);
+      };
+      const normal = legacy('ATI2', 16), color = legacy('DXT1', 8);
+      await writeFile(join(root, 'normal.dds'), normal);
+      await writeFile(join(root, 'color.dds'), color);
+      const normalOut = join(root, 'normal-out');
+      run(join(root, 'normal.dds'), normalOut, ['--format', 'rgba8', '--color-space', 'linear', '--encoder', 'builtin', '--normal-convention', 'directx']);
+      const expected = decodeLegacyDds(new Uint8Array(normal)).pixels;
+      convertNormalMap(expected, { flipGreen: true, reconstructZ: true });
+      expect((await readFile(join(normalOut, 'mips/0.bin'))).equals(Buffer.from(expected))).toBe(true);
+      expect((await readFile(join(normalOut, 'source-input.dds'))).equals(normal)).toBe(true);
+      const build = JSON.parse(await readFile(join(normalOut, 'build.json'), 'utf8'));
+      expect(build.source).toEqual({ file: 'source-input.dds', byteLength: normal.length, sha256: sha256(normal) });
+      expect(build.codec.decodedSource).toMatchObject({ format: 'dds', fourCC: 'ATI2', encoding: 'bc5', channels: 2, decodedLevels: 1 });
+      expect(build.codec.normalMap).toEqual({ convention: 'directx', flippedGreen: true, reconstructedZ: true, convertedRgba8Sha256: sha256(expected) });
+      const colorOut = join(root, 'color-out');
+      run(join(root, 'color.dds'), colorOut, ['--format', 'bc7', '--color-space', 'srgb', '--encoder', 'builtin', '--workers', '0']);
+      const colorBuild = JSON.parse(await readFile(join(colorOut, 'build.json'), 'utf8'));
+      expect(colorBuild.codec.decodedSource).toMatchObject({ format: 'dds', fourCC: 'DXT1', encoding: 'bc1', width: 8, height: 8 });
+      expect(colorBuild.codec.normalMap).toBeNull();
+      expect(colorBuild.codec.quality.summary.top.width).toBe(8);
+      // DDS without an encoder stays a pass-through; texconv never runs on DDS;
+      // a normal convention needs the builtin encoder and linear data.
+      expect(() => run(join(root, 'color.dds'), join(root, 'x'), ['--encoder', 'builtin'])).toThrow();
+      expect(() => run(join(root, 'color.dds'), join(root, 'y'), ['--format', 'bc7', '--color-space', 'srgb', '--texconv', join(root, 'color.dds')])).toThrow();
+      expect(() => run(join(root, 'normal.dds'), join(root, 'z'), ['--format', 'rgba8', '--color-space', 'srgb', '--encoder', 'builtin', '--normal-convention', 'directx'])).toThrow();
+      expect((await readdir(root)).sort()).toEqual(['color-out', 'color.dds', 'normal-out', 'normal.dds']);
     });
   });
 

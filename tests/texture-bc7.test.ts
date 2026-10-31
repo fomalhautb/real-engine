@@ -172,6 +172,25 @@ describe('BC7 encoder', () => {
     expect(histogram[8]).toBe(0);
   });
 
+  it('treats a zero alpha weight as unused alpha while opaque blocks still decode alpha 255', () => {
+    const out = new Uint8Array(16), decoded = new Uint8Array(64);
+    let improved = 0, translucent = 0;
+    for (const pixels of blocks) {
+      const opaque = pixels.every((value, i) => (i & 3) !== 3 || value === 255);
+      const reported = encodeBc7Block(pixels, out, 0, { quality: 2, channelWeights: [1, 1, 1, 0] });
+      decodeBc7Block(out, 0, decoded);
+      const error = errorOf(pixels, decoded);
+      if (opaque) { expect(error.alphaSse).toBe(0); expect(reported).toBe(error.sse); continue; }
+      translucent++;
+      expect(reported).toBe(error.sse);
+      encodeBc7Block(pixels, out, 0, { quality: 2 });
+      decodeBc7Block(out, 0, decoded);
+      if (error.sse < errorOf(pixels, decoded).sse) improved++;
+    }
+    // Ignoring alpha frees bits for color on most translucent blocks.
+    expect(improved).toBeGreaterThan(translucent / 2);
+  });
+
   it('encodes solid colors within one code value', () => {
     const random = lcg(31), out = new Uint8Array(16), decoded = new Uint8Array(64);
     for (let n = 0; n < 256; n++) {

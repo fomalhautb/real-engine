@@ -64,6 +64,8 @@ npm run dev
 
 `/gi.html?finalGather=1` 额外开启实验性 Final Gather 预览，起始为固定镜头，持续渲染以积累近场样本；常规 `/gi.html` 保持世界探针路径。代码可通过 `DiffuseGiOptions.finalGather` 配置，并用 `setDiffuseGiFinalGatherEnabled(boolean)` 单独启停。普通镜头运动可将前帧原始锚点重投影；切镜头、动态几何或光照/材质突变仍保守地整体重置。此预览的近场误差和帧间隔仍有未通过门槛，见 [实现状态](docs/implementation.md#实验性屏幕-final-gather)。
 
+`/joint.html` 是 GI 联合动态验收场景的交互演示。场景包括两间相通的房间、天窗阳光、发光板、门、移动物体和三个漏光箱。可以切换相机和事件、full/scheduled 两种更新策略以及 GI 开关，并实时显示探针捕获数、陈旧度、查询数和 GPU GI 时间。联合验收中 L01 稳态与 L04 漏光尚未通过，此页不代表最终 GI 画质。
+
 `/fog.html` 展示柱廊中的局部盒状雾，可切换雾、密度、太阳和镜头轨迹，查看网格与资源诊断。此前未启用时序重建的 NVIDIA 截图为[雾开](artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png) / [雾关](artifacts/fog-demo-native-20261019-v2/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-off.png)；本轮可选时序版的实际 NVIDIA 截图为[雾开](artifacts/fog-temporal-demo-native-20261019/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-on.png) / [关闭时序、每格中心采样](artifacts/fog-temporal-demo-native-20261019/fog-demo-fog-colonnade-exp-ca6cc-trols-and-bounded-resources/fog-colonnade-centered.png)。演示显式配置 `pixelSize=8`、64 个切片、最多 16 帧历史和 128 MiB 雾预算；截图是有限场景的功能证据，不代表最终画质或性能。
 
 ```sh

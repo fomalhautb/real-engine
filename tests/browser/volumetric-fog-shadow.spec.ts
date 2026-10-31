@@ -26,8 +26,12 @@ test('local media add optical coefficients and share masked Morph/skin sun shado
   }
   expect(maximumLocalError).toBeLessThan(0.012);
   expect(maximumHeightError).toBeLessThan(0.001);
-  // A camera-only medium does not silently feed fogged surface radiance back into GI.
-  expect(result.mediaGi.probes).toEqual(result.firstGi.probes);
+  // A camera-only medium does not silently feed fogged surface radiance back into GI: the
+  // default full policy recaptures every probe with the media present, and only the
+  // capture-frame stamp changes.
+  const capture = (probes: typeof result.firstGi.probes) => probes.map(({ captureFrame: _frame, ...probe }) => probe);
+  expect(result.mediaGi.probes.every((probe, i) => probe.captureFrame > result.firstGi.probes[i].captureFrame)).toBe(true);
+  expect(capture(result.mediaGi.probes)).toEqual(capture(result.firstGi.probes));
   expect(result.diagnostics.passes).toEqual(expect.arrayContaining(['fog-inject', 'fog-integrate', 'fog-compose']));
   expect(result.errors).toEqual([]); expect(errors).toEqual([]); expect(result.releasedBytes).toBe(0);
   if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) expect(result.info.adapterInfo.vendor.toLowerCase()).toContain(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR.toLowerCase());

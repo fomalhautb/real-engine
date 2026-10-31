@@ -121,6 +121,16 @@ export class GeometryStreamCut {
     return { selectedClusters, selectedPages, requestedPages, refinedGroups, fallbackGroups };
   }
 
+  /** Projected error, in pixels, of drawing this group's parents instead of its
+   * children: the exact quantity GPU refinement compares with maxErrorPixels.
+   * For a drawn cluster, use its refinedGroup to get the error it displays. */
+  groupErrorPixels(groupId: number, view: GeometryStreamView): number {
+    checkView(view);
+    const group = this.directory.groups[groupId];
+    if (!Number.isSafeInteger(groupId) || !group) throw new RangeError('GEOMETRY_STREAM_GROUP');
+    return this.measure(group, view).pixels;
+  }
+
   private needsRefinement(group: GeometryStreamGroup, view: GeometryStreamView): boolean {
     return this.measure(group, view).pixels > view.maxErrorPixels;
   }

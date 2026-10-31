@@ -63,6 +63,26 @@ describe('geometryCutCoverage', () => {
     }
   });
 
+  it('reports the projected error refinement compares, for every drawn cluster of a cut', async () => {
+    const directory = await fixture(), planner = new GeometryStreamCut(directory);
+    const all = new Set(directory.pages.map(page => page.id)), roots = new Set(directory.rootPages);
+    const view = { eye: [0, 0.4, 3] as [number, number, number], near: 0.1, projectionScale: 800, maxErrorPixels: 4 };
+    const full = planner.plan(all, view);
+    for (const groupId of full.refinedGroups) expect(planner.groupErrorPixels(groupId, view)).toBeGreaterThan(view.maxErrorPixels);
+    // Fully resident: every drawn coarse cluster displays at most the threshold.
+    for (const id of full.selectedClusters) {
+      const refined = directory.clusters[id].refinedGroup;
+      if (refined !== null) expect(planner.groupErrorPixels(refined, view)).toBeLessThanOrEqual(view.maxErrorPixels);
+    }
+    // Roots only: fallback clusters display more than the threshold.
+    const fallback = planner.plan(roots, view);
+    expect(fallback.fallbackGroups.length).toBeGreaterThan(0);
+    expect(Math.max(...fallback.selectedClusters.map(id => directory.clusters[id].refinedGroup)
+      .filter((group): group is number => group !== null).map(group => planner.groupErrorPixels(group, view)))).toBeGreaterThan(view.maxErrorPixels);
+    expect(() => planner.groupErrorPixels(directory.groups.length, view)).toThrow('GEOMETRY_STREAM_GROUP');
+    expect(() => planner.groupErrorPixels(0.5, view)).toThrow('GEOMETRY_STREAM_GROUP');
+  });
+
   it('rejects invalid and duplicate cluster IDs', async () => {
     const directory = await fixture();
     expect(() => geometryCutCoverage(directory, [directory.clusters.length])).toThrow('GEOMETRY_CUT_COVERAGE_CLUSTER');

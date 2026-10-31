@@ -1,5 +1,13 @@
 @group(3) @binding(4) var<uniform> reflection: ReflectionParameters;
 @group(3) @binding(5) var<storage, read> reflectionAnchors: array<ReflectionAnchor>;
+// Near-mirror estimate of the sampler's BRDF/PDF weight at this view angle:
+// Schlick Fresnel and the direct-light Schlick-GGX visibility with L = reflect(V).
+fn reflectionLobeAlbedo(noV: f32, roughness: f32, f0: vec3f) -> vec3f {
+    let x = clamp(noV, 0.001, 1.0);
+    let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+    let g = x / (x * (1.0 - k) + k);
+    return (f0 + (vec3f(1.0) - f0) * pow(1.0 - x, 5.0)) * g * g;
+}
 fn reflectionRadiance(pixel: vec2f, position: vec3f, normal: vec3f, geometricNormal: vec3f,
     base: vec3f, metallic: f32, roughness: f32, identity: vec2u) -> vec3f {
     if (reflection.settings.w == 0u) { return vec3f(0.0); }
@@ -31,9 +39,12 @@ fn reflectionRadiance(pixel: vec2f, position: vec3f, normal: vec3f, geometricNor
         // Bounded fallback for curved receivers whose four corners all fail the
         // strict normal test: same-identity, same-material anchors of the 4x4
         // neighborhood within ~25 degrees, on a surface consistent with that
-        // curvature, weighted toward the closest normal. It never crosses
-        // identities or materials; with no such anchor the pixel receives none.
+        // curvature, weighted toward the closest normal. Each anchor's result is
+        // rescaled from its view angle's lobe weight to this pixel's. It never
+        // crosses identities or materials; with no such anchor the pixel gets none.
         sum = vec3f(0.0); total = 0.0;
+        let f0 = mix(vec3f(0.04), base, metallic);
+        let own = reflectionLobeAlbedo(dot(normal, normalize(reflection.eye.xyz - position)), roughness, f0);
         for (var neighbor = 0u; neighbor < 16u; neighbor++) {
             let cell = lower + vec2i(i32(neighbor % 4u) - 1, i32(neighbor / 4u) - 1);
             if (any(cell < vec2i(0)) || any(cell >= vec2i(reflection.viewport.zw))) { continue; }
@@ -49,7 +60,9 @@ fn reflectionRadiance(pixel: vec2f, position: vec3f, normal: vec3f, geometricNor
                 || any(abs(base - hit.baseColor.xyz) > vec3f(0.02))
                 || abs(metallic - hit.previous.w) > 0.01 || abs(roughness - hit.normal.w) > 0.01) { continue; }
             let weight = (agreement - 0.9) * (agreement - 0.9) + 1e-6;
-            sum += anchor.radiance.xyz * weight; total += weight;
+            let theirs = reflectionLobeAlbedo(dot(hit.normal.xyz, normalize(reflection.eye.xyz - hit.position.xyz)), roughness, f0);
+            let scale = clamp(own / max(theirs, vec3f(1e-4)), vec3f(0.25), vec3f(4.0));
+            sum += anchor.radiance.xyz * scale * weight; total += weight;
         }
         if (total <= 0.0) { return vec3f(0.0); }
     }

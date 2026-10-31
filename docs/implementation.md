@@ -17,6 +17,7 @@
   - 提供最多 8 个固定关键帧，可沿资产集的相机路径漫游，并有材质、簇、层级三种视图。
   - 在 Apple 上，Bistro Exterior（1,402 个批次）和 Sponza（401 个批次）都能加载、绘制，释放后应用持有的 GPU 字节归零。
   - 满载时 Bistro 的 rAF 间隔为 140–200 ms，只作诊断。
+  - 观察到的缺陷：Bistro 关键帧 0 中，路缘与路面交界处有透出天空的漏洞。材质视图里这些像素正好是天空色 (36,53,61)，簇视图里是背景色；这些位置不属于任何 MASK 材质，原因待查（源资产缝隙、转换后的背面剔除、LOD 或流送都未排除）。截图见 `artifacts/main-integration-20261030/test-results-large-scene-bistro-exterior-asset-set-mac-20261031/`。
 - **未完成**：
   - 资产：Ivy 的几何（有一个 primitive 超过每 primitive 100 万三角形的上限）、Emissive Candles、Animated Knight、Bistro Interior 与 Interior_Wine 都还没有转换；Curtains 与 Trees 还没有和 Sponza 合成场景。
   - 渲染路径：MASK/BLEND primitive 不进分页漫游；遮蔽贴图不参与着色；渲染器的 FOV 和远平面仍是固定值，Bistro 路径的 FOV 没有应用；法线贴图还没有 BC5 路径。

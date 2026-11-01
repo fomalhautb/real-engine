@@ -25,7 +25,7 @@
 - **能力矩阵**：`docs/capability-matrix.json` 共 40 行，包括 26 个固定场景、12 个工作包、自动 LOD 演示与大场景视觉交付。门槛逐字取自 benchmarks.md，状态由门槛结果与证据推导，`npm run capability:report` 校验一致性。截至 main `6d687b0`：pass 0、fail 5、unsupported 3、partial 28、untested 4，没有任何一行达到 pass。
 - **基准帧节奏**：基准运行器逐帧记录 rAF 回调延迟与主线程工作，观察长任务，并把超预算帧与准时帧分成两组对照；组间差异只说明相关，不说明原因。macOS 上另记录机型、GPU、电源、温控与负载均值；`--caffeinate` 只在运行期间阻止睡眠，不改系统设置。
 - **诊断运行**：目标机上的 4 次 1,800 帧 foundation 运行都在主机争用下进行。同一压力负载相隔 8 分钟运行两次，超预算帧从 93 变为 0，CPU 与 GPU 时间同时变化，差异来自主机状态。这些都不是验收性能。
-- **未完成**：目标机 30 分钟运行、无干扰的验收计时和 headed 模式都没有执行。Safari 需要用户开启远程自动化，Playwright WebKit 需要用户允许下载。详见「当前能力边界」中的「机器可读能力矩阵与浏览器入口」，以及「基准运行器与首轮证据」中的「帧节奏归因、macOS 主机信息与争用下的诊断运行」。
+- **未完成**：目标机 30 分钟运行、无干扰的验收计时和 headed 模式都没有执行。用户开启 Safari 远程自动化并允许下载 WebKit 后，两者的冒烟探测显示 WebGPU 可用、首页能渲染，但完整回归都没有运行。详见「当前能力边界」中的「机器可读能力矩阵与浏览器入口」，以及「基准运行器与首轮证据」中的「帧节奏归因、macOS 主机信息与争用下的诊断运行」。
 
 ## 有界点光与聚光灯（2026-10-31）
 
@@ -3377,8 +3377,10 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 合计：pass 0，fail 5，unsupported 3，partial 28，untested 4。按阶段：
 - 阶段 1：8 行全部 partial；
-- 阶段 2：fail 5、unsupported 2、partial 20、untested 4；
-- 阶段 4：F06 为 unsupported。
+- 阶段 2：fail 5、unsupported 1、partial 20、untested 4；
+- 阶段 4：F06 与 M02 为 unsupported。
+
+矩阵 v2（2026-10-31）：用户确认阶段 2 范围后，M02（角色光学）移到阶段 4；M03 的基础透明、Masked 与 decal 留在阶段 2，高级透明与折射仍随 F06 属阶段 4。门槛和其他行不变，合计不变。
 
 | 状态 | 行 | 依据 |
 | --- | --- | --- |
@@ -3386,7 +3388,7 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 | fail | L04 | 默认配置漏光箱 0/6，细缝箱归一化 MAE 6.63；可选配置下黑箱与薄墙箱低于暂定 1%，细缝箱仍为 2.76 |
 | fail | P2-gi-reflections | 包含 L01、L04 的 GI 稳态未满足项；反射的两项门槛只在可选质量配置下满足 |
 | fail | P2-participating-media、F05 | 8 像素/格、64 层带历史需 158.2 MiB，预算 64 MiB |
-| unsupported | M02、M03、F06 | 缺角色光学、透明与 decal；F06 属阶段 4 |
+| unsupported | M03、M02、F06 | M03 缺透明与 decal；M02（角色光学）与 F06 属阶段 4 |
 | untested | P2-joint-large-scene、G02、G05、W01 | 没有目标机证据 |
 
 相对首版（0 pass、5 fail、4 unsupported、26 partial、5 untested）的变化：
@@ -3448,7 +3450,7 @@ npx vitest run tests/capability-matrix.test.ts
 - 范围、优先级或门槛的修改须在 `changeLog` 记录版本与原因；状态只随证据变化。
 
 
-#### Safari 与 WebKit（需要用户操作）
+#### Safari 与 WebKit
 
 - **Safari 26.6.2（21624.5.1.11.3）**：
   - 系统自带 safaridriver；
@@ -3459,7 +3461,14 @@ npx vitest run tests/capability-matrix.test.ts
   - Playwright 1.64.0 需要 webkit-2370，本机缓存只有 webkit-2248；
   - 运行前需要用户允许下载（`npx playwright install webkit`）；
   - Playwright WebKit 不是 Safari，结果只能作功能参考。
-- 矩阵的 `browsers` 中，两项都是 untested，blocker 分别为 `needs-user-action` 和 `needs-download-permission`。
+- 当时矩阵的 `browsers` 中，两项都是 untested，blocker 分别为 `needs-user-action` 和 `needs-download-permission`。
+- **2026-10-31 更新**：用户开启了 Safari 远程自动化，并允许下载 Playwright WebKit。
+  - 已安装 WebKit 27.2（playwright webkit v2370，来自 cdn.playwright.dev）。
+  - 两个浏览器都做了冒烟探测，用的是一次性的探测脚本，不是仓库里的规格。
+    - Playwright WebKit 无头模式：WebGPU 可用，适配器信息为 `apple / apple`，支持 timestamp-query 与 subgroups。
+    - Safari 26.6.2：经 safaridriver 驱动。WebGPU 可用，适配器信息同为 `apple / apple`（WebKit 不报告 `metal-3`），支持 timestamp-query；没有 subgroups、clip-distances、primitive-index 与 texture-formats-tier2。
+    - 首页在两者中都渲染了形变、阴影与 PBR。截图与日志在 `artifacts/browser-matrix-20261031/`。
+  - 两个浏览器的完整回归都还没有运行。Playwright 规格不能直接驱动 Safari。矩阵 `browsers` 中两项改为 partial。
 
 ## 验证入口
 
@@ -3639,7 +3648,7 @@ SwiftShader 使用同一命令，去掉三个 GPU 相关变量。
 #### 失败、限制与未完成
 
 - **未执行**：30 分钟运行与无干扰的验收计时，需要在主机空闲的窗口运行。
-- **未在目标机运行**：headed 模式、Safari 和 Playwright WebKit。Safari 需要用户操作，WebKit 需要下载许可。
+- **未在目标机运行**：headed 模式，以及 Safari 和 Playwright WebKit 的完整回归。两者目前只有冒烟探测（见「Safari 与 WebKit」）。
 - **节奏分组**只说明相关。负载均值是整机指标，不能区分 GPU 争用。
 - **矩阵**中的数值为转录，只反映截至 `evidenceMain` 的证据。
 - **SwiftShader 偶发失败**：此前 `raster-receivers` 出现过一次 `Execution context was destroyed`（`artifacts/phase1-apple-triage-20261030/fix-b-swiftshader.log`），单独重跑和第二次完整运行都通过。Playwright 的 webServer 没有转接 stdout，Vite 的依赖重载提示不会写进测试日志，所以这份日志既不能证实也不能排除「依赖预构建触发重载」的假设。要验证，可以在 webServer 上设 `stdout: 'pipe'` 后复现。

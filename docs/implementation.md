@@ -2,6 +2,22 @@
 
 更新日期：2026-10-31。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## Safari 与 Playwright WebKit 兼容性回归（2026-11-01）
+
+- **Playwright WebKit**：`PLAYWRIGHT_BROWSER=webkit` 选择 WebKit 27.2（无头，需 `PLAYWRIGHT_GPU=hardware`）。完整浏览器回归 176 项：172 通过、4 跳过、0 失败。
+  - 修复前有 14 项失败，都是夹具在 `destroy()` 之后读 `GPUBuffer.size`（直接读取或经 `ownedBytes` 取值器）：WebKit 读作 0，Chrome 按规范保留原值。
+  - 引擎的 `Renderer.releaseBuffer` 有同样的写法，会让 WebKit 中的 `ownedGpuBytes` 偏大，已改为先读大小。新增守卫测试防止再出现。
+- **Safari 26.6.2**：`scripts/safari-webdriver.mjs` 经 safaridriver 运行 15 项检查，全部通过。检查包括初始化、首页渲染与诊断、resize、释放与显式设备丢失、设备恢复、6 个规格夹具和 4 个演示页。
+  - Safari 26.6.2 在渲染任务结束到下一次渲染更新之间读 WebGPU 画布会得到空白图。实例 BVH 夹具已改为在渲染任务内读初始画面；运行器没有覆盖的夹具中仍有跨任务读取。
+- **Chrome 目标机**：改动后完整回归 176 项：172 通过、4 跳过、0 失败，与 main 相同。
+- **合入复核**：在高负载下重跑 Chrome 完整回归，结果为 171 通过、4 跳过、1 失败。失败来自流送画廊夹具：背压跳过渲染时，参考仍按请求的位姿渲染。夹具已修复，该规格在目标机重跑 3 次通过。SwiftShader 首轮有 1 项在高负载下超时，单独重跑通过。
+- **矩阵**：新增 `compatibility` 证据作用域。WebKit 与 Safari 的结果记为兼容性证据，不计入门槛，P1-runtime 仍为 partial。
+  - 引擎不依赖 Safari 缺少的 subgroups、clip-distances、primitive-index 与 texture-formats-tier2，`tests/webgpu-optional-features.test.ts` 固定了这一约定。
+- **未完成**：
+  - Safari 只覆盖规格断言的子集。缺适配器重试与 WebGPU 不可用两个用例需要 `addInitScript`，在 Safari 中没有覆盖。
+  - 真实驱动崩溃引起的设备丢失在三个浏览器中都没有覆盖。
+  - 详见「当前能力边界」中的「Safari 与 Playwright WebKit 回归（2026-11-01）」。
+
 ## GI 稳态精度与漏光：收敛参考与可选可见性细化（2026-10-31）
 
 - **参考修正**：L01 的路径追踪参考由 512 路径 × 8 次反弹改为 8192 × 24。原参考与收敛参考相差 0.06–0.23，8 次反弹截断损失 3%–8% 的能量，在 3 个 ROI 上本身就超过门槛；两份独立收敛参考之间相差 0.015–0.071。门槛 0.15 不变。
@@ -22,10 +38,10 @@
 
 ## 能力矩阵、基准帧节奏与浏览器检查（2026-10-31）
 
-- **能力矩阵**：`docs/capability-matrix.json` 共 40 行，包括 26 个固定场景、12 个工作包、自动 LOD 演示与大场景视觉交付。门槛逐字取自 benchmarks.md，状态由门槛结果与证据推导，`npm run capability:report` 校验一致性。截至 main `6d687b0`：pass 0、fail 5、unsupported 3、partial 28、untested 4，没有任何一行达到 pass。
+- **能力矩阵**：`docs/capability-matrix.json` 共 40 行，包括 26 个固定场景、12 个工作包、自动 LOD 演示与大场景视觉交付。门槛逐字取自 benchmarks.md，状态由门槛结果与证据推导，`npm run capability:report` 校验一致性。截至 main `ed3b487`：pass 0、fail 5、unsupported 3、partial 28、untested 4，没有任何一行达到 pass。
 - **基准帧节奏**：基准运行器逐帧记录 rAF 回调延迟与主线程工作，观察长任务，并把超预算帧与准时帧分成两组对照；组间差异只说明相关，不说明原因。macOS 上另记录机型、GPU、电源、温控与负载均值；`--caffeinate` 只在运行期间阻止睡眠，不改系统设置。
 - **诊断运行**：目标机上的 4 次 1,800 帧 foundation 运行都在主机争用下进行。同一压力负载相隔 8 分钟运行两次，超预算帧从 93 变为 0，CPU 与 GPU 时间同时变化，差异来自主机状态。这些都不是验收性能。
-- **未完成**：目标机 30 分钟运行、无干扰的验收计时和 headed 模式都没有执行。用户开启 Safari 远程自动化并允许下载 WebKit 后，两者的冒烟探测显示 WebGPU 可用、首页能渲染，但完整回归都没有运行。详见「当前能力边界」中的「机器可读能力矩阵与浏览器入口」，以及「基准运行器与首轮证据」中的「帧节奏归因、macOS 主机信息与争用下的诊断运行」。
+- **未完成**：目标机 30 分钟运行、无干扰的验收计时和 headed 模式都没有执行。Playwright WebKit 27.2 的完整回归 176 项 172 通过、0 失败，Safari 26.6.2 经 safaridriver 运行的 15 项检查全部通过；两者都是兼容性证据，见「Safari 与 Playwright WebKit 回归（2026-11-01）」。详见「当前能力边界」中的「机器可读能力矩阵与浏览器入口」，以及「基准运行器与首轮证据」中的「帧节奏归因、macOS 主机信息与争用下的诊断运行」。
 
 ## 有界点光与聚光灯（2026-10-31）
 
@@ -1980,6 +1996,8 @@ GPU 选簇在既有每簇/实例状态字的高位写入两个诊断位：`0x100
 
 这一分类来自 Apple 证据：旧判据（CPU 预测的回退误差带，48 像素封顶）在漫游中报出 1–762 个洞像素。逐像素射线诊断显示：遮挡统计全为 0、无溢出；一类是环面自遮挡的内部轮廓，射线不与切割相交，但完整表面点距已绘制切割仅 0.36–0.64 像素，而切割声明误差为 7.1–7.5 像素（walk 10.67–11.33 s，物体 15）；另一类是只剩一个根簇的物体（声明误差 598–651 像素），根簇整体在视锥外被剔除，而真实表面在屏幕边缘可见（walk 2.00/2.33 s）。二者都是声明误差之内的近似，不是剔除或绘制错误。日志 `artifacts/geometry-streamed-gallery-20261030/hw-hole-diagnosis.log`。
 
+任一几何流已有 `maxFramesInFlight` 帧在途时，`render()` 不绘制（计入 `stats.streamBackpressureFrames`），HDR 目标保留上一次绘制的帧。夹具原先每次调用都把参考相机移到请求的位姿，所以紧跟在被跳过的渲染之后的检查会拿较早的流送画面对照较新的参考，把相机视差报成洞。2026-11-01 合入浏览器矩阵前的完整回归（主机负载约 24–30）中，walk 12.00 s 之前 10 次调用只绘制了 4 帧，物体 14 出现 1,506 个未解释洞像素（整轮背压 118 帧）；同一规格单独重跑 3 次通过。此前的通过运行同样有背压（如 175 帧），只是每次检查之前的那次调用恰好都绘制了。夹具现在只在帧确实绘制时更新参考位姿，每次检查记录之前被跳过的渲染次数 `skippedRenders`。修复后在目标机重跑 3 次全部通过：背压 66、20、129 帧，共 20 次检查紧跟 1–4 次被跳过的渲染，未解释洞像素都为 0。
+
 Apple M3 Max（`apple / metal-3`，Chrome 156）硬件运行 24 个物体、192×48 段、640×400：442,368 源三角形、12,077 簇；唯一数据 115.6 MB，池预算 28.9 MB（比值 4.00），驻留上限 46.7 MB（2.48），峰值上限 79.8 MB（1.45），完整驻留与驻留上限之比 4.08，根 12.9 MB。基于 main `e63e3f4` 的最终运行中，六个站点和四个跳转首帧全部通过：覆盖误差、裂缝边和 CPU/GPU 切割差异均为 0，重复边 6–32；稳定站点测试 4,203–18,428 个内部像素，2–18 个物体因声明误差过大未测试（多数在其他房间）；各阶段到最后一次驻留变化用 28、40、49、31、16、14 帧（含探测），加载/逐出/重载页为冷启动 402/0/0、传送到末房间 229/313/0、传回 309/225/309、门口 213/319/175、转身 292/4/191、转回 296/264/184；跳转首帧回退簇 140–768，洞像素为 0，但回退误差使多数首帧没有可测试的内部像素（仅一帧测试 6,496 个），首帧主要靠覆盖和裂缝检查；漫游 70 次检查共测试 432,564 个内部像素、回退簇最多 937，只有 walk 13.33 s 出现 1 个已解释的洞像素。日志 `artifacts/geometry-streamed-gallery-20261030/hw-final-after-rebase-e63e3f4.log`。更早基于旧 main 的一次运行判定相同，转身阶段页数（368/31/237、296/264/200）、漫游测试像素（436,577）和重复边上限（36）略有不同，来自异步上传与读回时序（`hw-renderer-gallery-recovery-abba.log`）。
 
 SwiftShader 只证明功能（16 个物体、96×32 段、400×260）：98,304 源三角形、2,565 簇；唯一数据 23.87 MB，池预算 5.97 MB（比值 4.00），驻留上限 9.76 MB（2.45），峰值上限 19.96 MB（1.20），完整驻留与驻留上限之比 4.12，根 2.87 MB。六个站点和四个跳转首帧全部通过，覆盖误差、裂缝边和 CPU/GPU 切割差异为 0，重复边 6–18；各阶段加载/逐出/重载页为 83/0/0、53/53/0、53/53/53、58/58/46、83/83/38、83/83/83，累计迁移 14、28、42、56、69、81，到最后一次驻留变化分别用 19、31、57、36、15、14 帧（毫秒数含软件光栅化与探测，不作参考）。稳定站点测试 0–6,043 个内部像素：冷启动和传回首房间两个站点在 400×260 下按 7–40 像素容差半径腐蚀后没有内部像素，这两处只有覆盖、裂缝和切割一致性检查生效。跳转首帧洞像素为 0、回退簇 81–205，均无可测试的内部像素；漫游 47 次检查共测试 44,283 个内部像素、回退簇最多 222，只有 walk 8.67 s 出现 1 个已解释的洞像素，未解释为 0。以上为基于 `e63e3f4` 的最终运行（`sw-final-after-rebase-e63e3f4.log`）；更早一次运行的页数和稳定站点结果相同，帧数、迁移数和漫游中的已解释洞像素（13 个）因时序不同。
@@ -3373,7 +3391,7 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 门槛结果取 `met`、`unmet`、`partly-measured` 或 `not-measured`，未列出的门槛按 `not-measured` 处理。结果不是 `not-measured` 时，必须有目标机证据引用该门槛。
 
-#### 当前状态（main `6d687b0`）
+#### 当前状态（main `ed3b487`）
 
 合计：pass 0，fail 5，unsupported 3，partial 28，untested 4。按阶段：
 - 阶段 1：8 行全部 partial；
@@ -3401,7 +3419,7 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 - **unsupported → partial**：F03。点光/聚光灯接入后，移动聚光灯与短闪光用例改为带门限运行，在目标机与 SwiftShader 上通过。F05 与 P2-participating-media 不再缺能力，但仍因 F05 的显存预算为 fail。
 - **untested → partial**：P2-visual-delivery。`/large-scene.html` 在目标机上漫游了 Bistro Exterior 与 Sponza；Bistro 关键帧 0 的路缘有透出天空的漏洞，原因待查，记为限制。
 
-这些数值转录自各项工作的日志、JSON 和本文档，没有重新采集。新增 12 条目标机证据记录：
+这些数值转录自各项工作的日志、JSON 和本文档，没有重新采集。新增 13 条目标机证据记录（另有 2 条兼容性证据，见「Safari 与 Playwright WebKit 回归（2026-11-01）」）：
 
 | 记录 | 种类 | 内容 |
 | --- | --- | --- |
@@ -3417,6 +3435,7 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 | `apple-main-lights-20261031` | functional | 合入局部灯与本小节内容后的 main 完整回归 171 项：168 通过、3 跳过、0 失败（`0802479`） |
 | `apple-main-reflq-20261031` | functional | 合入反射质量选项后的 main 完整回归 171 项：168 通过、3 跳过、0 失败（`234eb39`），不再有 `test.fail` |
 | `apple-main-gi-20261031` | functional | 合入 GI 可见性细化与收敛参考后的 main 完整回归 176 项：172 通过、4 跳过、0 失败（`6d687b0`） |
+| `apple-browser-matrix-20261031` | functional | WebKit 兼容修改后的 Chrome 完整回归 176 项：172 通过、4 跳过、0 失败（`6e9a7fa`） |
 
 #### 命令
 
@@ -3468,12 +3487,142 @@ npx vitest run tests/capability-matrix.test.ts
     - Playwright WebKit 无头模式：WebGPU 可用，适配器信息为 `apple / apple`，支持 timestamp-query 与 subgroups。
     - Safari 26.6.2：经 safaridriver 驱动。WebGPU 可用，适配器信息同为 `apple / apple`（WebKit 不报告 `metal-3`），支持 timestamp-query；没有 subgroups、clip-distances、primitive-index 与 texture-formats-tier2。
     - 首页在两者中都渲染了形变、阴影与 PBR。截图与日志在 `artifacts/browser-matrix-20261031/`。
-  - 两个浏览器的完整回归都还没有运行。Playwright 规格不能直接驱动 Safari。矩阵 `browsers` 中两项改为 partial。
+  - 这次只是冒烟探测。完整回归与 Safari 运行器的结果见「Safari 与 Playwright WebKit 回归（2026-11-01）」。
+
+### Safari 与 Playwright WebKit 回归（2026-11-01）
+
+本小节对应提交 `b846e9b`（缓冲区台账先读大小再销毁）、`c72a6aa`（按需在 Playwright WebKit 中运行回归）、`16c7eb6`（固定引擎依赖的可选 WebGPU 特性）、`6e9a7fa`（Safari WebDriver 运行器）与 `ed3b487`（能力矩阵的兼容性证据）。目标机仍是 Apple M3 Max 上的 Chrome 156（`apple / metal-3`），目标机定义与适配器定义都没有改。Playwright WebKit 27.2 与 Safari 26.6.2 的适配器报告为 `apple / apple`，它们的结果是兼容性证据，不计入任何门槛；两者的计时只作诊断。日志与截图在 `artifacts/browser-matrix-20261031/`，不入库。
+
+#### 实现内容
+
+- **Playwright WebKit 项目**：
+  - `PLAYWRIGHT_BROWSER=webkit` 选择 Playwright 的 WebKit；不设或设为 `chromium` 时，`playwright.config.ts` 生成的配置与之前逐项相同。
+  - 选择逻辑在 `tests/browser/browser-engine.ts`（`resolveBrowserEngine`、`browserEngine`），不依赖 Playwright，单元测试覆盖。WebKit 必须配 `PLAYWRIGHT_GPU=hardware`（WebKit 没有软件 WebGPU 适配器），并拒绝 `PLAYWRIGHT_CHANNEL` 与 `PLAYWRIGHT_HIGH_PERFORMANCE_GPU` 这两个 Chromium 选项；其他取值抛出带变量名的错误。
+  - WebKit 不接收任何 Chrome 参数。`world-query-shared-benchmark.spec.ts` 的 `--enable-webgpu-developer-features` 只传给 Chromium 硬件运行。
+- **按浏览器检查适配器**：`tests/browser/run-adapter.ts` 的 `expectRunAdapter` 替换了 `engine.spec.ts` 中原有的两项检查。Chrome 的检查不变（硬件运行不得是回退适配器，`PLAYWRIGHT_EXPECT_GPU_VENDOR` 指定时厂商必须一致）。WebKit 运行另要求 WebKit 用户代理（含 `Version/… Safari/`，不含 `Chrome/`），在期望 Apple 厂商时要求适配器为 `apple / apple`。没有任何用例检查 `metal-3`，其他规格的厂商检查与浏览器无关，保持原样。
+- **Safari WebDriver 运行器**：`scripts/safari-webdriver.mjs`，只用 Node 内置模块与项目已有的 Vite，没有新依赖。
+  - 启动本检出的私有 Vite 开发服务器（127.0.0.1，关闭 HMR 与文件监视）和自己的 safaridriver（端口被占用时拒绝运行，不连接别人的驱动），只用标准能力 `{ browserName: 'safari' }` 打开一个会话。
+  - 无论成功、失败还是 Ctrl-C，都会删除会话、停止驱动、关闭服务器，并写出截图与 `results.json`；有失败、致命错误或清理失败时以非零状态退出。
+  - 只访问自己的开发服务器，不改 Safari 或系统设置。
+- **缓冲区台账修复**：WebKit 27.2 与 Safari 26.6.2 在 `GPUBuffer.destroy()` 之后把 `size` 读作 0；Chrome 保留创建时的大小，符合 WebGPU 规范。先读大小再销毁，见下文「修复」。
+- **可选特性审计**：Safari 没有 subgroups、clip-distances、primitive-index 与 texture-formats-tier2。引擎不依赖其中任何一项：渲染器只请求 timestamp-query 与三类纹理压缩特性，且都先检查适配器；没有着色器启用扩展，也没有用到 subgroup、quad、clip_distances 或 primitive_index 内建；唯一的存储纹理是只写的 r32float（遮挡金字塔），属核心格式。因此不需要新的能力检查或回退。`tests/webgpu-optional-features.test.ts` 固定了这一约定：以后引入新的可选特性时，必须同时加显式检查与回退，这个测试才会通过。
+- **能力矩阵的兼容性证据**：证据新增 `compatibility` 作用域，见「接口变化」。
+
+#### 命令与结果
+
+所有运行都在本机（Apple M3 Max，macOS 26.6.2）上进行，日志在 `artifacts/browser-matrix-20261031/`（不入库）。Playwright 端口 5267，safaridriver 端口 5268。
+
+| 浏览器 | 命令 | 结果 |
+| --- | --- | --- |
+| Chrome 156（目标机，`apple / metal-3`） | `PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGHT_EXPECT_GPU_VENDOR=apple PLAYWRIGHT_PORT=5267 npx playwright test` | 176 项：172 通过、4 跳过、0 失败（13.4 分钟），与 main `b908476` 的基线相同 |
+| Playwright WebKit 27.2（webkit-2370，无头），修复前 | `PLAYWRIGHT_BROWSER=webkit PLAYWRIGHT_GPU=hardware PLAYWRIGHT_EXPECT_GPU_VENDOR=apple PLAYWRIGHT_PORT=5267 npx playwright test` | 176 项：158 通过、4 跳过、14 失败（12.3 分钟） |
+| Playwright WebKit 27.2，修复后 | 同上 | 176 项：172 通过、4 跳过、0 失败（13.1 分钟） |
+| Safari 26.6.2（21624.5.1.11.3），首轮 | `node scripts/safari-webdriver.mjs --port 5267 --driver-port 5268 --out artifacts/browser-matrix-20261031/safari-run1` | 15 项：13 通过、2 失败、0 跳过；清理 3/3 成功 |
+| Safari 26.6.2，修复后 | `node scripts/safari-webdriver.mjs --port 5267 --driver-port 5268 --out artifacts/browser-matrix-20261031/safari` | 15 项：15 通过、0 失败、0 跳过；清理 3/3 成功（整轮约 7 秒） |
+| Chrome（SwiftShader 软件适配器），受影响的 14 个规格文件 | `PLAYWRIGHT_PORT=5267 npx playwright test` 加上这 14 个文件（engine、gi-reconstruction-diagnostic、gi-visibility、gi-supplemental-cache-values、gi-progressive-sequence、gi-variance-history、gi-reconstruction、reflections-sampling、world-query-parameters、world-query-watertight、world-query-instances、world-query-face-policy、world-query-shared、world-query-shared-benchmark） | 19 项：18 通过、1 跳过（只在硬件上运行的计时用例）、0 失败（1.8 分钟） |
+| 单元测试与构建 | `npm run check` | 112 个测试文件、953 项通过（main 为 109 个文件、944 项；新增 3 个文件、9 项），TypeScript 检查与生产构建通过 |
+| 能力矩阵 | `npm run capability:report`、`npx vitest run tests/capability-matrix.test.ts` | 校验无错误；5 项测试通过；合计仍为 pass 0、fail 5、unsupported 3、partial 28、untested 4 |
+
+- 上述运行都在基于 main `b908476` 的最终提交上进行。
+- 合入 main 前在同一代码上复核（主机同时运行 8 个代理，负载约 24–30），日志在 `artifacts/main-integration-20261030/`（不入库）：
+  - Chrome 完整回归 176 项：171 通过、4 跳过、1 失败。失败的是 `geometry-streamed-gallery.spec.ts:17`：夹具在流送背压跳过渲染时仍按请求的位姿渲染参考，见「超额订阅程序化画廊（G03/G04 功能验证）」。修复夹具后，该规格在目标机重跑 3 次全部通过。
+  - SwiftShader 上受影响的 14 个规格 19 项：首轮 `engine.spec.ts:14` 超过 60 秒测试超时（同一批规格比无争用时慢约 8 倍），单独重跑通过；其余 17 项通过、1 项跳过。
+  - Playwright WebKit 中 `engine.spec.ts` 2 项通过，适配器为 `apple / apple / apple`。
+- Chrome 与 WebKit 跳过的 4 项相同，都需要显式开关或本地资产：`geometry-demo-recording.spec.ts:28`（`GEOMETRY_RECORD_DIR`）、`geometry-streamed-recovery.spec.ts:11`（`GEOMETRY_RECOVERY_ABBA`）、`gi-quality-diagnostics.spec.ts:100`（`GI_QUALITY_OUT`）、`large-scene.spec.ts:24`（`LARGE_SCENE_ASSET_SET`）。
+- WebKit 与 Safari 报告的环境相同：适配器 `apple / apple / apple`，`isFallbackAdapter` 为 false；设备特性 timestamp-query、texture-compression-bc/etc2/astc、core-features-and-limits；限制为默认值（如 `maxStorageBuffersPerShaderStage` 8、`maxBufferSize` 268435456）。用户代理分别为 `Version/27.2` 与 `Version/26.6.2`。
+
+#### Safari 运行器的检查
+
+每项检查复用一个 Playwright 规格的夹具或流程，保留其断言的一个子集，阈值不放宽。
+
+| 检查 | 对应规格 | 覆盖 |
+| --- | --- | --- |
+| initialization | engine.spec.ts | 经 `Renderer.create` 创建适配器与设备，适配器报告、特性、限制，无 GPU 错误 |
+| home-render | engine.spec.ts | 渲染图与绘制次数、GPU 形变回读对照 CPU、缓存帧上传、刚体控制、重置、射线查询、可见场景像素 |
+| resize | engine.spec.ts | 窗口缩小与恢复时重新分配尺寸相关目标，形变验证通过，台账回到初值 |
+| dispose-and-device-loss | device-loss.spec.ts | 释放销毁设备、台账归零；显式 `GPUDevice.destroy()` 后停帧、查询被拒、资源释放 |
+| device-recovery | device-loss.spec.ts | 首页在新适配器与设备上重建 Renderer，保留场景（7 个刚体），台账与形变验证一致，之后主动释放不再恢复 |
+| fixture-deformation | deformation.spec.ts | 六骨蒙皮、有序多 Morph/波形图与逐实体上一帧位置对照 CPU 参考 |
+| fixture-hdr | hdr.spec.ts | 线性 HDR 辐射度经曝光与 resize、ACES/sRGB 解析、曝光后速度、尺寸相关台账 |
+| fixture-gltf | gltf.spec.ts | 导入的 glTF 蒙皮与 Morph 片段保持独立的 GPU 历史，逐顶点对照 CPU |
+| fixture-velocity | velocity.spec.ts | 相机、物体、蒙皮与 Morph 运动的速度附件，镜头切换、遮罩孔与 resize |
+| fixture-world-query-watertight | world-query-watertight.spec.ts | 恰好落在共享边与顶点上的射线在两条静态遍历路径上都命中，无溢出，台账归零 |
+| fixture-world-query-instances | world-query-instances.spec.ts | 夹具页：批内实例 BVH 与线性查询及 GI 在移动、重排、删除与恢复中一致 |
+| demo-gi、demo-fog、demo-reflection、demo-geometry | 演示页 | 页面启动、渲染帧、无渲染器错误并截图；无数值断言 |
+
+最终运行（`artifacts/browser-matrix-20261031/safari/results.json`）的主要数值：
+
+- **窗口**：1440 × 940，位于屏幕左上（x 0、y 33），视口 1440 × 888，`devicePixelRatio` 2，渲染器按 1.5 取绘制缓冲。
+- **home-render**：15 次绘制；GPU 形变 512 个顶点对照 CPU，最大位置误差 2.4e-7；视口截图中蓝色像素 24,349、绿色 160,690（阈值都是 > 50）。
+- **resize**：绘制缓冲 1695 × 1158 → 1185 × 990 → 1695 × 1158，GPU 占用 39,231,780 → 26,597,220 → 39,231,780 字节，回到初值。
+- **device-recovery**：事件依次为 started、lost（destroyed）、attempt、recovered；恢复后仍是 7 个刚体，GPU 占用与丢失前相同，形变验证通过。显式设备丢失后，Safari 与 Chrome 都报告 `DEVICE_LOST` 和一条 `TIMESTAMP_READBACK`（等待中的 mapAsync 被拒绝），只是顺序不同。
+- **夹具**：形变最大误差 2.4e-7；HDR 首帧辐射度 [5, 0.75, 0.125, 1]；水密用例 10,480 条射线全部命中；实例 BVH 两幅画面相同，4 次读取的可见像素都是 63,603。
+- **演示页**：截图时已渲染 41–45 帧，没有渲染器错误。
+- 截图：`artifacts/browser-matrix-20261031/safari/` 下的 initialization、home-viewport、resize-small、device-recovery、fixture-world-query-instances、demo-gi、demo-fog、demo-reflection、demo-geometry（均为 `.png`）。
+
+#### 失败分类
+
+| 浏览器 | 失败 | 原因 | 分类 | 处理 |
+| --- | --- | --- | --- | --- |
+| WebKit | `gi-progressive-sequence.spec.ts:12`、`gi-reconstruction.spec.ts:4`、`gi-supplemental-cache-values.spec.ts:4`、`gi-variance-history.spec.ts:10`、`gi-visibility.spec.ts:20/63/135`、`reflections-sampling.spec.ts:16`、`world-query-shared.spec.ts:12`、`world-query-watertight.spec.ts:4`（10 项） | 夹具自己的字节台账在 `destroy()` 之后才读 `buffer.size`，WebKit 读到 0，台账不归零 | 测试假设 | 先读大小再销毁 |
+| WebKit | `world-query-face-policy.spec.ts:4`（linear 与 scene BVH 两项）、`world-query-parameters.spec.ts:4` | 同上，夹具以 `WORLD_QUERY_FACE_POLICY_RESOURCE_LEAK` / `WORLD_QUERY_FIXTURE_ACCOUNT_LEAK` 报告 | 测试假设 | 同上 |
+| WebKit | `world-query-shared-benchmark.spec.ts:13`（修改后为 :15） | 同上；首次修复后仍差 24,557,568 字节，原因是稠密 UDF 的 `ownedBytes` 取值器对存活缓冲求和，却在 `dispose()` 之后读取 | 测试假设 | 先记账再 `dispose()` |
+| WebKit / Safari | 无用例失败 | `Renderer.releaseBuffer`（分页流输出失败时的释放路径）同样在 `destroy()` 后读大小，WebKit 中会让 `stats.ownedGpuBytes` 偏大 | 引擎缺陷（由 WebKit 的规范外行为触发） | 先读大小；Chrome 中行为不变 |
+| Safari | `resize` | 自动化窗口初始视口只有 800 × 600，旧检查把窗口缩到 `max(800, 宽 − 340)`，尺寸没有变化，等待超时 | 测试假设 | 改为显式窗口矩形 |
+| Safari | `fixture-world-query-instances`（可见像素 0） | Safari 26.6.2 在渲染任务结束到下一次渲染更新之间，WebGPU 画布的 `toDataURL()` 返回空白图；夹具在 `traceRays` 之后才读初始画面。两幅空白图相等，所以 `pictureEqual` 也是假阳性 | Safari 行为差异（测试假设） | 在渲染任务内读取初始画面 |
+
+- 每一项都有证据：
+  - 一次性探测（`buffer-size-probe.log`）显示，WebKit 27.2 中 256 字节缓冲销毁后 `size` 为 0（`mappedAtCreation` 的 64 字节缓冲同样为 0），Chrome 156 仍为 256；纹理的宽、高与格式在两者中都保留。
+  - 画布探测（`safari-canvas-readback-probe.log`）：Safari 同任务读取 4096 个红色像素，50 ms 后的任务读到 0，两次 rAF 之后又是 4096；Chrome 156 与 WebKit 27.2 三种时机都是 4096。
+  - 修复后，14 项 WebKit 失败与 `engine.spec.ts` 定向重跑全部通过。
+- 没有放宽任何阈值，也没有把 WebKit 独有的失败改记为通过。
+
+#### 修复与改动的文件
+
+- **台账（引擎与夹具）**：
+  - `src/renderer.ts`：`releaseBuffer` 先读 `buffer.size`。
+  - 夹具：`gi-progressive-sequence.ts`、`gi-reconstruction.ts`、`gi-supplemental-cache-values.ts`、`gi-variance-history.ts`、`gi-visibility.ts`（两处）、`reflections-sampling.ts`、`world-query-face-policy.ts`、`world-query-parameters.ts`（正常释放与失败路径）、`world-query-shared.ts`、`world-query-shared-benchmark.ts`（`release` 与稠密 UDF 两处）、`world-query-watertight.ts`，均在 `tests/browser/fixtures/`。
+  - `tests/gpu-buffer-ledger-guard.test.ts`：扫描 `src` 与 `tests/browser`，发现 `x.destroy()` 之后同行或下一行读 `x.size`、`x.dispose()` 之后读 `x.ownedBytes` 时失败。对修复前的代码运行，它能找出全部原有位置。
+- **Safari 画布读取**：`tests/browser/fixtures/world-query-instances.ts`，`capture()` 增加可选的 `onRendered` 回调，在渲染所在的任务内读初始画面；`stillImage()` 可接收已读出的 PNG。Chrome 与 WebKit 中可见像素仍为 63603，与修改前相同。
+- **WebKit 项目**：`playwright.config.ts`、`tests/browser/browser-engine.ts`、`tests/browser/run-adapter.ts`、`tests/browser/engine.spec.ts`、`tests/browser/world-query-shared-benchmark.spec.ts`、`tests/browser-engine.test.ts`。
+- **Safari 运行器**：`scripts/safari-webdriver.mjs`。
+- **特性约定**：`tests/webgpu-optional-features.test.ts`。
+- **能力矩阵**：`scripts/capability-report.mjs`、`tests/capability-matrix.test.ts`、`docs/capability-matrix.json`。
+
+#### 接口变化
+
+- **环境变量 `PLAYWRIGHT_BROWSER`**：`chromium`（默认）或 `webkit`，其他值报错。WebKit 需要 `PLAYWRIGHT_GPU=hardware`，不能与 `PLAYWRIGHT_CHANNEL`、`PLAYWRIGHT_HIGH_PERFORMANCE_GPU` 同用。
+- **测试辅助模块**：`tests/browser/browser-engine.ts` 导出 `BROWSER_ENGINES`、`BrowserEngine`、`resolveBrowserEngine(env)` 与 `browserEngine`；`tests/browser/run-adapter.ts` 导出 `ReportedAdapter` 与 `expectRunAdapter(adapter, userAgent)`。
+- **Safari 运行器命令行**：`node scripts/safari-webdriver.mjs --out <目录> [--port 5173] [--driver-port 5268] [--only id,id] [--list]`。`--port` 默认取 `PLAYWRIGHT_PORT`，否则 5173；`--list` 列出检查与对应规格。需要用户事先在 Safari 中允许远程自动化。
+- **能力矩阵**：
+  - 证据作用域新增 `compatibility`。这类记录必须有 `browserId`，指向 `browsers` 中角色为 `candidate` 或 `functional-only` 的条目；`adapter` 必须与该条目一致，且不能是目标适配器。
+  - 行可选字段 `compatibilityEvidence: [{ ref, specs }]`，只能引用兼容性记录；`browsers` 条目可选字段 `evidence` 只能引用本浏览器的兼容性记录。
+  - `deriveStatus` 与门槛结果只看 `targetEvidence`，兼容性证据不改变任何行的状态。`targetEvidence` 引用兼容性记录时校验失败。
+  - 顶层新增 `evidenceScopes`，说明 target、historical、compatibility 三种作用域。
+  - 新增证据记录：`webkit-suite-20261031`、`safari-webdriver-20261101`（兼容性），`apple-browser-matrix-20261031`（目标机，Chrome 回归）。`browsers` 中 `safari-26-macos` 与 `playwright-webkit` 更新结果并引用证据，状态仍为 partial。P1-runtime 的 statusReason 与 limitations 已更新，门槛结果仍为 `functional: partly-measured`，状态仍由推导得出 partial。
+  - `version` 仍为 2；`evidenceAsOf` 改为 2026-11-01（Safari 记录的日期），`evidenceMain` 改为 `ed3b487`。
+
+#### 剩余差距
+
+- **Safari 只覆盖子集**：Safari 只运行运行器的 15 项检查，其余 Playwright 规格不能直接驱动 Safari。检查保留的是各规格断言的子集，演示页只截图、不做数值断言。
+- **WebDriver 的限制**：
+  - 没有 `addInitScript`，所以设备恢复检查改用一次性的 `createCommandEncoder` 钩子取得设备。另有两个用例需要在页面脚本之前注入，在 Safari 中没有覆盖：`device-loss.spec.ts:134`（缺适配器时有界重试并报告耗尽）与 `engine.spec.ts:101`（WebGPU 不可用时显示错误而不是空白画布）。
+  - 不能设置 deviceScaleFactor：夹具中 `devicePixelRatio` 被改报为 1，与 Playwright 一致；首页检查保留 Safari 的 Retina 比例 2（渲染器取 1.5）。
+  - 没有请求拦截与录像。
+- **窗口尺寸**：Safari 自动化窗口可见，在 1512 × 982 pt 的笔记本屏幕上放不下 1000 pt 高的视口。运行器使用 1440 × 940 的窗口（视口 1440 × 888），resize 检查缩到 1100 × 820（视口 1100 × 768）。Playwright 规格用的是 1440 × 1000 与 1100 × 820。
+- **跨任务读取画布**：Safari 运行器没有覆盖的夹具中，仍有在渲染任务之后读取 WebGPU 画布的写法（例如 `world-query-scene.ts` 的 `pictureEqual`）。在 Safari 26.6.2 中，这类读取会得到空白图。
+- **Playwright WebKit 不是 Safari**：两者版本不同（27.2 与 26.6.2），也只有 WebKit 报告 subgroups 适配器特性。WebKit 的完整回归不能代替 Safari 的完整回归。
+- **其他**：
+  - 所有 WebKit 与 Safari 计时只作诊断。
+  - WebKit 只在无头模式运行，Safari 只在可见窗口中运行。
+  - 真实驱动崩溃引起的设备丢失在三个浏览器中都没有覆盖。
 
 ## 验证入口
 
 - npm run check：TypeScript、Vitest 数学/几何/OBJ/材质/纹理/物理/场景测试、生产构建。
 - npm run test:browser：WebGPU 编译、渲染、共享形变、材质遮罩/阴影覆盖、纹理、重置、尺寸变化、实例操作与错误路径；包含材质程序在 Compute 中的显式 LOD 数值对照。
+- `PLAYWRIGHT_BROWSER=webkit PLAYWRIGHT_GPU=hardware npm run test:browser`：在 Playwright WebKit 中运行同一套浏览器回归，结果只作兼容性参考。
+- `node scripts/safari-webdriver.mjs --out <目录>`：在 Safari 中允许远程自动化后，经 safaridriver 运行 15 项引擎检查。
 - 运行页的 GPU 验证按钮：显式读回每批第一实例的全部顶点，对照 CPU 当前/前帧位置及法线，误差门槛为 0.0002；还要求当前顶点全部位于保守包围盒内。
 - 运行页导出 JSON：记录本次环境与诊断；不等同完整 benchmark 报告。
 
@@ -3648,7 +3797,7 @@ SwiftShader 使用同一命令，去掉三个 GPU 相关变量。
 #### 失败、限制与未完成
 
 - **未执行**：30 分钟运行与无干扰的验收计时，需要在主机空闲的窗口运行。
-- **未在目标机运行**：headed 模式，以及 Safari 和 Playwright WebKit 的完整回归。两者目前只有冒烟探测（见「Safari 与 WebKit」）。
+- **未在目标机运行**：headed 模式。Playwright WebKit 的完整回归与 Safari 运行器的结果见「Safari 与 Playwright WebKit 回归（2026-11-01）」，Safari 只覆盖规格断言的子集。
 - **节奏分组**只说明相关。负载均值是整机指标，不能区分 GPU 争用。
 - **矩阵**中的数值为转录，只反映截至 `evidenceMain` 的证据。
 - **SwiftShader 偶发失败**：此前 `raster-receivers` 出现过一次 `Execution context was destroyed`（`artifacts/phase1-apple-triage-20261030/fix-b-swiftshader.log`），单独重跑和第二次完整运行都通过。Playwright 的 webServer 没有转接 stdout，Vite 的依赖重载提示不会写进测试日志，所以这份日志既不能证实也不能排除「依赖预构建触发重载」的假设。要验证，可以在 webServer 上设 `stdout: 'pipe'` 后复现。

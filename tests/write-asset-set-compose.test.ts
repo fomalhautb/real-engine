@@ -104,10 +104,11 @@ describe('write-asset-set compose mode', () => {
           cameraPath: { url: '/artifacts/main-set/camera-path.json', sha256: sha256(camera), samples: 2, durationSeconds: 2 } },
         license: { file: 'credits_license.txt', bytes: NOTICE.length, sha256: sha256(NOTICE) },
         omitted: [{ meshIndex: 1, primitiveIndex: 0, materialIndex: 1, coverage: 'blend', route: 'source' }] });
-      // Single-source readers keep accepting single sets (the scene roots; the fine query root is read elsewhere).
+      // Single-source readers keep accepting single sets, with the fine query root and the recorded manifest hashes.
       vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(single))));
-      const { fineQueryRoot: _fineQueryRoot, ...sceneRoots } = single.roots;
-      await expect(loadAssetSetRoots('/artifacts/main-set/asset-set.json')).resolves.toEqual(sceneRoots);
+      await expect(loadAssetSetRoots('/artifacts/main-set/asset-set.json')).resolves.toEqual({ ...single.roots,
+        manifestSha256: { geometry: single.packages.geometry.manifestSha256, textures: single.packages.textures.manifestSha256,
+          fineQuery: single.packages.fineQuery.manifestSha256 } });
 
       const compose = ['--compose', 'main=' + mainSet, '--compose', 'ivy=' + ivySet, '--name', 'test-composed',
         '--license', join(root, 'inputs', 'credits_license.txt'), '--artifacts-root', root];

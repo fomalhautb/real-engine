@@ -43,6 +43,7 @@ import { subscribeGpuDeviceLoss } from './gpu-device-loss';
 import { createTimestampQuerySet, timestampSpanEnd, timestampSpanStart } from './gpu-timestamp-span';
 import { GpuLocalLights, localLightsShaderSource } from './gpu-local-lights';
 import { resolveLocalLightOptions, type LocalLightDescriptor, type LocalLightHandle, type LocalLightOptions, type ResolvedLocalLight } from './local-lights';
+import { projectionScale, resolveCameraProjection, type CameraProjection, type CameraProjectionOptions } from './camera-projection';
 
 type Previous = { model: Mat4; bones: Mat4[]; scalars: number[]; version: number; generation: number; source?: InstanceState; settled: boolean };
 function differsF32(values: ArrayLike<number>, old: ArrayLike<number>, offset = 0, length = values.length): boolean {
@@ -123,6 +124,9 @@ export interface RendererOptions {
   occlusion?: OcclusionOptions;
   /** Bounded point/spot lights with a budgeted shadow atlas; disabled when omitted. */
   localLights?: LocalLightOptions;
+  /** Main-view perspective, also used for LOD error, texture demand, fog and reflections.
+   * Validated and bounded; defaults to vertical FOV π/3.2, near 0.1, far 150. */
+  projection?: CameraProjectionOptions;
 }
 
 export interface RendererAdapterInfo {
@@ -165,6 +169,8 @@ export class Renderer {
   private queryResolve?: GPUBuffer;
   private queryRead?: GPUBuffer;
   private readonly timestampCount: number;
+  /** Validated main-view projection, fixed for the renderer's lifetime. */
+  readonly projection: CameraProjection;
   private timingPending = false;
   private disposed = false;
   private gatherDiagnosticPending = false;
@@ -216,6 +222,7 @@ export class Renderer {
     if (options.antiAliasing !== undefined && options.antiAliasing !== 'none' && options.antiAliasing !== 'fxaa') throw new Error('INVALID_ANTI_ALIASING');
     resolveSunShadowOptions(options.sunShadow);
     if (options.localLights) resolveLocalLightOptions(options.localLights);
+    resolveCameraProjection(options.projection);
     if (options.volumetricFog && resolveVolumetricFogOptions(options.volumetricFog).airLighting && !options.diffuseGi) {
       throw new Error('FOG_AIR_LIGHTING_REQUIRES_DIFFUSE_GI');
     }
@@ -311,6 +318,7 @@ export class Renderer {
     this.frameBuffer = this.buffer('frame uniforms', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.exposureBuffer = this.buffer('exposure uniforms', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     this.antiAliasing = options.antiAliasing ?? 'none';
+    this.projection = resolveCameraProjection(options.projection);
     this.setExposure(0);
     this.sunShadowOptions = resolveSunShadowOptions(options.sunShadow, device.limits.maxTextureDimension2D);
     const shadowResolution = this.sunShadowOptions.resolution;
@@ -1313,7 +1321,7 @@ export class Renderer {
     const length = Math.hypot(...target.map((value, axis) => value - eye[axis]));
     const forward = target.map((value, axis) => (value - eye[axis]) / length);
     const demands = new Map<PreparedTextureAsset, { source: PreparedTextureAsset; mip: number; priority: number }>();
-    const focalPixels = this.stats.height / (2 * Math.tan(Math.PI / 6.4));
+    const focalPixels = projectionScale(this.projection, this.stats.height);
     for (const batch of this.batches) {
       const sources = new Set(batch.material.program.textureSlots.map(slot => streaming.source(batch.textureInputs[slot])).filter(source => source !== undefined));
       if (!sources.size) continue;
@@ -1349,7 +1357,8 @@ export class Renderer {
     this.worldQueries?.validateSources();
     this.geometryLod?.validateSources();
     for (const batch of this.batches) this.upload(batch);
-    const vp = multiply(perspective(Math.PI / 3.2, this.stats.width / this.stats.height, 0.1, 150), lookAt(eye, target, [0, 1, 0]));
+    const { verticalFovRadians: fovY, near, far } = this.projection, lodScale = projectionScale(this.projection, this.stats.height);
+    const vp = multiply(perspective(fovY, this.stats.width / this.stats.height, near, far), lookAt(eye, target, [0, 1, 0]));
     this.stats.uploadedBytes += this.updateTextureStreaming(eye, target, vp);
     this.stats.uploadedBytes += this.worldQueries?.updateSnapshot(this.stats.frames + 1, this.materialRevision) ?? 0;
     if (this.surfaceReceivers) {
@@ -1372,10 +1381,10 @@ export class Renderer {
     this.device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
     // Before GI and fog, which compare the light set revision for history invalidation.
     this.stats.uploadedBytes += this.localLights?.update() ?? 0;
-    this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4))) ?? 0;
+    this.stats.uploadedBytes += this.geometryLod?.update(this.stats.frames + 1, vp, eye, lodScale) ?? 0;
     for (const batch of this.batches) if (batch.stream) {
       const count = batch.material.program.alphaMode === 'opaque' ? batch.scene.instances.length : 0;
-      this.stats.uploadedBytes += batch.stream.runtime.update(this.stats.frames + 1, count, vp, eye, this.stats.height / (2 * Math.tan(Math.PI / 6.4)));
+      this.stats.uploadedBytes += batch.stream.runtime.update(this.stats.frames + 1, count, vp, eye, lodScale);
       this.device.queue.writeBuffer(batch.stream.bindings.params, 0, new Uint32Array([batch.stream.runtime.selection.physicalVertexCount, count, 0, 0]));
       this.stats.uploadedBytes += 16;
     }
@@ -1398,14 +1407,14 @@ export class Renderer {
     // first so reflection history sees this frame's media revision.
     if (this.volumetricFog) {
       const fog = this.volumetricFog;
-      this.stats.uploadedBytes += fog.update(eye, target, Math.PI / 3.2, 0.1, 150,
+      this.stats.uploadedBytes += fog.update(eye, target, fovY, near, far,
         this.sunDirection, this.sunColor, this.lightMatrix, vp,
         { cameraCut: !this.lastViewProjection, sceneChanged: this.batches.some(batch => batch.fogSceneChanged), materialRevision: this.materialRevision,
           changedBounds: fog.localRejection ? this.batches.flatMap(batch => batch.fogChangedBounds) : null,
           shadowResolution: this.sunShadowOptions.resolution, lightRevision: this.localLights?.revision });
     }
     this.stats.uploadedBytes += this.reflections?.update({ frame: this.stats.frames + 1, materialRevision: this.materialRevision,
-      width: this.stats.width, height: this.stats.height, eye, target, fovY: Math.PI / 3.2, near: 0.1, far: 150,
+      width: this.stats.width, height: this.stats.height, eye, target, fovY, near, far,
       sunDirection: this.sunDirection, sunColor: this.sunColor, viewProjection: vp, previousViewProjection: this.lastViewProjection,
       sceneMotion: this.batches.some(batch => batch.dirty), historyRevision: this.worldQueries!.historyRevision }) ?? 0;
     this.lastViewProjection = vp;

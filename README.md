@@ -68,6 +68,8 @@ npm run dev
 
 `/gi.html` 展示世界空间漫反射 GI：红蓝墙面和发光条通过真实场景查询照亮白色物体，可切换单次/跨帧多次反弹（演示默认多次）、开关 GI、改变墙色及太阳参数、暂停逐帧、按 H 隐藏面板。引擎的 `diffuseGi.multiBounce` 默认 `false`，运行时用 `setDiffuseGiMultiBounce(boolean)` 切换，`invalidateDiffuseGiHistory()` 可显式丢弃旧反馈。探针使用 8×8 八面体方向距离矩和低置信度平滑权重；`visibilityWeightThreshold` 默认 0.2、设 0 可关闭额外曲线。固定网格仍每帧全量更新；无镜面反弹、时域平均、自动布点或探针流送。关闭 GI 时没有旧常量环境补光。
 
+2026-10-31 新增可选的 `DiffuseGiOptions.visibilityRefinement: 'grid-axis-neighbor'`：在原有八面体深度矩之外，给每个探针加沿六个网格轴的深度矩和朝相邻探针的可见性，用来抑制墙后接收点从墙外探针插值得到的漏光。它不增加射线和存储，只多一个有界 pass，默认关闭，默认输出逐位不变。联合漏光场景中，它与聚焦太阳阴影一起把黑箱与薄墙箱降到箱外的 0.52% 与 0.80%；细缝箱和 L01 稳态仍未通过。
+
 `/gi.html?finalGather=1` 额外开启实验性 Final Gather 预览，起始为固定镜头，持续渲染以积累近场样本；常规 `/gi.html` 保持世界探针路径。代码可通过 `DiffuseGiOptions.finalGather` 配置，并用 `setDiffuseGiFinalGatherEnabled(boolean)` 单独启停。普通镜头运动可将前帧原始锚点重投影；切镜头、动态几何或光照/材质突变仍保守地整体重置。此预览的近场误差和帧间隔仍有未通过门槛，见 [实现状态](docs/implementation.md#实验性屏幕-final-gather)。
 
 `/joint.html` 是 GI 联合动态验收场景的交互演示。场景包括两间相通的房间、天窗阳光、发光板、门、移动物体和三个漏光箱。可以切换相机和事件、full/scheduled 两种更新策略以及 GI 开关，并实时显示探针捕获数、陈旧度、查询数和 GPU GI 时间。联合验收中 L01 稳态与 L04 漏光尚未通过，此页不代表最终 GI 画质。

@@ -311,7 +311,7 @@ async function checkFrame(context: ReturnType<typeof makeContext>, label: string
     };
     evidence = { reference: encode(a, false), streamed: encode(b, true) };
   }
-  return { label, frame: streamed.stats.frames, settled, eye: eyeTarget.eye.map(value => +value.toFixed(3)), evidence, holeDiagnosis, radii,
+  return { label, frame: streamed.stats.frames, skippedRenders: context.skippedRenders, settled, eye: eyeTarget.eye.map(value => +value.toFixed(3)), evidence, holeDiagnosis, radii,
     coverage: { uncovered, overlapping, partialGroups }, edges: { boundaryEdges, repeatedEdges }, visibleClusters: visible, fallbackClusters: fallback, rootClusters: roots,
     drawnTriangles: triangles, cpuCutMismatches: settled ? cpuMismatches : null, mismatchExamples,
     projectedErrorBandPixels: +band.toFixed(3), predictedErrorBandPixels: +predicted.toFixed(3), nominalRadiusObjects: radii.filter(radius => radius === Math.ceil(1.5 * maxErrorPixels) + 2).length,
@@ -330,7 +330,8 @@ function makeContext(scene: StreamedGalleryScene, streamed: Renderer, reference:
     // Capacity migrations replace a runtime's pool and selection, not the runtime itself.
     scene, streamed, reference, maxErrorPixels, runtimes, evidenceBudget: 4, diagnosisBudget: 4,
     planners: scene.objects.map(object => new GeometryStreamCut(object.directory)),
-    current: { eye: [0, 1.65, 0] as Vec3, target: [0, 1.2, 6] as Vec3 },
+    // Pose of the last frame the streamed renderer drew, and renders skipped since.
+    current: { eye: [0, 1.65, 0] as Vec3, target: [0, 1.2, 6] as Vec3 }, skippedRenders: 0,
     view: (model: Float32Array): GeometryStreamView => ({ eye: context.current.eye, near: 0.1, maxErrorPixels,
       projectionScale: streamed.stats.height / (2 * Math.tan(Math.PI / 6.4)), model }),
   };
@@ -379,9 +380,12 @@ export async function runStreamedGalleryFixture(options: StreamedGalleryFixtureO
     const s = streamed;
     const pace = () => new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     const render = async (pose: { eye: Vec3; target: Vec3 }) => {
-      context.current = { eye: [...pose.eye], target: [...pose.target] };
-      s.render(context.current.eye, context.current.target);
+      const next: typeof context.current = { eye: [...pose.eye], target: [...pose.target] }, drawn = s.stats.frames;
+      s.render(next.eye, next.target);
       if (s.errors.length) throw new Error(s.errors.join('\n'));
+      // Under stream backpressure render() draws nothing and the HDR target keeps the
+      // last drawn frame, so checks compare against the pose that frame used.
+      if (s.stats.frames !== drawn) { context.current = next; context.skippedRenders = 0; } else context.skippedRenders++;
       await pace();
     };
     // Settle: idle admission, no outstanding pages or owners, and an unchanged

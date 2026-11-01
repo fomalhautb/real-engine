@@ -49,6 +49,7 @@ function textureSource(id: string, fill: number): TextureStreamSource {
     fallback: { kind: 'prepared', width: 4, height: 4, format: 'rgba8', colorSpace: 'linear', baseMipLevel: 1, levels },
     provider: async mip => new Uint8Array(mip.byteLength) };
 }
+const noMask = (): GltfPackageScene['mask'] => ({ primitives: 0, sourceVertices: 0, sourceTriangles: 0, triangles: 0, meshBytes: 0, sourceBufferBytes: 0, budget: null });
 /** A package scene as loadGltfPackageScene returns it: instances numbered from 1 per scene. */
 function packageScene(name: string, instancesPerBatch: number[], offset: number): GltfPackageScene {
   let entityId = 1;
@@ -60,8 +61,14 @@ function packageScene(name: string, instancesPerBatch: number[], offset: number)
     omitted: [{ mesh: 1, primitive: 0, material: 2, route: 'source', coverage: 'blend', nodes: [4], sourceTriangles: 12, reason: 'blend' }],
     conversions: [{ path: 'materials[0].pbrMetallicRoughness.roughnessFactor', before: 1.0000001, after: 1 }],
     unsupportedMaterialInputs: [{ path: 'materials[1].occlusionTexture', reason: 'not read' }],
-    sourceInstances: 10 * offset, pagedTriangles: 1000 * offset, omittedTriangles: 12, assetIdentity: sha256('identity-' + name) };
+    sourceInstances: 10 * offset, pagedTriangles: 1000 * offset, omittedTriangles: 12, mask: noMask(),
+    queryProxies: { root: `/artifacts/${name}-geometry/`, fine: false, maxError: null, primitives: 4, triangles: 100 * offset },
+    assetIdentity: sha256('identity-' + name) };
 }
+/** Two components named main and ivy, without fetching their sets. */
+const twoComponents = (): AssetComposition => ({ name: 'test-composed', cameraPath: null, components: ['main', 'ivy'].map(name => ({ name, setName: 'test-' + name,
+  assetSet: { url: `/artifacts/${name}-set/asset-set.json`, bytes: 1, sha256: sha256(name) }, sourceSha256: sha256('source-' + name),
+  roots: roots(name) as AssetComposition['components'][number]['roots'] })) });
 
 describe('glTF package composition', () => {
   beforeEach(() => { loadScene.mockReset(); });
@@ -150,14 +157,44 @@ describe('glTF package composition', () => {
       { component: 'ivy', path: 'materials[1].occlusionTexture', reason: 'not read' }]);
     expect(scene).toMatchObject({ sourceInstances: 60, pagedTriangles: 6000, omittedTriangles: 24 });
     expect(scene.components).toEqual([
-      { name: 'main', assetIdentity: sha256('identity-main'), batches: 2, sources: 2, firstEntityId: 1, entities: 3, sourceInstances: 10, pagedTriangles: 1000, omittedTriangles: 12 },
-      { name: 'ivy', assetIdentity: sha256('identity-ivy'), batches: 1, sources: 2, firstEntityId: 4, entities: 3, sourceInstances: 50, pagedTriangles: 5000, omittedTriangles: 12 }]);
+      { name: 'main', assetIdentity: sha256('identity-main'), batches: 2, sources: 2, firstEntityId: 1, entities: 3, sourceInstances: 10, pagedTriangles: 1000, omittedTriangles: 12,
+        mask: main.mask, queryProxies: main.queryProxies },
+      { name: 'ivy', assetIdentity: sha256('identity-ivy'), batches: 1, sources: 2, firstEntityId: 4, entities: 3, sourceInstances: 50, pagedTriangles: 5000, omittedTriangles: 12,
+        mask: ivy.mask, queryProxies: ivy.queryProxies }]);
+    expect(scene.mask).toEqual(noMask());
+  });
+
+  it('passes each component set\'s fine query root and manifest hashes to the package loader', async () => {
+    const ivy = set('ivy');
+    ivy.roots.fineQueryRoot = '/artifacts/ivy-query/';
+    ivy.packages = { geometry: { manifestSha256: sha256('geometry') }, fineQuery: { manifestSha256: sha256('query') } };
+    serve(published([set('main', true), ivy]));
+    const composition = await loadAssetComposition('/artifacts/composed/asset-set.json');
+    expect(composition.components.map(c => c.roots)).toEqual([roots('main', true), { ...roots('ivy'), fineQueryRoot: '/artifacts/ivy-query/',
+      manifestSha256: { geometry: sha256('geometry'), fineQuery: sha256('query') } }]);
+    ivy.packages.textures = { manifestSha256: 'not-a-hash' };
+    serve(published([set('main', true), ivy]));
+    await expect(loadAssetComposition('/artifacts/composed/asset-set.json')).rejects.toThrow('GLTF_COMPOSITION_COMPONENT_HASH: ivy textures');
+  });
+
+  it('counts the MASK geometry of all components against one budget', async () => {
+    const budget = { maxPrimitives: 10, maxVertices: 1000, maxTriangles: 500 }, left = { maxPrimitives: 7, maxVertices: 600, maxTriangles: 300 };
+    const main = { ...packageScene('main', [1], 1), mask: { primitives: 3, sourceVertices: 400, sourceTriangles: 200, triangles: 600, meshBytes: 9000, sourceBufferBytes: 7000, budget } };
+    const ivy = { ...packageScene('ivy', [1], 2), mask: { primitives: 1, sourceVertices: 100, sourceTriangles: 50, triangles: 50, meshBytes: 1000, sourceBufferBytes: 7000, budget: left } };
+    loadScene.mockResolvedValueOnce(main).mockResolvedValueOnce(ivy);
+    const scene = await loadComposedPackageScene(twoComponents(), { mask: budget });
+    // The second component may only use what the first one left.
+    expect(loadScene.mock.calls.map(([, options]) => options?.mask)).toEqual([budget, left]);
+    expect(scene.mask).toEqual({ primitives: 4, sourceVertices: 500, sourceTriangles: 250, triangles: 650, meshBytes: 10000, sourceBufferBytes: 14000, budget });
+    expect(scene.components.map(c => c.mask.primitives)).toEqual([3, 1]);
+    loadScene.mockReset();
+    loadScene.mockResolvedValueOnce(packageScene('main', [1], 1)).mockResolvedValueOnce(packageScene('ivy', [1], 2));
+    await loadComposedPackageScene(twoComponents(), { mask: false });
+    expect(loadScene.mock.calls.map(([, options]) => options?.mask)).toEqual([false, false]);
   });
 
   it('keeps the batch budget for the whole composition and rejects repeated assets or aborted loads', async () => {
-    const composition: AssetComposition = { name: 'test-composed', cameraPath: null, components: ['main', 'ivy'].map(name => ({ name, setName: 'test-' + name,
-      assetSet: { url: `/artifacts/${name}-set/asset-set.json`, bytes: 1, sha256: sha256(name) }, sourceSha256: sha256('source-' + name),
-      roots: roots(name) as AssetComposition['components'][number]['roots'] })) };
+    const composition = twoComponents();
     loadScene.mockResolvedValueOnce(packageScene('main', [1, 1], 1));
     await expect(loadComposedPackageScene(composition, { maxBatches: 2 })).rejects.toThrow('GLTF_COMPOSITION_BATCH_BUDGET');
     expect(loadScene).toHaveBeenCalledTimes(1);

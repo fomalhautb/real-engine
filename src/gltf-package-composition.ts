@@ -7,10 +7,14 @@
  * scene prefixes batch names and texture source ids with the component name,
  * renumbers entity ids so they stay unique across components, and tags
  * omitted primitives, conversions and unsupported inputs with their component.
+ * Full-detail MASK geometry of all components counts against one MASK budget.
  * Components get no extra transform. Loading creates no GPU resources.
  */
-import type { StreamedSceneBatch } from './contracts';
-import { loadGltfPackageScene, type GltfPackageRoots, type GltfPackageSceneOptions, type OmittedPrimitive } from './gltf-package-scene';
+import type { SceneBatch, StreamedSceneBatch } from './contracts';
+import {
+  loadGltfPackageScene, type GltfPackageMaskBudget, type GltfPackageMaskSummary, type GltfPackageRoots, type GltfPackageScene,
+  type GltfPackageSceneOptions, type OmittedPrimitive,
+} from './gltf-package-scene';
 import { validateTextureStreamSource } from './texture-stream-source';
 import type { TextureStreamSource } from './texture-stream-types';
 
@@ -47,7 +51,8 @@ export interface ComposedPackageSceneOptions extends Omit<GltfPackageSceneOption
 }
 
 export interface ComposedPackageScene {
-  batches: StreamedSceneBatch[];
+  /** Streamed (paged) batches and full-detail MASK batches of all components, in composition order. */
+  batches: (StreamedSceneBatch | SceneBatch)[];
   /** Texture sources with ids `<component>/<source id>`; fallback identities are unchanged. */
   sources: TextureStreamSource[];
   bounds: { min: [number, number, number]; max: [number, number, number] };
@@ -55,12 +60,15 @@ export interface ComposedPackageScene {
   conversions: { component: string; path: string; before: number; after: number }[];
   unsupportedMaterialInputs: { component: string; path: string; reason: string }[];
   components: { name: string; assetIdentity: string; batches: number; sources: number; firstEntityId: number; entities: number;
-    sourceInstances: number; pagedTriangles: number; omittedTriangles: number }[];
+    sourceInstances: number; pagedTriangles: number; omittedTriangles: number; mask: GltfPackageMaskSummary;
+    queryProxies: GltfPackageScene['queryProxies'] }[];
   sourceInstances: number;
   /** Instance-expanded triangles of the streamed (paged) batches of all components. */
   pagedTriangles: number;
   /** Instance-expanded triangles of omitted primitives of all components. */
   omittedTriangles: number;
+  /** MASK geometry of all components; `budget` is the one budget they share (null when MASK primitives are omitted). */
+  mask: GltfPackageMaskSummary;
 }
 
 function localPath(value: unknown, label: string, directory: boolean): string {
@@ -134,6 +142,12 @@ export async function loadAssetComposition(url: string, signal?: AbortSignal): P
       uvAuditUrl: localPath(set.roots.uvAuditUrl, name + ' uvAuditUrl', false),
     };
     if (set.roots.cameraPathUrl !== undefined) roots.cameraPathUrl = localPath(set.roots.cameraPathUrl, name + ' cameraPathUrl', false);
+    if (set.roots.fineQueryRoot !== undefined) roots.fineQueryRoot = localPath(set.roots.fineQueryRoot, name + ' fineQueryRoot', true);
+    // Manifest hashes recorded by the component set; loadGltfPackageScene checks each fetched manifest against them.
+    const hashes = Object.entries({ geometry: set.packages?.geometry?.manifestSha256, textures: set.packages?.textures?.manifestSha256,
+      fineQuery: set.packages?.fineQuery?.manifestSha256 }).filter(([, value]) => value !== undefined);
+    for (const [kind, value] of hashes) if (typeof value !== 'string' || !SHA256.test(value)) throw new Error(`GLTF_COMPOSITION_COMPONENT_HASH: ${name} ${kind}`);
+    if (hashes.length) roots.manifestSha256 = Object.fromEntries(hashes);
     components.push({ name, setName: String(set.name), assetSet: { url: setUrl, bytes: record.bytes, sha256: record.sha256 }, sourceSha256, roots });
   }
   let cameraPath: AssetComposition['cameraPath'] = null;
@@ -153,7 +167,10 @@ export async function loadComposedPackageScene(composition: AssetComposition, op
   if (!Number.isSafeInteger(maxBatches) || maxBatches < 1) throw new Error('GLTF_COMPOSITION_BATCH_BUDGET');
   if (!composition.components.length || composition.components.length > ASSET_COMPOSITION_LIMITS.components) throw new Error('GLTF_COMPOSITION_COMPONENT_COUNT');
   const result: ComposedPackageScene = { batches: [], sources: [], bounds: { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] },
-    omitted: [], conversions: [], unsupportedMaterialInputs: [], components: [], sourceInstances: 0, pagedTriangles: 0, omittedTriangles: 0 };
+    omitted: [], conversions: [], unsupportedMaterialInputs: [], components: [], sourceInstances: 0, pagedTriangles: 0, omittedTriangles: 0,
+    mask: { primitives: 0, sourceVertices: 0, sourceTriangles: 0, triangles: 0, meshBytes: 0, sourceBufferBytes: 0, budget: null } };
+  // One MASK budget covers the composition: each component may use what the earlier components left.
+  let mask: GltfPackageMaskBudget | false | undefined = options.mask;
   const names = new Set<string>(), identities = new Set<string>();
   let nextEntityId = 1;
   for (const component of composition.components) {
@@ -163,7 +180,7 @@ export async function loadComposedPackageScene(composition: AssetComposition, op
     const remaining = maxBatches - result.batches.length;
     if (remaining < 1) throw new Error('GLTF_COMPOSITION_BATCH_BUDGET');
     const scene = await loadGltfPackageScene(component.roots, { anisotropy: options.anisotropy, signal, name: `${prefix}/${component.name}`,
-      maxBatches: remaining, progress: (phase, data) => progress(phase, { component: component.name, data }) });
+      maxBatches: remaining, mask, progress: (phase, data) => progress(phase, { component: component.name, data }) });
     if (identities.has(scene.assetIdentity)) throw new Error('GLTF_COMPOSITION_DUPLICATE_ASSET: ' + component.name);
     identities.add(scene.assetIdentity);
     // Each component numbers its instances from 1; shift them past the previous components.
@@ -189,8 +206,16 @@ export async function loadComposedPackageScene(composition: AssetComposition, op
     for (const entry of scene.omitted) result.omitted.push({ component: component.name, ...entry });
     for (const entry of scene.conversions) result.conversions.push({ component: component.name, ...entry });
     for (const entry of scene.unsupportedMaterialInputs) result.unsupportedMaterialInputs.push({ component: component.name, ...entry });
+    const used = scene.mask;
+    if (used.budget) {
+      result.mask.budget ??= used.budget;
+      mask = { maxPrimitives: used.budget.maxPrimitives - used.primitives, maxVertices: used.budget.maxVertices - used.sourceVertices,
+        maxTriangles: used.budget.maxTriangles - used.sourceTriangles };
+    }
+    for (const key of ['primitives', 'sourceVertices', 'sourceTriangles', 'triangles', 'meshBytes', 'sourceBufferBytes'] as const) result.mask[key] += used[key];
     result.components.push({ name: component.name, assetIdentity: scene.assetIdentity, batches: scene.batches.length, sources: scene.sources.length,
-      firstEntityId, entities: last - offset, sourceInstances: scene.sourceInstances, pagedTriangles: scene.pagedTriangles, omittedTriangles: scene.omittedTriangles });
+      firstEntityId, entities: last - offset, sourceInstances: scene.sourceInstances, pagedTriangles: scene.pagedTriangles, omittedTriangles: scene.omittedTriangles,
+      mask: used, queryProxies: scene.queryProxies });
     result.sourceInstances += scene.sourceInstances;
     result.pagedTriangles += scene.pagedTriangles;
     result.omittedTriangles += scene.omittedTriangles;

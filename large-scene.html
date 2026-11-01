@@ -46,17 +46,34 @@
         <input id="lod-error" type="range" min="0.5" max="8" step="0.5" value="2" />
         <span id="lod-error-value">2 px</span>
       </div>
+      <div class="row" aria-label="光照">
+        <label><input id="light-gi" type="checkbox" disabled /> GI</label>
+        <label><input id="light-reflections" type="checkbox" disabled /> 反射</label>
+        <label><input id="light-fog" type="checkbox" disabled /> 雾</label>
+        <label><input id="light-airLighting" type="checkbox" disabled /> 雾中 GI</label>
+      </div>
+      <div class="row">
+        <label for="sun-elevation">太阳高度</label>
+        <input id="sun-elevation" type="range" min="2" max="90" step="1" value="58" />
+        <label for="sun-azimuth">方位</label>
+        <input id="sun-azimuth" type="range" min="0" max="359" step="1" value="49" />
+      </div>
       <dl>
         <dt>adapter</dt><dd id="adapter">—</dd>
         <dt>batches</dt><dd id="batches">—</dd>
-        <dt>paged triangles</dt><dd id="triangles">—</dd>
+        <dt>triangles</dt><dd id="triangles">—</dd>
         <dt>omitted</dt><dd id="omitted">—</dd>
+        <dt>projection</dt><dd id="projection">—</dd>
+        <dt>shadow/query</dt><dd id="queries">—</dd>
+        <dt>lighting budget</dt><dd id="lighting">—</dd>
+        <dt>geometry budget</dt><dd id="geometry">—</dd>
         <dt>frame</dt><dd id="frame">—</dd>
         <dt>CPU frame interval</dt><dd id="interval">—</dd>
+        <dt>GPU passes</dt><dd id="gpu">—</dd>
         <dt>owned GPU memory</dt><dd id="memory">—</dd>
         <dt>camera time</dt><dd id="time">—</dd>
       </dl>
-      <p style="margin-top:8px">H 隐藏界面 · 帧间隔为浏览器 rAF 间隔，仅供诊断，不是基准结果。</p>
+      <p style="margin-top:8px">H 隐藏界面 · 帧间隔与 GPU pass 时间戳仅供诊断（共享 GPU），不是基准结果。</p>
       <div id="error" role="alert" hidden></div>
     </aside>
     <script type="module" src="/src/large-scene-demo.ts"></script>

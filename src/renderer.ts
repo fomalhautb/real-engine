@@ -373,8 +373,10 @@ export class Renderer {
   private releaseBuffer(buffer: GPUBuffer): void {
     const index = this.buffers.indexOf(buffer);
     if (index < 0) return;
+    // WebKit reports size 0 once a buffer is destroyed, so the ledger reads it first.
+    const size = buffer.size;
     this.buffers.splice(index, 1); buffer.destroy();
-    if (!this.disposed) this.stats.ownedGpuBytes -= buffer.size;
+    if (!this.disposed) this.stats.ownedGpuBytes -= size;
   }
 
   private async initialize(format: GPUTextureFormat, scene: RenderBatch[]): Promise<void> {

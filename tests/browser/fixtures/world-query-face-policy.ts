@@ -137,7 +137,7 @@ export async function runWorldQueryFacePolicyFixture(sceneBvh = false) {
       diagnostics: query.diagnostics(), cleanup, errors };
   } finally {
     query?.dispose(); materials?.dispose();
-    for (const buffer of buffers) { buffer.destroy(); account(-buffer.size); }
+    for (const buffer of buffers) { account(-buffer.size); buffer.destroy(); }
     cleanup.ownedBytesAfterDispose = ownedBytes;
     device.destroy();
     if (ownedBytes !== 0) throw new Error('WORLD_QUERY_FACE_POLICY_RESOURCE_LEAK');

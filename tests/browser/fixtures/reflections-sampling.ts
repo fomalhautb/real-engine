@@ -91,7 +91,7 @@ export async function runReflectionSamplingFixture() {
   } finally {
     try { validationError = String((await device.popErrorScope())?.message ?? ''); }
     finally {
-      for (const buffer of buffers) { buffer.destroy(); ownedBytes -= buffer.size; }
+      for (const buffer of buffers) { ownedBytes -= buffer.size; buffer.destroy(); }
       device.destroy();
     }
   }

@@ -134,7 +134,7 @@ export async function runGiSupplementalCacheValuesFixture() {
   } finally {
     try { validationError = String((await device.popErrorScope())?.message ?? ''); }
     finally { for (const buffer of buffers) { if (buffer.mapState === 'mapped') buffer.unmap();
-      buffer.destroy(); ownedBytes -= buffer.size; } device.destroy(); }
+      ownedBytes -= buffer.size; buffer.destroy(); } device.destroy(); }
   }
   return { ordinary, reset, adapter: { vendor: adapter.info.vendor, architecture: adapter.info.architecture,
     isFallbackAdapter: adapter.info.isFallbackAdapter }, errors, validationError, ownedBytes };

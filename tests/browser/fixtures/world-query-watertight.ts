@@ -188,7 +188,7 @@ export async function runWorldQueryWatertightFixture() {
   } finally {
     for (const query of queries) query.dispose();
     materials.dispose();
-    for (const created of owned) { created.destroy(); account(-created.size); }
+    for (const created of owned) { account(-created.size); created.destroy(); }
     cleanup.ownedBytesAfterDispose = ownedBytes;
     device.destroy();
   }

@@ -94,12 +94,12 @@ async function setup(device: GPUDevice, options: WorldQueryOptions, sceneBvh: bo
     const readyQuery = query, readyBuffers = buffers;
     return { query: readyQuery, scene, names, getOwnedBytes: () => ownedBytes,
       dispose: () => { readyQuery.dispose(); materials.dispose();
-        readyBuffers.output.destroy(); readyBuffers.instances.destroy();
-        account(-readyBuffers.output.size - readyBuffers.instances.size); } };
+        account(-readyBuffers.output.size - readyBuffers.instances.size);
+        readyBuffers.output.destroy(); readyBuffers.instances.destroy(); } };
   } catch (error) {
     query?.dispose(); materials.dispose();
-    if (buffers) { buffers.output.destroy(); buffers.instances.destroy();
-      account(-buffers.output.size - buffers.instances.size); }
+    if (buffers) { account(-buffers.output.size - buffers.instances.size);
+      buffers.output.destroy(); buffers.instances.destroy(); }
     throw error;
   }
 }

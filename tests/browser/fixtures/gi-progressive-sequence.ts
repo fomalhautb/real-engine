@@ -141,7 +141,7 @@ export async function runProgressiveSequenceFixture() {
     }
   } finally {
     try { validationError = String((await device.popErrorScope())?.message ?? ''); }
-    finally { for (const b of buffers) { if (b.mapState === 'mapped') b.unmap(); b.destroy(); ownedBytes -= b.size; } device.destroy(); }
+    finally { for (const b of buffers) { if (b.mapState === 'mapped') b.unmap(); ownedBytes -= b.size; b.destroy(); } device.destroy(); }
   }
   return { rows, recovery, errors, validationError, ownedBytes, adapter: { vendor: adapter.info.vendor,
     architecture: adapter.info.architecture, isFallbackAdapter: adapter.info.isFallbackAdapter } };

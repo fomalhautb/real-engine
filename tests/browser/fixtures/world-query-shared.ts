@@ -361,7 +361,7 @@ export async function runWorldQuerySharedParityFixture() {
   } finally {
     for (const { query } of queries) query.dispose();
     materials.dispose();
-    for (const buffer of buffers) { buffer.destroy(); account(-buffer.size); }
+    for (const buffer of buffers) { account(-buffer.size); buffer.destroy(); }
     cleanup.ownedBytesAfterDispose = ownedBytes;
     device.destroy();
   }

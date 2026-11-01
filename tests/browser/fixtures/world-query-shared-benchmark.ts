@@ -101,7 +101,7 @@ export async function runWorldQuerySharedBenchmark(settings: SharedBenchmarkSett
     if (source) { new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(source)); buffer.unmap(); }
     return buffer;
   };
-  const release = (owned: GPUBuffer[]) => { for (const buffer of owned) { buffer.destroy(); account(-buffer.size); buffers.splice(buffers.indexOf(buffer), 1); } };
+  const release = (owned: GPUBuffer[]) => { for (const buffer of owned) { account(-buffer.size); buffer.destroy(); buffers.splice(buffers.indexOf(buffer), 1); } };
   // Slots 0-1 time a single span (refits, builds, a one-query trace); with K queries the
   // first query carries 0-1 and the last 2-3, and the interval is slot 3 minus slot 0.
   const querySet = createTimestampQuerySet(device, 4, 'shared query benchmark timestamps');
@@ -379,7 +379,7 @@ export async function runWorldQuerySharedBenchmark(settings: SharedBenchmarkSett
         results.push({ scene: sceneSettings, triangles: sceneSettings.batches * sceneSettings.instances * sceneSettings.triangles,
           refit, parity, timing, diagnostics, sdf, sdfSkipped });
       } finally {
-        for (const arm of sdfArms.splice(0)) { arm.udf.dispose(); account(-arm.udf.ownedBytes); }
+        for (const arm of sdfArms.splice(0)) { account(-arm.udf.ownedBytes); arm.udf.dispose(); }
         for (const { query } of queries) query.dispose();
         materials.dispose();
         release(owned);

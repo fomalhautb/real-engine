@@ -170,7 +170,7 @@ export async function runGiVarianceHistoryFixture() {
       compacted: { sourceSlot, targetSlot, mapRank, recovered, withoutMap, rejected } };
   } finally {
     try { validationError = String((await device.popErrorScope())?.message ?? ''); }
-    finally { for (const buffer of buffers) { buffer.destroy(); ownedBytes -= buffer.size; } device.destroy(); }
+    finally { for (const buffer of buffers) { ownedBytes -= buffer.size; buffer.destroy(); } device.destroy(); }
   }
   return { ...result!, errors, validationError, ownedBytes };
 }

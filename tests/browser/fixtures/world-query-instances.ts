@@ -104,8 +104,10 @@ function queryDiagnostics(renderer: Renderer): QueryDiagnostics {
   if (!result) throw new Error('INSTANCE_BVH_QUERY_DIAGNOSTICS_MISSING');
   return result;
 }
-async function capture(accelerated: Renderer, linear: Renderer, rays: WorldRay[]): Promise<Stage> {
+async function capture(accelerated: Renderer, linear: Renderer, rays: WorldRay[],
+  onRendered?: () => void): Promise<Stage> {
   accelerated.render(CAMERA, TARGET); linear.render(CAMERA, TARGET);
+  onRendered?.();
   const a = await accelerated.traceRays(rays), b = await linear.traceRays(rays);
   return { accelerated: a, linear: b,
     acceleratedDiagnostics: queryDiagnostics(accelerated), linearDiagnostics: queryDiagnostics(linear) };
@@ -113,9 +115,10 @@ async function capture(accelerated: Renderer, linear: Renderer, rays: WorldRay[]
 async function rejection(operation: () => Promise<unknown>): Promise<string> {
   try { await operation(); return ''; } catch (error) { return String(error); }
 }
-async function stillImage(canvas: HTMLCanvasElement): Promise<{ image: HTMLImageElement; visiblePixels: number }> {
+async function stillImage(canvas: HTMLCanvasElement, png = canvas.toDataURL('image/png')):
+  Promise<{ image: HTMLImageElement; visiblePixels: number }> {
   const image = document.createElement('img');
-  image.src = canvas.toDataURL('image/png');
+  image.src = png;
   await image.decode();
   const check = document.createElement('canvas'); check.width = canvas.width; check.height = canvas.height;
   const context = check.getContext('2d')!; context.drawImage(image, 0, 0);
@@ -155,14 +158,19 @@ export async function runWorldQueryInstancesFixture() {
       worldQueries: { ...query, instanceAcceleration: 'bvh' }, diffuseGi: gi });
     linear = await Renderer.create(linearCanvas, [linearScene], {
       worldQueries: { ...query, instanceAcceleration: 'linear' }, diffuseGi: gi });
-    const initial = await capture(accelerated, linear, initialRays());
+    // Safari 26.6 returns a blank image from toDataURL() of a WebGPU canvas after the rendering
+    // task has ended and before the next rendering update, so the pictures are read in that task.
+    let initialPictures = ['', ''];
+    const initial = await capture(accelerated, linear, initialRays(), () => {
+      initialPictures = [acceleratedCanvas.toDataURL('image/png'), linearCanvas.toDataURL('image/png')];
+    });
     const tieWitness = await accelerated.traceRays([
       rayFor(OVERLAP_SECOND, false, { entityId: OVERLAP_SECOND, generation: 1 }),
       rayFor(OVERLAP_SECOND, false, { entityId: OVERLAP_FIRST, generation: 1 }),
     ]);
-    const pictureEqual = acceleratedCanvas.toDataURL('image/png') === linearCanvas.toDataURL('image/png');
-    const initialVisiblePixels = (await Promise.all([stillImage(acceleratedCanvas), stillImage(linearCanvas)]))
-      .map(snapshot => snapshot.visiblePixels);
+    const pictureEqual = initialPictures[0] === initialPictures[1];
+    const initialVisiblePixels = (await Promise.all([stillImage(acceleratedCanvas, initialPictures[0]),
+      stillImage(linearCanvas, initialPictures[1])])).map(snapshot => snapshot.visiblePixels);
     const acceleratedGi = await accelerated.probeDiffuseGi(), linearGi = await linear.probeDiffuseGi();
     accelerated.setDiffuseGiEnabled(false); linear.setDiffuseGiEnabled(false);
 

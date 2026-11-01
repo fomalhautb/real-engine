@@ -6,11 +6,12 @@ import { describe, expect, it } from 'vitest';
 interface Row {
   id: string; kind: string; priority: string; phase: number; status: string; qualityGate: string[]; performanceBudget: string[];
   gateResults: Record<string, string>; unsupportedCapabilities: string[]; targetEvidence: { ref: string, specs: string[], gates: string[] }[];
-  historicalEvidence: { ref: string }[];
+  historicalEvidence: { ref: string }[]; compatibilityEvidence?: { ref: string, specs: string[] }[];
 }
 interface Matrix {
   version: number; targetHardware: { adapter: string }; globalGates: { id: string, item: string, check: string }[];
-  evidence: Record<string, { scope: string, adapter: string, kind: string }>; rows: Row[];
+  browsers: { id: string, role: string, adapter: string, evidence?: string[] }[];
+  evidence: Record<string, { scope: string, adapter: string, kind: string, browserId?: string }>; rows: Row[];
 }
 interface Docs { benchmarks: string, roadmap: string, fileExists: (path: string) => boolean }
 
@@ -67,6 +68,32 @@ describe('capability matrix', () => {
     const unmet = copy();
     row(unmet, 'F01').gateResults = { ...row(unmet, 'F01').gateResults, functional: 'unmet' };
     expect(validateMatrix(unmet, docs)).toContain('F01: status partial does not match derived fail');
+  });
+
+  it('keeps candidate-browser results as compatibility evidence that never counts for the target', () => {
+    const base = copy();
+    base.evidence.webkit = { scope: 'compatibility', browserId: 'playwright-webkit', adapter: 'apple / apple', kind: 'functional' };
+    expect(validateMatrix(base, docs)).toEqual([]);
+    const relabelled = structuredClone(base);
+    relabelled.evidence.webkit.adapter = 'apple / metal-3';
+    expect(validateMatrix(relabelled, docs)).toEqual(expect.arrayContaining([
+      'evidence webkit: adapter must be apple / apple as browser playwright-webkit reports it',
+      'evidence webkit: compatibility evidence must not use the target adapter']));
+    const targetBrowser = structuredClone(base);
+    targetBrowser.evidence.webkit.browserId = 'chrome-macos-apple';
+    expect(validateMatrix(targetBrowser, docs)).toContain('evidence webkit: compatibility evidence must name a candidate or functional-only browser');
+    const promoted = structuredClone(base);
+    row(promoted, 'P1-runtime').targetEvidence.push({ ref: 'webkit', specs: [], gates: ['functional'] });
+    expect(validateMatrix(promoted, docs)).toContain('P1-runtime: target evidence webkit is not a target record');
+    const misfiled = structuredClone(base);
+    row(misfiled, 'P1-runtime').compatibilityEvidence = [{ ref: 'apple-main-suite-20261031', specs: [] }];
+    expect(validateMatrix(misfiled, docs)).toContain('P1-runtime: compatibility evidence apple-main-suite-20261031 is not a compatibility record');
+    const crossed = structuredClone(base);
+    crossed.browsers.find(entry => entry.id === 'safari-26-macos')!.evidence = ['webkit'];
+    expect(validateMatrix(crossed, docs)).toContain('browser safari-26-macos: evidence webkit is not a compatibility record of this browser');
+    const untested = structuredClone(base.rows.find(entry => entry.status === 'untested')!);
+    untested.compatibilityEvidence = [{ ref: 'webkit', specs: [] }];
+    expect(deriveStatus(untested, base.evidence)).toBe('untested');
   });
 
   it('needs uncontended acceptance timing before a row with a budget can pass', () => {

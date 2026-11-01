@@ -9,6 +9,10 @@ import { fileURLToPath } from 'node:url';
 const STATUSES = ['pass', 'fail', 'unsupported', 'partial', 'untested'];
 const GATE_RESULTS = ['met', 'unmet', 'partly-measured', 'not-measured'];
 const EVIDENCE_KINDS = ['functional', 'quality', 'long-run', 'diagnostic-timing', 'acceptance-timing'];
+// target: the target adapter in the target browser; historical: earlier hardware; compatibility: a
+// candidate or functional-only browser entry. Only target evidence supports gate results or status.
+const EVIDENCE_SCOPES = ['target', 'historical', 'compatibility'];
+const COMPATIBILITY_ROLES = ['candidate', 'functional-only'];
 const ROW_FIELDS = ['id', 'kind', 'subsystem', 'priority', 'phase', 'basis', 'inputScale', 'correctnessReference', 'qualityGate',
   'performanceBudget', 'compatibleCombinations', 'gateResults', 'unsupportedCapabilities', 'status', 'statusReason', 'targetEvidence',
   'historicalEvidence', 'limitations'];
@@ -87,11 +91,23 @@ export function validateMatrix(matrix, { benchmarks, roadmap, fileExists }) {
   }
 
   const evidence = matrix.evidence ?? {};
+  const browsers = new Map((matrix.browsers ?? []).map(entry => [entry.id, entry]));
   for (const [key, record] of Object.entries(evidence)) {
     if (record.scope === 'target' && record.adapter !== target) fail(`evidence ${key}: target evidence must come from ${target}`);
     if (record.scope === 'historical' && record.adapter === target) fail(`evidence ${key}: historical evidence must not use the target adapter`);
-    if (record.scope !== 'target' && record.scope !== 'historical') fail(`evidence ${key}: scope must be target or historical`);
+    if (record.scope === 'compatibility') {
+      const browser = browsers.get(record.browserId);
+      if (!COMPATIBILITY_ROLES.includes(browser?.role)) fail(`evidence ${key}: compatibility evidence must name a ${COMPATIBILITY_ROLES.join(' or ')} browser`);
+      else if (record.adapter !== browser.adapter) fail(`evidence ${key}: adapter must be ${browser.adapter} as browser ${browser.id} reports it`);
+      if (record.adapter === target) fail(`evidence ${key}: compatibility evidence must not use the target adapter`);
+    }
+    if (!EVIDENCE_SCOPES.includes(record.scope)) fail(`evidence ${key}: scope must be one of ${EVIDENCE_SCOPES.join(', ')}`);
     if (!EVIDENCE_KINDS.includes(record.kind)) fail(`evidence ${key}: kind must be one of ${EVIDENCE_KINDS.join(', ')}`);
+  }
+  for (const entry of matrix.browsers ?? []) {
+    for (const ref of entry.evidence ?? []) {
+      if (evidence[ref]?.scope !== 'compatibility' || evidence[ref].browserId !== entry.id) fail(`browser ${entry.id}: evidence ${ref} is not a compatibility record of this browser`);
+    }
   }
   const references = new Set([...Object.keys(matrix.references ?? {}), 'functional']);
   for (const row of rows) {
@@ -113,6 +129,10 @@ export function validateMatrix(matrix, { benchmarks, roadmap, fileExists }) {
     }
     for (const item of row.historicalEvidence ?? []) {
       if (evidence[item.ref]?.scope !== 'historical') fail(`${row.id}: historical evidence ${item.ref} is not a historical record`);
+    }
+    for (const item of row.compatibilityEvidence ?? []) {
+      if (evidence[item.ref]?.scope !== 'compatibility') fail(`${row.id}: compatibility evidence ${item.ref} is not a compatibility record`);
+      for (const spec of item.specs ?? []) if (!fileExists(spec)) fail(`${row.id}: evidence spec ${spec} does not exist`);
     }
     if (row.status === 'unsupported' && !(row.unsupportedCapabilities ?? []).length) fail(`${row.id}: unsupported rows must name the missing capability`);
     if (row.status === 'untested' && Object.keys(row.gateResults ?? {}).length) fail(`${row.id}: untested rows cannot carry gate results`);

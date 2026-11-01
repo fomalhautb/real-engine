@@ -4,7 +4,9 @@ struct GiParameters {
     spacing: vec4f, // xyz spacing, w maximum ray distance
     counts: vec4u, // xyz grid dimensions, w rays per probe
     sunDirection: vec4f, // xyz unit vector, w receiver offset for spatial probe interpolation
-    sunColor: vec4f, // xyz radiance; w exact integer flags: bit 0 receiver-directed support, bit 1 per-tap Chebyshev
+    // xyz radiance; w exact integer flags: bit 0 receiver-directed support, bit 1 per-tap Chebyshev,
+    // bit 2 grid-axis-neighbor visibility refinement
+    sunColor: vec4f,
     sky: vec4f, // xyz radiance, w low-confidence visibility weight threshold
     state: vec4u, // rendered frame, usable history frame, feedback enabled, emissive area sampling enabled
     // x capture-to-sun geometric-normal bias; y probes captured by this update;
@@ -13,7 +15,10 @@ struct GiParameters {
 }
 struct GiProbe {
     coefficients: array<vec4f, 9>, // RGB incoming radiance SH; first three w values store sampled RGB maxima
-    moments: array<vec4f, GI_DISTANCE_CELLS>, // mean distance, squared distance, weight; 0.w emissive failures, 1.w support failures
+    // mean distance, squared distance, weight; 0.w emissive failures, 1.w support failures.
+    // With the opt-in refinement, w of cells [GI_AXIAL_LANE, +12) holds axial-depth
+    // moments and w of cells [GI_NEIGHBOR_LANE, +27) neighbour visibility; otherwise 0.
+    moments: array<vec4f, GI_DISTANCE_CELLS>,
     // valid, published field frame, primary | shadow overflows << 16, capture frame.
     // Scheduled updates carry unscheduled probes into each new field unchanged
     // except for the field frame; the capture frame keeps their actual age.

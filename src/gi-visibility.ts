@@ -123,3 +123,38 @@ export function buildGiDistanceWeights(directions: readonly Vec3[]): Float32Arra
   }
   return weights;
 }
+
+/** Opt-in 'grid-axis-neighbor' refinement data lives in the otherwise unused
+ * fourth lane of the moment cells: cells 0 and 1 keep their failure counts,
+ * cells [GI_AXIAL_LANE, +12) hold axial-depth (mean, mean square) for the
+ * signed axes +x,-x,+y,-y,+z,-z and cells [GI_NEIGHBOR_LANE, +27) hold the
+ * probe's visibility toward each grid offset (dx + 3 dy + 9 dz + 13; self = 1). */
+export const GI_AXIAL_LANE = 2;
+export const GI_NEIGHBOR_LANE = 14;
+export const GI_AXIAL_LOBE_EXPONENT = 32;
+if (GI_NEIGHBOR_LANE + 27 > GI_DISTANCE_CELLS || GI_AXIAL_LANE + 12 > GI_NEIGHBOR_LANE) {
+  throw new Error('GI_REFINEMENT_LANES');
+}
+
+/** Axial-depth moments of one probe: for each signed grid axis e, the
+ * cos^32-weighted mean and mean square of t * dot(w, e) over capture rays with
+ * dot(w, e) > 0; a miss travels the maximum distance. Same order as the GPU lanes. */
+export function giAxialMoments(directions: readonly Vec3[], distances: readonly (number | null)[], maxDistance: number): number[] {
+  if (directions.length !== distances.length || directions.length < 16 || directions.length > 256
+    || !Number.isFinite(maxDistance) || maxDistance <= 0) throw new RangeError('GI_AXIAL_MOMENTS');
+  const result: number[] = [];
+  for (let signed = 0; signed < 6; signed++) {
+    const axis = signed >> 1, sign = signed & 1 ? -1 : 1;
+    let mean = 0, meanSquared = 0, total = 0;
+    for (let ray = 0; ray < directions.length; ray++) {
+      const cosine = directions[ray][axis] * sign;
+      if (cosine <= 0) continue;
+      const distance = distances[ray] ?? maxDistance;
+      if (!Number.isFinite(distance) || distance < 0) throw new RangeError('GI_AXIAL_MOMENTS');
+      const weight = cosine ** GI_AXIAL_LOBE_EXPONENT, depth = distance * cosine;
+      mean += weight * depth; meanSquared += weight * depth * depth; total += weight;
+    }
+    result.push(mean / Math.max(total, 1e-30), meanSquared / Math.max(total, 1e-30));
+  }
+  return result;
+}

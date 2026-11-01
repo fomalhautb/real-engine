@@ -130,6 +130,28 @@ describe('diffuse GI probe contract', () => {
     }
   });
 
+  it('keeps grid-axis-neighbor visibility refinement opt-in without extra rays, slots or storage', () => {
+    const legacy = resolveDiffuseGiOptions(grid);
+    expect(legacy.visibilityRefinement).toBe('none');
+    for (const visibilityFilter of ['moment-bilinear', 'per-tap-chebyshev-bilinear'] as const) {
+      const input: DiffuseGiOptions = { ...grid, visibilityFilter, visibilityRefinement: 'grid-axis-neighbor' };
+      const resolved = resolveDiffuseGiOptions(input);
+      input.visibilityRefinement = 'none';
+      expect(resolved.visibilityRefinement).toBe('grid-axis-neighbor');
+      expect(resolved.visibilityFilter).toBe(visibilityFilter);
+      expect(Object.isFrozen(resolved)).toBe(true);
+      expect(resolved.rayCount).toBe(legacy.rayCount);
+      expect(resolved.probeCount).toBe(legacy.probeCount);
+      expect(resolved.maxBytes).toBe(legacy.maxBytes);
+      expect(diffuseGiQueryParameterSlots(resolved)).toBe(diffuseGiQueryParameterSlots(legacy));
+    }
+    expect(resolveDiffuseGiOptions({ ...grid, visibilityRefinement: 'none' }).visibilityRefinement).toBe('none');
+    for (const value of [null, '', 'grid', 'axis-neighbor', 0, 1, true, NaN, {}]) {
+      expect(() => resolveDiffuseGiOptions({ ...grid, visibilityRefinement: value as never }))
+        .toThrow('DIFFUSE_GI_VISIBILITY_REFINEMENT');
+    }
+  });
+
   it('rejects invalid grids, float32-collapsed neighbours, and excess work or storage', () => {
     expect(() => resolveDiffuseGiOptions({ ...grid, origin: [1_000_001, 0, 0] })).toThrow();
     expect(() => resolveDiffuseGiOptions({ ...grid, origin: [1_000_000, 0, 0], spacing: [0.001, 1, 1] }))

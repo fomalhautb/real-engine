@@ -5,6 +5,13 @@ import type { WorldQueryOptions } from './world-query';
 import { resolveDiffuseGiUpdateOptions, type DiffuseGiUpdateOptions, type ResolvedDiffuseGiUpdateOptions } from './gi-probe-schedule';
 export type GiVisibilityDirection = 'probe-to-receiver' | 'receiver-to-probe';
 export type GiVisibilityFilter = 'moment-bilinear' | 'per-tap-chebyshev-bilinear';
+/** Opt-in thin-occluder refinement of probe interpolation weights:
+ * 'grid-axis-neighbor' adds per-probe axial-depth moments along the six grid
+ * axes and one-sided visibility toward the 26 grid neighbours (both stored in
+ * unused moment lanes); interpolation then also requires the receiver offset
+ * along each axis to be unoccluded and suppresses corners not mutually visible
+ * with the strongest corner. 'none' (default) leaves interpolation unchanged. */
+export type GiVisibilityRefinement = 'none' | 'grid-axis-neighbor';
 export interface DiffuseGiOptions {
   origin: readonly [number, number, number];
   spacing: readonly [number, number, number];
@@ -29,6 +36,10 @@ export interface DiffuseGiOptions {
   /** Default: interpolate moments before evaluating confidence. Per-tap
    * confidence filtering is opt-in and does not add capture rays or storage. */
   visibilityFilter?: GiVisibilityFilter;
+  /** Default 'none'. 'grid-axis-neighbor' adds one bounded per-probe pass
+   * (6 axial lobes over the capture rays, 26 neighbour moment lookups) and no
+   * rays or storage; it targets leaks through walls thinner than the grid spacing. */
+  visibilityRefinement?: GiVisibilityRefinement;
   /** Additional traversal allowance for receiver-directed support. Zero (default)
    * disables that capture and rejects switching to it at runtime. */
   maxVisibilityWorkUnits?: number;
@@ -54,6 +65,7 @@ export interface ResolvedDiffuseGiOptions {
   readonly visibilityWeightThreshold: number;
   readonly visibilityDirection: GiVisibilityDirection;
   readonly visibilityFilter: GiVisibilityFilter;
+  readonly visibilityRefinement: GiVisibilityRefinement;
   readonly maxVisibilityWorkUnits: number;
   readonly maxBytes: number;
   readonly probeCount: number;
@@ -139,6 +151,10 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   if (visibilityFilter !== 'moment-bilinear' && visibilityFilter !== 'per-tap-chebyshev-bilinear') {
     throw new RangeError('DIFFUSE_GI_VISIBILITY_FILTER');
   }
+  const visibilityRefinement = options.visibilityRefinement === undefined ? 'none' : options.visibilityRefinement;
+  if (visibilityRefinement !== 'none' && visibilityRefinement !== 'grid-axis-neighbor') {
+    throw new RangeError('DIFFUSE_GI_VISIBILITY_REFINEMENT');
+  }
   const maxVisibilityWorkUnits = options.maxVisibilityWorkUnits === undefined ? 0 : options.maxVisibilityWorkUnits;
   if (!Number.isSafeInteger(maxVisibilityWorkUnits) || maxVisibilityWorkUnits < 0 || maxVisibilityWorkUnits > 67_108_864
     || (maxVisibilityWorkUnits > 0 && maxVisibilityWorkUnits < rayCount)
@@ -164,7 +180,7 @@ export function resolveDiffuseGiOptions(options: DiffuseGiOptions): ResolvedDiff
   const update = resolveDiffuseGiUpdateOptions(options.update, probeCount);
   return Object.freeze({ origin, spacing, counts, raysPerProbe, maxDistance, normalBias, shadowNormalBias,
     skyRadiance, multiBounce, emissiveSamplesPerProbe, visibilityWeightThreshold, visibilityDirection, visibilityFilter,
-    maxVisibilityWorkUnits, maxBytes, probeCount, rayCount, finalGather, update });
+    visibilityRefinement, maxVisibilityWorkUnits, maxBytes, probeCount, rayCount, finalGather, update });
 }
 
 /** Conservative slots for all configured GI modes, including a later support

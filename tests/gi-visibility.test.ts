@@ -1,8 +1,11 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
-  GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, buildGiDistanceWeights,
-  octaDecode, octaEncode, wrapGiDistanceTexel,
+  GI_AXIAL_LANE, GI_AXIAL_LOBE_EXPONENT, GI_DISTANCE_CELLS, GI_DISTANCE_RESOLUTION, GI_NEIGHBOR_LANE, buildGiDistanceWeights,
+  giAxialMoments, octaDecode, octaEncode, wrapGiDistanceTexel,
 } from '../src/gi-visibility';
+import { giReplayAxisVisibility, giReplayMomentVisibility } from '../src/gi-interpolation';
 
 type Vec3 = readonly [number, number, number];
 
@@ -156,5 +159,51 @@ describe('octahedral GI visibility', () => {
       .toThrow('GI_VISIBILITY_DIRECTION');
     expect(() => buildGiDistanceWeights(new Array(16) as Vec3[]))
       .toThrow('GI_VISIBILITY_DIRECTION');
+  });
+});
+
+describe('grid-axis-neighbor refinement data', () => {
+  it('records the exact perpendicular distance of a wall in front of each signed axis', () => {
+    const directions = fibonacciDirections(64), maxDistance = 12;
+    // Infinite wall at x = 0.4: every +x ray hits it at t = 0.4 / w.x; -x rays escape.
+    const distances = directions.map(direction => direction[0] > 0 ? 0.4 / direction[0] : null);
+    const moments = giAxialMoments(directions, distances, maxDistance);
+    expect(moments).toHaveLength(12);
+    expect(moments[0]).toBeCloseTo(0.4, 12);
+    expect(moments[1]).toBeCloseTo(0.16, 12);
+    // A miss travels the maximum distance; the cos^32 lobe keeps its axial depth near it.
+    expect(moments[2]).toBeGreaterThan(0.9 * maxDistance);
+    expect(moments[2]).toBeLessThanOrEqual(maxDistance);
+    const probe = { axial: moments };
+    expect(giReplayAxisVisibility(probe, [0.38, 0.1, -0.2])).toBe(1);
+    expect(giReplayAxisVisibility(probe, [0.45, 0, 0])).toBeCloseTo(giReplayMomentVisibility(0.4, 0.16, 0.45), 12);
+    expect(giReplayAxisVisibility(probe, [0.45, 0, 0])).toBeLessThan(0.05);
+    expect(giReplayAxisVisibility(probe, [-3, 0, 0])).toBe(1);
+  });
+
+  it('validates axial moment inputs', () => {
+    const directions = fibonacciDirections(16), open = directions.map(() => null);
+    expect(() => giAxialMoments(directions, open.slice(1), 12)).toThrow('GI_AXIAL_MOMENTS');
+    expect(() => giAxialMoments(directions.slice(1), open.slice(1), 12)).toThrow('GI_AXIAL_MOMENTS');
+    expect(() => giAxialMoments(fibonacciDirections(257), fibonacciDirections(257).map(() => null), 12)).toThrow('GI_AXIAL_MOMENTS');
+    for (const maxDistance of [0, -1, NaN, Infinity]) expect(() => giAxialMoments(directions, open, maxDistance)).toThrow('GI_AXIAL_MOMENTS');
+    for (const bad of [-0.1, NaN, Infinity]) {
+      expect(() => giAxialMoments(directions, directions.map(() => bad), 12)).toThrow('GI_AXIAL_MOMENTS');
+    }
+  });
+
+  it('keeps the moment-lane layout, lobe and flag bit identical in TypeScript and WGSL', () => {
+    const source = (path: string) => readFileSync(fileURLToPath(new URL(`../src/${path}`, import.meta.url)), 'utf8');
+    const interpolate = source('shaders/diffuse-gi-interpolate.wgsl'), update = source('shaders/diffuse-gi-update.wgsl');
+    expect(interpolate).toContain(`const GI_AXIAL_LANE: u32 = ${GI_AXIAL_LANE}u;`);
+    expect(interpolate).toContain(`const GI_NEIGHBOR_LANE: u32 = ${GI_NEIGHBOR_LANE}u;`);
+    expect(interpolate).toContain('(u32(gi.sunColor.w) & 4u) != 0u');
+    expect(update).toContain(`pow(cosine, ${GI_AXIAL_LOBE_EXPONENT.toFixed(1)})`);
+    expect(update).toContain('for (var k = 0u; k < 27u; k++)');
+    expect(source('gpu-diffuse-gi.ts')).toContain("(Number(o.visibilityRefinement === 'grid-axis-neighbor') << 2)");
+    // Cells 0 and 1 keep their failure counts; 12 axial lanes then 27 neighbour slots.
+    expect(GI_AXIAL_LANE).toBe(2);
+    expect(GI_AXIAL_LANE + 12).toBeLessThanOrEqual(GI_NEIGHBOR_LANE);
+    expect(GI_NEIGHBOR_LANE + 27).toBeLessThanOrEqual(GI_DISTANCE_CELLS);
   });
 });

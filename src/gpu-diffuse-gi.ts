@@ -57,6 +57,8 @@ export class GpuDiffuseGi {
   private integrate!: GPUComputePipeline;
   private integrateVisibility!: GPUComputePipeline;
   private validateVisibility!: GPUComputePipeline;
+  /** Only with visibilityRefinement 'grid-axis-neighbor'. */
+  private refineVisibility?: GPUComputePipeline;
   private restamp!: GPUComputePipeline;
   private schedule!: GPUBuffer;
   private readonly scheduler: GiProbeScheduler;
@@ -190,6 +192,10 @@ export class GpuDiffuseGi {
       ['generate', 'generateShadows', 'integrate', 'integrateVisibility', 'validateVisibility', 'restamp'].map(entryPoint =>
       this.device.createComputePipelineAsync({ label: 'diffuse GI ' + entryPoint,
         layout: entryPoint === 'integrate' ? integrateLayout : layout, compute: { module, entryPoint } })));
+    if (this.options.visibilityRefinement === 'grid-axis-neighbor') {
+      this.refineVisibility = await this.device.createComputePipelineAsync({ label: 'diffuse GI refineVisibility', layout,
+        compute: { module, entryPoint: 'refineVisibility' } });
+    }
     if (this.options.emissiveSamplesPerProbe) {
       this.emissiveSampler = await GpuGiEmissiveSampler.create(this.device, this.queries, this.parameters,
         this.probeBuffers, this.schedule, this.options.rayCount, this.options.emissiveSamplesPerProbe, bytes => {
@@ -357,9 +363,11 @@ export class GpuDiffuseGi {
     integers.set([...o.counts, o.raysPerProbe], 8);
     data.set([...direction, o.normalBias], 12); data.set(color, 16); data.set(o.skyRadiance, 20);
     // Exactly represented integer flags in the existing f32 lane: direction
-    // switches replace bit 0 while preserving the immutable filter in bit 1.
+    // switches replace bit 0 while preserving the immutable filter (bit 1) and
+    // grid-axis-neighbor refinement (bit 2).
     data[19] = Number(this.visibilityDirection === 'receiver-to-probe')
-      | (Number(o.visibilityFilter === 'per-tap-chebyshev-bilinear') << 1);
+      | (Number(o.visibilityFilter === 'per-tap-chebyshev-bilinear') << 1)
+      | (Number(o.visibilityRefinement === 'grid-axis-neighbor') << 2);
     data[23] = o.visibilityWeightThreshold;
     integers[24] = frame;
     integers[25] = this.lastHistoryFrame;
@@ -415,7 +423,10 @@ export class GpuDiffuseGi {
       dispatch('validate receiver-directed GI support', this.validateVisibility, slots);
     }
     dispatch('integrate GI directional visibility', this.integrateVisibility, slots * GI_DISTANCE_CELLS,
-      timestampSpanEnd(timing));
+      this.refineVisibility ? undefined : timestampSpanEnd(timing));
+    // Axial depths read the same capture distances; neighbour visibility reads
+    // the moment map completed by the previous pass.
+    if (this.refineVisibility) dispatch('refine GI grid-axis visibility', this.refineVisibility, slots, timestampSpanEnd(timing));
     this.scheduler.commit(plan);
     this.plan = undefined;
     this.lastCapturedProbes = slots;
@@ -482,6 +493,7 @@ export class GpuDiffuseGi {
       visibility: 'octahedral-distance-moments', visibilityResolution: GI_DISTANCE_RESOLUTION,
       visibilityCapture: 'normalized-cosine-power-32', distanceCaptureSamplesPerUpdate: GI_DISTANCE_CELLS * this.options.rayCount,
       visibilityFilter: this.options.visibilityFilter,
+      visibilityRefinement: this.options.visibilityRefinement,
       visibilityDirection: this.visibilityDirection,
       visibilityQueriesPerUpdate: this.enabled ? supportRays : 0,
       visibilityMaxWorkUnitsPerUpdate: this.enabled && supportRays ? this.options.maxVisibilityWorkUnits : 0,

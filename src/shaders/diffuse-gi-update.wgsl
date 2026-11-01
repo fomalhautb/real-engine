@@ -156,3 +156,70 @@ fn integrateVisibility(@builtin(global_invocation_id) id: vec3u) {
     if (cell == 1u) { failures = probes[probeIndex].moments[1].w; }
     probes[probeIndex].moments[cell] = vec4f(moments / max(total, 0.00000001), total, failures);
 }
+
+// Opt-in grid-axis-neighbor refinement inputs. Runs after integrateVisibility
+// has published this probe's moment map; one invocation owns each probe record
+// and writes only the w lanes reserved in gi-visibility.ts.
+fn giOwnMomentTap(probe: u32, coordinate: vec2i) -> vec2f {
+    return probes[probe].moments[giDistanceTexel(coordinate)].xy;
+}
+// Mirrors giVisibility for the record being written, with the same filter.
+fn giOwnVisibility(probe: u32, direction: vec3f, distance: f32) -> f32 {
+    let pixel = giOctaEncode(direction) * f32(GI_DISTANCE_RESOLUTION) - 0.5;
+    let lower = vec2i(floor(pixel));
+    let fraction = fract(pixel);
+    let a = giOwnMomentTap(probe, lower);
+    let b = giOwnMomentTap(probe, lower + vec2i(1, 0));
+    let c = giOwnMomentTap(probe, lower + vec2i(0, 1));
+    let d = giOwnMomentTap(probe, lower + vec2i(1, 1));
+    if ((u32(gi.sunColor.w) & 2u) != 0u) {
+        return mix(mix(giMomentVisibility(a, distance), giMomentVisibility(b, distance), fraction.x),
+            mix(giMomentVisibility(c, distance), giMomentVisibility(d, distance), fraction.x), fraction.y);
+    }
+    return giMomentVisibility(mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y), distance);
+}
+
+@compute @workgroup_size(64)
+fn refineVisibility(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= giScheduledProbes()) { return; }
+    let probe = schedule[id.x];
+    // Axial depth t * dot(w, e) with a cos^32 lobe around each signed axis e,
+    // from the same distances as the moment map (support hits when bit 0 is set).
+    for (var signed = 0u; signed < 6u; signed++) {
+        let axis = signed / 2u;
+        let sign = select(1.0, -1.0, (signed & 1u) != 0u);
+        var moments = vec2f(0.0);
+        var total = 0.0;
+        for (var i = 0u; i < gi.counts.w; i++) {
+            let cosine = giDirection(i, gi.counts.w)[axis] * sign;
+            if (cosine <= 0.0) { continue; }
+            let index = id.x * gi.counts.w + i;
+            var distance = gi.spacing.w;
+            if ((u32(gi.sunColor.w) & 1u) != 0u) {
+                if (shadows[index].identity.x != 0u) { distance = shadows[index].metric.x; }
+            } else if (primary[index].identity.x != 0u) { distance = primary[index].metric.x; }
+            let depth = distance * cosine;
+            let weight = pow(cosine, 32.0);
+            moments += vec2f(depth, depth * depth) * weight;
+            total += weight;
+        }
+        moments /= max(total, 1e-30);
+        probes[probe].moments[GI_AXIAL_LANE + 2u * signed].w = moments.x;
+        probes[probe].moments[GI_AXIAL_LANE + 2u * signed + 1u].w = moments.y;
+    }
+    // One-sided visibility toward every grid neighbour from this probe's own map.
+    let coordinate = vec3i(giCoordinate(probe, gi.counts.xyz));
+    for (var k = 0u; k < 27u; k++) {
+        let offset = vec3i(i32(k % 3u), i32((k / 3u) % 3u), i32(k / 9u)) - vec3i(1);
+        let neighbor = coordinate + offset;
+        var visibility = 0.0;
+        if (k == 13u) {
+            visibility = 1.0;
+        } else if (all(neighbor >= vec3i(0)) && all(neighbor < vec3i(gi.counts.xyz))) {
+            let delta = vec3f(offset) * gi.spacing.xyz;
+            let distance = length(delta);
+            visibility = giOwnVisibility(probe, delta / distance, distance);
+        }
+        probes[probe].moments[GI_NEIGHBOR_LANE + k].w = visibility;
+    }
+}

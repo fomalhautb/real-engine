@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { expectRunAdapter } from './run-adapter';
 
 test.afterEach(async ({ page }, testInfo) => {
   if (testInfo.status !== testInfo.expectedStatus && !page.isClosed()) {
@@ -21,12 +22,7 @@ test('shared deformation, lifetime, physics controls, resize, and GPU validation
   await expect(page.locator('#error')).toBeHidden();
   const first = await page.evaluate(() => window.__REAL_ENGINE__!.snapshot());
   console.log('ENGINE_ADAPTER_DIAGNOSTIC ' + JSON.stringify(first.environment));
-  if (process.env.PLAYWRIGHT_GPU === 'hardware') {
-    expect(first.environment!.adapterInfo.isFallbackAdapter).toBe(false);
-  }
-  if (process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR) {
-    expect(first.environment!.adapterInfo.vendor.toLowerCase()).toBe(process.env.PLAYWRIGHT_EXPECT_GPU_VENDOR);
-  }
+  expectRunAdapter(first.environment!.adapterInfo, first.environment!.userAgent);
   expect(first.stats!.drawCalls).toBe(15); // Seven batches in two views, plus HDR resolve.
   expect(first.physics.bodies).toBe(6);
   expect(first.errors).toEqual([]);

@@ -1,11 +1,13 @@
 import { expect, test } from '@playwright/test';
+import { browserEngine } from './browser-engine';
 import type { runWorldQuerySharedBenchmark } from './fixtures/world-query-shared-benchmark';
 
 // Timing needs a real adapter; SwiftShader proves functionality in world-query-shared.spec.ts.
 test.skip(process.env.PLAYWRIGHT_GPU !== 'hardware', 'hardware-only paired timing');
 // Unquantized timestamps (Chrome otherwise rounds them to 65.536 us) for this diagnostic only;
-// the override applies to hardware runs so a software run keeps its SwiftShader arguments.
-if (process.env.PLAYWRIGHT_GPU === 'hardware') {
+// the override applies to Chromium hardware runs so a software run keeps its SwiftShader
+// arguments and WebKit receives no Chrome flags.
+if (process.env.PLAYWRIGHT_GPU === 'hardware' && browserEngine === 'chromium') {
   test.use({ launchOptions: { args: [...(process.env.PLAYWRIGHT_HIGH_PERFORMANCE_GPU === '1' ? ['--force-high-performance-gpu'] : []),
     '--enable-webgpu-developer-features'] } });
 }

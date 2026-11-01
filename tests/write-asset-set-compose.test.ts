@@ -73,6 +73,8 @@ async function assetSet(root: string, fixture: Fixture, directory = `${fixture.n
   return join(root, directory, 'asset-set.json');
 }
 
+// Each test runs the tool as a child process many times, so it gets a 60 s
+// limit: the default 5 s is exceeded on a loaded machine.
 describe('write-asset-set compose mode', () => {
   afterEach(() => { vi.unstubAllGlobals(); });
 
@@ -149,7 +151,7 @@ describe('write-asset-set compose mode', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it('rejects mixed arguments, duplicates, stale or partial packages, missing audits and foreign licenses', async () => {
     const root = await mkdtemp(join(resolve('.'), '.write-asset-set-compose-test-'));
@@ -222,5 +224,5 @@ describe('write-asset-set compose mode', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 });

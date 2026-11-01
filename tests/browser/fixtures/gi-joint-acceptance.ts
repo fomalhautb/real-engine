@@ -7,6 +7,7 @@ import { createJointLeakScene, createJointRoomsScene, JOINT_CAMERAS, JOINT_DOOR_
 import { luminance } from '../../../src/gi-acceptance';
 import { lookAt, multiply, perspective, transformPoint } from '../../../src/math';
 import { Renderer } from '../../../src/renderer';
+import type { SunShadowOptions } from '../../../src/sun-shadow';
 import type { WorldHit, WorldRay } from '../../../src/world-query';
 
 type Vec3 = [number, number, number];
@@ -40,7 +41,7 @@ function dot(a: readonly number[], b: readonly number[]): number { return a[0] *
 function normalize(v: readonly number[]): Vec3 { const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; }
 
 /** Same projection and camera rays as Renderer.render. */
-function camera(name: JointCameraName, width: number, height: number) {
+export function camera(name: JointCameraName, width: number, height: number) {
   const { eye, target } = JOINT_CAMERAS[name];
   const viewProjection = multiply(perspective(Math.PI / 3.2, width / height, 0.1, 150), lookAt(eye, target, [0, 1, 0]));
   const forward = normalize(sub(target, eye)), right = normalize(cross(forward, [0, 1, 0])), up = cross(right, forward);
@@ -59,7 +60,7 @@ function camera(name: JointCameraName, width: number, height: number) {
   };
 }
 
-async function verifiedPixels(r: Renderer, name: JointCameraName, worlds: readonly Vec3[], accept: (hit: WorldHit) => boolean) {
+export async function verifiedPixels(r: Renderer, name: JointCameraName, worlds: readonly Vec3[], accept: (hit: WorldHit) => boolean) {
   const view = camera(name, r.stats.width, r.stats.height);
   const candidates = worlds.map(world => view.project(world)).filter((pixel): pixel is Pixel => !!pixel);
   const unique = [...new Map(candidates.map(pixel => [pixel.x + ',' + pixel.y, pixel])).values()];
@@ -68,7 +69,7 @@ async function verifiedPixels(r: Renderer, name: JointCameraName, worlds: readon
   return { pixels, hits: hits.filter((hit, index) => hit && accept(hit) && unique[index]) as WorldHit[], total: worlds.length };
 }
 
-function roiWorlds(roi: JointRoi, grid: number): Vec3[] {
+export function roiWorlds(roi: JointRoi, grid: number): Vec3[] {
   const worlds: Vec3[] = [];
   for (let j = 0; j < grid; j++) for (let i = 0; i < grid; i++) {
     const s = (2 * (i + 0.5) / grid - 1) * 0.9, t = (2 * (j + 0.5) / grid - 1) * 0.9;
@@ -104,18 +105,18 @@ function rgbMeans(sets: PixelSet[], hdrFrames: number[][][]) {
   }));
 }
 
-function canvasFor(width: number, height: number): HTMLCanvasElement {
+export function canvasFor(width: number, height: number): HTMLCanvasElement {
   const element = document.createElement('canvas');
   element.style.cssText = `position:fixed;left:0;top:0;width:${width}px;height:${height}px;`;
   document.body.appendChild(element);
   return element;
 }
 
-function roomGrid(input: Pick<JointRunInput, 'raysPerProbe' | 'emissiveSamplesPerProbe' | 'update'>): DiffuseGiOptions {
+export function roomGrid(input: Pick<JointRunInput, 'raysPerProbe' | 'emissiveSamplesPerProbe' | 'update'>): DiffuseGiOptions {
   return { ...JOINT_ROOM_GRID, raysPerProbe: input.raysPerProbe ?? JOINT_ROOM_GRID.raysPerProbe,
     emissiveSamplesPerProbe: input.emissiveSamplesPerProbe ?? JOINT_ROOM_GRID.emissiveSamplesPerProbe, update: input.update };
 }
-function rayBudget(grid: DiffuseGiOptions): number {
+export function rayBudget(grid: DiffuseGiOptions): number {
   return Math.max(8192, grid.counts.reduce((a, b) => a * b, 1) * (grid.raysPerProbe ?? 64));
 }
 
@@ -242,16 +243,20 @@ function cosineDirection(normal: Vec3, sample: number, point: number, bounce: nu
 /** Independent diffuse path-traced outgoing indirect radiance at receiver hits,
  * with the engine's GI transport model (diffuse-only, F0 0.04, binary sun
  * visibility through world queries, sky beyond the scene, unlit emitters). */
-async function pathTrace(r: Renderer, receivers: readonly WorldHit[], options: { paths: number; bounces: number;
-  sky: Vec3; sun: { direction: Vec3; color: Vec3 }; normalBias: number }) {
+export async function pathTrace(r: Renderer, receivers: readonly WorldHit[], options: { paths: number; bounces: number;
+  sky: Vec3; sun: { direction: Vec3; color: Vec3 }; normalBias: number; seed?: number; batchRays?: number }) {
   const oneBounce = receivers.map(() => [0, 0, 0]), total = receivers.map(() => [0, 0, 0]);
-  const batch = Math.max(1, Math.floor(8192 / options.paths));
+  // Contribution of each bounce depth, for convergence and truncation diagnostics.
+  const perBounce = receivers.map(() => Array.from({ length: options.bounces }, () => [0, 0, 0]));
+  // seed 0 keeps the frozen acceptance reference; other seeds give independent sample streams.
+  const sampleOffset = (options.seed ?? 0) * 0x10000;
+  const batch = Math.max(1, Math.floor((options.batchRays ?? 8192) / options.paths));
   let rays = 0;
   for (let start = 0; start < receivers.length; start += batch) {
     const paths = receivers.slice(start, start + batch).flatMap((hit, local) => Array.from({ length: options.paths }, (_, sample) => {
       const normal = normalize(hit.normal);
       return { point: start + local, sample, origin: add(hit.position, normal, options.normalBias),
-        direction: cosineDirection(normal, sample, start + local, 0),
+        direction: cosineDirection(normal, sample + sampleOffset, start + local, 0),
         throughput: hit.baseColor.map(value => value * 0.96 * (1 - hit.metallic)), active: true };
     }));
     for (let bounce = 0; bounce < options.bounces; bounce++) {
@@ -281,18 +286,21 @@ async function pathTrace(r: Renderer, receivers: readonly WorldHit[], options: {
         for (let c = 0; c < 3; c++) {
           const contribution = path.throughput[c] * radiance[c] / options.paths;
           total[path.point][c] += contribution;
+          perBounce[path.point][bounce][c] += contribution;
           if (bounce === 0) oneBounce[path.point][c] += contribution;
         }
         if (!hit || hit.shading === 'unlit' || bounce === options.bounces - 1) { path.active = false; return; }
         for (let c = 0; c < 3; c++) path.throughput[c] *= hit.baseColor[c] * 0.96 * (1 - hit.metallic);
         const normal = normalize(hit.normal);
         path.origin = add(hit.position, normal, options.normalBias);
-        path.direction = cosineDirection(normal, path.sample, path.point, bounce + 1);
+        path.direction = cosineDirection(normal, path.sample + sampleOffset, path.point, bounce + 1);
       });
     }
   }
-  return { oneBounce, total, rays };
+  return { oneBounce, total, perBounce, rays };
 }
+
+const REFERENCE_BATCH_RAYS = 32_768;
 
 /** L01 steady state: GI on/off and single/multi bounce at frozen ROI pixels, plus
  * an independent path-traced reference of the same pixels (optional, costly). */
@@ -303,8 +311,9 @@ export async function runJointSteadyState(input: Omit<JointRunInput, 'frames' | 
   const grid = roomGrid(input);
   let renderer: Renderer | undefined;
   try {
-    renderer = await Renderer.create(element, scene.batches, { worldQueries: { maxRays: rayBudget(grid) }, diffuseGi: grid,
-      antiAliasing: 'none' });
+    // Query capacity only; GI results do not depend on it.
+    renderer = await Renderer.create(element, scene.batches, { worldQueries: { maxRays: Math.max(rayBudget(grid),
+      input.reference ? REFERENCE_BATCH_RAYS : 0) }, diffuseGi: grid, antiAliasing: 'none' });
     const r = renderer;
     r.setSun({ direction: [...JOINT_SUN.direction], color: [...JOINT_SUN.color] });
     r.render(JOINT_CAMERAS.roomA.eye as Vec3, JOINT_CAMERAS.roomA.target as Vec3);
@@ -339,7 +348,7 @@ export async function runJointSteadyState(input: Omit<JointRunInput, 'frames' | 
       paths: number; bounces: number } | null = null;
     if (input.reference) {
       const receivers = rois.flatMap(({ hits }) => hits);
-      const traced = await pathTrace(r, receivers, { ...input.reference, sky: JOINT_SKY,
+      const traced = await pathTrace(r, receivers, { ...input.reference, batchRays: REFERENCE_BATCH_RAYS, sky: JOINT_SKY,
         sun: { direction: [...JOINT_SUN.direction] as Vec3, color: [...JOINT_SUN.color] as Vec3 }, normalBias: grid.normalBias ?? 0.03 });
       let offset = 0;
       const oneBounce: Record<string, number[][]> = {}, total: Record<string, number[][]> = {};
@@ -362,15 +371,19 @@ export async function runJointSteadyState(input: Omit<JointRunInput, 'frames' | 
 
 /** L04: interiors of closed black/thin-wall boxes and a slit box, GI on and off. */
 export async function runJointLeak(input: { update?: DiffuseGiUpdateOptions; width: number; height: number; warmup: number;
-  raysPerProbe?: number; samples: [number, number]; reference?: { paths: number; bounces: number }; screenshots: boolean }) {
+  raysPerProbe?: number; samples: [number, number]; reference?: { paths: number; bounces: number }; screenshots: boolean;
+  /** GI overrides on top of JOINT_LEAK_GRID (for example visibilityRefinement). */
+  grid?: Partial<DiffuseGiOptions>;
+  /** Omitted keeps the legacy fixed sun-shadow projection. */
+  sunShadow?: SunShadowOptions }) {
   const element = canvasFor(input.width, input.height);
   const { batches } = createJointLeakScene();
   const grid: DiffuseGiOptions = { ...JOINT_LEAK_GRID, raysPerProbe: input.raysPerProbe ?? JOINT_LEAK_GRID.raysPerProbe,
-    update: input.update };
+    ...input.grid, update: input.update };
   let renderer: Renderer | undefined;
   try {
     renderer = await Renderer.create(element, batches, { worldQueries: { maxRays: rayBudget(grid) }, diffuseGi: grid,
-      antiAliasing: 'none' });
+      antiAliasing: 'none', sunShadow: input.sunShadow });
     const r = renderer;
     r.setSun({ direction: [...JOINT_SUN.direction], color: [...JOINT_SUN.color] });
     const views = ['blackBox', 'thinBox', 'slitBox'] as const;
@@ -414,8 +427,10 @@ export async function runJointLeak(input: { update?: DiffuseGiUpdateOptions; wid
       slitReference = hits.map(hit => hit ? traced.total[next++] : [0, 0, 0]);
     }
     const errors = [...r.errors];
+    const diagnostics = r.diagnostics();
     const result = { adapter: r.info.adapterInfo, viewport: { width: r.stats.width, height: r.stats.height },
-      update: r.diagnostics().diffuseGi?.update, pixels: pixels.length, on: on.values, off: off.values, pngs: on.pngs, offPngs: off.pngs,
+      update: diagnostics.diffuseGi?.update, visibilityRefinement: diagnostics.diffuseGi?.options.visibilityRefinement,
+      sunShadow: diagnostics.sunShadow, pixels: pixels.length, on: on.values, off: off.values, pngs: on.pngs, offPngs: off.pngs,
       slitReference, errors };
     r.dispose();
     return { ...result, afterDispose: r.stats.ownedGpuBytes };

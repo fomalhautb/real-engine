@@ -3,6 +3,7 @@
  * acceptance fixtures so cameras, events and ROIs stay frozen in one place. */
 import type { InstanceState, SceneBatch } from './contracts';
 import type { DiffuseGiOptions } from './diffuse-gi';
+import type { SunShadowBounds } from './sun-shadow';
 import { createCube } from './geometry';
 import { m, type MaterialDefinition } from './material';
 import { multiply, normalMatrix, scaling, translation, type Mat4 } from './math';
@@ -116,6 +117,12 @@ export const JOINT_LEAK_BOXES = Object.freeze({
   thin: { center: 0.25, wall: 0.02 },
   slit: { center: 2.75, wall: 0.15, slit: 0.04 },
 });
+
+/** Sun-shadow focus for the leak scene: the boxes and the sunlit ground read as the
+ * outside reference, as every demo sets one. Without it the legacy fixed 50 m
+ * projection at 1024^2 has a 4.9 cm texel, wider than the 2 cm thin wall. */
+export const JOINT_LEAK_SHADOW_FOCUS: SunShadowBounds = Object.freeze({
+  min: Object.freeze([-5, -0.2, -2.5] as const), max: Object.freeze([5, 1.4, 2.5] as const) });
 
 function enclosure(firstId: number, cx: number, wall: number, slit = 0): InstanceState[] {
   const inner = 1, half = inner / 2, floor = 0.1, top = floor + inner;

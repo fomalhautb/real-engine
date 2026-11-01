@@ -2,6 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Gate } from '../../src/gi-acceptance';
+import { JOINT_LEAK_SHADOW_FOCUS } from '../../src/gi-joint-scene';
 import type { DiffuseGiUpdateOptions } from '../../src/gi-probe-schedule';
 import type { JointFrames, runJointDynamics, runJointLeak, runJointSteadyState } from './fixtures/gi-joint-acceptance';
 import { analyzeDynamics, analyzeLeak, analyzeSteady, dynamicGates, JOINT_ANALYSIS, roiSeries } from './gi-joint-analysis';
@@ -51,6 +52,9 @@ function savePngs(directory: string, prefix: string, shots: { index: number; png
 }
 
 const SCHEDULED: DiffuseGiUpdateOptions = { mode: 'scheduled' };
+// Opt-in L04 configuration: focused sun shadow and grid-axis-neighbor probe visibility.
+const LEAK_REFINED = { grid: { visibilityRefinement: 'grid-axis-neighbor' as const },
+  sunShadow: { focusBounds: JOINT_LEAK_SHADOW_FOCUS } };
 
 test('joint GI acceptance harness runs every dynamic, steady and leak case on frozen ROIs', async ({ page }) => {
   test.setTimeout(900_000);
@@ -122,7 +126,11 @@ test('joint GI quality capture records L01-L04, T01 and stability verdicts on ha
     writeFileSync(join(out, `dynamics-${name}.csv`), csv(run));
     for (const phase of run.phases) savePngs(out, `${name}-${phase.name}`, phase.screenshots);
   }
-  const reference = { paths: 512, bounces: 8 };
+  // Converged reference (evidence: artifacts/gi-quality-20261031/diag/reference-8192). The
+  // former 512 paths x 8 bounces differed from an 8192 x 24 reference by 0.06-0.23
+  // normalized MAE (above 0.15 on 3/6 ROIs) and truncated 3-8% of the energy; two
+  // independent 8192 x 24 seeds differ by 0.015-0.071. The 0.15 threshold is unchanged.
+  const reference = { paths: 8192, bounces: 24 };
   for (const [name, update] of Object.entries(policies)) {
     const steady = await call(page, 'runJointSteadyState', { ...base, update, warmup: 240, singleBounceWarmup: 60,
       reference: name === Object.keys(policies)[0] ? reference : undefined });
@@ -136,24 +144,56 @@ test('joint GI quality capture records L01-L04, T01 and stability verdicts on ha
     summary[`L01-${name}`] = analyzed.rois;
     gates.push(...analyzed.gates);
   }
-  for (const [name, update] of Object.entries(policies)) {
-    const leak = await call(page, 'runJointLeak', { width: 640, height: 360, warmup: 120, samples: [16, 9], update,
-      screenshots: true, reference: name === Object.keys(policies)[0] ? { paths: 512, bounces: 6 } : undefined });
-    healthy(leak);
-    const analyzed = analyzeLeak(leak, name);
-    summary[`L04-${name}`] = analyzed;
-    gates.push(...analyzed.gates);
-    for (const [view, png] of Object.entries(leak.pngs)) savePngs(out, `${name}-leak-${view}`, [{ index: 0, png }]);
-    for (const [view, png] of Object.entries(leak.offPngs)) savePngs(out, `${name}-leak-${view}-giOff`, [{ index: 0, png }]);
+  // L04: the frozen default configuration (legacy fixed sun-shadow projection, no
+  // visibility refinement) and the opt-in configuration, gated as `<policy>.refined`.
+  // The slit reference depends only on the scene and the sampled pixels, so the first
+  // run's reference serves every run.
+  let slitReference: number[][] | null = null;
+  for (const [suffix, config] of [['', {}], ['.refined', LEAK_REFINED]] as const) {
+    for (const [name, update] of Object.entries(policies)) {
+      const label = name + suffix;
+      const leak: Awaited<ReturnType<typeof runJointLeak>> = await call(page, 'runJointLeak', { width: 640, height: 360,
+        warmup: 120, samples: [16, 9], update, ...config,
+        screenshots: true, reference: slitReference ? undefined : { paths: 512, bounces: 6 } });
+      healthy(leak);
+      slitReference ??= leak.slitReference;
+      const analyzed = analyzeLeak({ ...leak, slitReference: leak.slitReference ?? slitReference }, label);
+      summary[`L04-${label}`] = { ...analyzed, visibilityRefinement: leak.visibilityRefinement, sunShadow: leak.sunShadow };
+      gates.push(...analyzed.gates);
+      for (const [view, png] of Object.entries(leak.pngs)) savePngs(out, `${label}-leak-${view}`, [{ index: 0, png }]);
+      for (const [view, png] of Object.entries(leak.offPngs)) savePngs(out, `${label}-leak-${view}-giOff`, [{ index: 0, png }]);
+    }
   }
   summary.gates = gates;
   writeFileSync(join(out, 'joint-acceptance.json'), JSON.stringify(summary, null, 1));
   console.log('GI_JOINT_GATES ' + JSON.stringify(gates.map(item => [item.metric, item.value, item.verdict])));
   expect(gates.length).toBeGreaterThan(20);
   // Regression floor (Apple M3 Max, 2026-10-31): the full-grid and default scheduled
-  // policies met every response, stability, off-screen and recovery gate. L01 and
-  // L04 quality gates still fail and are recorded, not asserted.
-  for (const item of gates) if (['L03', 'stability', 'L02', 'T01'].includes(item.id)
-    && /^(full|scheduled|direct)\./.test(item.metric)) expect.soft(item.verdict, item.metric).toBe('pass');
+  // policies met every response, stability, off-screen and recovery gate, and the opt-in
+  // L04 configuration keeps the black and thin boxes under the provisional 1%. L01, the
+  // slit box and the default L04 configuration still fail and are recorded, not asserted.
+  for (const item of gates) if ((['L03', 'stability', 'L02', 'T01'].includes(item.id) && /^(full|scheduled|direct)\./.test(item.metric))
+    || /^(full|scheduled)\.refined\.(blackBox|thinBox)\./.test(item.metric)) expect.soft(item.verdict, item.metric).toBe('pass');
+  expect(pageErrors).toEqual([]);
+});
+
+test('opt-in grid-axis-neighbor visibility and a focused sun shadow keep the L04 black and thin boxes dark', async ({ page }) => {
+  test.setTimeout(900_000);
+  const pageErrors = await fixturePage(page);
+  // Full-grid updates take one multi-bounce feedback step per frame. The interiors start
+  // dark and only brighten while converging, so the warm-up reaches the fixed point.
+  const leak = await call(page, 'runJointLeak', { width: 320, height: 180, warmup: 120, samples: [16, 9], screenshots: false,
+    ...LEAK_REFINED });
+  healthy(leak);
+  expect(leak.visibilityRefinement).toBe('grid-axis-neighbor');
+  expect(leak.sunShadow.projection).toBe('world-bounds-snapped');
+  const analyzed = analyzeLeak(leak, 'refined');
+  console.log('GI_JOINT_LEAK_REFINED ' + JSON.stringify({ outside: analyzed.outsideLuminance,
+    gates: analyzed.gates.map(item => [item.metric, item.value, item.verdict]) }));
+  // Provisional 1% threshold, unchanged. The slit gate needs the path-traced reference of
+  // the hardware capture, where it still fails.
+  expect(analyzed.gates.map(item => item.metric)).toEqual(['refined.blackBox.interiorLuminance/outside',
+    'refined.thinBox.interiorLuminance/outside']);
+  for (const item of analyzed.gates) expect(item.verdict, item.metric).toBe('pass');
   expect(pageErrors).toEqual([]);
 });

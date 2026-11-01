@@ -2,9 +2,20 @@
 
 更新日期：2026-10-31。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
 
+## 反射粗糙档空间滤波与波瓣内运动响应（2026-10-31）
+
+- **新增可选项**：
+  - `ReflectionsOptions.spatialFilter`：锚点网格上的边缘感知 à-trous 滤波，只作用于显示，历史保存未滤波的值。核半径随粗糙度、反射命中距离与视距变化，小于一个锚点间隔时镜面细节逐位不变。
+  - `temporal.lobeMotionResponse`：利用世界查询已有的反射命中运动，检测粗糙波瓣内移动的内容，用 5×5 邻域重建替换旧历史 4 帧。
+  - `temporal.stationaryHistoryFrames`：只在场景静止时延长静止锚点的历史。
+  - 三者默认都关闭，不开启时结果与重置契约不变。
+- **受控用例结果**：在质量配置 `{ spatialFilter: {}, temporal: { lobeMotionResponse: 0.25, stationaryHistoryFrames: 64 } }` 下，L05 阶梯六档误差 0.013–0.031（目标 < 0.1），静态 120 帧峰峰值 0.48%–2.47%（≤ 3%）；D02 物体进入粗糙度 0.3 波瓣时 T90 从 31 帧降到 2 帧。两个目标用例在原阈值下去掉了 `test.fail`，Apple 与 SwiftShader 结果几乎一致。
+- **代价**：无条件地，每个锚点从 256 B 增至 272 B，参数块从 304 B 增至 336 B。配置滤波时每锚点再加 96 B，每帧多 5 个 compute pass，没有新光线，也没有回读。滤波有偏：0.7 档相对参考 −2.9%（默认 −0.7%），D02 高光中心低 0.5%–1.5%。
+- **未完成**：默认配置仍未达标；细接收体漏反射未实现（0.024 m 杆仍全部漏反射）；大场景与 GI 联合配置未测；计时只作诊断。详见「世界空间反射」后的「反射粗糙档空间滤波与波瓣内运动响应」。
+
 ## 能力矩阵、基准帧节奏与浏览器检查（2026-10-31）
 
-- **能力矩阵**：`docs/capability-matrix.json` 共 40 行，包括 26 个固定场景、12 个工作包、自动 LOD 演示与大场景视觉交付。门槛逐字取自 benchmarks.md，状态由门槛结果与证据推导，`npm run capability:report` 校验一致性。截至 main `0802479`：pass 0、fail 6、unsupported 3、partial 27、untested 4，没有任何一行达到 pass。
+- **能力矩阵**：`docs/capability-matrix.json` 共 40 行，包括 26 个固定场景、12 个工作包、自动 LOD 演示与大场景视觉交付。门槛逐字取自 benchmarks.md，状态由门槛结果与证据推导，`npm run capability:report` 校验一致性。截至 main `234eb39`：pass 0、fail 5、unsupported 3、partial 28、untested 4，没有任何一行达到 pass。
 - **基准帧节奏**：基准运行器逐帧记录 rAF 回调延迟与主线程工作，观察长任务，并把超预算帧与准时帧分成两组对照；组间差异只说明相关，不说明原因。macOS 上另记录机型、GPU、电源、温控与负载均值；`--caffeinate` 只在运行期间阻止睡眠，不改系统设置。
 - **诊断运行**：目标机上的 4 次 1,800 帧 foundation 运行都在主机争用下进行。同一压力负载相隔 8 分钟运行两次，超预算帧从 93 变为 0，CPU 与 GPU 时间同时变化，差异来自主机状态。这些都不是验收性能。
 - **未完成**：目标机 30 分钟运行、无干扰的验收计时和 headed 模式都没有执行。Safari 需要用户开启远程自动化，Playwright WebKit 需要用户允许下载。详见「当前能力边界」中的「机器可读能力矩阵与浏览器入口」，以及「基准运行器与首轮证据」中的「帧节奏归因、macOS 主机信息与争用下的诊断运行」。
@@ -52,7 +63,7 @@
 - **时间重建**（`ReflectionsOptions.temporal`，可选）：逐帧旋转的 GGX 样本，按粗糙度设定历史上限，从静止复用、表面运动和反射命中视差三种方式中选择重投影；双线性四角逐一校验，再做 3×3 邻域截断，每次重置都记录具名原因。历史为双缓冲，计入反射预算。
 - **屏幕空间补充**（`ReflectionsOptions.screenTrace`，可选）：使用自有的上一帧 HDR 与深度拷贝，每像素 12 B；只有屏幕命中与世界命中的距离一致时才混合。离屏、未解析或不一致的样本分别计数，并保留世界查询结果。
 - **曲面回退**：四个重建角全部不合格时，改从 4×4 邻域中同身份、同材质的锚点重建，并按视角重新标定 BRDF 权重。金属球在锚点间隔 4 时的漏反射比例从 83% 降到 0%。
-- **未达标**：L05 粗糙度 0.5 与 0.7 的误差为 0.105 与 0.182（目标 < 0.1）；静态 120 帧峰峰值只有镜面档 ≤ 3%；D02 中物体出现在粗糙度 0.3 的波瓣内时 T90 为 31–35 帧。以上都按原阈值记为已知差距。细杆接收体仍会漏反射。详见「已实现的运行路径」中的「反射时间重建与屏幕补充的实现和实测」。
+- **未达标**：L05 粗糙度 0.5 与 0.7 的误差为 0.105 与 0.182（目标 < 0.1）；静态 120 帧峰峰值只有镜面档 ≤ 3%；D02 中物体出现在粗糙度 0.3 的波瓣内时 T90 为 31–35 帧。以上是默认配置的结果；可选质量配置的结果见「反射粗糙档空间滤波与波瓣内运动响应」。细杆接收体仍会漏反射。详见「已实现的运行路径」中的「反射时间重建与屏幕补充的实现和实测」。
 
 ## 世界查询共享遍历、水密测试与距离场决策（2026-10-31）
 
@@ -137,6 +148,13 @@
 - 168 项通过中包括反射 L05 与 D02 两项标为 `test.fail` 的已知差距，它们按预期失败，不代表这两项达标。
 - SwiftShader 上定向运行局部灯、雾、GI、反射、基准等 18 个 spec：32 项全部通过（`swiftshader-lights-phase1.log`）。
 - `npm run check`：第一次运行在主机高负载下有 2 项 CPU 测试超过 5 s 的默认超时（`instance-bvh.test.ts` 的 4096 槽用例和 `volumetric-fog-air.test.ts` 的 HG 数值积分用例）。单独重跑这两个文件 14/14 通过，随后完整重跑 108 个文件、931 项测试和构建全部通过。这两项属于超时，不是断言失败，但完整检查的第一次运行确实没有通过。
+
+再合入反射粗糙档的可选空间滤波与波瓣内运动响应后，完整回归仍为 171 项：168 项通过、3 项跳过、0 项失败，用时 8.0 分钟（日志 `artifacts/main-integration-20261030/apple-full-reflq.log`，代码提交 `234eb39`）。
+
+- L05 与 D02 的目标用例已去掉 `test.fail`，在可选质量配置下实际通过；默认配置未变。至此完整回归中没有按预期失败的已知差距用例。
+- 跳过的 3 项与上次相同。
+- SwiftShader 上定向运行反射相关 10 个 spec 与 `engine.spec.ts`：16 项全部通过（`swiftshader-reflq.log`）。
+- `npm run check`：108 个文件、936 项测试和构建全部通过（`check-reflq.log`）。
 
 **体积雾。** 新增可选的 GI 空气光照和遮挡体局部历史拒绝，详见「线性 HDR、输出与光照基础」中的体积雾小节。F01–F04 的自动化用例在目标机和 SwiftShader 上均通过。F05 的 1080p 扫描显示，默认预算靠把网格降到 14 像素/格保持在 64 MiB 以内；8 像素/格、64 层并开启时序历史需要 158.2 MiB，**未满足 64 MiB 预算**。局部灯散射、移动聚光灯和短闪光尚未支持。
 
@@ -1529,6 +1547,268 @@ PLAYWRIGHT_PORT=5207 PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGH
 - 面板 477 个样本全部离屏，天空样本全部跳过，两者都与纯世界查询结果逐位相同。
 - 关闭补充或相机切换后，状态和结果都回到纯世界查询。
 
+### 反射粗糙档空间滤波与波瓣内运动响应（2026-10-31）
+
+本小节对应提交 `aac6c04`（引擎）与 `234eb39`（目标用例）。新行为全部需要显式开启，不开启时解析后的辐亮度、历史与重置都与原来一致；唯一的无条件变化是锚点与参数块各变大 16/32 字节（见「预算与工作量」）。用下面的可选质量配置，L05 与 D02 的目标用例在原阈值下通过，已去掉 `test.fail`；默认配置仍未达标。细接收体漏反射没有实现。硬件数据来自目标机 Apple M3 Max（Chrome 156，`apple / metal-3`）；测量时多个并行任务共用 GPU，所有计时只作诊断。SwiftShader 结果只证明功能正确。证据在 `artifacts/reflections-quality-20261031/`，不入库。
+
+#### 结论
+
+测量所用的质量配置在 `tests/browser/reflection-quality-options.ts`，合并在各用例原有的历史 8–32 帧之上：
+
+```ts
+{ spatialFilter: {}, temporal: { lobeMotionResponse: 0.25, stationaryHistoryFrames: 64 } }
+```
+
+| 目标 | 默认配置 | 质量配置（Apple） | 质量配置（SwiftShader） |
+| --- | --- | --- | --- |
+| L05 阶梯误差 < 0.1 | 0.5/0.7 档 0.105/0.182，未达标 | 六档 0.013–0.031 | 六档 0.013–0.031 |
+| L05 静态 120 帧峰峰值 ≤ 3% | 只有 0.045 档（2.99%）达标，其余 3.87%–7.15% | 0.48%–2.47% | 0.41%–2.45% |
+| D02 粗糙度 0.3 波瓣内瞬移进入 T90 ≤ 2 帧 | 31 帧 | 2 帧 | 2 帧 |
+| 移动视角粗糙档误差（只报告） | 0.35/0.5/0.7 档 0.436/0.341/0.312 | 0.359/0.188/0.203 | 0.328/0.184/0.175（默认 0.421/0.347/0.335） |
+
+- **镜面细节不被模糊**：阶梯中粗糙度 0.045/0.1/0.2 三档的滤波核半径小于一个锚点间隔，滤波后结果与滤波前逐位相同。
+- **默认不变**：三项都保持可选。原因见「为什么不设为默认」。
+- **细接收体**：未实现，只给出设计与阻碍。
+
+#### 实现了什么
+
+##### 边缘感知空间滤波（`ReflectionsOptions.spatialFilter`）
+
+- **位置**：只作用于显示。在时间重建之后运行；未启用时间重建时，作用于本帧估计。历史始终保存未滤波的值，所以开关滤波不重置任何历史。
+- **算法**：锚点网格上的 à-trous 滤波。每级 3×3 个 B1 样条权重的采样点，步长依次为 1、2、4、8 个锚点；用两块缓冲交替读写，最后一级写回锚点的 `radiance`。
+- **引导条件**：两个锚点同时满足以下全部条件才互相参与：
+  - 接收体身份（批次、实体、世代）相同；
+  - 粗糙度、金属度相差 ≤ 0.01，基础色（8 位量化）逐通道相差 ≤ 0.02；
+  - 几何法线和着色法线的夹角都在波瓣半角以内（限制在 0.02–0.45 rad）；
+  - 到中心接收平面的距离不超过「平面容差 + 距离 × sin 夹角」。
+- **核半径**：紧支撑双权重 (1 − u²)²，u = 距离 / R。R = footprint × tanθ × D × V / (D + V)：
+  - tanθ = tan(min(2·atan(α), 1.2))，α = 粗糙度²，近似反射波瓣的中位角；
+  - D 是本帧反射命中的 BSDF 加权平均距离，未命中的样本看到平滑天空，不计入；
+  - V 是视距。
+  - 含义：接收点移动 R 时，波瓣在反射内容上的覆盖范围移动 footprint 倍自身半径。
+- **镜面保持**：R 小于一个锚点间隔时，邻居全部落在核外，结果等于中心值本身。阶梯中锚点间隔为 0.0668 m，六档的 R 为 0.0027/0.0122/0.0458/0.150/0.345/0.960 m。
+- **选项**：`iterations` 1–5，默认 4；`footprint` 0.05–2，默认 0.3。
+- **运行时开关**：`Renderer.setReflectionsSpatialFilterEnabled(enabled)`。
+
+##### 波瓣内运动响应（`temporal.lobeMotionResponse`）
+
+问题：物体只覆盖部分粗糙波瓣时，平均反射距离的变化落在容差内，4 样本噪声又让 3×3 截断窗口过宽，旧历史只能按 20 帧上限慢慢淡出（D02 T90 31 帧）。曾试过「按截断超出量缩短历史」，没有效果，已撤回。
+
+现在利用世界查询本来就带有的反射命中运动来判断，不需要任何回读：
+
+1. **积分**：反射命中移动超过 0.25 × D × tanθ + 1e-4 m 的样本记为「已移动」。BSDF 加权的已移动比例写入锚点 `motion.w`，原先这里是没有使用者的权重和。探针字段为 `movedLobeFraction`。
+2. **重建**：时间重建 pass 在 5×5 邻域内用同一引导条件、footprint 0.3（`REFLECTION_RECONSTRUCTION_FOOTPRINT`）做加权平均，得到：
+   - 重建值 C；
+   - 有效锚点数 N_eff = (Σw)² / Σw²；
+   - 邻域的已移动比例 F。
+3. **混合**：s = smoothstep(0, lobeMotionResponse, F)。
+   - 历史保留 1 − s 的权重；没有可用历史时为 0。
+   - 本帧样本取 mix(raw, C, s)，权重为 mix(1, N_eff, s)。
+   - 探针字段 `historyResponse` 即 s。
+4. **重建帧**：s ≥ 0.5 时，在之后的静止帧里继续用 C 和权重 N_eff 代替本锚点的单帧估计，连同响应帧共 `REFLECTION_REBUILD_FRAMES` = 4 帧。剩余帧数存放在历史记录原先保留的 `versions.w` 中，只在静止模式下继承，其他模式不读取上一帧的值。
+   - 作用：响应帧之后历史只有约 7 帧权重，若立即回到 4 样本的单锚点估计，噪声会把结果推出 ±10%。
+5. **重置契约不变**：全局重置后计数为 1、首帧等于原始估计。响应需要有效的全局历史，因此不会在重置帧运行。
+- **物体移出波瓣**：剩下的命中都是静止的，F = 0，仍由原有 3×3 截断处理，T90 = 1 帧。
+
+##### 静止历史上限（`temporal.stationaryHistoryFrames`）
+
+- **作用范围**：只对处于 `stationary` 模式的锚点生效，并且要求本帧没有场景运动。相机移动或场景运动时仍用 min..max 粗糙度斜坡。
+- **原因**：设计中曾让场景运动时也用 64 帧上限，D02 运动阶段的最大滞后从 0.083 升到 0.092（`exp/fp30-apple.log`），因此加上这条限制。
+- **CPU 复现**：`reflectionHistoryLimit(roughness, temporal, stationary)`，浏览器测试用它核对静止累计。
+
+##### 为什么不设为默认
+
+- **滤波有偏**：滤波是空间平均，会压低局部高光。
+  - D02 粗糙度 0.3 高光中心：物体在波瓣内的五个事件中，最后 16 帧的显示值比滤波前低 0.5%–1.5%。
+  - 阶梯 0.7 档相对 4,096 样本参考的有符号偏差为 −2.9%，默认配置为 −0.7%（`exp/young-apple.log`、`exp/base-apple.log`）。归一化 MAE 仍从 0.182 降到 0.031。
+- **静止上限 64 帧**：没有具名重置的缓慢变化，在静止视角下最多要经过 64 帧的平均窗口。例如 GI 探针持续收敛时，反射命中上的间接光会滞后。这一点未测。
+- **成本**：每帧增加 1 + iterations 个 compute pass，以及 5×5 重建（见「预算」）。
+- **范围**：只在受控小场景测过，大场景与 GI 联合配置都未测。
+
+##### 设计过程中的对照（Apple，实验用 spec 已删除，日志保留）
+
+| 变体 | 内容 | L05 最差误差 / 最差峰峰值 | D02 波瓣内 T90 | 结论 |
+| --- | --- | --- | --- | --- |
+| `base` | 默认配置 | 0.182 / 7.15% | 31 | — |
+| `d02resp` | 只加波瓣内运动响应 | 未测 | 7 | 响应后的单锚点噪声使 T90 超标 |
+| `filterA` | 滤波（footprint 0.5，按全部样本平均距离），默认历史 | 0.058 / 3.97% | 未测 | 稳定性不达标 |
+| `st64nf` | 静止上限 64，不滤波 | 0.126 / 3.81% | 未测 | 误差与稳定性都不达标 |
+| `st64` | 静止上限 64 + 滤波（footprint 0.5） | 0.053 / 2.21% | 未测 | 达标，但 0.5 档偏差 −5.2% |
+| `q1` | 滤波（footprint 0.5）+ 响应，历史 32 | 0.056 / 3.78% | 41 | 滤波压低高光，T90 变差 |
+| `hitd` | 按命中距离 + 响应 + 静止 64（footprint 0.5） | 0.037 / 2.25% | 28（滤波前 7） | 同上 |
+| `fp30` | footprint 0.3 + 命中距离 + 响应 + 静止 64 | 0.031 / 2.47% | 2 | 场景运动时也用 64 帧，运动滞后 0.092 |
+| `young` | `fp30` + 只在无场景运动时用静止上限 + 重建帧 | 0.031 / 2.47% | 2 | **采用** |
+| `young50` | `young`，footprint 0.5 | 0.037 / 2.25% | 3 | 不采用 |
+
+日志位于 `artifacts/reflections-quality-20261031/exp/`，`young-swiftshader.log` 为最终方案在 SwiftShader 上的同一实验。
+
+#### 接口
+
+- **选项**：
+  - `ReflectionTemporalOptions.lobeMotionResponse?`：0–1，默认 0（关闭）。
+  - `ReflectionTemporalOptions.stationaryHistoryFrames?`：2–128 的整数，默认不设（沿用斜坡）。解析后为 `number | undefined`。
+  - `ReflectionsOptions.spatialFilter?: ReflectionSpatialFilterOptions { iterations?, footprint? }`，解析后为 `ResolvedReflectionsOptions.spatialFilter`，未配置时为 `undefined`。
+  - 新错误码：`REFLECTIONS_SPATIAL_FILTER`、`REFLECTIONS_FILTER_ITERATIONS`、`REFLECTIONS_FILTER_FOOTPRINT`、`REFLECTIONS_LOBE_MOTION_RESPONSE`、`REFLECTIONS_STATIONARY_HISTORY_FRAMES`、`REFLECTIONS_SPATIAL_FILTER_ENABLED`、`REFLECTIONS_SPATIAL_FILTER_NOT_CONFIGURED`。
+- **导出**（`src/reflections.ts`）：`REFLECTION_RECONSTRUCTION_FOOTPRINT` = 0.3、`REFLECTION_REBUILD_FRAMES` = 4、`REFLECTION_FILTER_BYTES_PER_ANCHOR` = 96、`reflectionLobeTangent`、`reflectionFilterRadius`；`reflectionHistoryLimit` 增加可选参数 `stationary`。
+- **API**：`Renderer.setReflectionsSpatialFilterEnabled`、`GpuReflections.setSpatialFilterEnabled`、`GpuReflections.spatialFilterConfigured`。
+- **探针**（`probeReflections` 的锚点）：
+  - `unfilteredRadiance`：滤波前的结果，未滤波时等于 `radiance`；
+  - `filterRadius`：本锚点的世界空间核半径，未滤波时为 0；
+  - `historyResponse`：s；
+  - `movedLobeFraction`：本锚点的已移动比例。
+- **诊断**：
+  - `reflections.temporal.lobeMotionResponse`；
+  - `reflections.temporal.stationaryHistoryFrames`，未设时为 `null`；
+  - `reflections.spatialFilter { configured, enabled, active, iterations, footprint, scratchBytes, bytesPerAnchor }`。
+- **布局**：
+  - `REFLECTION_PARAMETER_BYTES` 304 → 336，新增 `spatial: vec4f`（滤波 footprint、响应阈值、重建 footprint、保留）和 `spatialState: vec4u`（滤波开启、级数、静止上限，0 表示斜坡、保留）。
+  - `REFLECTION_ANCHOR_BYTES` 256 → 272，新增 `unfiltered: vec4f`：rgb 为滤波前结果；w 在滤波前是命中平均距离，滤波后被替换为核半径。
+  - 锚点 `motion.w` 由权重和改为已移动比例；`temporal.w` 存 s 的 f32 位；历史记录 `versions.w` 存剩余重建帧数。
+- **着色器**：新增 `reflections-guide.wgsl`（始终拼入）与 `reflections-filter.wgsl`（只在配置滤波时拼入）。滤波入口 `filterPrepare`、`filterLevelPass` 使用 group 0 的 binding 13–16，与积分 pass 的屏幕追踪 binding 11/12 和局部灯绑定组互不冲突。光照与命中着色未改。
+- **计时**：配置滤波时，反射时间戳段结束于最后一级滤波 pass，`gpuMs.reflections` 包含滤波。
+- **测试**：
+  - L05 与 D02 目标用例使用 `REFLECTION_QUALITY_OPTIONS`，去掉 `test.fail`，阈值未改。
+  - D02 的重置检查改为比较滤波前的历史与原始估计。
+  - 视差用例增加第四次运行：质量配置下每档移动误差不超过默认的 1.02 倍 + 0.002。镜面档的差异只来自静置阶段更长的静止历史，最大绝对差约 7.5e-5，因此没有用逐位相等。
+
+#### 验证
+
+命令（端口 5213）：
+
+```
+npm run check
+PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGHT_EXPECT_GPU_VENDOR=apple PLAYWRIGHT_PORT=5213 npx playwright test \
+  tests/browser/reflection-demo.spec.ts tests/browser/reflections-coverage.spec.ts tests/browser/reflections-dynamic.spec.ts \
+  tests/browser/reflections-lighting.spec.ts tests/browser/reflections-sampling.spec.ts tests/browser/reflections-screen.spec.ts \
+  tests/browser/reflections-temporal.spec.ts tests/browser/reflections.spec.ts tests/browser/local-lights-reflections.spec.ts \
+  tests/browser/volumetric-fog-air.spec.ts --reporter=line
+# SwiftShader：去掉前三个环境变量
+```
+
+- **单元测试与构建**：`npm run check` 通过，108 个文件、936 项测试，类型检查与生产构建通过。日志 `artifacts/reflections-quality-20261031/check-2.log`。
+- **Apple**：**14/14** 通过（45.3 s），没有 `test.fail` 或跳过。日志 `final2-apple.log`，JSON 报告在 `final2-apple/`。
+- **SwiftShader**：**14/14** 通过（3.0 min）。日志 `final2-swiftshader.log`，JSON 报告在 `final2-swiftshader/`。
+- **最后一处改动**：只修正诊断标志 `historyClamped`，没有可用历史的锚点不再被标为截断，解析结果不变。改动前两种适配器也都是 14/14（`final-apple.log`、`final-swiftshader.log`），汇总数值与改动后完全相同。
+- **基线**：改动前同一组 spec（当时没有局部灯反射 spec）在两种适配器上都是 13/13，其中 2 项 `test.fail` 按预期失败。日志 `baseline-apple.log`、`baseline-swiftshader.log`。
+- **确定性**：两种适配器的 L05 与 D02 数值几乎一致，D02 各事件的 T90 完全相同。
+- 以上路径都在 `artifacts/reflections-quality-20261031/` 下（不提交）。
+
+##### L05 粗糙度阶梯（`reflections-temporal.spec.ts`，Apple）
+
+设置与原用例相同：48 px 视口，每像素一个锚点，每锚点 4 个样本，静止预热 64 帧后测 120 帧。误差为对照每锚点 4,096 个分层 GGX 样本的 CPU 参考的归一化 MAE。
+
+| 粗糙度 | 默认：历史上限 | 默认：误差 | 默认：峰峰值 | 质量：核半径 R | 质量：滤波前误差 | 质量：误差 | 质量：峰峰值 | 质量：变异系数 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.045 | 8 | 0.031 | 2.99% | 0.0027 m | 0.018 | **0.018** | **0.48%** | 0.11% |
+| 0.1 | 8 | 0.055 | 4.07% | 0.0122 m | 0.013 | **0.013** | **0.61%** | 0.16% |
+| 0.2 | 12 | 0.080 | 4.02% | 0.0458 m | 0.025 | **0.025** | **1.01%** | 0.22% |
+| 0.35 | 24 | 0.094 | 4.19% | 0.150 m | 0.052 | **0.021** | **1.74%** | 0.47% |
+| 0.5 | 32 | 0.105 | 3.87% | 0.345 m | 0.073 | **0.022** | **2.03%** | 0.43% |
+| 0.7 | 32 | 0.182 | 7.15% | 0.960 m | 0.126 | **0.031** | **2.47%** | 0.48% |
+
+- 质量配置下六档的历史上限都是 64。
+- 锚点间隔 0.0668 m：前三档的 R 小于一个间隔，滤波前后逐位相同；后三档的 R 为 2.2–14 个间隔。
+- 只加静止上限、不滤波时，六档误差为 0.013–0.126，峰峰值为 0.48%–3.81%（`exp/st64nf-apple.log`）。0.7 档的误差与峰峰值都要靠滤波才达标。
+- SwiftShader：质量配置误差 0.018/0.013/0.025/0.022/0.022/0.031，峰峰值 0.41%/0.62%/1.00%/1.74%/2.03%/2.45%；默认配置误差 0.032/0.055/0.080/0.095/0.105/0.182，峰峰值 2.76%–7.06%。
+- 质量配置下固定样本集（关闭时间重建）的结果也经过滤波，所以「不劣于固定样本」这条门槛比较的是同一配置下的固定样本误差。
+
+##### 相机移动视差（同一 spec，Apple）
+
+相机每帧竖直平移 0.08 m，共 16 帧，取第 4–15 帧对照逐帧参考的归一化 MAE：
+
+| 粗糙度 | 默认（视差 0.35） | 仅表面运动 | 无历史 | 质量配置 |
+| --- | --- | --- | --- | --- |
+| 0.045 | 0.063 | 0.177 | 0.058 | 0.063 |
+| 0.1 | 0.206 | 0.230 | 0.211 | 0.206 |
+| 0.2 | 0.345 | 0.417 | 0.478 | 0.345 |
+| 0.35 | 0.436 | 0.436 | 0.889 | **0.359** |
+| 0.5 | 0.341 | 0.341 | 1.168 | **0.188** |
+| 0.7 | 0.312 | 0.312 | 1.794 | **0.203** |
+
+SwiftShader 的质量配置为 0.062/0.209/0.347/0.328/0.184/0.175，默认为 0.063/0.209/0.346/0.421/0.347/0.335。移动时粗糙档仍受 4 样本噪声限制，只报告，不设门槛。
+
+##### D02 动态内容与响应（`reflections-dynamic.spec.ts`，Apple）
+
+中心 16 个锚点；T90 为结果稳定进入阶跃 ±10% 所需的帧数。两种适配器的 T90 完全相同。
+
+| 事件 | 粗糙度 | 默认 T90 | 质量 T90 | 质量：首帧残差 | 质量：首帧 s | 说明 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 物体瞬移进入波瓣 | 0.045 | 1 | 1 | 0.00 | 1.00 | 镜面的重建只含自身，等同重置 |
+| 物体瞬移进入波瓣 | 0.3 | **31** | **2** | −0.16（默认 −0.48） | 0.99 | 首帧后最大偏差 0.053（默认 0.379） |
+| 物体移出波瓣 | 0.045 / 0.3 | 1 / 1 | 1 / 1 | 0.00 | 0 | 由 3×3 截断处理 |
+| 实例着色变化 | 0.045 / 0.3 | 1 / 1 | 1 / 1 | −0.08（0.3） | 0 | — |
+| 材质参数变化 | 0.045 / 0.3 | 1 / 1 | 1 / 1 | 0.00 | 0 | 全部锚点重置 |
+| 材质恢复 | 0.045 / 0.3 | 1 / 2 | 1 / 2 | −0.11（0.3） | 0 | — |
+| 历史版本变化 | 0.045 / 0.3 | 1 / 7 | 1 / 6 | −0.32（0.3） | 0 | 重置后的 4 样本噪声，0.3 档不设门槛 |
+| 接收体粗糙度 0.3 → 0.045 | — | 1 | 1 | 0.00 | 0 | — |
+
+- **运动阶段**：两种配置相同。最大滞后 0.083，9,575 个锚点帧中只有 1 个超过 5%，主导反射身份与精确镜面光线一致率 ≥ 0.985。
+- **重置契约**：材质与历史版本事件后计数为 1，滤波前的首帧结果等于原始估计。
+- **首帧计数**：粗糙度 0.3 瞬移进入后为 7.4，即重建的有效锚点数；默认配置为 20。
+
+##### 诊断计时（Apple，并发负载，不是验收计时）
+
+- **设置**：640×360，`pixelSpacing` 4，14,400 个锚点，每组 57,600 条光线，阶梯场景，静止相机。
+- **方法**：跳过前 60 帧后，每次运行取 120 个 `gpuMs.reflections` 样本；默认与质量配置交替各跑两次。读数按 65.536 µs 量化。
+- **结果**：
+  - 默认（只有时间重建）：中位数 0.393 / 0.459 ms，p95 0.524 / 0.524 ms；
+  - 质量配置：中位数 0.524 / 0.524 ms，p95 0.590 / 0.852 ms。
+  - 中位数的差约为 1–2 个量化单位。
+- **来源**：临时 spec 已删除，没有提交。日志 `timing-apple.log`，JSON 在 `timing-apple/`。
+- 多个并行任务同时占用 GPU，这些数字只能说明量级，不能作为帧时间验收。
+
+#### 预算与工作量
+
+- **无条件**：
+  - 锚点 256 → 272 B/锚点。默认上限 16,384 个锚点时增加 262,144 B，诊断读回缓冲（最多 1,024 个锚点）增加 16,384 B。
+  - 参数块 304 → 336 B。
+- **只在配置滤波时分配**：
+  - 引导 64 B/锚点，两块辐亮度缓冲各 16 B/锚点，共 96 B/锚点；
+  - 每级一个 256 B 的 uniform 槽。
+  - 全部计入 `maxBytes` 与 `ownedGpuBytes`，`dispose()` 后归零；预算不足在分配前报 `REFLECTIONS_MEMORY_BUDGET`。
+  - 实测：14,400 个锚点、4 级时，反射账本从 20,323,664 B 增至 21,707,088 B，增量 1,383,424 B = 14,400 × 96 + 4 × 256。
+- **历史**：仍为 2 × 96 B/锚点，重建帧数复用保留字。
+- **工作量**（都有上界，没有新光线，没有 GPU→CPU 回读）：
+  - 积分：每个样本多 3 个累加量。
+  - 时间重建：`lobeMotionResponse` > 0 且历史有效时，每锚点每帧 25 次邻居引导求值。
+  - 滤波：1 个准备 pass，加上 iterations 个 pass，每个 pass 每锚点 9 个采样点。默认 4 级，即每帧多 5 个 compute pass，每锚点 36 次采样。
+
+#### 能力矩阵
+
+`docs/capability-matrix.json` 新增目标机证据 `apple-reflections-quality-20261031`（kind `quality`）。状态由脚本推导，`npm run capability:report` 与 `npx vitest run tests/capability-matrix.test.ts` 通过。
+
+- **L05**：`dynamic-response` 与 `temporal-stability` 由 unmet 改为 met，并注明依赖可选质量配置。`functional` 仍为 partly-measured，帧时间未测，因此推导状态由 fail 变为 **partial**。
+- **D02**：仍为 partial，原因改写为质量配置 T90 2 帧、默认配置 31 帧。
+- **P2-gi-reflections**：`dynamic-response`、`temporal-stability` 改为 met。这两项的 GI 部分原本已满足：L03 响应通过，GI 120 帧稳定性 9/9。`gi-steady` 仍为 unmet，状态保持 **fail**。
+- **合计**：由 pass 0、fail 6、unsupported 3、partial 27、untested 4，变为 pass 0、fail **5**、unsupported 3、partial **28**、untested 4。
+
+#### 未完成与限制
+
+##### 细接收体（未实现）
+
+- **现象**：重建只能借用落在同一接收体上的锚点，窄于约两个锚点间隔的接收体拿不到反射。`reflections-coverage.spec.ts` 的结果与之前相同：
+  - 0.024 m 杆：间隔 2 与 4 时都 100% 漏反射；
+  - 0.05 m 杆：51% / 100%；
+  - 0.1 m 杆：49% / 51%。
+  - 默认间隔 4 px 时，窄于约 8 px 的接收体会受影响。
+- **考虑过的设计**：主表面 pass 把「四角与回退都失败」的像素写入有界的补充锚点列表，容量 K 固定，每个网格单元最多一项；下一帧沿用同一套查询与积分管线追踪这些锚点。
+- **阻碍**：
+  1. **片元副作用**：漏反射只在主表面片元着色器（`reflections-sample.wgsl` 的 `reflectionRadiance`，只读锚点）中才知道。写回需要片元阶段的 storage 写入或原子追加，主表面 pass 将不再无副作用。它对 Apple TBDR 的隐藏面消除和整帧成本的影响需要在目标机单独测量。
+  2. **确定性**：原子追加的顺序不确定。要保持结果确定，需要额外的前缀和压缩 pass，并对超出 K 的部分确定取舍，否则会闪烁。
+  3. **历史**：补充锚点没有固定网格位置，现有历史按网格下标存取，需要新的身份与重投影契约，以及显式的拓扑与历史失效。否则补充锚点只有 4 样本的单帧估计，过不了稳定性门槛。
+  4. **成本与延迟**：每帧固定增加 K ×（1 + 2 × 样本数）次查询和对应内存，都必须进预算账本；另有一帧延迟，移动的细物体会滞后。
+- 在片元阶段逐像素补追踪也没有采用：世界查询目前只以 compute pass 处理光线缓冲，主表面片元着色器没有接入遍历；即使接入，成本也随漏反射像素数变化，没有上界。
+
+##### 其他
+
+- **质量配置的范围**：只在受控小场景（阶梯、D02、视差）测过；大场景、GI 联合配置、屏幕补充同时开启时都未测。
+- **滤波偏差**：见「为什么不设为默认」。滤波不会跨越身份、材质或法线不一致的边界，但同一表面上的高光峰值会被压低。
+- **重建帧的局限**：`lobeMotionResponse` 只在世界查询报告反射命中运动时触发。没有运动的内容变化仍依赖具名重置或 3×3 截断。
+- **未尝试**：按粗糙度自适应增加样本数。
+- **移动视角**：粗糙档误差仍为 0.19–0.36，只报告。
+- **D02 历史版本事件**：0.3 档 T90 仍为 6 帧，是重置后的噪声，不设门槛。
+- **计时**：都是并发负载下的诊断值，没有验收计时。
+
 ### 共享运行时、场景与材质
 
 原生 WebGPU 初始化、能力检查、可诊断错误与设备丢失报告；TypeScript 运行时、WGSL 着色器、Vite 构建。运行场景使用程序网格、仓库内原创 OBJ 卡片和固定版本的 Khronos glTF 参考资产；运行时仅请求本地托管的文件。第三方来源、许可证与哈希见 [assets.md](assets.md)。
@@ -2690,7 +2970,7 @@ Rapier 以独立适配器提供盒子刚体和地面碰撞、最近命中射线�
 | 材质 | 有界表达式图；PBR/Unlit、Opaque/Masked、双面、纹理与参数，基础法线贴图；无多层材质、透射或通用透明 |
 | 资源 | 固定容量批次；材质变体和纹理预算；静态 Opaque 几何有 CPU 缓存、GPU 页池、每帧上传预算、整组准入、祖先保留及默认预算内固定阴影/查询代理；尚无全应用资源预算或纹理流送 |
 | 几何/动画资产 | OBJ、glTF/GLB、蒙皮/Morph；静态 Opaque 离线簇层级、压缩页面、GPU LOD/视锥剔除/间接绘制与分簇演示，可选两阶段主视图遮挡剔除；主 Renderer 已接入分页表面和自动调度，源网格可省略时以固定代理供阴影/查询/GI，旧完整源流送仍可用；源网格可省略批次拒绝 Masked；离线工具可校验解包 ZIP、确定性编码 BC7、经 Blender 转换 FBX 并写出资产集，`/large-scene.html` 能加载 Bistro Exterior 与 Sponza 资产集（MASK/BLEND 不进分页，遮蔽贴图不参与着色）；仍缺动态形变简化或大型流送联合验收 |
-| 光照 | 可更新的单方向太阳光、直接光与阴影；可选有界点光/聚光灯（每像素遍历全部启用灯、可选图集阴影，同时进入 GI 捕获、Final Gather、反射命中与雾），无分簇灯剔除；共享形变世界查询上的固定探针漫反射 GI、可选跨帧反馈、可选变化驱动的有界探针更新和实验性屏幕 Final Gather；新增有界单段镜面/粗糙世界反射，以及可选的反射时间重建与屏幕空间补充（L05 粗糙档与 D02 粗糙波瓣响应未达标）；仍无完整 GI；联合验收中 L01 稳态与 L04 漏光未通过 |
+| 光照 | 可更新的单方向太阳光、直接光与阴影；可选有界点光/聚光灯（每像素遍历全部启用灯、可选图集阴影，同时进入 GI 捕获、Final Gather、反射命中与雾），无分簇灯剔除；共享形变世界查询上的固定探针漫反射 GI、可选跨帧反馈、可选变化驱动的有界探针更新和实验性屏幕 Final Gather；新增有界单段镜面/粗糙世界反射，以及可选的反射时间重建、屏幕空间补充、空间滤波与波瓣内运动响应（L05 与 D02 只在可选质量配置下达标，默认配置未达标）；仍无完整 GI；联合验收中 L01 稳态与 L04 漏光未通过 |
 | 体积雾 | 主视图有界 GPU 高度雾和最多 64 个局部盒/球体积，太阳共享阴影的单次散射、可选三维历史重投影（可选遮挡体局部历史拒绝）、平方深度切片积分与全分辨率深度 HDR 合成；反射沿共享世界介质另行积分；可选 GI 探针空气光照与天空可见性；可选点光/聚光灯单次散射（带该灯阴影，按 4×4×4 块筛灯）；无透明介质路径、自阴影或多散射 |
 | 物理 | 地面、盒子刚体、最近命中射线与球形重叠查询；无角色控制器、ragdoll、布料或破坏 |
 | 平台 | WebGPU 必需；初始化失败明确报错，设备丢失报告后停止帧循环；主页面按有界策略在新设备上重建 Renderer，其他页面恢复需要重新加载 |
@@ -2720,7 +3000,7 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 #### 内容
 
-- **版本**：v1，2026-10-30 冻结。目标为 Apple M3 Max（30 核 GPU，36 GB），macOS 26.6.2（25G83），Chrome 156.0.8078.76，适配器 `apple / metal-3`。证据截至 2026-10-31，对应 main `0802479`（字段 `evidenceMain`）。
+- **版本**：v1，2026-10-30 冻结。目标为 Apple M3 Max（30 核 GPU，36 GB），macOS 26.6.2（25G83），Chrome 156.0.8078.76，适配器 `apple / metal-3`。证据截至 2026-10-31，对应 main `234eb39`（字段 `evidenceMain`）。
 - **40 行**：
   - 26 个固定场景：G01–G05、D01–D03、L01–L05、M01–M04、F01–F06、T01、P01、W01；
   - 阶段 1 的 7 个工作包和阶段 2 的 5 个工作包；
@@ -2747,19 +3027,18 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 门槛结果取 `met`、`unmet`、`partly-measured` 或 `not-measured`，未列出的门槛按 `not-measured` 处理。结果不是 `not-measured` 时，必须有目标机证据引用该门槛。
 
-#### 当前状态（main `0802479`）
+#### 当前状态（main `234eb39`）
 
-合计：pass 0，fail 6，unsupported 3，partial 27，untested 4。按阶段：
+合计：pass 0，fail 5，unsupported 3，partial 28，untested 4。按阶段：
 - 阶段 1：8 行全部 partial；
-- 阶段 2：fail 6、unsupported 2、partial 19、untested 4；
+- 阶段 2：fail 5、unsupported 2、partial 20、untested 4；
 - 阶段 4：F06 为 unsupported。
 
 | 状态 | 行 | 依据 |
 | --- | --- | --- |
 | fail | L01 | 两室联合场景的 6 个 ROI 中有 4 个超过 0.15（0.205–0.511） |
 | fail | L04 | 漏光箱 0/7，细缝箱归一化 MAE 6.63 |
-| fail | L05 | 静态 120 帧峰峰值只有镜面档 ≤ 3%；物体进入粗糙度 0.3 波瓣时 T90 为 31–35 帧 |
-| fail | P2-gi-reflections | 包含 L01、L04、L05 的未满足项 |
+| fail | P2-gi-reflections | 包含 L01、L04 的 GI 稳态未满足项；反射的两项门槛只在可选质量配置下满足 |
 | fail | P2-participating-media、F05 | 8 像素/格、64 层带历史需 158.2 MiB，预算 64 MiB |
 | unsupported | M02、M03、F06 | 缺角色光学、透明与 decal；F06 属阶段 4 |
 | untested | P2-joint-large-scene、G02、G05、W01 | 没有目标机证据 |
@@ -2769,11 +3048,12 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 - **fail → partial**：P2-world-query、G03、P2-geometry-visibility。
   - 世界查询的 3 项由水密三角形测试修复。
   - `geometry-stream-renderer.spec.ts:4` 只在放宽的 Apple 阈值下通过，矩阵把它记为测试假设变更，不是修复。
-- **partial → fail**：L01、L04、L05、P2-gi-reflections。
+- **partial → fail**：L01、L04、P2-gi-reflections。
+- **partial → fail → partial**：L05。粗糙档稳定性与波瓣响应未达标时改为 fail；可选反射质量配置达标后回到 partial，默认配置仍未达标。
 - **unsupported → partial**：F03。点光/聚光灯接入后，移动聚光灯与短闪光用例改为带门限运行，在目标机与 SwiftShader 上通过。F05 与 P2-participating-media 不再缺能力，但仍因 F05 的显存预算为 fail。
 - **untested → partial**：P2-visual-delivery。`/large-scene.html` 在目标机上漫游了 Bistro Exterior 与 Sponza；Bistro 关键帧 0 的路缘有透出天空的漏洞，原因待查，记为限制。
 
-这些数值转录自各项工作的日志、JSON 和本文档，没有重新采集。新增 8 条目标机证据记录：
+这些数值转录自各项工作的日志、JSON 和本文档，没有重新采集。新增 10 条目标机证据记录：
 
 | 记录 | 种类 | 内容 |
 | --- | --- | --- |
@@ -2784,7 +3064,9 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 | `apple-large-scene-20261031` | functional | 本地资产集漫游，Bistro Exterior 与 Sponza 各 3/3 |
 | `apple-benchmark-diagnostic-20261031` | diagnostic-timing | 「帧节奏归因、macOS 主机信息与争用下的诊断运行」中的 4 次基准运行 |
 | `apple-local-lights-20261031` | quality | 点光/聚光灯的表面、GI、反射与雾对照，以及 F03 移动聚光灯与短闪光 |
+| `apple-reflections-quality-20261031` | quality | 可选反射质量配置下的 L05 阶梯、静态稳定性与 D02 响应 |
 | `apple-main-lights-20261031` | functional | 合入局部灯与本小节内容后的 main 完整回归 171 项：168 通过、3 跳过、0 失败（`0802479`） |
+| `apple-main-reflq-20261031` | functional | 合入反射质量选项后的 main 完整回归 171 项：168 通过、3 跳过、0 失败（`234eb39`），不再有 `test.fail` |
 
 #### 命令
 
@@ -3011,6 +3293,6 @@ SwiftShader 使用同一命令，去掉三个 GPU 相关变量。
 - **未执行**：30 分钟运行与无干扰的验收计时，需要在主机空闲的窗口运行。
 - **未在目标机运行**：headed 模式、Safari 和 Playwright WebKit。Safari 需要用户操作，WebKit 需要下载许可。
 - **节奏分组**只说明相关。负载均值是整机指标，不能区分 GPU 争用。
-- **矩阵**中的数值为转录，只反映 main `0802479` 及之前的证据。
+- **矩阵**中的数值为转录，只反映截至 `evidenceMain` 的证据。
 - **SwiftShader 偶发失败**：此前 `raster-receivers` 出现过一次 `Execution context was destroyed`（`artifacts/phase1-apple-triage-20261030/fix-b-swiftshader.log`），单独重跑和第二次完整运行都通过。Playwright 的 webServer 没有转接 stdout，Vite 的依赖重载提示不会写进测试日志，所以这份日志既不能证实也不能排除「依赖预构建触发重载」的假设。要验证，可以在 webServer 上设 `stdout: 'pipe'` 后复现。
 - **保留的早期证据**：`dcb95df` 的压力运行（93 个迟到帧）保留在 `foundation-stress-headless/`。

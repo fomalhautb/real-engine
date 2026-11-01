@@ -64,6 +64,8 @@ npm run dev
 
 `/reflection.html` 展示世界空间反射：镜子中的彩色实体位于相机身后，可切换反射、粗糙度、薄雾、暂停和逐帧。代码通过 `RendererOptions.reflections` 配置采样/距离/内存预算，要求同时配置 `worldQueries`；`setReflectionsEnabled` 切换，`probeReflections` 显式读回有限锚点。反射命中复用材质、Mask 与共享形变，配置 GI 时借用世界探针，配置雾时沿实际反射方向积分世界介质。可选的 `temporal` 与 `screenTrace` 分别开启时间重建和屏幕空间补充。当前仅单段反射，粗糙档误差与稳定性、粗糙波瓣内的响应时间仍未达标，有限采样与空间重建仍有画质限制，不代表阶段 2 完成，详见[世界空间反射](docs/implementation.md#世界空间反射)。
 
+2026-10-31 新增三个可选反射质量项：`spatialFilter`（边缘感知空间滤波，只作用于显示）、`temporal.lobeMotionResponse`（粗糙波瓣内内容移动时用邻域重建替换旧历史）和 `temporal.stationaryHistoryFrames`（场景静止时延长历史）。受控用例中，`{ spatialFilter: {}, temporal: { lobeMotionResponse: 0.25, stationaryHistoryFrames: 64 } }` 使 L05 粗糙度阶梯与 D02 粗糙波瓣响应达标；默认配置不变且仍未达标，滤波会把粗糙高光压低约 1%–3%。`setReflectionsSpatialFilterEnabled` 可在运行时开关已配置的滤波。演示页没有启用这些选项。
+
 `/gi.html` 展示世界空间漫反射 GI：红蓝墙面和发光条通过真实场景查询照亮白色物体，可切换单次/跨帧多次反弹（演示默认多次）、开关 GI、改变墙色及太阳参数、暂停逐帧、按 H 隐藏面板。引擎的 `diffuseGi.multiBounce` 默认 `false`，运行时用 `setDiffuseGiMultiBounce(boolean)` 切换，`invalidateDiffuseGiHistory()` 可显式丢弃旧反馈。探针使用 8×8 八面体方向距离矩和低置信度平滑权重；`visibilityWeightThreshold` 默认 0.2、设 0 可关闭额外曲线。固定网格仍每帧全量更新；无镜面反弹、时域平均、自动布点或探针流送。关闭 GI 时没有旧常量环境补光。
 
 `/gi.html?finalGather=1` 额外开启实验性 Final Gather 预览，起始为固定镜头，持续渲染以积累近场样本；常规 `/gi.html` 保持世界探针路径。代码可通过 `DiffuseGiOptions.finalGather` 配置，并用 `setDiffuseGiFinalGatherEnabled(boolean)` 单独启停。普通镜头运动可将前帧原始锚点重投影；切镜头、动态几何或光照/材质突变仍保守地整体重置。此预览的近场误差和帧间隔仍有未通过门槛，见 [实现状态](docs/implementation.md#实验性屏幕-final-gather)。

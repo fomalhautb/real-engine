@@ -105,3 +105,104 @@ export function geometryCutWatertightness(hierarchy: Pick<GeometryHierarchy, 'so
   }
   return { triangles, boundaryEdges, repeatedEdges };
 }
+
+/** Decoded payload of one cluster: interleaved 80-byte rest records (position
+ * first, as float32) and local triangle corners, as produced by page decoding. */
+export interface GeometryClusterPayload {
+  readonly rest: Uint8Array;
+  readonly localTriangles: Uint8Array;
+}
+
+/** Signed welded boundary preservation of every non-terminal group. */
+export interface GeometryGroupBoundaryAudit {
+  readonly groups: number;
+  /** Non-terminal groups whose children and parents were compared. */
+  readonly checkedGroups: number;
+  /** Groups whose parents' signed welded boundary differs from their children's. */
+  readonly mismatchedGroups: number;
+  readonly mismatchExamples: readonly number[];
+  /** Undirected welded edges with a nonzero signed balance over all LOD0 clusters: the source's open borders. */
+  readonly lod0BoundaryEdges: number;
+  readonly clusters: number;
+  readonly triangles: number;
+}
+
+const REST_RECORD_BYTES = 80;
+const WELD_KEY_SCALE = 0x4000000;
+const BOUNDARY_AUDIT_TRIANGLES = 16_000_000;
+
+/** Exact crack audit of a streamed hierarchy over the payload bytes that stream.
+ * Vertices are welded by equal float32 positions (the builder's position remap),
+ * then every non-terminal group must have the same signed undirected edge
+ * balance (opposite interior half edges cancel) in its parent clusters as in its
+ * children. Because the balance is additive over disjoint triangle sets, every
+ * cut that geometryCutCoverage accepts (each LOD0 cluster represented exactly
+ * once through complete group replacements) then has exactly the net boundary of
+ * LOD0, for open and closed sources alike: a crack or T-junction between
+ * clusters of different levels would add a nonzero edge LOD0 does not have.
+ * Folds that keep the net balance are not cracks and are not reported here.
+ * Work is bounded: each cluster is visited at most three times (as a child, as a
+ * parent and as LOD0) and the total is capped. */
+export function geometryGroupBoundaryAudit(directoryInput: GeometryStreamDirectory,
+  payloads: ReadonlyMap<number, GeometryClusterPayload> | ((clusterId: number) => GeometryClusterPayload | undefined)): GeometryGroupBoundaryAudit {
+  const directory = validateGeometryStreamDirectory(directoryInput);
+  const payload = typeof payloads === 'function' ? payloads : (id: number) => payloads.get(id);
+  const canonical = new Map<string, number>(), welded = new Map<number, Uint32Array>();
+  let visited = 0;
+  const weld = (id: number) => {
+    const known = welded.get(id);
+    if (known) return known;
+    const cluster = directory.clusters[id], data = payload(id);
+    if (!data || data.rest.byteLength !== cluster.vertexCount * REST_RECORD_BYTES
+      || data.localTriangles.length !== cluster.triangleCount * 3) throw new RangeError('GEOMETRY_GROUP_BOUNDARY_PAYLOAD: ' + id);
+    const view = new DataView(data.rest.buffer, data.rest.byteOffset, data.rest.byteLength);
+    const ids = new Uint32Array(cluster.vertexCount);
+    for (let vertex = 0; vertex < cluster.vertexCount; vertex++) {
+      const offset = vertex * REST_RECORD_BYTES;
+      const key = `${view.getFloat32(offset, true)},${view.getFloat32(offset + 4, true)},${view.getFloat32(offset + 8, true)}`;
+      let weldedId = canonical.get(key);
+      if (weldedId === undefined) {
+        weldedId = canonical.size;
+        if (weldedId >= WELD_KEY_SCALE) throw new RangeError('GEOMETRY_GROUP_BOUNDARY_VERTEX_BUDGET');
+        canonical.set(key, weldedId);
+      }
+      ids[vertex] = weldedId;
+    }
+    welded.set(id, ids);
+    return ids;
+  };
+  const balance = (ids: readonly number[]) => {
+    const edges = new Map<number, number>();
+    for (const id of ids) {
+      const vertices = weld(id), corners = payload(id)!.localTriangles;
+      visited += corners.length / 3;
+      if (visited > BOUNDARY_AUDIT_TRIANGLES) throw new RangeError('GEOMETRY_GROUP_BOUNDARY_BUDGET');
+      for (let t = 0; t < corners.length; t += 3) for (let e = 0; e < 3; e++) {
+        const local = corners[t + e], next = corners[t + (e + 1) % 3];
+        if (local >= vertices.length || next >= vertices.length) throw new RangeError('GEOMETRY_GROUP_BOUNDARY_CORNER: ' + id);
+        const a = vertices[local], b = vertices[next];
+        if (a === b) continue;
+        const key = a < b ? a * WELD_KEY_SCALE + b : b * WELD_KEY_SCALE + a;
+        const count = (edges.get(key) ?? 0) + (a < b ? 1 : -1);
+        if (count) edges.set(key, count); else edges.delete(key);
+      }
+    }
+    return edges;
+  };
+  let checkedGroups = 0, mismatchedGroups = 0, triangles = 0;
+  const mismatchExamples: number[] = [];
+  for (const [index, group] of directory.groups.entries()) {
+    if (group.terminal) continue;
+    checkedGroups++;
+    const before = balance(group.children), after = balance(group.parents);
+    const same = before.size === after.size && [...before].every(([key, count]) => after.get(key) === count);
+    if (!same) { mismatchedGroups++; if (mismatchExamples.length < 8) mismatchExamples.push(index); }
+    // Each cluster is a child of exactly one group: its welded ids are no longer needed here.
+    for (const id of group.children) welded.delete(id);
+  }
+  const lod0 = directory.clusters.flatMap((cluster, id) => cluster.level === 0 ? [id] : []);
+  const lod0BoundaryEdges = balance(lod0).size;
+  for (const cluster of directory.clusters) triangles += cluster.triangleCount;
+  return { groups: directory.groups.length, checkedGroups, mismatchedGroups, mismatchExamples, lod0BoundaryEdges,
+    clusters: directory.clusters.length, triangles };
+}

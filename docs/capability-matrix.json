@@ -303,7 +303,7 @@
       "gateResults": { "functional": "partly-measured" }, "unsupportedCapabilities": [], "status": "partial",
       "statusReason": "目标机上 /large-scene.html 用本地资产集沿相机路径漫游 Bistro Exterior 与 Sponza（各 3/3）并完整释放。尚无联合场景、动态角色、录屏、参考对照、帧时间/内存验收或用户视觉验收。",
       "targetEvidence": [ { "ref": "apple-large-scene-20261031", "specs": ["tests/browser/large-scene.spec.ts"], "gates": ["functional"] } ], "historicalEvidence": [ { "ref": "hist-nvidia-sponza-20261025" } ],
-      "limitations": ["最终画面须经用户视觉验收", "MASK/BLEND primitive 不进分页漫游，遮蔽贴图不参与着色，FOV 与远平面固定", "Ivy、Emissive Candles、Animated Knight、Bistro Interior 未转换，Curtains/Trees 未合成", "Bistro 关键帧 0 的路缘与路面交界处有透出天空的漏洞，不属于 MASK 材质；源资产缝隙、背面剔除、LOD 与流送都未排除"] },
+      "limitations": ["最终画面须经用户视觉验收", "MASK/BLEND primitive 不进分页漫游，遮蔽贴图不参与着色，FOV 与远平面固定", "Ivy 已离线拆分（17 个 primitive）并转换；Curtains、Trees、Ivy 各有资产集，合成的 Sponza 资产集（main + curtains + trees + ivy，463 个分页 primitive）只做过 CPU 侧加载检查，尚未接入演示页、没有浏览器运行；Trees 树叶（BLEND）被省略，只显示树干", "Emissive Candles、Animated Knight、Bistro Interior 未转换", "Bistro 关键帧 0 的路缘与路面交界处有透出天空的漏洞，不属于 MASK 材质；源资产缝隙、背面剔除、LOD 与流送都未排除"] },
     { "id": "G01", "kind": "scene", "scene": { "action": "单高模缓慢拉近、绕行", "checks": "简化误差、轮廓跳变、裂缝" },
       "subsystem": "geometry", "priority": "P0", "phase": 2, "basis": "benchmarks.md：几何、光照、材质及形变用例同属阶段 2 的 P0 组合门槛",
       "inputScale": "未冻结", "correctnessReference": ["geometry"], "qualityGate": ["geometry-lod-error", "geometry-correctness"], "performanceBudget": ["base-output", "frame-time"],

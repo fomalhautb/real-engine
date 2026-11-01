@@ -1,6 +1,46 @@
 # 阶段 1–2 实现状态
 
-更新日期：2026-10-31。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
+更新日期：2026-11-01。当前补全阶段 1.2 的验收，并实现阶段 2 驻留 GPU LOD、世界空间查询、可选跨帧反馈的漫反射 GI 基础、有界单段世界空间反射及 GPU 体积雾；整组预算流送接入主 Renderer 共用的 Worker 解码池，把页哈希、解压和载荷校验移到后台，限制共享在途工作并传递取消。分页表面复用材质与当前/前帧变换语义；固定有界查询代理允许静态 Opaque 流送批次省略完整源 `mesh`，阴影、世界查询与 GI 共用该代理。世界查询增加批次内部实例 BVH 与跨批次候选筛选，沿用共享形变、材质和统一工作预算。旧完整源路径仍可用，Masked 对源网格可省略批次明确拒绝。完整阶段 1 和阶段 2 的目标保持不变，逐项状态见 [phase-1-2-status.md](phase-1-2-status.md)。尚未完成 Nanite 类虚拟几何、Lumen 类光照或阶段 2 大场景联合验收。
+
+## Sponza 超额订阅游走、G01/G05 记录与新资产（2026-11-01）
+
+- **Sponza 超额订阅游走**：Intel Sponza 主建筑演示资产集（401 个分页批次、3,738,848 个源三角形、唯一数据 961.5 MB）在 4 倍与 8 倍超额订阅下跳转、转身 180° 并游走 1,320 帧，期间持续淘汰 5,810 / 1,106 页。
+  - 286 次检查中，覆盖误差、静止时 CPU/GPU 切割差异、漏绘与未解释洞像素都为 0；洞像素全部归因于邻近物体的已绘制切割。
+  - 像素级检查每次只覆盖 3–43 个物体（声明误差带 ≤ 48 px），单次最多 232 个物体不做像素测试。
+  - 恢复（诊断）：每个阶段到驻留稳定需要 193–953 帧（36.1–88.6 s），1 s 目标没有达到。
+- **组边界审计**：五个 Sponza 分页包共 37,810 个组，没有不一致。结合运行时的覆盖检查，开放网格的切割也有精确的裂缝判据。
+- **G01**：524,288 个三角形的闭合环面按固定 1921 步轨迹拉近并绕行。常驻 GPU LOD 与分页流送两条路径都通过：边界边、覆盖误差、深度超界与 CPU 切割差异都为 0。
+  - 测试假设变更：超出 2D 轮廓判据的像素必须由 3D 表面误差界或光栅平局解释，实际全部得到解释；数值阈值没有放宽。
+  - 构建器缺口：每帧至多 18 条重复有向边（折叠）。修复要改构建器并重建分页包，这次没有修。
+- **G05**：微三角形、重叠薄片与 1–256 种材质的三个用例在目标机与 SwiftShader 上通过，没有不符的像素。计时只作诊断，选簇阶段没有单独计时。
+- **静默丢失审计**：蒙皮、Morph、Masked 与流送/GPU LOD 批次在主视图、阴影和世界查询中都存在；10 种不支持的组合在创建渲染器时显式拒绝。
+- **资产**（都没有浏览器运行）：
+  - Ivy 离线拆分为 17 个 primitive 并转换。
+  - Curtains、Trees、Ivy 各有资产集；合成的 Sponza 资产集（12,833,689 个源三角形、463 个分页 primitive）只做过 CPU 侧加载检查。
+  - Animated Knight 从 FBX 转换为带蒙皮动画的 glTF，只在 Node 中校验。
+- **合入复核**：本流与大场景流一起合入 main（`85c10ab`），合入时修了合成模块与大场景接口的不一致（`afc7162`、`85c10ab`）。合并后的 Chrome 完整回归 184 项：180 通过、4 跳过、0 失败（主机同时运行其他代理的 GPU 回归，负载约 23–27，诊断）；`npm run check` 120 个测试文件、988 项通过；Sponza 资产集的大场景用例 4/4 通过。
+- **矩阵**：G05 由 untested 改为 partial；G01、G03、G05 与 P2-geometry-visibility 的依据更新，仍为 partial。
+- 详见「GPU 流送选择与主渲染器接入」中的「Sponza 超额订阅游走、组边界审计、G01/G05 与静默丢失审计（2026-11-01）」，以及「大型资产的只读审计」中的「Ivy 拆分、合成的 Sponza 资产集与 Animated Knight（2026-11-01）」。
+
+## 大场景联合页：显式预算、光照与 MASK（2026-11-01）
+
+- **Bistro 漏洞的修复**：页面原先给每个分页流约四分之一页的初始池，也没有接入容量协调器，粗层祖先在路缘与路面交界处露出背景。
+  - 现在用一个显式的分页几何预算（默认 1 GiB）按首个位姿的需求分配初始池，之后由渲染器已有的容量协调器迁移。
+  - 两个资产集在关键帧 0 稳定后的覆盖审计都是 0 个漏洞。
+- **MASK 与 BLEND**：MASK primitive 在显式上限内按完整细节绘制（Bistro 189 个、285,355 个三角形），主视图、阴影与世界查询都包含它们。BLEND 省略并报告（Sponza 4 个），由 M03 透明流实现。阴影与世界查询改用资产集中的精确查询代理，读取清单时核对哈希。
+- **投影与光照**：
+  - `RendererOptions.projection` 设置 FOV 与远近平面，省略时与原来相同。
+  - scheduled GI、时间反射、高度雾与可选的雾中 GI 都按显式预算创建，会被引擎放粗的请求直接报错。
+  - 开关雾、开关间接光与改变太阳方向都有可测的画面差异。
+- **上传饥饿**：渲染器每提交一帧都租用流的全部常驻页。GPU 满载时，需要淘汰过期页的暂存页可能永远等不到槽。页面检测到这种状态时暂停一次渲染，等在途帧清空后再渲染（排空）。这是页面级规避，正确的修复应在渲染器或页池。
+- **验证（分支 `69437ee`）**：资产集用例 Sponza 4/4、Bistro Exterior 4/4；完整回归 177 项：173 通过、4 跳过、0 失败。合入后的复核见上一节。
+- **未完成**：
+  - 没有视觉验收，截图须经用户审阅。漫游中有明显噪点。
+  - 性能远未达标：Bistro 漫游时 GI 约 150 ms、反射约 219 ms（并发负载下的诊断值）。Apple 上 surface、resolve 与雾的时间戳不能逐 pass 归因。
+  - 组合场景未接入页面。
+  - 用过世界查询的 Bistro 页面关闭时，Chrome crashpad 进程持有 stdio；用例只做了有界绕行。
+- **矩阵**：P2-joint-large-scene 由 untested 改为 partial（functional 部分测量）；P2-visual-delivery 仍为 partial。
+- 详见「大型资产的只读审计」中的「大场景联合页：显式预算、光照、MASK 与精确代理（2026-11-01）」。
 
 ## Safari 与 Playwright WebKit 兼容性回归（2026-11-01）
 
@@ -38,7 +78,7 @@
 
 ## 能力矩阵、基准帧节奏与浏览器检查（2026-10-31）
 
-- **能力矩阵**：`docs/capability-matrix.json` 共 40 行，包括 26 个固定场景、12 个工作包、自动 LOD 演示与大场景视觉交付。门槛逐字取自 benchmarks.md，状态由门槛结果与证据推导，`npm run capability:report` 校验一致性。截至 main `ed3b487`：pass 0、fail 5、unsupported 3、partial 28、untested 4，没有任何一行达到 pass。
+- **能力矩阵**：`docs/capability-matrix.json` 共 40 行，包括 26 个固定场景、12 个工作包、自动 LOD 演示与大场景视觉交付。门槛逐字取自 benchmarks.md，状态由门槛结果与证据推导，`npm run capability:report` 校验一致性。截至 main `85c10ab`：pass 0、fail 5、unsupported 3、partial 30、untested 2，没有任何一行达到 pass。
 - **基准帧节奏**：基准运行器逐帧记录 rAF 回调延迟与主线程工作，观察长任务，并把超预算帧与准时帧分成两组对照；组间差异只说明相关，不说明原因。macOS 上另记录机型、GPU、电源、温控与负载均值；`--caffeinate` 只在运行期间阻止睡眠，不改系统设置。
 - **诊断运行**：目标机上的 4 次 1,800 帧 foundation 运行都在主机争用下进行。同一压力负载相隔 8 分钟运行两次，超预算帧从 93 变为 0，CPU 与 GPU 时间同时变化，差异来自主机状态。这些都不是验收性能。
 - **未完成**：目标机 30 分钟运行、无干扰的验收计时和 headed 模式都没有执行。Playwright WebKit 27.2 的完整回归 176 项 172 通过、0 失败，Safari 26.6.2 经 safaridriver 运行的 15 项检查全部通过；两者都是兼容性证据，见「Safari 与 Playwright WebKit 回归（2026-11-01）」。详见「当前能力边界」中的「机器可读能力矩阵与浏览器入口」，以及「基准运行器与首轮证据」中的「帧节奏归因、macOS 主机信息与争用下的诊断运行」。
@@ -1258,6 +1298,169 @@ SwiftShader 的同组 10 项也通过，实际适配器为 `google / swiftshader
   - `vite.config.ts` 新增 `largeScene` 入口。
 - **未改动的部分。** 没有修改渲染器、几何流送或材质的运行时接口。
 
+### 大场景联合页：显式预算、光照、MASK 与精确代理（2026-11-01）
+
+本小节对应提交 `a4bf9b7`（投影选项）、`c393de8`（预算规划）、`65fb8d7`（MASK 与精确代理）与 `8eb454e`（联合页与用例），分支上为 `f47f217`–`69437ee`（基于 main `b908476`；下文以 `69437ee` 命名的日志与目录指该分支提交）。`/large-scene.html` 改成阶段 2 后期的 Sponza / Bistro Exterior 联合页。所有计时都是并发负载下（其他代理同时占用 GPU）的诊断值，不是基准或验收计时；这里没有做、也不宣称大场景视觉验收或性能验收。
+
+#### 已实现
+
+- **投影选项**（`src/camera-projection.ts`，`RendererOptions.projection`）：
+  - 主视图垂直 FOV、近平面、远平面在 `Renderer.create` 前校验一次：FOV 1°–170°，near 0.01–10，far ∈ (near, min(100000, 10⁶·near)]；越界报 `INVALID_PROJECTION: verticalFovRadians|near|far`。
+  - 同一投影驱动主视图、LOD 误差像素尺度（流送选择与驻留 GPU LOD）、纹理 mip 需求、体积雾与反射；渲染器里不再有写死的 π/3.2、0.1、150。
+  - 省略时仍是 π/3.2、0.1、150，已有页面与用例的行为不变。`Renderer.projection` 只读暴露生效值。
+  - 大场景页使用相机路径的 FOV（没有时用 π/3.2），near 0.1，far 取 150 m 与包围盒对角线（向上取整）中的较大者：Bistro 为 43.2°、0.1–259 m，路径末端不再被远平面裁掉；Sponza 为 56.25°、0.1–150 m。
+- **Bistro 漏洞的根因与修复**：
+  - 根因：main `712507e` 的页面给每个分页流只分配约四分之一页的初始池，且没有接入容量协调器。关键帧 0 的需求超出这些池，选择回退到粗层祖先簇（primitive `1112:0` 用到第 1–3 层，136 个回退簇）。路缘与路面是分别简化的不同 primitive，粗层边界互不锁定，在交界处露出背景：簇视图中 (592,644)、(476,720)、(452,736) 恰为背景色 (3,6,7)，材质视图中恰为天空色 (36,53,61)。全部页驻留后同一 primitive 回到第 0 层（326 簇、0 回退），这些像素被几何覆盖。证据：`artifacts/large-scene-20261031/diag/holes-712507e.log` 与 `holes-allpages.log`（及同名目录下的截图与逐流状态）。
+  - 修复：页面改用一个显式的分页几何预算（`geometryMiB`，默认 1024 MiB）。`src/large-scene-plan.ts` 的 `planLargeSceneGeometry` 按首个相机位姿的 CPU 组需求（与 GPU 选择相同的 0.1 距离钳制和投影尺度）求每个流的初始池，并给出容量协调器选项（常驻上限、迁移峰值上限、并发迁移、单次复制字节/页数、间隔帧）。之后的位姿由渲染器已有的容量协调器在同一预算内迁移。预算低于全部根页时报 `LARGE_SCENE_GEOMETRY_BUDGET`，单个流根页复制超过复制上限时报 `LARGE_SCENE_GEOMETRY_COPY_BUDGET`；预算挤掉的组记入 `budgetDeferredGroups`，不隐藏。
+  - 结果：Bistro 关键帧 0 的首个位姿需求 924,535,824 B，全部放进 1 GiB 预算（预算挤掉 0 组）；稳定用 375 个渲染帧（其间排空 3 次）；覆盖审计 22,500 个格点中 20,122 个内部、372 个天空（全部为背景色），漏洞 0。
+- **流送速率**：为缩短稳定时间，每个流每帧最多 4 个页请求、4 页上传（≤ 1 MiB），并发请求 4、排队 16（原为 2 个请求、1 页上传 ≤ 256 KiB、并发 2、排队 8）；CPU 缓存、在途字节和暂存字节随之按 4 页设上限。
+- **上传饥饿与排空**：
+  - 现象：Sponza 漫游 240 帧后回到关键帧 0，`settle(3000)` 不能稳定，始终有 1 个已分配的页处于待上传状态，而 CPU 侧没有任何请求（`artifacts/large-scene-20261031/spec/sponza-apple-9c57346.log`；`diag/sponza-settle-240.log` 中 2,400 帧后仍是同一状态，其间 2,253 次回调被背压跳过）。只漫游 60 帧时 195 帧就能稳定（`diag/sponza-settle.log`）。
+  - 根因：渲染器每提交一帧都租用该流全部常驻页，页池只能淘汰没有被在途帧租用的页。卡住的流（`diag/sponza-stuck.log`，第 192 个流）有 41 个槽、41 个常驻页，其中 1 个已不在分配集合中；待上传的第 112 页在分配集合中，需要淘汰那个过期页；41 页全部被租用、2 帧在途，这个池自上次容量迁移后上传和淘汰都是 0。开光照的大场景 GPU 一直满载，更新时几乎总有帧在途，于是这一页永远等不到可淘汰的槽。停 1.5 s 让队列排空后再渲染 1 帧，该页立即上传，状态稳定。漫游中同样的饥饿会让该流停在较粗的祖先簇上。
+  - 试过把每个流的在途帧数降为 1（`maxFramesInFlight: 1`）：两个资产集的用例都通过，但整个运行中容量协调器一次迁移都没做（Sponza 0 次迁移、4,779 次延后；Bistro 0 次、5,621 次；`spec/sponza-apple-4c5f00e/`、`spec/bistro-apple-4c5f00e/` 下的报告）。协调器的一轮在渲染帧数到达间隔时到期，最先看到它的总是刚提交完一帧后的那次调用；它遇到在途帧数达到上限就延后并把下一轮排到一个间隔之后，于是上限为 1 时每一轮都被延后，各流的池停在首个位姿的大小。因此没有采用。
+  - 处理：保留默认的 3 帧在途。页面每 15 个渲染帧读一次 `diagnostics()`：某个流有暂存页、没有正在上传的页、池中没有空槽，且所有未被钉住的常驻页都被在途帧租用时（快照中的 `leaseBlockedStreams`），从下一次回调起暂停渲染，等所有流的在途帧数都为 0 再渲染一帧，这一帧的上传就能淘汰过期页。等待有上限（3,600 次回调，约 1 分钟，超过报 `LARGE_SCENE_DRAIN_STALLED`），渲染器报错时立即失败；只读 CPU 侧的诊断，没有 GPU 读回。快照给出完成的排空次数 `drains`。代价是这一帧失去 CPU 与 GPU 的重叠。结果：Sponza 漫游中排空 0 次，关键帧 0 用 180 帧、3 次排空稳定，容量协调器全程迁移 187 次、延后 1 次；Bistro 漫游中 0 次，关键帧 0 用 375 帧、3 次排空稳定，迁移 240 次、延后 67 次。这是页面级的规避；正确的修复应在渲染器或页池（例如只租用可能被引用的页，或旧帧退休后再复用槽），不在本流范围内，用到同一页池的其他页面仍会遇到同样的饥饿。
+- **MASK 走完整细节路径**（`src/gltf-package-scene.ts`）：
+  - 包中按源路由的 MASK primitive 从按清单哈希校验的源 buffer 中抽取为完整细节（非分页）批次，主视图、阴影与世界查询都包含它们；渲染器为此没有改动（已有的非流送绘制路径就处理 MASK）。预算显式：默认最多 1024 个源 primitive、4,194,304 个顶点、2,097,152 个三角形，超出报 `GLTF_PACKAGE_MASK_BUDGET`；抽取结果与清单记录的顶点数、三角形数和覆盖方式不一致时报 `GLTF_PACKAGE_MASK_SOURCE_MISMATCH`。`mask: false` 恢复原先的省略并报告。
+  - Bistro Exterior：189 个 MASK primitive、508,613 个顶点、285,355 个三角形全部绘制，网格 56,320,012 B，为此读取 179,130,372 B 源 buffer；省略数为 0。
+  - Sponza：没有 MASK primitive。
+  - BLEND 仍省略，原因写明“BLEND coverage is not supported by the renderer; omitted, never drawn as MASK or opaque”（Sponza 4 个、8,140 个三角形；Bistro 0 个）。按用户 2026-10-31 的决定，BLEND 由阶段 2 的 M03 透明流实现；本页只报告被省略的 primitive，不画成 MASK 或不透明。镜像实例（行列式 ≤ 0）仍省略并报告：渲染器不会为它们翻转正面。
+  - 页面快照与面板给出 MASK 数量、三角形、字节与预算。
+- **精确查询代理**：
+  - 资产集的 `roots.fineQueryRoot` 现在由加载器读取，阴影和世界查询使用其中的精确代理（误差 0），并逐项校验来源包、源文件哈希与流目录哈希（`GLTF_PACKAGE_QUERY_SOURCE` / `GLTF_PACKAGE_QUERY_MISSING`）。
+  - Bistro 原资产集只有内置代理，最大误差 5,942 m，阴影、GI 与审计都不可信。新建精确代理与资产集：
+    - `node scripts/build-gltf-query-proxies.mjs --package artifacts/bistro-exterior-group16-pages-mac-20261031 --output artifacts/bistro-exterior-fine-query-proxies-mac-20261031 --query-error 0`（1,402 个 primitive、2,543,852 个三角形、282,142,259 B，8.9 s，日志 `artifacts/large-scene-20261031/bistro-fine-query-proxies-build.log`）；
+    - `node scripts/write-asset-set.mjs --name bistro-exterior --geometry artifacts/bistro-exterior-group16-pages-mac-20261031 --textures artifacts/bistro-exterior-textures-mac-20261031 --query artifacts/bistro-exterior-fine-query-proxies-mac-20261031 --uv artifacts/bistro-exterior-uv-demand-mac-20261031.json --license artifacts/bistro-exterior-asset-set-mac-20261031/LICENSE.txt --camera-path artifacts/bistro-exterior-asset-set-mac-20261031/camera-path.json --output artifacts/bistro-exterior-asset-set-fine-mac-20261031`。
+  - Sponza 资产集本来就带精确代理。
+- **清单哈希校验**：资产集在 `packages.*.manifestSha256` 记录的几何、纹理与精确代理清单哈希，在读取对应清单时核对，不符报 `GLTF_PACKAGE_MANIFEST_HASH: <url>`；资产集中格式不对的哈希报 `GLTF_PACKAGE_ASSET_SET_HASH`。
+- **光照控制**（只用公开的渲染器选项，没有改 GI、反射、雾的内部）：
+  - `planLargeSceneLighting` 在 `Renderer.create` 前给出显式预算：世界查询 65,536 条射线、遍历工作 67,108,864、512 MiB；漫反射 GI 用 `scheduled` 更新策略，探针网格按资产集包围盒以统一间距求得（≤ 512 个探针、每轴 2–32），每探针 64 条射线、128 MiB；反射带时间重建，锚点 ≤ 32,768、96 MiB；体积雾为高度雾（消光 0.012、高度衰减 0.08、基准高度为包围盒底面），可选 GI 空气照明（`air=1`），froxel ≤ 1,048,576、96 MiB、48 层。
+  - 显式请求的反射间距或雾 froxel 尺寸在当前画布尺寸下会被引擎放粗时，直接报 `LARGE_SCENE_REFLECTION_BUDGET` / `LARGE_SCENE_FOG_BUDGET`，不静默降级；`auto` 只在创建时选一次能放下的最细值，之后每次画布尺寸变化都按这个值重新校验。GI 射线超出预算报 `LARGE_SCENE_GI_BUDGET`；空气照明缺 GI 或雾时报错。
+  - 天空辐亮度取 (0.095, 0.115, 0.15)，使无遮挡的朝上表面大致得到渲染器原有环境补光（0.11 × 反照率）的亮度；开 GI 增加的是遮蔽与反弹光，而不是整体提亮。曝光默认仍为 EV 3。关掉 GI 时渲染器不恢复原有环境补光，所以“只有直接光”的对照图在阴影区接近全黑。
+  - 面板可分别开关 GI、反射、雾与雾中 GI，并用滑块改太阳高度和方位；URL 参数 `lighting=on|off`、`gi=0|1`、`reflections=0|1`、`fog=0|1`、`air=1`、`probes=`、`reflectionSpacing=`、`fogPixel=`、`sun=`、`exposure=`、`geometryMiB=`，越界报 `LARGE_SCENE_PARAM: <name>`（`air=1` 而 `gi=0` 也报错）。
+  - 1440×1000 时：GI 网格 Bistro 11×4×11（484 个探针、30,976 条射线）、Sponza 11×6×7（462 个探针、29,568 条射线）；两者的反射间距都是 7 px（29,458 个锚点），雾都是 9 px × 48 层（860,160 个 froxel，73,457,024 B）。
+  - 没有在本页接入 main `fdb901c` 的可选反射质量选项和 `9a585ea` 的可选 GI 可见性细化；两者的大场景开销未测。
+- **帧计数修正**：渲染器在流送背压（在途帧达到上限）时直接返回，不增加 `stats.frames`，原页面却按 rAF 回调计帧，所以 `frames=240` 实际可能只渲染了一半，GPU 时间戳也可能一次都没采到。页面现在按渲染器实际渲染的帧计数，固定长度运行每渲染一帧推进 1/60 s 相机时间；回调数有上限（64 × 帧数 + 3600），超过报 `LARGE_SCENE_STALLED`。快照给出 `renderedFrames`、`callbacks` 与 `backpressureFrames`：Bistro 漫游 240 个渲染帧用了 499 次回调，其中 259 次被背压跳过。
+- **每 pass GPU 时间戳**：页面收集渲染器已有的 `stats.gpuMs`（基于 `src/gpu-timestamp-span.ts`，每 30 个渲染帧采样一次），快照给出每次运行各 pass 的中位数、p90、最大值和 `repeated`（与上一样本逐位相同的次数）。只作诊断。
+  - 运行时关闭的 GI/反射仍写一个空的带时间戳 pass，Apple 上它的值保持上一次写入（两个只有直接光的样本中 GI 89.45664 ms、反射 199.950336 ms 逐位相同），因此页面把关闭的 GI 与反射记为 0。世界查询 refit 在静态场景只在首帧真正执行，之后各样本都重复首帧值（Bistro 77.86 ms、Sponza 55.51 ms），`repeated` 会标出这类值。
+- **测试入口**：`window.__LARGE_SCENE__` 增加 `setLighting`、`setSun`、`settle`（等页、纹理与容量迁移都稳定，有帧数上限；期间与其他运行一样按需排空）、`auditCoverage`、`setUiHidden`；快照包含投影、MASK 与查询代理、几何计划与实时状态、光照预算与 pass 列表、GPU 时间戳与相机路径关键帧。
+  - `auditCoverage(step, offset)` 用渲染器的世界查询（精确代理）对上一帧相机逐格点发 5 条射线：中心与上下左右 offset 像素处都命中不透明分页几何且深度相差 ≤ 10% 的格点为“内部”，5 条都未命中为“天空”。内部格点上的渲染像素等于背景色即为漏洞。这是一次性的诊断读回，不在帧路径上。
+  - 用例的判定：有天空格点时，背景色取天空格点中最多的颜色（须占 ≥ 95%），内部像素与之相差 ≤ 3 即为漏洞。Sponza 关键帧 0 看不到天空，原来的判定因此没有可比的背景色、恒为通过；现在另加一条：簇视图的调试色每个通道在曝光前都 ≥ 0.08（线性），在默认曝光下两个资产集的内部像素最暗通道都是 85/255，而清屏色是 (3,6,7)，所以三个通道都 ≤ 20 的内部像素也算漏洞；有天空时还断言测得的背景色确实 ≤ 20。
+- **浏览器关闭挂起与绕行**（只在用例中）：
+  - 现象：在 Bistro 上用过世界查询（开 GI 或反射）之后，`browser.close()` 永不返回。Chrome 主进程已经退出，但一个 `chrome_crashpad_handler` 进程仍持有 Chrome 的 stderr；Playwright 等所有 stdio 关闭才认为浏览器已关，于是一直等待。手动结束这个 crashpad 进程后关闭立即完成（`artifacts/large-scene-20261031/diag/teardown-bistro-crashpad.log`）。
+  - 二分：Bistro 关光照（`teardown-bistro-nolight.log`）、只开雾（`teardown-bistro-gi_0_reflections_0.log`）与 Sponza（`teardown-sponza-none.log`）都正常关闭；只开 GI（`teardown-bistro-reflections_0.log`）或只开反射（`teardown-bistro-gi_0.log`）都挂起；是否先 `dispose()`、是否导航到 `about:blank`、是否多等 20 s 都不改变结果（`teardown-bistro-blank*.log`、`teardown-bistro-none*.log`）。以上日志都在 `artifacts/large-scene-20261031/diag/`。crashpad 为何被拉起、Chrome 进程里发生了什么没有查清；世界查询内部不在本流范围内，未改。
+  - 绕行：资产集用例自己 `launchServer` 并 `connect`，关闭时等浏览器进程退出（上限 60 s），再释放仍被占用的 stdio 管道，最后等服务关闭（上限 10 s）；结果写进 `LARGE_SCENE_TEARDOWN` 日志行并断言浏览器已退出、服务已关闭。Bistro：浏览器退出、服务关闭，退出后仍有 1 个管道被占用，用时 1,093 ms。
+
+#### 验证
+
+浏览器运行都在目标机（Apple M3 Max，Chrome 156，apple / metal-3）上，主机同时被其他代理占用。日志与输出在 `artifacts/large-scene-20261031/spec/`。
+
+- `npm run check`（`69437ee`）：类型检查、111 个文件 953 项单元测试与构建通过。
+- 资产集用例（硬件，`69437ee`）：`PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGHT_EXPECT_GPU_VENDOR=apple PLAYWRIGHT_PORT=5211 LARGE_SCENE_ASSET_SET=<资产集> npx playwright test tests/browser/large-scene.spec.ts --reporter=line`
+  - Sponza（`/artifacts/sponza-asset-set-demo-mac-20261031/asset-set.json`）：4/4 通过，2.7 分钟（`sponza-apple-69437ee.log`，输出 `sponza-apple-69437ee/`）。
+  - Bistro Exterior（`/artifacts/bistro-exterior-asset-set-fine-mac-20261031/asset-set.json`）：4/4 通过，10.5 分钟（`bistro-apple-69437ee.log`，输出 `bistro-apple-69437ee/`）。
+- SwiftShader 定向（`69437ee`）：`PLAYWRIGHT_PORT=5211 npx playwright test tests/browser/large-scene.spec.ts tests/browser/engine.spec.ts tests/browser/geometry-stream-renderer.spec.ts tests/browser/raster-receivers.spec.ts tests/browser/volumetric-fog.spec.ts tests/browser/reflections.spec.ts tests/browser/texture-streaming.spec.ts tests/browser/geometry-lod.spec.ts --reporter=line`：8 个文件 16 项，15 通过、1 跳过（需要资产集的用例），3.8 分钟（`swiftshader-69437ee.log`）。SwiftShader 只证明功能行为，不代表硬件性能。
+- 完整 Apple 回归（`69437ee`）：`PLAYWRIGHT_GPU=hardware PLAYWRIGHT_CHANNEL=chrome PLAYWRIGHT_EXPECT_GPU_VENDOR=apple PLAYWRIGHT_PORT=5211 npx playwright test --reporter=line`：177 项，173 通过、4 跳过、0 失败，15.4 分钟（`apple-full-69437ee.log`）。main 的基线为 176 项 172 通过、4 跳过；多出的一项是新增的预算拒绝用例，跳过数相同（资产集用例在没有 `LARGE_SCENE_ASSET_SET` 时跳过）。
+- 合入 main 后的复核见「Sponza 超额订阅游走、组边界审计、G01/G05 与静默丢失审计（2026-11-01）」中的「合入时的调整」。
+- 能力矩阵：`npm run capability:report` 合计 pass 0、fail 5、unsupported 3、partial 29、untested 3（改前 partial 28、untested 4）；`npx vitest run tests/capability-matrix.test.ts` 4/4 通过。
+- 无效或失败的运行（保留作证据，都不计入上面的结果）：
+  - `bistro-apple.log`：Bistro 首次运行在关闭浏览器时挂起，34 分钟后 worker 被结束，由此查出 crashpad 持有 stdio（见上文）。
+  - `sponza-apple-213199d.log`：运行中在同一工作树变基，Vite 重新加载页面，自动运行重新开始，结果无效。
+  - `sponza-apple-9c57346.log`：关键帧 0 的 `settle(3000)` 没有稳定（上传饥饿，见上文），1 项失败。
+  - `sponza-apple-4c5f00e.log`、`bistro-apple-4c5f00e.log`：每个流 1 帧在途的试验，各 4/4 通过，但容量协调器 0 次迁移，未采用。
+  - `bistro-apple-9c05e30.log`：较早提交上的 4/4（6.4 分钟）；之后漏洞判定、关闭 pass 的计时与排空又有改动，被本次运行取代。
+
+#### 测量数据（诊断）
+
+1440×1000，资产集用例在 `69437ee` 上的报告（`<资产集>-apple-69437ee/…/large-scene-report.json`）。漫游 240 个渲染帧后回到关键帧 0 稳定、审计、对照。所有时间都是并发负载下的诊断值。
+
+| 项目 | Bistro Exterior | Sponza |
+| --- | --- | --- |
+| 批次（分页 / 完整细节 MASK） | 1,402 / 189 | 401 / 0 |
+| 源实例 / 纹理 | 1,591 / 405 | 405 / 72 |
+| 分页三角形 / MASK 三角形 | 2,543,852 / 285,355 | 3,738,848 / 0 |
+| 省略 | 0 | 4 个 BLEND（8,140 个三角形） |
+| 投影 | 43.2°，0.1–259 m | 56.25°，0.1–150 m |
+| 根页 / 全部页 | 395,020,472 / 1,381,127,380 B | 141,111,736 / 1,510,686,680 B |
+| 首个位姿需求（1 GiB 预算内） | 924,535,824 B，3,049 组 | 580,027,620 B，1,880 组 |
+| 漫游：回调 / 背压跳过 / 排空 | 499 / 259 / 0 | 497 / 257 / 0 |
+| 关键帧 0 稳定：渲染帧 / 排空 | 375 / 3 | 180 / 3 |
+| 容量迁移 / 延后（全程） | 240 / 67 | 187 / 1 |
+| 覆盖审计：格点 / 内部 / 天空 / 漏洞 | 22,500 / 20,122 / 372 / 0 | 22,500 / 21,596 / 0 / 0 |
+| 平均像素差：雾 / 间接光 / 太阳（0–255） | 9.82 / 89.43 / 66.09 | 1.83 / 12.62 / 45.17 |
+| 应用持有 GPU 内存 / 释放后 | 2,072,709,116 B / 0 | 1,617,181,396 B / 0 |
+| 关闭：退出后仍占用的管道 / 用时 | 1 / 1,093 ms | 2 / 643 ms |
+
+GPU 时间（ms，中位数；漫游 8 个样本，关键帧 0 开光照与雾 3 个样本）：
+
+| pass | Bistro 漫游 | Bistro 关键帧 0 | Sponza 漫游 | Sponza 关键帧 0 |
+| --- | --- | --- | --- | --- |
+| 漫反射 GI | 150.11 | 67.24 | 53.64 | 32.51 |
+| 反射 | 219.19 | 215.55 | 70.48 | 72.48 |
+| 形变 | 13.30 | 6.95 | 3.51 | 3.28 |
+| 阴影 | 2.65 | 1.64 | 1.11 | 0.85 |
+| surface / resolve / 雾 | 209.35 / 208.60 / 208.57 | 209.45 / 207.88 / 207.95 | 90.54 / 83.92 / 84.08 | 87.03 / 86.64 / 86.90 |
+
+- 世界查询 refit 只在首帧执行，之后各样本重复首帧值（Bistro 77.86 ms，Sponza 55.51 ms），不计入上表。
+- surface、resolve 与雾三段在开光照时几乎相等，只开直接光时 Sponza 为 1.18 / 0.66 / 0.92 ms；Sponza 关雾而 GI 与反射仍开时三段为 2.49 / 2.29 / 2.42 ms，而 Bistro 同样设置时仍是 174.46 / 173.54 / 173.47 ms。原因没有查清（见“未完成与已知问题”）。
+- 截图（每个资产集各一组，在 `artifacts/large-scene-20261031/spec/<资产集>-apple-69437ee/large-scene-large-scene-wa-732c7-les-and-disposes-everything/`）：`large-scene-walk-final.png`（漫游末帧）、`large-scene-keyframe0-clusters.png`（审计用簇视图）、`large-scene-keyframe0-lit-fog.png`、`large-scene-keyframe0-lit-nofog.png`、`large-scene-keyframe0-direct.png`、`large-scene-keyframe0-direct-overhead-sun.png`。Sponza 关键帧 0 地面中央的小暗块在簇视图中由单独的簇覆盖，不是露出背景的漏洞。
+
+#### 未完成与已知问题
+
+- **没有做视觉验收**：最终画面须经用户审阅，曝光（EV 3）与天空辐亮度的取值也要看图确认。截图见“测量数据”中的路径。
+- **漫游中有噪点**：边走边渲染时墙面与路面上有明显的亮暗斑点（`large-scene-walk-final.png`），推测来自运动中尚未收敛的时间反射与 scheduled GI；关键帧 0 稳定后的截图里没有这类斑点。没有在本页接入可选的反射质量或 GI 可见性选项，也没有测它们在大场景上的效果。
+- **性能远未达标**：Bistro 1440×1000 同时开 GI、反射与雾漫游时，GI 约 150 ms、反射约 219 ms（中位数，并发负载下的诊断值）；Sponza 为 54 ms 与 70 ms。面板上的 CPU 回调间隔（指数平均）在 Bistro 漫游结束时为 630.5 ms（见 `large-scene-walk-final.png`），只作诊断；帧时间没有单独测量。本流没有做任何降低大场景 GI/反射成本的工作。
+- **Apple 时间戳不能逐 pass 归因**：开光照时 Bistro 的 surface、resolve 与雾三段几乎相等（约 209 ms），只有直接光时为 2.6–3.9 ms；关雾而 GI 与反射仍开时 Bistro 仍约 174 ms，Sponza 却降到约 2.4 ms。Sponza 开光照时也不一致：诊断运行中 60 帧漫游的两个样本 surface 约 2 ms，240 帧漫游中三段相等约 69 ms（`diag/sponza-settle.log`、`diag/sponza-settle-240.log`），本次用例约 84–91 ms。原因没有查清；这些 render pass 的时间不能逐 pass 归因或相加，快照里的 `totalMedian` 也不是帧 GPU 时间。
+- **审计范围有限**：覆盖审计只在关键帧 0 稳定后做一次；漫游途中尚未稳定的帧和其他关键帧没有审计。审计只判断内部格点是否露出背景，不检查几何或材质是否正确。
+- **组合场景未接**：让 `?set=` 接受组合（Sponza 主体加扩展等）要用组合流的接口，组合接口（`src/gltf-package-composition.ts`）与本流同时合入，页面尚未接入。
+- **页池上传饥饿只做了页面级规避**：见“上传饥饿与排空”。渲染器每帧租用全部常驻页的做法没有改；其他用到分页流送的页面在 GPU 满载时仍可能有页永远等不到槽。
+- **BLEND、镜像实例与遮蔽贴图**：BLEND primitive 省略并报告（Sponza 4 个、8,140 个三角形，Bistro 0 个），由 M03 透明流实现；镜像实例省略并报告（两个资产集当前都是 0 个）。引擎材质模型不读遮蔽贴图，Bistro 有 131 个材质的遮蔽贴图被忽略并计数。
+- **关闭挂起只绕行**：见上文；crashpad 被拉起的原因没有查清，其他用到世界查询的大场景用例也可能遇到。
+- **世界查询共享静态池**：诊断时临时试过在 Bistro 上开启世界查询的共享静态池，页面在加载中被关闭（`artifacts/large-scene-20261031/diag/perf-shared.log`），没有查原因，本页不暴露此选项。按批次分派（默认）与单 pass 分派的 GI/反射时间相差不到 5%（GI 141.6/136.1 ms，反射 198.8/196.0 ms；`perf-per-batch.log`、`perf-single-pass.log`），本页用默认设置。
+- **其他未做**：动态角色与物体、录屏、参考对照、帧时间/内存/长时运行验收、Bistro Interior 与其余扩展资产。
+
+#### 能力矩阵变化
+
+- 新增目标机证据 `apple-large-scene-joint-20261031`（functional）与 `apple-large-scene-timing-20261031`（diagnostic-timing，只作诊断），放在 GI/反射质量记录之后；提交记为 main 上的 `8eb454e`（分支 `69437ee`）。原 `apple-large-scene-20261031`（3/3、有漏洞）保留在证据表中，不再被引用。
+- `P2-visual-delivery`：仍为 partial（`functional: partly-measured`），依据与限制改为本次结果；不记录任何视觉验收。
+- `P2-joint-large-scene`：由 untested 改为 partial（`functional: partly-measured`，状态由脚本推导）：开光照、雾与分页几何的大场景联合运行有了目标机功能证据；动态对象、参考对照、动态响应、历史恢复、帧时间与长时运行仍未测。
+
+#### 接口变化
+
+- `src/renderer.ts`：`RendererOptions.projection?: CameraProjectionOptions`（`verticalFovRadians`、`near`、`far`，各自可省略）；`Renderer.projection: CameraProjection` 只读。省略时行为与原来相同。渲染器没有为 MASK 改动。
+- 新模块 `src/camera-projection.ts`：`CameraProjectionOptions`、`CameraProjection`、`DEFAULT_CAMERA_PROJECTION`、`resolveCameraProjection`（越界抛 `INVALID_PROJECTION: …`）、`projectionScale`（LOD 与纹理需求共用的焦距像素尺度）。
+- 新模块 `src/large-scene-plan.ts`：`planLargeSceneGeometry`、`largeSceneDemands`、`largeSceneProbeGrid`、`planLargeSceneLighting` 及其请求/报告类型；都是纯函数，在创建渲染器前调用。
+- `src/gltf-package-scene.ts`：
+  - `GltfPackageRoots.fineQueryRoot?`、`GltfPackageRoots.manifestSha256?`（`geometry`、`textures`、`fineQuery`），`loadAssetSetRoots` 从资产集读取并校验格式；
+  - `GltfPackageSceneOptions.mask?: GltfPackageMaskBudget | false`；
+  - `GltfPackageScene.batches` 现在是分页批次与完整细节 MASK 批次（`SceneBatch`）的并集，新增 `mask`（`GltfPackageMaskSummary`）与 `queryProxies`；
+  - 新错误码 `GLTF_PACKAGE_MASK_BUDGET`、`GLTF_PACKAGE_MASK_SOURCE_MISMATCH`、`GLTF_PACKAGE_MANIFEST_HASH`、`GLTF_PACKAGE_ASSET_SET_HASH`、`GLTF_PACKAGE_QUERY_SOURCE`、`GLTF_PACKAGE_QUERY_MISSING`；BLEND 与镜像实例的省略原因文字改写（见上）。
+- `/large-scene.html`：新增 URL 参数 `geometryMiB`、`lighting`、`gi`、`reflections`、`fog`、`air`、`probes`、`reflectionSpacing`、`fogPixel`；`frames=N` 现在按渲染帧计。`window.__LARGE_SCENE__` 新增 `setLighting`、`setSun`、`settle`、`auditCoverage`、`setUiHidden`（`run(frames, walk)` 不变，帧数改按渲染帧计），快照新增 `renderedFrames`、`callbacks`、`backpressureFrames`、`drains`、`projection`、`geometry`（其中 `live.leaseBlockedStreams`）、`lighting`、`gpuTimings`、`lastSettle`、`scene.mask`、`scene.queryProxies`。新错误 `LARGE_SCENE_DRAIN_STALLED`。
+- `tests/browser/large-scene.spec.ts`：资产集用例改为自管浏览器服务（见“浏览器关闭挂起与绕行”），默认 240 个渲染帧（`LARGE_SCENE_FRAMES` 可改），超时 30 分钟；新增不需要资产集的参数拒绝用例。
+
+### Ivy 拆分、合成的 Sponza 资产集与 Animated Knight（2026-11-01）
+
+本小节来自几何资产流，提交与验证见「Sponza 超额订阅游走、组边界审计、G01/G05 与静默丢失审计（2026-11-01）」。派生资产都在被忽略的 `artifacts/` 下，均未提交。
+
+- **Ivy 拆分**：网格 0 的 primitive 0 有 4,905,636 个三角形，超过几何构建器每 primitive 100 万三角形或顶点的上限。`scripts/split-gltf-primitives.mjs --max-triangles 320000 --max-vertices 1000000` 按三角形质心递归中位切分为 16 份，每份 306,602 或 306,603 个三角形、192k–204k 个顶点；网格 1（159,922 个三角形）原样复制。各部分逐字节保留源三角形与角顺序、材质、UV、法线和切线；切口上的 40,369 个顶点（1.30%）精确复制，新边界因此是构建器锁定的共享接缝。输入输出都是 5,065,558 个三角形。输出清单记录拆分工具的哈希。
+- **Ivy 分页与纹理**：
+
+| 目录 | 清单 SHA-256 | 内容 |
+| --- | --- | --- |
+| `sponza-ivy-split-mac-20261031` | `43b8cf3d3ec629bc8023d9fd46cf95c962c0a9ac5e99d749e4c9e78f98cc74f2` | 拆分后的 glTF（bin 272,562,568 字节）、3 张硬链接图像与逐部分来源映射 |
+| `sponza-ivy-group16-pages-mac-20261031` | `cb6aca9b43964dfb560e9f595956dc2e19cde9576418ab3dd5c546860acfa3e5` | 152,895 个簇、19,781 页，编码 738.8 MB / 解码 1,210.6 MB，根解码 81.4 MB；代理 543,482 个三角形，最大一个 74,204（上限 262,144）；Ivy 资产集使用这一份 |
+| `sponza-ivy-group8-pages-mac-20261031` | `1fcb4fb68fdd8f53d2afdcaf9ec066f1e21781ea5c2c84965b62ab82fdce6b4f` | 156,754 个簇、19,848 页，编码 737.8 MB / 解码 1,208.0 MB，根解码 122.4 MB；最大代理 86,338 个三角形 |
+| `sponza-ivy-split-textures-mac-20261031` | `a27158279aa8dc1433f3ec0a3460e636ac81821429361c80feea597e6e337f03` | 2 张 BC7、1 张 RGBA8，原生 134,217,780 字节；载荷与 `sponza-ivy-textures-material-weights-mac-20261030` 相同 |
+
+- **UV 审计与单源资产集**：Curtains 43 个 primitive（35 个有限跨度、8 个未知），Trees 4 个（均有限），拆分后的 Ivy 17 个（全部未知，纹理流送因此请求 Ivy 的最细 mip）。资产集 `sponza-curtains-asset-set-mac-20261031`（清单 `80a6d745…4dcf`）、`sponza-trees-asset-set-mac-20261031`（`948764a0…d20f`，省略 2 个 BLEND 树叶 primitive，共 1,354,570 个三角形）、`sponza-ivy-asset-set-mac-20261031`（`4342da81…09ff`）。分页目录没有 `credits_license.txt`，因为 `build-gltf-geometry.mjs` 没有许可证选项（此前的主建筑、Curtains、Trees 分页包同样没有）；每个资产集与合成集都带许可证。
+- **合成的 Sponza 资产集**：`write-asset-set.mjs --compose name=path …` 写出 `real-engine-asset-composition` v1。写出前重新读取并重新哈希每个组件资产集及其几何、纹理、精细查询、UV 审计与相机路径清单；`frame.componentTransform` 为 `identity`，各组件保留自己的节点、变换与材质。`sponza-composed-asset-set-mac-20261031`（清单 `b0a1c43593993ab11a9310f26304efab277605ed373925d611183b7b78924fd0`）合成 main（演示集及其相机路径）、Curtains、Trees、Ivy：12,833,689 个源三角形、463 个分页 primitive、6 个省略、87 张纹理（原生 3.83 GB）。`src/gltf-package-composition.ts` 提供 `loadAssetComposition` 与 `loadComposedPackageScene`。只做过 CPU 侧检查（Node 中把 fetch 指向磁盘加载：463 个批次与实体、87 个纹理源）；没有接入 `/large-scene.html`（该页与 `src/gltf-package-scene.ts` 由 large-scene 流修改），没有浏览器运行或视觉检查。各附加包的世界包围盒都在主建筑包围盒内，这支持但不证明共享同一场景坐标。
+- **Animated Knight**：Blender 5.2.2 LTS（glTF 导出器 5.2.40）运行 `scripts/convert-fbx-gltf.py`，`--threads 1` 时多次运行输出逐字节相同。输出 `sponza-knight-gltf-mac-20261031`（清单 `c07ecdb783c0f7a4dc0c226296992b2652a08083015a80807843d7ccd77767a5`，`knight.gltf` `eb5d05b4…140b8c`，`knight.bin` `644b2d88…f915b`）。
+  - 来源：几何取自 `Exports/FBX/Knight_USD_002.fbx`；该 FBX 保留蒙皮变形器但丢了权重，权重与绑定矩阵取自 `Scenes/knight_ARNOLD_002.rnd.ma` 中的 skinCluster332/333/334（其输入形状与 FBX 点相差不超过 8.6e-9 cm）；usdPreviewSurface 材质按金属粗糙度从 `knight_USD_PREVIEW_SURFACE_ANIM_002.rnd.ma` 重建；动画取自 `Knight_Animation_Data_Only_002.fbx`。
+  - 规模：3 个网格、8 个 primitive、70,266 个顶点、122,252 个三角形、8 个双面材质、10 张纹理、88 个节点；1 个 84 关节的蒙皮，每顶点至多 4 个影响；1 个动画 `Take 001`，12.458 s（24 fps 的第 1–300 帧），252 个通道；没有 morph。
+  - 校验：`scripts/validate-gltf-skinned-animation.mjs` 在 Node 中用引擎自己的加载器、导入器、动画骨架与 CPU 形变加载它，没有警告；静止姿态乘逆绑定矩阵与单位矩阵相差不超过 1.9e-7；t = 0 与 1 s 之间 84 个关节中 75 个矩阵变化。与包内 USD 顶点缓存对照（第 1、25、150、300 帧，先施加 glTF 不含的恒定 −74.67° 朝向）：剑与盾不超过 6.4e-6 m，身体不超过 27.9 mm，即线性与双四元数蒙皮之差。证据 `artifacts/geometry-assets-20261031/knight/validate-published.log`。
+  - 超出默认上限：10 张图像解码需要 671,088,640 字节，是 `loadGltf` 默认 `maxDecodedImageBytes`（268,435,456）的 2.5 倍，调用方须提高这一选项；没有修改引擎上限。
+  - 未带入（`manifest.notCarriedOver` 16 项，各有证据）：双四元数蒙皮（改为线性混合）、超过 4 个的影响（2,189 个顶点被裁剪，位移至多 3.03 mm）、365 关节的 AdvancedSkeleton 绑定及约束与 IK（运动已烘焙进关节关键帧）、毛发动力学、ngSkinTools 图层与脚本节点、Arnold 专有材质属性、5 套额外 UV 与顶点色、USD 缓存与 Looks、Alembic 导出、环境图与预览图、FBX 自定义属性；IOR 固定为 1.5、粗糙度贴图从 R 改存到 G、n 边形三角化、厘米转米属于改动。
+  - 未完成：没有在 GPU 上渲染，也没有放进场景；纹理色彩空间与法线贴图约定没有经过视觉核对。
+
 ## 已实现的运行路径
 
 ### 世界空间反射
@@ -2037,6 +2240,165 @@ SwiftShader 只证明功能（16 个物体、96×32 段、400×260）：98,304 �
 - 洞分类依赖 meshoptimizer 的简化误差，它不是经过证明的几何上界；声明误差超过 48 像素的物体不做像素测试，只做覆盖和裂缝检查。根级简化仍会产生非流形收缩（重复边）。
 - 录像只覆盖程序化画廊，没有 Sponza 录像；录像中的帧时间不是性能数据。
 - 恢复 A/B 只在 16 个物体的画廊上测量；时间受其他代理争用影响。
+
+### Sponza 超额订阅游走、组边界审计、G01/G05 与静默丢失审计（2026-11-01）
+
+本小节对应提交 `8889917`、`d0c509d`、`a38ab76`、`529f524`、`1ef9241`、`c601672`、`e59bfe4`、`b9326e0`、`cec2521`、`874aa05`，分支上为 `6085bea`–`8bfcb66`（基于 main `b908476`；下文的 `8bfcb66` 指该分支提交），以及合入时的调整 `afc7162`、`85c10ab`。所有计时都在其他代理共用 GPU 时采集，只作诊断，不是验收或性能结论。软件适配器（SwiftShader）只证明功能，不代表硬件性能。目标机为 Apple M3 Max、Chrome 156、适配器 `apple / metal-3`。证据在被忽略的 `artifacts/geometry-assets-20261031/`，派生资产目录带 `-mac-20261031` 后缀，均未提交。资产部分见「Ivy 拆分、合成的 Sponza 资产集与 Animated Knight（2026-11-01）」。
+
+#### Sponza 超额订阅游走（4 倍与 8 倍）
+
+- **内容与预算**：Sponza 主建筑演示资产集（401 个分页批次，3,738,848 个源三角形，4 个 MASK/BLEND primitive 不进分页）。每条流从只含根页的池启动，`oversubscribedGeometryBudget` 按流送画廊的同一公式确定运行时预算：唯一数据 = Σ(顶点数 × 144 + 三角形数 × 12)，池预算 = 唯一数据 / 比值，常驻上限 = 固定开销 + (池预算 − 元数据) / 存储占比，峰值上限再加最大的 4 条完整流。准入为默认的工作守恒（intervalFrames 30、并发迁移 4），两阶段遮挡开启，LOD 误差 1 px。
+
+| 比值 | 唯一数据 | 池预算 | 常驻上限 | 峰值上限 | 实测峰值记账 | 实测最大常驻 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 961,491,276 | 240,372,819 | 387,818,796 | 519,656,756 | 413,740,616 | 387,806,540 |
+| 8 | 961,491,276 | 120,186,409 | 220,257,037 | 352,094,997 | 240,251,808 | 220,253,732 |
+
+  单位为字节。根页共 141,111,736 字节，全部常驻需要 1,510,686,680 字节，分别是 4 倍与 8 倍常驻上限的 3.90 倍与 6.86 倍。
+- **轨迹**（`tests/browser/fixtures/intel-sponza-walk.ts`，`scripts/capture-sponza-walk.mjs`）：在 A 冷启动，跳到 B，跳回 A，在 A 用 0.25 s 转身 180° 再转回，跳到侧廊，再跳回 A；每个阶段渲染到驻留空闲并连续 45 帧不变（上限 1800 帧）。随后沿资产集的相机路径 `sponza-nave-walk`（44 s）以固定 1/30 s 步长游走 1,320 帧。
+- **verify 检查**（960 × 540，身份色无光照，HDR rgba16f 读回，只用于测试）：
+  - 每次检查探测全部 401 条流的 GPU 切割，要求精确覆盖（无遗漏、无重叠、无部分组）；静止状态下还要求 GPU 切割与 CPU 规划器在同一驻留集上的切割逐簇相同。结合下一节的静态组边界审计，这就是开放网格的精确裂缝检查。
+  - 洞像素：对照用精细 LOD0 查询代理（requestedError 0）绘制的全细节参考，按每个物体的声明误差带内缩参考内部（半径 ⌈1.5 × 带宽⌉ + 2 px，超过 48 px 的物体不测）。每个洞像素用屏幕分块的 CPU 光线归因：全细节光线未命中为光栅平局；所显示物体的已绘制切割在光线上最近（或深度相当）为“邻近物体切割”；本物体的已绘制切割覆盖光线、图像却显示其后方或空白为漏绘；本物体切割未覆盖光线时，命中点在本物体误差带内为 LOD 误差，否则未解释。半像素偏移的光线用于识别已绘制轮廓处的光栅平局。
+- **verify 结果**（两个比值都通过，失败项为空）：
+
+| 比值 | 检查次数（静止 / 跳转首帧 / 阶段内每 15 帧 / 游走每 45 帧） | 测试的内部像素 | 洞像素 | 归因于邻近物体切割 | 漏绘 | 未解释 | 覆盖误差 | 静止时 CPU/GPU 切割差异 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 204（7 / 6 / 161 / 30） | 46,879,213 | 74,065 | 74,065 | 0 | 0 | 0 | 0 |
+| 8 | 82（7 / 6 / 39 / 30） | 9,305,417 | 28,086 | 28,086 | 0 | 0 | 0 | 0 |
+
+  洞像素全部是被邻近物体更粗的已绘制切割（预算不足时保留的回退祖先）盖住的像素，图像与已绘制切割一致。在被测物体中没有一个像素是漏绘或错误剔除，180° 转身与跳转后的首帧也没有。邻近物体本身的误差没有在这里限定，LOD 误差由 G01 测量。
+- **真实流送**：4 倍下全程载入 6,125 页、淘汰 5,810 页、重新载入 2,909 页，游走 1,320 帧中 1,300 帧有已分配但未驻留的页（峰值 535）；8 倍下载入 1,247、淘汰 1,106、重新载入 579 页。每帧都核对容量记账，常驻与峰值都没有超过上限。证据 `artifacts/geometry-assets-20261031/walk/verify-4x/report.json`、`verify-8x/report.json`。
+- **洞像素测试的覆盖范围**：每次检查只有 3–43 个物体有可测的内部像素；声明误差带超过 48 px 的物体（回退到很粗的祖先时最大带宽约 249,880 px，单次最多 232 个物体）不做像素测试，只靠覆盖、切割一致和静态审计。
+- **恢复（诊断，并发负载下）**：recovery 模式不读回、不检查，按墙钟记录每个阶段到驻留不再变化的帧数与时间，以及已分配但未驻留的页何时清零（前 120 帧逐帧采样，之后每 10 帧）。超额订阅下需求无法满足（总有因预算推迟的组，`framesToDemandMet` 为空），所以这里的恢复指驻留集稳定。两次运行都在 `8bfcb66` 上：
+
+| 阶段 | 4 倍：到驻留稳定（帧 / s） | 4 倍：未驻留页清零（帧） | 8 倍：到驻留稳定（帧 / s） | 8 倍：未驻留页清零（帧） |
+| --- | ---: | ---: | ---: | ---: |
+| 在 A 冷启动 | 414 / 38.9 | 410 | 193 / 36.1 | 190 |
+| 跳到 B | 545 / 58.8 | 530 | 339 / 75.5 | 260 |
+| 跳回 A | 685 / 67.4 | 680 | 363 / 75.5 | 310 |
+| 在 A 转身 180° | 953 / 85.7 | 960 | 398 / 69.0 | 400 |
+| 转回 | 441 / 46.3 | 450 | 443 / 88.6 | 440 |
+| 跳到侧廊 | 456 / 54.9 | 460 | 370 / 50.6 | 370 |
+| 再跳回 A | 462 / 53.6 | 390 | 373 / 55.5 | 310 |
+
+  - 每个渲染帧的墙钟时间：4 倍 90–120 ms，8 倍 137–223 ms。墙钟大部分花在等待下一帧：4 倍 416 s、8 倍 467 s，其中包括 6,142 / 3,608 次被流送背压扣下的帧（渲染帧共 4,527 / 3,103）；渲染调用本身 62 / 83 s。
+  - 每个阶段有 105–173 次（4 倍）或 64–107 次（8 倍）容量迁移，并发上限 4。
+  - 即使按 30 fps 的帧数换算，最快的阶段也要 6.4 s，1 s 目标没有达到。
+  - 随后按墙钟沿相机路径游走 44 s：4 倍只渲染 228 帧，其中 217 帧有未驻留页（峰值 64）；8 倍渲染 281 帧，159 帧有未驻留页（峰值 9）。
+  - 证据 `artifacts/geometry-assets-20261031/walk/recovery-4x-rebased/report.json`、`recovery-8x/report.json`。
+- **录像**：present 模式在目标机录制 4 倍游走：1280 × 720，左半为材质着色，右半为驻留视图（蓝为根页，绿为满足误差目标的已驻留细节，橙为缺页时的祖先回退，红为根回退）。每渲染一帧写一帧，用 `/opt/homebrew/bin/ffmpeg` 编码为 H.264 30 fps：6,566 帧、218.9 s、36.7 MB，`artifacts/geometry-assets-20261031/walk/present-4x/walk.mp4`（SHA-256 `b2c07e6d1f8a3efa01f730418fefdd032ee576e523c32138287a9102d62310ba`），未提交。
+  - 视频时间对应帧序号而不是墙钟，不反映实时节奏。
+  - 驻留视图的颜色经过与材质相同的曝光和色调映射，被冲淡：橙显示为浅黄，蓝为浅青，红为粉色。
+  - present 模式不做像素检查，只核对容量记账。该次运行全程载入 7,668 页、淘汰 7,162 页；游走中 1,297 帧有已分配但未驻留的页，峰值 1,303，高于 verify 的 535（present 的分辨率更高）。
+
+#### 已构建分页的静态裂缝审计
+
+- **方法**：`geometryGroupBoundaryAudit`（`src/geometry-stream-coverage.ts`）按位置焊接解码后的簇载荷，要求每个非终端组的父簇与子簇有相同的带符号焊接边平衡。满足这一性质时，`geometryCutCoverage` 接受的每个切割都与 LOD0 的净边界完全相同，开放网格因此也有精确的裂缝判据：运行时只需检查每个探测到的 GPU 切割的覆盖。审计对簇数、角数与访问的三角形数设上限。
+- **工具**：`scripts/audit-geometry-boundaries.mjs --package <分页目录> … --output report.json` 先核对流目录哈希，再逐页解码并校验页哈希，之后逐 primitive 审计；有任何不一致的组时退出码为 1。
+- **结果**：五个分页包都没有不一致的组。证据 `artifacts/geometry-assets-20261031/boundary-audit/sponza-packages.json` 与同名 `.log`。
+
+| 分页包 | 分页 primitive | 检查的组 | 不一致 | LOD0 边界边 |
+| --- | ---: | ---: | ---: | ---: |
+| Sponza 主建筑 group 16 | 401 | 6,385 | 0 | 117,690 |
+| Curtains group 16 | 43 | 3,327 | 0 | 62,188 |
+| Trees group 8 | 2 | 1,625 | 0 | 68,737 |
+| Ivy group 16 | 17 | 8,929 | 0 | 77,722 |
+| Ivy group 8 | 17 | 17,544 | 0 | 77,722 |
+
+- **限制**：审计比较的是净平衡，不排除简化把三角形折叠到锁定边上（重复的有向边）；G01 记录了这一构建器缺口。
+
+#### G01 记录：单高模拉近与绕行
+
+- **场景与轨迹**：`src/geometry-g01-scene.ts` 用固定种子 20261031 生成闭合的带细节环面：目标机用 1024 × 256 网格（524,288 个三角形），SwiftShader 用同一曲面的 256 × 64 网格（32,768 个三角形），使固定轨迹能在其用例时限内跑完。轨迹为 1921 个固定 1/60 s 步：先缓慢拉近，再在三个距离绕行。视口 480 × 320，LOD 误差参数 1 px。常驻 GPU LOD 路径与分页流送路径各自对照全细节参考绘制。
+- **检查**（`tests/browser/geometry-g01.spec.ts`，度量在 `src/geometry-lod-error.ts`）：
+  - 裂缝与破洞：每帧切割的边界边为 0，覆盖无遗漏、无重叠、无部分组；每 240 步用 `geometryCutWatertightness`、`geometryCutCoverage` 交叉核对逐帧计数；GPU 绘制的三角形数等于切割三角形数。
+  - 简化误差：轮廓位移不超过 ε·sec²θ + √2 px，表面间隙不超过 ε·secθ + 0.001 px（ε 为切割声明的误差，θ 为视线与法线夹角）。
+  - 常驻切割与 CPU 参考一致（只允许浮点舍入内的阈值判定），冻结选簇相机时绘制的正是上一帧切割。
+  - 轮廓跳变只测量，不设门槛。
+- **目标机结果**（`8bfcb66`，在完整回归中运行，记录 `artifacts/geometry-assets-20261031/g01-rebased/hardware/g01.json`）：两条路径各 1921 帧通过。
+  - 每帧边界边、覆盖遗漏/重叠/部分组都为 0；GPU 绘制三角形数等于切割三角形数；常驻与流送的 CPU 切割差异都为 0 帧。
+  - 深度：7,712 个采样，超界 0，最大间隙 0.795 px（界的 0.73 倍）。
+  - 声明误差：常驻最大 1.00 px；流送最大 2.51 px、p99 2.31 px，出现在缺页回退时（流送路径 1,154 帧空闲，回退簇最多 607 个）。
+  - 超出 2D 轮廓判据的像素：常驻 17 个、流送 18 个，全部分类（见下文测试假设变更）。
+  - 轮廓跳变（只测量）：切割变化帧中只有 LOD 一侧改变标签的像素每帧最多 99 个。
+  - 循环 129.5 s，此时主机负载约 11–15（诊断）。
+  - 常驻路径的所有计数与变基前的记录逐项相同；流送路径取决于页到达的时机，与变基前（17 个超界像素，声明误差最大 2.60 px）略有不同。
+- **SwiftShader 结果**：两条路径 1921 帧，边界边、覆盖误差、重复有向边、轮廓超界与表面间隙超界都为 0（深度采样 7,709 个），常驻与流送的 CPU 切割差异都为 0 帧；声明误差最大 1.00 px（常驻）与 1.05 px（流送）。
+- **轮廓判据的测试假设变更**：2D 判据是到参考标签边界的距离，隐含“标签边界是唯一轮廓”。环面还有内部轮廓（近处管体遮住中间的孔），误差 ε 以内的 LOD 偏差会在标签内部打开一像素宽的透视缝。目标机 480 × 320 下常驻路径有 17 个像素超出 2D 判据：其中 16 个像素显示的全细节表面点与切割表面相距 0.028–0.202 px，在 3D 表面误差界内；另 1 个像素（第 1297 步）的 CPU 光线同样没有命中切割（轮廓处的光栅平局）。流送路径有 18 个：17 个在 3D 误差界内（0.028–0.274 px），1 个是同一处光栅平局。`G01_LARGE=1`（960 × 640，变基前运行）下常驻 13 个、流送 14 个，全部在 3D 误差界内（0.023–0.383 px）。因此改为：所有超界像素都必须被分类，用 3D 表面误差界和 CPU 光线解释不了的像素必须为 0；原始计数保留在记录中。数值阈值没有放宽。证据为 `g01-rebased/hardware/g01.json`、`g01/hardware-large/g01.json` 的 `violationDiagnoses`。
+- **已知构建器缺口（折叠）**：目标机的 524k 网格上，常驻与流送路径每帧有至多 18 条重复有向边（第 1–3 层），SwiftShader 的 32k 网格为 0。重复有向边意味着简化把三角形折叠到锁定的组边界上或产生重复表面，比引擎的裂缝定义（只看边界边）更严。原因是构建器的组边界检查比较的是带符号边的净平衡，净平衡不变的折叠能通过。修复需要改构建器并重建所有分页包，这次没有做；用例只记录并标注（`known-gap`），不作门槛。
+- **录像**：`G01_VIDEO=1` 在目标机上把参考、常驻、流送三栏（标出不一致像素）编码为 H.264：`artifacts/geometry-assets-20261031/g01/video/g01-apple.mp4`，未提交。
+
+#### G05 记录：微三角形、重叠薄片与多材质
+
+- **用例**（`tests/browser/geometry-g05.spec.ts`，固定程序化内容与种子，经真实 Renderer 绘制）：
+  - 微三角形：焊接的切线扭曲立方体球（默认 1,051,392 个三角形，448 × 336），直径 100 与 300 px，分别走全细节、GPU LOD（0 与 1 px）和分页流送（1 px）路径；轮廓对照解析圆，允许带宽为全细节 1 px、LOD 或分页切割 ⌈1.5 × 1⌉ + 2 px。
+  - 重叠薄片：1、8、32、64 层，Opaque 与 Masked 各两种提交顺序（320 × 200）；HDR 身份色对照 CPU 解析参考，并要求两种顺序结果一致。
+  - 多材质：1、8、64、256 种材质的墙面瓦片加阴影（480 × 300）；逐瓦片身份色与阴影明暗对照。
+  - `G05_SCALE=large` 是只在硬件上运行的变体：1920 × 1080，1,354,752 个三角形的球。
+- **正确性**（目标机与 SwiftShader 均通过；目标机默认尺寸取自 `8bfcb66` 上的完整回归，报告在 `artifacts/geometry-assets-20261031/g05-rebased/`）：微三角形各路径超出带宽的像素为 0，全细节与 0 px 路径绘制全部源三角形，1 px 路径绘制更少（默认 68,532 / 97,518 个三角形，large 变体 86,258 / 115,848 个）；薄片 16 次运行的 950,760 个稳健像素无一不符，两种提交顺序的结果相同，Masked 的非最前层像素与解析预期一致；多材质 4 档的稳健像素无一不符，阴影区亮度为受光区的 0.134。所有资源释放后应用持有的 GPU 字节为 0。
+- **诊断计时**（目标机，GPU 与其他代理共用；逐 pass 时间戳，记录但不作门槛，不是性能结果）：默认尺寸取自完整回归，当时主机负载约 30；large 变体取自变基前的单独运行（`artifacts/geometry-assets-20261031/g05/`）。以下都是中位数。
+  - 微三角形的 GPU 帧跨度，直径 100 / 300 px：全细节 0.49 / 0.58 ms，GPU LOD 0 px 0.63 / 0.68 ms，GPU LOD 1 px 0.29 / 0.28 ms，分页 1 px 0.73 / 0.73 ms。large 变体：全细节 0.60 / 1.27 ms，GPU LOD 1 px 0.47 / 0.45 ms，分页 1 px 0.77 / 0.81 ms。
+  - 薄片 64 层的表面 pass：Masked 从后到前 0.092 ms，从前到后 0.024 ms，相差 3.9 倍（变基前一次为 3.6 倍）；large 变体 1.383 ms 对 0.152 ms，相差 9.1 倍。Opaque 两种顺序都在 0.03–0.05 ms，差别在噪声内。
+  - 多材质 1 / 8 / 64 / 256 种：绘制调用 5 / 19 / 131 / 515 次；表面 pass 0.27 / 0.07 / 0.07 / 0.13 ms；CPU 提交 0.1 / 0.1 / 0.1 / 0.3 ms；从渲染到 GPU 完成的串行整帧 1.0 / 1.2 / 1.7 / 3.6 ms。1 种材质的表面 pass 比 8 种还慢，说明负载噪声大于差异。large 变体的串行整帧为 1.5 / 2.0 / 2.1 / 3.2 ms。
+- **记录的限制**：
+  - Apple 上 Chrome 默认把时间戳量化到 65.536 µs，用例在硬件上加 `--enable-webgpu-developer-features` 取得未量化时间戳；只有新鲜的时间戳样本进入统计。
+  - 选簇（selection）阶段没有单独计时：需要在 `renderer.ts` 中为该 pass 加时间戳，这次没有改渲染器。
+  - Masked 薄片按从后到前提交时，64 层的表面 pass 中位数在默认尺寸下约为从前到后的 3.6–3.9 倍，large 变体约 9 倍（没有提前深度剔除）。
+  - 球的 LOD 层级打包后约为源三角形的 2.05 倍，须放进 `src/geometry-lod-data.ts` 300 万打包三角形的上限，large 变体球的规模因此受限。
+
+#### Masked、蒙皮与 Morph 批次的静默丢失审计
+
+- **场景**（`tests/browser/geometry-silent-drop.spec.ts`）：同一个 Renderer 里有 8 种面板：蒙皮、Morph、Masked、Masked + GPU LOD、Masked + 流送、省略源网格的分页流送（固定阴影/查询代理）、带完整源的分页流送、常驻 GPU LOD；外加地面与一面遮挡墙。三条流共用超额订阅的容量预算（常驻上限 1,993,068 字节，低于全部不透明需求 3,849,876 字节），两阶段遮挡开启。世界查询分逐批次与共享静态遍历两种配置各跑一次。
+- **检查**：每个批次在主视图（身份色无光照，0.1 m 密集网格覆盖；镂空孔保持打开；显示形变后而非静止位置）、太阳阴影图（投射体深度，以及与只有地面时对照的阴影区域）和世界查询（身份、形变后的距离、镂空处穿透）中都必须存在。静止时做一次全量审计，之后在负载下逐帧抽查：相机路径先让墙遮住全部面板再让它们重新露出，Masked 与 Opaque 材质来回切换，遮挡开关，动画姿态变化，共 31 帧。渲染器不能绘制的组合必须显式报错。
+- **结果**：目标机与 SwiftShader 上 3 个用例全部通过，没有静默丢失。形变输出与独立 CPU 参考相差至多 5.4e-7；遮挡帧中流送与 LOD 簇被两阶段遮挡剔除，同帧的阴影与查询仍找到每个投射体，回到相机 A 的第一帧在第二阶段全部恢复；超额订阅的流保留更粗的祖先而不是丢簇；每帧的常驻字节不超过上限。10 种不支持的组合（蒙皮/Morph/波动形变 + GPU LOD，蒙皮/Morph + 两种流送，Masked + 省略源网格的流送，GPU LOD + 流送，没有虚拟几何时开启遮挡）都在创建时以具名错误拒绝，没有创建渲染器。
+- **记录的行为**：Masked + GPU LOD 与 Masked + 流送批次不选簇，按完整源网格绘制；切换为 Opaque 后进入虚拟几何路径，切回 Masked 后回到完整源网格。单面投射体背对太阳的一面不投射阴影（用例按这一规则布置）。`stats.drawCalls` 是记账值，用例只核对它与预期一致，不把它当作实际绘制的证据。
+
+#### 命令与通过数
+
+分支变基到 main `b908476` 之后运行：
+
+- `npm run check`：变基后在主机较空闲时运行，115 个文件、968 项测试通过，类型检查与构建通过（日志 `artifacts/geometry-assets-20261031/check-rebased.log`）。加入文档与矩阵改动后在主机负载约 21–31 时重跑：类型检查与构建通过，966/968 项通过；另两项与本流无关的 CPU 密集用例（`tests/instance-bvh.test.ts` 的 4096 槽位用例、`tests/volumetric-fog-air.test.ts` 的 HG 积分用例）超过 vitest 默认 5 s 时限，单独运行这两个文件 14/14 通过（日志 `check-docs.log`、`build-docs.log`）。
+- SwiftShader 上全部几何规格：`PLAYWRIGHT_PORT=5234 npx playwright test tests/browser/geometry- --output <私有目录>`：25 项中 22 通过、2 跳过（`geometry-demo-recording` 需要 `GEOMETRY_RECORD_DIR`，`geometry-streamed-recovery` 需要 `GEOMETRY_RECOVERY_ABBA`）、1 失败：`geometry-stream-renderer.spec.ts:4` 在 Sponza 游走与其他代理同时占用主机时超过 120 s 用例时限；单独重跑 20.3 s 通过，用例与阈值都没有改。日志 `artifacts/geometry-assets-20261031/geometry-swiftshader-rebased.log` 与 `stream-renderer-swiftshader-rerun.log`。
+- 目标机完整浏览器回归：`PLAYWRIGHT_GPU=hardware PLAYWRIGHT_EXPECT_GPU_VENDOR=apple PLAYWRIGHT_PORT=5244 G01_RECORD_DIR=… G05_REPORT_DIR=… npx playwright test --output <私有目录>`：183 项中 179 通过、4 跳过（录像目录、容量恢复 A/B、本地资产集、需要 `GI_QUALITY_OUT` 的采集）、0 失败，用时 22.6 分钟，运行时主机负载 11–31。main 基线是 176 项（172 通过、4 跳过）；新增的 7 项是 G01 1 项、G05 3 项与静默丢失审计 3 项，全部通过。日志 `artifacts/geometry-assets-20261031/apple-full-rebased.log`。
+- Sponza 游走：`node scripts/with-dev-server.mjs --port 5214 -- node scripts/capture-sponza-walk.mjs --asset-set artifacts/sponza-asset-set-demo-mac-20261031/asset-set.json --mode verify|recovery|present --ratio 4|8 --output <目录>`（verify 另加 `--walk-check-every 45`）。verify-4x、verify-8x、recovery-8x 与 present-4x 都在 `8bfcb66` 上运行并通过；4 倍 recovery 在 2026-11-01 用端口 5224 重跑（输出 `walk/recovery-4x-rebased`），取代变基前的一次。报告与日志在 `artifacts/geometry-assets-20261031/walk/`。
+- 裂缝审计：`node scripts/audit-geometry-boundaries.mjs --package artifacts/sponza-group16-pages-mac-20261030 --package … --output artifacts/geometry-assets-20261031/boundary-audit/sponza-packages.json`。
+
+#### 接口变化
+
+- `src/geometry-stream-coverage.ts` 新增 `geometryGroupBoundaryAudit(directory, payloads)`、`GeometryClusterPayload`、`GeometryGroupBoundaryAudit`；错误码 `GEOMETRY_GROUP_BOUNDARY_PAYLOAD`、`_CORNER`、`_VERTEX_BUDGET`、`_BUDGET`。原有导出不变。
+- 新模块 `src/geometry-stream-oversubscription.ts`：`oversubscribedGeometryBudget(inputs, targetUniqueToPoolRatio, limits, maxConcurrentMigrations)` 按“唯一数据 / 比值”确定池预算，返回常驻与峰值上限及各项比值；比值 1–64、并发迁移 1–16，根数据放不下时报 `GEOMETRY_OVERSUBSCRIPTION_ROOTS_EXCEED_BUDGET`。
+- 新模块 `src/geometry-g01-scene.ts`（G01 的种子网格与 1921 步轨迹）与 `src/geometry-lod-error.ts`（纯 CPU 的身份覆盖、精确距离变换、轮廓与跳变计数、增量边账本与覆盖检查、按簇剔除的 CPU 光线投射），不含渲染器类型，不在运行时帧循环中使用。
+- 新模块 `src/gltf-package-composition.ts`：`loadAssetComposition(url, signal)`、`loadComposedPackageScene(composition, options)`。
+- 脚本：`split-gltf-primitives.mjs`、`write-asset-set.mjs --compose`、`audit-geometry-boundaries.mjs`、`capture-sponza-walk.mjs`、`convert-fbx-gltf.py`、`write-gltf-conversion-manifest.mjs`、`validate-gltf-skinned-animation.mjs`。
+- 本流没有改动渲染器、`src/large-scene-demo.ts` 与 `src/gltf-package-scene.ts`；后两者由大场景流修改，合入时的调整见下文。
+
+#### 失败、缺口与未完成
+
+- **1 s 恢复目标未达到**（诊断）：Sponza 在 4 倍与 8 倍下，每个阶段到驻留稳定都需要数百帧，墙钟数十秒（见上文恢复表）。工作守恒准入在小型程序化画廊上把传送恢复降到 0.27–0.33 s，但在 401 条流的真实资产上没有达到。超额订阅下需求本来就满足不了，这里只测驻留稳定，不测“需求满足”。
+- **像素级检查的覆盖范围**：Sponza 游走每次检查只有 3–43 个物体做洞像素测试，单次最多 232 个物体因声明误差带超过 48 px 不测；这些物体的错误剔除没有图像级验证，只靠覆盖、切割一致与静态审计。矩阵中 G03 的 geometry-correctness 因此记为 partly-measured。
+- **4 倍的口径**：比值按流送画廊的公式（唯一数据 / 页载荷池）计算。相对包含固定缓冲与槽位填充的全部常驻上限，4 倍运行只有 2.48 倍；8 倍运行为 4.37 倍，按任何一种口径都超过 4 倍。
+- **折叠（重复有向边）**：构建器的组边界检查只比较净平衡，G01 的 524k 网格每帧至多 18 条重复有向边。修复需要改构建器并重建全部分页包，没有做。
+- **测试假设变更**：G01 的轮廓判据改为允许 3D 表面误差界内的像素（证据见 G01 一节），没有放宽任何数值阈值。
+- **帧时间、1080p 基础输出与 30 分钟长时运行**：都没有测。所有计时是其他代理共用 GPU 时的诊断值。Sponza 游走每个渲染帧的墙钟时间在 recovery 模式（960 × 540）为 90–223 ms，在 present 模式（1280 × 720，含逐帧 JPEG 编码）为 125–266 ms，都包含等待下一帧与流送背压，远超 33.3 ms 预算；这只是并发负载下的观察，不是性能结论。
+- **G05 选簇阶段**没有单独计时，需要改 `renderer.ts`，这次没有改。
+- **合成的 Sponza 资产集**没有接入 `/large-scene.html`，没有浏览器运行或视觉检查；Trees 的 2 个 BLEND 树叶 primitive 被省略。
+- **Animated Knight** 没有在 GPU 上渲染，也没有放进场景；纹理色彩空间与法线贴图约定没有视觉核对；默认图像解码上限不够，调用方须提高。
+- **Emissive Candles 与 Bistro Interior** 没有转换。
+- **SwiftShader 批量运行中的超时**：25 个几何规格一起运行时（同时有 Sponza 游走占用 GPU、其他代理占用 CPU），`geometry-stream-renderer.spec.ts:4` 超过 120 s 用例时限；单独重跑 20.3 s 通过。没有改该用例或其阈值。
+- **Sponza 游走不是 Playwright 用例**：它由 `scripts/capture-sponza-walk.mjs` 驱动，依赖本地资产集，不在完整回归中运行。
+
+#### 合入时的调整
+
+- 大场景流让 `loadGltfPackageScene` 同时返回分页批次与完整细节 MASK 批次，并让 `loadAssetSetRoots` 读取精确代理根与清单哈希。合成模块原先假定只有分页批次，自建组件根时也不带这两项；合成的 Sponza 因此会改用内置查询代理并跳过清单核对。合入时改为（`afc7162`）：
+  - 合成场景保留两种批次，逐组件报告 MASK 与查询代理摘要；
+  - 所有组件的 MASK 几何共用一份预算，每个组件只能用前面组件剩下的部分，`mask: false` 对所有组件生效；
+  - 组件根带上 `fineQueryRoot` 与资产集记录的清单哈希，哈希格式不对时报 `GLTF_COMPOSITION_COMPONENT_HASH`；
+  - 新增两项单元测试，覆盖共用预算与根的传递。
+- compose 模式的测试原先断言单源读取器不返回精确代理根，现按新行为期望精确代理根与清单哈希（`85c10ab`）。
+- 合入前在合并后的代码（`85c10ab`）上复核，主机同时运行其他代理的 GPU 回归（负载约 23–27），日志在 `artifacts/main-integration-20261030/`（不入库）：
+  - Chrome 完整回归 184 项：180 通过、4 跳过、0 失败（`geo-large-apple.log`）。两个分支各自是 183 项与 177 项；合并后的 184 项是 main 的 176 项加几何流的 7 项与大场景流的 1 项。
+  - `npm run check`：120 个测试文件、988 项通过，类型检查与生产构建通过（`geo-large-check.log`）。
+  - 大场景资产集用例（Sponza，`LARGE_SCENE_ASSET_SET=/artifacts/sponza-asset-set-demo-mac-20261031/asset-set.json`）：4/4 通过，2.8 分钟（`geo-large-sponza.log`）。关键帧 0 用 180 个渲染帧稳定，覆盖审计 22,500 个格点中 0 个漏洞；开关雾、开关间接光与改变太阳方向的平均像素差为 1.83、12.62、45.17，与分支记录相同；释放后应用持有的 GPU 字节为 0。
 
 ## 驻留 GPU LOD 与可视化
 
@@ -3364,7 +3726,7 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 #### 内容
 
-- **版本**：v1，2026-10-30 冻结。目标为 Apple M3 Max（30 核 GPU，36 GB），macOS 26.6.2（25G83），Chrome 156.0.8078.76，适配器 `apple / metal-3`。证据截至 2026-10-31，对应 main `6d687b0`（字段 `evidenceMain`）。
+- **版本**：v1，2026-10-30 冻结。目标为 Apple M3 Max（30 核 GPU，36 GB），macOS 26.6.2（25G83），Chrome 156.0.8078.76，适配器 `apple / metal-3`。证据日期与对应的 main 提交记在 `evidenceAsOf` 与 `evidenceMain`，每次合入时更新；当前为 2026-11-01 与 `85c10ab`。
 - **40 行**：
   - 26 个固定场景：G01–G05、D01–D03、L01–L05、M01–M04、F01–F06、T01、P01、W01；
   - 阶段 1 的 7 个工作包和阶段 2 的 5 个工作包；
@@ -3391,11 +3753,11 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 
 门槛结果取 `met`、`unmet`、`partly-measured` 或 `not-measured`，未列出的门槛按 `not-measured` 处理。结果不是 `not-measured` 时，必须有目标机证据引用该门槛。
 
-#### 当前状态（main `ed3b487`）
+#### 当前状态（main `85c10ab`）
 
-合计：pass 0，fail 5，unsupported 3，partial 28，untested 4。按阶段：
+合计：pass 0，fail 5，unsupported 3，partial 30，untested 2。按阶段：
 - 阶段 1：8 行全部 partial；
-- 阶段 2：fail 5、unsupported 1、partial 20、untested 4；
+- 阶段 2：fail 5、unsupported 1、partial 22、untested 2；
 - 阶段 4：F06 与 M02 为 unsupported。
 
 矩阵 v2（2026-10-31）：用户确认阶段 2 范围后，M02（角色光学）移到阶段 4；M03 的基础透明、Masked 与 decal 留在阶段 2，高级透明与折射仍随 F06 属阶段 4。门槛和其他行不变，合计不变。
@@ -3407,7 +3769,7 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 | fail | P2-gi-reflections | 包含 L01、L04 的 GI 稳态未满足项；反射的两项门槛只在可选质量配置下满足 |
 | fail | P2-participating-media、F05 | 8 像素/格、64 层带历史需 158.2 MiB，预算 64 MiB |
 | unsupported | M03、M02、F06 | M03 缺透明与 decal；M02（角色光学）与 F06 属阶段 4 |
-| untested | P2-joint-large-scene、G02、G05、W01 | 没有目标机证据 |
+| untested | G02、W01 | 没有目标机证据 |
 
 相对首版（0 pass、5 fail、4 unsupported、26 partial、5 untested）的变化：
 
@@ -3417,9 +3779,12 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 - **partial → fail**：L01、L04、P2-gi-reflections。
 - **partial → fail → partial**：L05。粗糙档稳定性与波瓣响应未达标时改为 fail；可选反射质量配置达标后回到 partial，默认配置仍未达标。
 - **unsupported → partial**：F03。点光/聚光灯接入后，移动聚光灯与短闪光用例改为带门限运行，在目标机与 SwiftShader 上通过。F05 与 P2-participating-media 不再缺能力，但仍因 F05 的显存预算为 fail。
-- **untested → partial**：P2-visual-delivery。`/large-scene.html` 在目标机上漫游了 Bistro Exterior 与 Sponza；Bistro 关键帧 0 的路缘有透出天空的漏洞，原因待查，记为限制。
+- **untested → partial**：P2-visual-delivery、P2-joint-large-scene、G05。
+  - `/large-scene.html` 在目标机上漫游了 Bistro Exterior 与 Sponza。Bistro 关键帧 0 路缘处的漏洞后来查明是初始池过小、没有接入容量协调器，修复后为 0（见「大场景联合页：显式预算、光照、MASK 与精确代理（2026-11-01）」）。
+  - 大场景页同时开启 GI、反射与雾后，P2-joint-large-scene 有了功能证据。
+  - G05 的三个固定程序化用例在目标机通过。
 
-这些数值转录自各项工作的日志、JSON 和本文档，没有重新采集。新增 13 条目标机证据记录（另有 2 条兼容性证据，见「Safari 与 Playwright WebKit 回归（2026-11-01）」）：
+这些数值转录自各项工作的日志、JSON 和本文档，没有重新采集。新增 18 条目标机证据记录（另有 2 条兼容性证据，见「Safari 与 Playwright WebKit 回归（2026-11-01）」）：
 
 | 记录 | 种类 | 内容 |
 | --- | --- | --- |
@@ -3436,6 +3801,11 @@ Rapier compat 将 WASM 内嵌在 JavaScript，初始 bundle 较大。模块分�
 | `apple-main-reflq-20261031` | functional | 合入反射质量选项后的 main 完整回归 171 项：168 通过、3 跳过、0 失败（`234eb39`），不再有 `test.fail` |
 | `apple-main-gi-20261031` | functional | 合入 GI 可见性细化与收敛参考后的 main 完整回归 176 项：172 通过、4 跳过、0 失败（`6d687b0`） |
 | `apple-browser-matrix-20261031` | functional | WebKit 兼容修改后的 Chrome 完整回归 176 项：172 通过、4 跳过、0 失败（`6e9a7fa`） |
+| `apple-geometry-assets-20261031` | quality | Intel Sponza 4 倍与 8 倍超额订阅游走的检查、组边界审计、G01、G05 与静默丢失审计（分支 `8bfcb66`） |
+| `apple-geometry-timing-20261031` | diagnostic-timing | Sponza 恢复与 G05 的并发负载计时 |
+| `apple-large-scene-joint-20261031` | functional | 大场景联合页：显式预算、光照与 MASK，Bistro Exterior 与 Sponza 各 4/4（分支 `69437ee`） |
+| `apple-large-scene-timing-20261031` | diagnostic-timing | 大场景页的逐 pass GPU 时间戳（并发负载下） |
+| `apple-main-geo-large-20261101` | functional | 合入几何资产流与大场景流后的 main 完整回归 184 项：180 通过、4 跳过、0 失败（`85c10ab`） |
 
 #### 命令
 

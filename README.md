@@ -58,7 +58,7 @@ npm run dev
 
 `/geometry.html?scene=streamed` 是超额订阅的流送画廊：默认 24 个程序化雕塑，唯一几何数据约为几何池的 4 倍。新增驻留视图，用颜色区分驻留细节、根和回退祖先；可以分屏对照材质视图，切换 walk/zoom/orbit/turn/teleport 固定轨迹，并实时显示驻留页、回退簇与迁移次数。画廊只证明流送的覆盖与恢复行为，不代表 Sponza 等真实资产的规模或性能。
 
-`/large-scene.html?set=/artifacts/<集合>/asset-set.json` 加载离线工具写出的资产集（几何页、纹理、查询代理和可选相机路径），提供固定关键帧、沿相机路径漫游，以及材质、簇、层级三种视图。资产集由 `scripts/write-asset-set.mjs` 生成，转换产物不入库，来源与转换约定见 [assets.md](docs/assets.md)。MASK/BLEND primitive 不进分页漫游，遮蔽贴图不参与着色；此页不是大场景视觉验收。
+`/large-scene.html?set=/artifacts/<集合>/asset-set.json` 加载离线工具写出的资产集（几何页、纹理、查询代理和可选相机路径），提供固定关键帧、沿相机路径漫游，以及材质、簇、层级三种视图。分页几何按显式预算（`geometryMiB`，默认 1024）分配初始池，之后由容量协调器迁移；MASK primitive 按完整细节绘制，BLEND 省略并报告，遮蔽贴图不参与着色。光照默认开启 scheduled GI、时间反射与高度雾，都按显式预算创建，可用 `lighting`、`gi`、`reflections`、`fog`、`air`、`probes`、`reflectionSpacing`、`fogPixel`、`sun`、`exposure` 参数调整，越界参数直接报错。资产集由 `scripts/write-asset-set.mjs` 生成（`--compose` 合成共享同一场景坐标的多个资产集，此页尚未接入），转换产物不入库，来源与转换约定见 [assets.md](docs/assets.md)。此页不是大场景视觉验收。
 
 ## 验证
 
